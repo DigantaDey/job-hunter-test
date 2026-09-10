@@ -115,5 +115,10 @@ class FundingCompany(Base):
     stage = Column(String, default="Series A")  # Seed, Series A-D
     raised_at = Column(DateTime, default=datetime.utcnow)
     website = Column(String, default="")
+    industry = Column(String, default="")
+    summary = Column(Text, default="")
+    keywords_matched = Column(JSON, default=list)
+    source = Column(String, default="curated-demo")  # ai, curated-demo
     has_open_positions = Column(Boolean, default=False)
+    discovered_at = Column(DateTime, default=datetime.utcnow)
     meta = Column(JSON, default=dict)

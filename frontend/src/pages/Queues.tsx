@@ -84,7 +84,7 @@ export default function Queues(){
         <div className="p-3 border-b dark:border-zinc-800 flex items-center gap-2">
           <span className="text-sm font-medium">Pipeline jobs</span>
           <div className="ml-auto flex gap-1">
-            {['discovery','application','ai','email'].map(p=> <button key={p} onClick={()=>setFilter(p)} className={`text-xs px-3 py-1 rounded-full border mono ${filter===p?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800'}`}>{p}</button>)}
+            {['discovery','application','ai','email','funding'].map(p=> <button key={p} onClick={()=>setFilter(p)} className={`text-xs px-3 py-1 rounded-full border mono ${filter===p?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800'}`}>{p}</button>)}
           </div>
         </div>
         <div className="max-h-[50vh] overflow-auto divide-y dark:divide-zinc-800">

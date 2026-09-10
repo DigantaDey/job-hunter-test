@@ -10,6 +10,10 @@ export default function Jobs(){
   const [discoverBusy, setDiscoverBusy] = useState(false)
   const [resumeChoice, setResumeChoice] = useState('auto')
   const [applyMsg, setApplyMsg] = useState('')
+  const [discoverMsg, setDiscoverMsg] = useState('')
+  const [generating, setGenerating] = useState(false)
+  const [generateMsg, setGenerateMsg] = useState('')
+  const [generatedLinks, setGeneratedLinks] = useState<any>(null)
 
   const load = ()=>{
     const p:any={}
@@ -29,9 +33,21 @@ export default function Jobs(){
   const discover = async()=>{
     setDiscoverBusy(true)
     try{
-      await client.post('/api/jobs/discover')
+      const {data} = await client.post('/api/jobs/discover')
+      setDiscoverMsg(`${(data.keywords || []).slice(0, 8).join(' • ')} — extracted from your ${data.context_source === 'ai' ? 'profile by AI' : 'profile (heuristic)'}`)
       setTimeout(load, 2000)
+      setTimeout(load, 4500)
     }finally{ setDiscoverBusy(false)}
+  }
+  const generateResume = async()=>{
+    if(!selected) return
+    setGenerating(true)
+    try{
+      const {data} = await client.post('/api/resumes/generate', null, {params:{job_id: selected.id}})
+      setGenerateMsg('Tailored resume ready')
+      setGeneratedLinks(data.files)
+    }catch(e:any){ setGenerateMsg(e.response?.data?.detail || 'Generation failed') }
+    finally{ setGenerating(false) }
   }
   const apply = async()=>{
     if(!selected) return
@@ -59,6 +75,7 @@ export default function Jobs(){
           </button>
         </div>
       </div>
+      {discoverMsg && <div className="text-xs mono p-2 rounded-lg bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300">AI keywords: {discoverMsg}</div>}
 
       {/* filters */}
       <div className="card p-3 flex flex-wrap gap-2 items-center">
@@ -158,9 +175,16 @@ export default function Jobs(){
               </div>
 
               {selected.error && <div className="text-xs mono p-2 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300">{selected.error}</div>}
-              <div className="flex gap-2 text-xs mono">
-                <a href={`/api/resumes/generate?job_id=${selected.id}`} className="flex-1 py-2 rounded-full border dark:border-zinc-700 text-center flex items-center justify-center gap-1"><Wand2 className="w-3.5 h-3.5"/> Generate tailored resume</a>
-                <button onClick={async()=>{ await client.post('/api/emails/generate', null, {params:{company: selected.company, job_id: selected.id}}); alert('Email drafted → check Email Bucket')}} className="flex-1 py-2 rounded-full border dark:border-zinc-700">Cold email</button>
+              <div className="space-y-2 text-xs mono">
+                <button onClick={generateResume} disabled={generating} className="w-full py-2 rounded-full border dark:border-zinc-700 flex items-center justify-center gap-1 disabled:opacity-50">{generating ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <Wand2 className="w-3.5 h-3.5"/>} Generate tailored resume (JD fact guard)</button>
+                {generateMsg && <div className="text-[11px] text-zinc-500">{generateMsg}</div>}
+                {generatedLinks && (
+                  <div className="flex gap-2">
+                    <a href={generatedLinks.docx} className="flex-1 py-1.5 rounded-full border dark:border-zinc-700 text-center">Download .docx</a>
+                    <a href={generatedLinks.pdf} className="flex-1 py-1.5 rounded-full border dark:border-zinc-700 text-center">Download .pdf</a>
+                  </div>
+                )}
+                <button onClick={async()=>{ await client.post('/api/emails/generate', null, {params:{company: selected.company, job_id: selected.id}}); alert('Email drafted → check Email Bucket')}} className="w-full py-2 rounded-full border dark:border-zinc-700">Cold email</button>
               </div>
             </div>
           )}

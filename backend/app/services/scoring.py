@@ -7,9 +7,24 @@ from app.core.config import settings
 
 STOPWORDS = set(["the","and","for","with","a","an","in","on","of","to","is","are","as","at","by","from","or"])
 
+SKILL_SYNONYMS = {
+    "js": "javascript", "nodejs": "nodejs", "node": "nodejs",
+    "k8s": "kubernetes", "golang": "go", "py": "python", "ts": "typescript",
+    "postgres": "postgresql", "psql": "postgresql", "reactjs": "react",
+    "nextjs": "nextjs",
+}
+
+def _normalize_token(t: str) -> str:
+    """Lowercase, strip trailing punctuation, unify separators like c++/ci/cd/node.js."""
+    t = t.strip(".,;:!?()[]{}'\"").lower()
+    t = SKILL_SYNONYMS.get(t, t)
+    return t
+
 def tokenize(text: str) -> List[str]:
-    tokens = re.findall(r"[a-zA-Z0-9\+#\.]+", text.lower())
-    return [t for t in tokens if t not in STOPWORDS and len(t)>1]
+    # NOTE: no '.' in the char class — previously "Python." tokenized as
+    # "python." and never matched the skill "python", zeroing many scores.
+    tokens = re.findall(r"[a-zA-Z0-9\+#/]+", text.lower())
+    return [_normalize_token(t) for t in tokens if t not in STOPWORDS and len(t.strip("+#/"))>1]
 
 def tf(text: str) -> Dict[str, float]:
     toks = tokenize(text)
@@ -42,13 +57,16 @@ def heuristic_score(profile: Dict[str,Any], jd: str) -> Tuple[float, str]:
     jd_tokens = set(tokenize(jd))
     prof_tokens = set(tokenize(profile_text))
     coverage = len(jd_tokens & prof_tokens) / max(1, len(jd_tokens))
+    # Calibrated scaling: raw cosine against a long profile reads low even for
+    # strong matches, so normalize typical good matches (sim≈0.3, cov≈0.5) → ~85.
+    relevance = 0.5 * min(1.0, sim / 0.32) + 0.5 * min(1.0, coverage / 0.55)
     # Experience years boost if mentioned
     exp_bonus = 0
     if "year" in jd.lower() and profile_text.lower().count("year"):
         exp_bonus = 5
-    score = (sim * 70) + (coverage * 25) + exp_bonus
+    score = relevance * 88 + exp_bonus
     score = min(100, max(0, round(score,1)))
-    reason = f"cosine={sim:.2f}, coverage={coverage:.2f}, heuristic"
+    reason = f"skill overlap {int(coverage*100)}% of JD terms, similarity {sim:.2f} (calibrated heuristic)"
     return score, reason
 
 async def ai_score(profile: Dict[str,Any], jd: str, ai_config: Dict[str,Any]=None) -> Tuple[float, str]:

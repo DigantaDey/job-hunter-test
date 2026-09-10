@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import client from '../api/client'
-import { Settings as SettingsIcon, Save, Bot, Search, Sliders, Mail, Shield, Zap } from 'lucide-react'
+import { Settings as SettingsIcon, Save, Bot, Search, Sliders, Mail, Shield, Zap, TrendingUp } from 'lucide-react'
 
 export default function Settings(){
   const [data, setData]=useState<any>(null)
@@ -49,6 +49,15 @@ export default function Settings(){
             <div><label className="text-xs mono">Keywords (comma-separated, extracted from resume + editable)</label><input value={data.scraping.keywords} onChange={e=>update('scraping','keywords',e.target.value)} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
             <div><label className="text-xs mono">Job freshness (hours)</label><input type="number" value={data.scraping.freshness_hours} onChange={e=>update('scraping','freshness_hours', Number(e.target.value))} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
             <div><label className="text-xs mono">Sources (clubbed)</label><div className="flex flex-wrap gap-1 mt-1">{(data.scraping.sources||[]).map((s:string)=> <span key={s} className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 mono">{s}</span>)}</div></div>
+          </div>
+        </div>
+
+        <div className="card p-5">
+          <h3 className="font-medium flex items-center gap-2"><TrendingUp className="w-4 h-4"/> Funding Radar</h3>
+          <p className="text-xs mono text-zinc-500 mt-1">AI auto-extracts keywords from your profile + resume. Add extra focus here (optional).</p>
+          <div className="mt-3 space-y-3">
+            <div><label className="text-xs mono">Context notes (free-form, merged with AI extraction)</label><textarea value={data.funding?.context_notes||''} onChange={e=>update('funding','context_notes',e.target.value)} rows={2} placeholder="e.g. AI infrastructure, fintech in India" className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
+            <div><label className="text-xs mono">Industries to prioritize (optional)</label><input value={data.funding?.industries||''} onChange={e=>update('funding','industries',e.target.value)} placeholder="ai/ml, fintech" className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
           </div>
         </div>
 

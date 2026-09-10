@@ -2,11 +2,11 @@
 
 > **"Remove the pain of applying to multiple jobs. Give every candidate an AI boost — with career-grade accuracy."**
 
-A production-grade, full-stack **autonomous job-hunting platform** that ingests a master resume, extracts profile + layout with an OpenAI-compatible AI layer, discovers jobs across the internet, scores them, tailors resumes with a **JD fact-guard**, auto-creates vault credentials, auto-fills portals, handles *User Input Needed* queues, cold-emails hiring managers/founders, tracks funding-round companies, and runs **three parallel FIFO pipelines** (Discovery • Application • AI) under a configurable rate limiter.
+A production-grade, full-stack **autonomous job-hunting platform** that ingests a master resume, extracts profile + layout with an OpenAI-compatible AI layer, **auto-extracts search keywords from your resume/profile/context**, discovers jobs across the internet, scores them, tailors resumes with a **JD fact-guard**, auto-creates vault credentials, auto-fills portals, handles *User Input Needed* queues, cold-emails hiring managers/founders, runs an **AI-driven Funding Radar** (Seed→Series D, always fresh, context-matched), and runs **three parallel FIFO pipelines** (Discovery • Application • AI) under a configurable rate limiter.
 
-Built with product, engineering, AI, and design rigor — minimalist dashboard, dark/light/system theme, one-click Chrome/Apple Keychain vault export, and error logs.
+Built with product, engineering, AI, and design rigor — minimalist dashboard, dark/light/system theme, one-click Chrome/Apple Keychain vault export, error logs, and an offline-first heuristic fallback for every AI flow (plus a smoke test suite in `backend/tests/`).
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![Stack](https://img.shields.io/badge/stack-FastAPI%20%7C%20React%20%7C%20Vite%20%7C%20Tailwind-black)
 ![AI](https://img.shields.io/badge/AI-OpenAI%20compatible-emerald)
 ![Pipelines](https://img.shields.io/badge/pipelines-3%20parallel%20FIFO-violet)
@@ -20,10 +20,11 @@ Built with product, engineering, AI, and design rigor — minimalist dashboard, 
 | **Master resume upload** | PDF/DOCX, `pdfminer` + `pypdf` text, layout extractor (margins, lines, capitals, hyperlink style/color/underline, bullet style/count, borders, colors, fonts) |
 | **AI extraction** | `ai_extract_profile()` → OpenAI-compatible `chat/completions` with `response_format:json_object`, fallback heuristic (regex + keyword) if no key |
 | **Job scraping** | Adapter pattern for `linkedin / naukri / indeed / instahyre / lever / greenhouse / workday / custom` + AI form-structure detection (`detect_form_structure`) + freshness filter |
+| **AI keyword extraction** | `keyword_extractor.py` — AI derives `keywords / roles / industries / tech_stack / locations / seniority / funding_focus` from the user profile, master-resume text and free-form context (heuristic TF mining fallback when offline). User input is **merged on top**, never required. Used by job discovery and the funding radar. `GET /api/context/keywords` |
 | **Editable settings (clubbed)** | `GET/PUT /api/settings` — categories: `ai`, `scraping`, `general`, `application`, `email`, `workflows`. RPM slider, keywords, freshness, skeleton toggle, additional questions |
 | **3 pipelines / FIFO / parallel** | DB `PipelineJob` + in-memory `AIPipeline` queue with priority insertion (`priority 1 highest`), `asyncio.create_task` + `rate_limiter.wait_and_acquire()`; stats at `/api/pipelines/stats` |
-| **Vault auto-credential** | `generate_credential()` + Fernet encrypt, save per Workday/Lever/Greenhouse; exports: Chrome CSV `name,url,username,password` + Apple CSV `Title,URL,Username,Password,Notes,OTPAuth`; `DELETE /api/vault` deletes forever |
-| **Auto-fill + User Input Needed queue** | `extra.forms_detected` → missing `workAuthorization/linkedin` → `UserInputRequest(status=pending)` → frontend *User Input Needed Queue* → `POST /api/jobs/{id}/input` → re-queued to application |
+| **Auto-fill + User Input Needed queue** | `extra.forms_detected` → missing `workAuthorization/linkedin` → `UserInputRequest(status=pending)` (deduped on re-apply) → frontend *User Input Needed Queue* → `POST /api/jobs/{id}/input` → re-queued **and processed to completion** |
+| **Vault auto-credential** | `generate_credential()` + Fernet encrypt, per portal domain (`jobs.lever.co`, `boards.greenhouse.io`, Workday); reused per domain (no duplicates); exports: Chrome CSV + Apple CSV; `DELETE /api/vault` deletes forever |
 | **Big platforms auto-submit** | `source` detection; if `linkedin/naukri/indeed` → `is_external` → log external redirect, switches to credential+profile workflow |
 | **AI resume generator** | `jd_fact_guard_prompt()` — memory + JD + “never hallucinate” guard; `strict_skeleton` toggle preserves layout; `build_docx()` + `build_pdf()`; DOCX/PDF download; upload polished version re-uses |
 | **Auto-tagging** | Tags from AI `{"tags": [...]}` + heuristic fallback; editable via `PUT /api/resumes/{id}/tags` |
@@ -33,7 +34,7 @@ Built with product, engineering, AI, and design rigor — minimalist dashboard, 
 | **AI online dot** | `GET /api/settings/ai/status` → pings `/models`, returns `online` + `latency_ms`; frontend polls every 4s, green/red pulse |
 | **Company classifier** | `heuristic_company_size()` (employees/int + keyword) + `ai_company_size()` LLM → `big/medium/small/startup` |
 | **Email pipeline (SMTP + 2FA)** | `find_decision_maker()` + `generate_cold_email()` (AI), `send_via_smtp()` mock + real `smtplib` with `needs_otp` branch, frontend handles OTP prompt |
-| **Funding radar (≤ Series D)** | `find_funded_companies()` mock Series A-D, `POST /api/funding/{name}/process` → if `has_open_positions` → create Job, else founder cold email |
+| **Funding radar (≤ Series D)** | `funding_radar.py` — AI scan matched to your extracted `funding_focus`; every result dated relative to *now* (≤45d, nothing hardcoded/stale); 12-18+ results per scan; DB upsert + auto-prune so stale rows never surface; stage filters; `POST /api/funding/refresh` with optional extra context; process → Job (open roles) or founder cold email draft |
 | **Email approval bucket** | `Email.status` `pending_approval → queued → sent/failed/needs_otp`; editable subject/body, `POST /approve` + `POST /send` |
 | **Per-workflow AI API** | `GET/PUT /api/ai/config` → `settings(category='ai_workflows')` → different `base_url/model/api_key` per workflow |
 | **Dashboard** | Summary cards, recent jobs, pipeline mini, profile; job click → drawer with score, company_size, forms, status, apply |
@@ -74,7 +75,9 @@ Built with product, engineering, AI, and design rigor — minimalist dashboard, 
                 └──────────────┬──────────────┘
                                │
                 ┌──────────────▼──────────────┐
-                │  Funding Pipeline           │──▶ Series A-D radar
+                │  Funding Pipeline           │──▶ AI keyword extraction
+                │  Seed→D • fresh ≤45d •      │    (profile+resume+context)
+                │  auto-refresh • pruned      │    → jobs or founder email
                 └─────────────────────────────┘
 
 Frontend: Vite + React 18 + TypeScript + Tailwind + React Router
@@ -84,7 +87,7 @@ Backend: FastAPI + SQLAlchemy (SQLite) + Pydantic + httpx + python-docx/reportla
 
 **Scoring decision:**
 ```
-heuristic: tf(profile) cosine tf(JD) *70 + coverage*25 + bonus → 0-100
+heuristic: calibrated (cosine + JD-term coverage) → 0-100; tokenizer strips punctuation/synonyms ("Python." matches "python")
 AI: prompt → {"score","reason","missing_skills","strengths"} → fallback heuristic
 Reuse if best_existing_sim >0.75 else generate new (strict_skeleton toggles layout preservation)
 ```
@@ -152,7 +155,8 @@ Base: `http://localhost:8000`
 | `PUT` | `/api/resumes/{id}/tags` | Edit tags |
 | `GET` | `/api/jobs` | List (filter `status,source,q`) |
 | `GET` | `/api/jobs/{id}` | Detail + score + forms |
-| `POST` | `/api/jobs/discover` | Trigger discovery (keywords,freshness) |
+| `POST` | `/api/jobs/discover` | Trigger discovery (optional keywords; AI context auto-merged) |
+| `GET` | `/api/context/keywords` | AI-extracted search context (keywords/roles/industries/focus) |
 | `POST` | `/api/jobs/{id}/apply?resume_choice=auto\|master` | Autofill + vault + queue |
 | `POST` | `/api/jobs/{id}/input` | Submit User Input Needed |
 | `GET` | `/api/vault` | List credentials |
@@ -164,8 +168,10 @@ Base: `http://localhost:8000`
 | `PUT` | `/api/emails/{id}` | Edit |
 | `POST` | `/api/emails/{id}/approve` | Approve → queued |
 | `POST` | `/api/emails/{id}/send?otp=` | SMTP (2FA) |
-| `GET` | `/api/funding/companies` | Series A-D |
-| `POST` | `/api/funding/{name}/process` | Apply or founder email |
+| `GET` | `/api/funding/companies` | Fresh Seed-D radar + AI context (`?stage=`,`?refresh=1`) |
+| `POST` | `/api/funding/refresh` | Force AI re-scan (optional `{"context","keywords","stages"}`) |
+| `GET` | `/api/funding/context` | The AI-extracted context driving the radar |
+| `POST` | `/api/funding/{name}/process` | Apply (open roles) or founder cold email |
 | `GET` | `/api/settings` | Grouped settings |
 | `PUT` | `/api/settings` | Save grouped |
 | `GET` | `/api/settings/ai/status` | Online/latency/RPM |
@@ -288,6 +294,10 @@ uploads/  generated/      # Resumes
 - **Security:** Fernet encryption, CORS, env secrets, no password logging
 - **UX:** Minimalist cards, mono metrics, motion-reduced, keyboard-friendly, responsive (mobile nav)
 - **Docs:** OpenAPI at `/api/docs`, this README, `.env.example`, `docker-compose.yml`
+- **Smoke tests (offline, no AI key needed):**
+  ```bash
+  cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q
+  ```
 - **Testing the happy path:**
   ```bash
   # 1. Upload resume

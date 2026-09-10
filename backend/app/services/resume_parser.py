@@ -67,6 +67,11 @@ def heuristic_profile_extract(text: str) -> Dict[str, Any]:
     found_skills = [k for k in skills_keywords if k.lower() in text.lower()]
     # Experience: split by years
     exp_years = re.findall(r"(\d+)\+?\s*years", text, re.IGNORECASE)
+    # Infer a current title from the first chunk of text
+    title_match = re.search(
+        r"\b((?:senior|junior|lead|staff|principal|associate)?\s*(?:software|backend|frontend|full[- ]?stack|data|ml|machine learning|devops|platform|product|qa)?\s*(?:engineer|developer|architect|scientist|manager|analyst|designer))\b",
+        text[:600], re.IGNORECASE)
+    current_title = title_match.group(1).strip().title() if title_match else ""
     return {
         "name": name_match.group(1) if name_match else "Unknown",
         "email": email.group(0) if email else "",
@@ -74,7 +79,8 @@ def heuristic_profile_extract(text: str) -> Dict[str, Any]:
         "location": "",
         "summary": text[:500],
         "skills": found_skills,
-        "experience": [{"title": "Extracted Experience", "years": exp_years[0] if exp_years else "", "raw": text[500:1000]}],
+        "current_title": current_title,
+        "experience": [{"title": current_title or "Experience", "years": exp_years[0] if exp_years else "", "raw": text[500:1000]}],
         "education": [],
         "projects": [],
         "links": re.findall(r"https?://\S+", text)[:5],
