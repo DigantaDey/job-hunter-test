@@ -104,3 +104,16 @@ fact that a deletion happened). Users can read their own trail at `GET /api/acco
 Open a private security advisory (or email the maintainer listed in the repository) with repro
 steps. Please do not open a public issue for anything exploitable. Target acknowledgement: 3
 business days; a fix or mitigation plan within 30 days for confirmed high-severity issues.
+
+## 9. Dependency hygiene
+
+* Runtime pins live in `backend/requirements.txt`. `pip-audit -r backend/requirements.txt --strict`
+  reports **no known vulnerabilities** for that set (re-verified 2026-09-11) and the same command
+  runs in CI.
+* `python-jose` was replaced by `PyJWT` so the unmaintained `ecdsa` package is no longer installed;
+  password hashing talks to `bcrypt` directly (passlib is deliberately absent — it is incompatible
+  with bcrypt >= 5).
+* Frontend: `npm audit` is clean after moving to `vite@7` and `react-router-dom@7`;
+  `npm audit --omit=dev` gates production dependencies in CI.
+* Upgrade policy: when the audit flags a package it is bumped in the same change, and the full test
+  suite must stay green on both SQLite and PostgreSQL (CI enforces both).

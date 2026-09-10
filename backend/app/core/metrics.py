@@ -105,7 +105,7 @@ def observe(name: str, value: float, labels: Optional[Dict[str, str]] = None,
     with _LOCK:
         entry = _HISTOGRAMS.setdefault(
             _key(name, merged),
-            {"count": 0, "sum": 0.0, "buckets": {b: 0 for b in buckets}, "bounds": tuple(buckets)},
+            {"count": 0, "sum": 0.0, "buckets": dict.fromkeys(buckets, 0), "bounds": tuple(buckets)},
         )
         entry["count"] = int(entry["count"]) + 1  # type: ignore[arg-type]
         entry["sum"] = float(entry["sum"]) + float(value)  # type: ignore[arg-type]

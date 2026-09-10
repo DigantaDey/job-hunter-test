@@ -95,6 +95,10 @@ curl -s localhost:8000/api/meta | python -m json.tool
 
 # 6. backup
 python backend/scripts/backup.py --out /tmp/jh-backups --keep 3
+
+# 7. dependency audit (CI job "Dependency audit")
+pip-audit -r backend/requirements.txt --strict   # no known vulnerabilities
+cd frontend && npm audit --omit=dev              # 0 vulnerabilities
 ```
 
 Test suite covers: auth/tenancy, vault encryption + re-keying + audit, queue leasing/retries/dead

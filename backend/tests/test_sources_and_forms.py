@@ -47,13 +47,10 @@ def test_registry_reports_gated_sources_honestly():
         assert sources[source_id]["available"] is True
 
 
-def test_gated_source_raises_with_reason():
+@pytest.mark.asyncio
+async def test_gated_source_raises_with_reason():
     with pytest.raises(SourceError) as excinfo:
-        import asyncio
-
-        asyncio.get_event_loop().run_until_complete(
-            LinkedInSource().fetch(keywords=[], limit=1, since_hours=24, board_tokens=[])
-        )
+        await LinkedInSource().fetch(keywords=[], limit=1, since_hours=24, board_tokens=[])
     assert "partner" in str(excinfo.value)
 
 

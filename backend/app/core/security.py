@@ -21,7 +21,8 @@ import secrets
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from jose import JWTError, jwt
+import jwt as pyjwt
+from jwt import PyJWTError as JWTError
 
 from app.core.config import settings
 
@@ -103,13 +104,16 @@ def create_access_token(user_id: int, *, email: str = "", role: str = "member", 
         "iss": settings.app_name,
         "typ": "access",
     }
-    token = jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
+    token = pyjwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
+    if isinstance(token, bytes):  # PyJWT < 2.0 compatibility
+        token = token.decode()
     return token, minutes * 60
 
 
 def decode_token(token: str) -> Dict[str, Any]:
     """Decode + verify a JWT; raises ``JWTError`` when invalid/expired."""
-    return jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm], issuer=settings.app_name)
+    return pyjwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm],
+                        issuer=settings.app_name)
 
 
 # --------------------------------------------------------------------------- #

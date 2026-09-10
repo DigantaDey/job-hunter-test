@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from app.models.models import Job, Resume, User
 from app.services.resume_service import diff_text, fact_guard_check, render_profile_text, resume_text
 from app.services.scoring import heuristic_score, jd_similarity, tokenize
@@ -189,7 +191,8 @@ def test_profile_update_invalidates_context(client, auth, uploaded_resume):
     assert after["generated_at"] != before["generated_at"]
 
 
-def test_resume_reuse_decision_prefers_similar_jd(client, auth, db, uploaded_resume):
+@pytest.mark.asyncio
+async def test_resume_reuse_decision_prefers_similar_jd(client, auth, db, uploaded_resume):
     from app.models.models import Profile
     from app.services.apply_flow import choose_resume
 
@@ -200,10 +203,6 @@ def test_resume_reuse_decision_prefers_similar_jd(client, auth, db, uploaded_res
     generated = client.post(f"/api/resumes/generate?job_id={first.id}", headers=auth).json()["resume_id"]
     client.post(f"/api/resumes/{generated}/approve", headers=auth)
 
-    import asyncio
-
-    chosen_id, decision = asyncio.get_event_loop().run_until_complete(
-        choose_resume(db, profile.user_id, profile, second, "auto")
-    )
+    chosen_id, decision = await choose_resume(db, profile.user_id, profile, second, "auto")
     assert decision == "reused"
     assert chosen_id == generated
