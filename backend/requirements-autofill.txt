@@ -1,0 +1,10 @@
+# Optional: real browser autofill (Playwright).
+#
+#     pip install -r requirements-autofill.txt
+#     playwright install chromium
+#
+# Without this extra the application still runs — /api/settings/runtime reports
+# autofill.available=false and applications are prepared (fields mapped, form
+# snapshots stored) but never submitted. Keeping the browser out of the default
+# install keeps the container small and the attack surface minimal.
+playwright==1.44.0

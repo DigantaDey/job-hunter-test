@@ -1,8 +1,9 @@
-import { NavLink, Outlet, useLocation } from 'react-router-dom'
+import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { LayoutDashboard, Briefcase, FileText, Mail, Vault, Settings, ScrollText, Layers, TrendingUp, Sparkles, Moon, Sun, Monitor, Circle } from 'lucide-react'
+import { LayoutDashboard, Briefcase, FileText, Mail, Vault, Settings, ScrollText, Layers, TrendingUp, Moon, Sun, Monitor, Circle, LogOut, UserCog } from 'lucide-react'
 import { useTheme } from '../hooks/useTheme'
 import client from '../api/client'
+import { useAuth } from '../context/AuthContext'
 
 const nav = [
   {to:'/', label:'Dashboard', icon: LayoutDashboard},
@@ -13,11 +14,13 @@ const nav = [
   {to:'/funding', label:'Funding Radar', icon: TrendingUp},
   {to:'/vault', label:'Vault', icon: Vault},
   {to:'/settings', label:'Settings', icon: Settings},
+  {to:'/account', label:'Account', icon: UserCog},
   {to:'/logs', label:'Error Logs', icon: ScrollText},
 ]
 
 export default function Layout() {
   const {theme, setTheme} = useTheme()
+  const {user, logout} = useAuth()
   const [ai, setAi] = useState<{online:boolean, rpm:number, remaining:number, latency_ms?:number} | null>(null)
   const loc = useLocation()
   useEffect(()=>{
@@ -26,7 +29,7 @@ export default function Layout() {
         const {data} = await client.get('/api/settings/ai/status')
         setAi(data)
       } catch { setAi({online:false, rpm:60, remaining:0}) }
-    }, 4000)
+    }, 15000)
     // immediate
     client.get('/api/settings/ai/status').then(r=>setAi(r.data)).catch(()=>{})
     return ()=> clearInterval(id)
@@ -64,7 +67,15 @@ export default function Layout() {
             <button onClick={()=>setTheme('dark')} className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-full text-xs ${theme==='dark'?'bg-zinc-900 shadow text-white':'text-zinc-500'}`}><Moon className="w-3.5 h-3.5"/> Dark</button>
             <button onClick={()=>setTheme('system')} className={`flex-1 flex items-center justify-center gap-1 py-1.5 rounded-full text-xs ${theme==='system'?'bg-white dark:bg-zinc-700 shadow':'text-zinc-500'}`}><Monitor className="w-3.5 h-3.5"/> Auto</button>
           </div>
-          <div className="mt-3 text-[11px] text-zinc-500 dark:text-zinc-400 mono text-center">v1.2 • three FIFO pipelines • AI keyword extraction • JD fact guard</div>
+          {user && (
+            <div className="mt-3 flex items-center gap-2 text-[11px] mono text-zinc-500 dark:text-zinc-400">
+              <span className="truncate flex-1" title={user.email}>{user.email}</span>
+              <button onClick={()=>void logout()} title="Sign out" className="p-1 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                <LogOut className="w-3.5 h-3.5"/>
+              </button>
+            </div>
+          )}
+          <div className="mt-2 text-[11px] text-zinc-500 dark:text-zinc-400 mono text-center">v2.0 • multi-tenant • durable queues • audit trail</div>
         </div>
       </aside>
 
@@ -87,7 +98,7 @@ export default function Layout() {
           <Outlet />
         </main>
         <footer className="px-6 py-4 text-[11px] mono text-zinc-500 dark:text-zinc-500 text-center border-t dark:border-zinc-800 bg-white/50 dark:bg-zinc-900/50">
-          JobHunter AI — accurate by design • resume skeleton guard • fact guard • rate-limited AI pipeline • vault exports for Chrome & Apple Keychain
+          JobHunter AI v2.0 — accurate by design • per-user encrypted vault • resume fact guard • consent-gated automation • audit trail
         </footer>
       </div>
     </div>

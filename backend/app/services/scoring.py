@@ -1,10 +1,11 @@
-import re
 import json
 import math
-from typing import Dict, Any, Tuple, List
-from app.services.ai_client import chat_completion, AIClientError
+import re
+from typing import Any, Dict, List, Tuple
 
-STOPWORDS = set(["the","and","for","with","a","an","in","on","of","to","is","are","as","at","by","from","or"])
+from app.services.ai_client import AIClientError, chat_completion
+
+STOPWORDS = {"the", "and", "for", "with", "a", "an", "in", "on", "of", "to", "is", "are", "as", "at", "by", "from", "or"}
 
 SKILL_SYNONYMS = {
     "js": "javascript", "nodejs": "nodejs", "node": "nodejs",
@@ -19,11 +20,19 @@ def _normalize_token(t: str) -> str:
     t = SKILL_SYNONYMS.get(t, t)
     return t
 
+# Tokens that are legitimately short but cannot be dropped (they are skills).
+SHORT_TECH_TOKENS = {"c++", "c#", "go", "r", "js", "ts", "ai", "ml", "qa", "ui", "ux"}
+
+
 def tokenize(text: str) -> List[str]:
     # NOTE: no '.' in the char class — previously "Python." tokenized as
     # "python." and never matched the skill "python", zeroing many scores.
     tokens = re.findall(r"[a-zA-Z0-9\+#/]+", text.lower())
-    return [_normalize_token(t) for t in tokens if t not in STOPWORDS and len(t.strip("+#/"))>1]
+    return [
+        _normalize_token(t)
+        for t in tokens
+        if t not in STOPWORDS and (len(t.strip("+#/")) > 1 or t in SHORT_TECH_TOKENS)
+    ]
 
 def tf(text: str) -> Dict[str, float]:
     toks = tokenize(text)

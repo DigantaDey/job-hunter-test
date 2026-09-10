@@ -1,18 +1,38 @@
+# Runtime dependencies (pinned). Install: pip install -r requirements.txt
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
+
+# Data layer — SQLAlchemy 2.x + Alembic migrations. PostgreSQL is the production
+# target; SQLite remains supported for single-user/self-host deployments.
 sqlalchemy==2.0.27
+alembic==1.13.1
+psycopg2-binary==2.9.9
+
+# Validation / settings — email-validator is required by pydantic EmailStr.
 pydantic==2.6.0
 pydantic-settings==2.1.0
+email-validator==2.1.1
 python-multipart==0.0.9
+
+# Documents: PDF/DOCX parsing and generation.
 pypdf==4.1.0
 python-docx==1.1.2
 reportlab==4.1.0
+pdfminer.six==20221105
+
+# HTTP + scraping primitives.
 httpx==0.27.0
-cryptography==42.0.2
-aiofiles==23.2.1
-jinja2==3.1.3
 beautifulsoup4==4.12.3
 lxml==5.1.0
-pdfminer.six==20221105
+aiofiles==23.2.1
+jinja2==3.1.3
+
+# Security: JWT signing, symmetric encryption for the vault, password hashing.
+# NOTE: passlib is deliberately NOT used — passlib 1.7.4 is incompatible with
+# bcrypt >= 5.0. app/core/security.py talks to bcrypt directly.
 python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
+cryptography==42.0.2
+bcrypt==5.0.0
+
+# DNS MX verification for contact discovery (no SMTP probing).
+dnspython==2.6.1

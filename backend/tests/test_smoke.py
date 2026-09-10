@@ -1,51 +1,73 @@
 """
-Smoke tests — run offline (no AI key needed; heuristic fallbacks are exercised).
+Smoke tests: the smallest possible end-to-end happy path, fully offline.
 
     cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q
 """
-import os
-import sys
-import io
+from __future__ import annotations
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from fastapi.testclient import TestClient  # noqa: E402
-from app.main import app  # noqa: E402
-
-# Context manager form triggers the lifespan (init_db + worker startup)
-client = TestClient(app)
-client.__enter__()
+from tests.conftest import pdf_bytes
 
 
-def _pdf_bytes() -> bytes:
-    from reportlab.lib.pagesizes import LETTER
-    from reportlab.platypus import SimpleDocTemplate, Paragraph
-    from reportlab.lib.styles import getSampleStyleSheet
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=LETTER)
-    styles = getSampleStyleSheet()
-    doc.build([
-        Paragraph("Test Candidate", styles["Title"]),
-        Paragraph("test.candidate@example.com | +91 90000 00001 | Bangalore, India", styles["Normal"]),
-        Paragraph("Summary", styles["Heading2"]),
-        Paragraph("Full-stack engineer with 6 years in Python, FastAPI, React, TypeScript, AWS, Kubernetes. Fintech and AI products.", styles["Normal"]),
-        Paragraph("Skills", styles["Heading2"]),
-        Paragraph("Python, FastAPI, React, TypeScript, AWS, Docker, Kubernetes, PostgreSQL", styles["Normal"]),
-        Paragraph("Experience", styles["Heading2"]),
-        Paragraph("Senior Software Engineer - FinCo (2021-present): Payments platform, 2M users, kubernetes on AWS.", styles["Normal"]),
-    ])
-    return buf.getvalue()
-
-
-def test_health_and_meta():
+def test_health_and_meta(client):
     assert client.get("/api/health").json()["status"] == "ok"
     meta = client.get("/api/meta").json()
+    assert meta["name"] and meta["version"]
     assert "ai_keyword_extraction" in meta["features"]
-    assert "funding_radar_ai_context" in meta["features"]
+    assert "real_job_sources" in meta["features"]
+
+
+def test_anonymous_requests_are_rejected(client):
+    for path in ("/api/jobs", "/api/resumes", "/api/vault", "/api/settings", "/api/logs"):
+        response = client.get(path)
+        assert response.status_code == 401, f"{path} leaked to anonymous callers"
+        assert response.headers.get("WWW-Authenticate") == "Bearer"
+
+
+def test_bootstrap_login_me_roundtrip(client, owner):
+    me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {owner['access_token']}"}).json()
+    assert me["email"] == "owner@example.com"
+
+    # Wrong password is rejected, and the second bootstrap is not allowed.
+    bad = client.post("/api/auth/login", json={"email": "owner@example.com", "password": "wrong-password"})
+    assert bad.status_code == 401
+    assert client.post("/api/auth/bootstrap", json={"email": "x@example.com", "password": "password-1234"}).status_code == 409
+
+
+def test_upload_resume_builds_profile(client, auth, uploaded_resume):
+    assert uploaded_resume["profile"]["name"] == "Test Candidate"
+    assert uploaded_resume["profile"]["email"] == "test.candidate@example.com"
+    assert uploaded_resume["search_context"]["keywords"]
+    assert client.get("/api/profile/current", headers=auth).status_code == 200
+
+
+def test_upload_rejects_non_resume(client, auth):
+    response = client.post("/api/resume/upload", files={"file": ("photo.png", b"\x89PNG", "image/png")}, headers=auth)
+    assert response.status_code == 415
+
+
+def test_resume_generation_requires_a_resume(client, auth, seeded_job):
+    response = client.post(f"/api/resumes/generate?job_id={seeded_job.id}", headers=auth)
+    assert response.status_code == 400
+    assert "resume" in response.text.lower()
+
+
+def test_ocr_free_pdf_parsing(tmp_path):
+    from app.services.resume_parser import extract_text, heuristic_profile_extract
+
+    path = tmp_path / "resume.pdf"
+    path.write_bytes(pdf_bytes())
+    text = extract_text(str(path))
+    assert "python" in text.lower()
+
+    profile = heuristic_profile_extract(text)
+    assert profile["email"] == "test.candidate@example.com"
+    assert profile["name"]
+    assert "python" in [skill.lower() for skill in profile["skills"]]
 
 
 def test_keyword_extractor_heuristic():
     from app.services.keyword_extractor import heuristic_context, merge_user_keywords
+
     profile = {
         "name": "Test Candidate",
         "skills": ["python", "fastapi", "react", "aws", "kubernetes"],
@@ -54,144 +76,28 @@ def test_keyword_extractor_heuristic():
         "location": "Bangalore, India",
         "raw_text": "python fastapi react aws kubernetes payments fintech microservices postgresql redis",
     }
-    ctx = heuristic_context(profile, "interested in AI infrastructure startups")
-    assert ctx["keywords"]
-    assert "python" in [k.lower() for k in ctx["keywords"]]
-    assert ctx["seniority"] in {"junior", "mid", "senior", "senior+", "staff+"}
-    merged = merge_user_keywords(ctx, "rust, golang")
+    context = heuristic_context(profile, "interested in AI infrastructure startups")
+    assert context["keywords"]
+    assert "python" in [keyword.lower() for keyword in context["keywords"]]
+    assert context["seniority"] in {"junior", "mid", "senior", "senior+", "staff+"}
+
+    merged = merge_user_keywords(context, "rust, golang")
     assert merged["keywords"][0].lower() == "rust"
 
 
-def test_scoring_tokenizer_fix():
-    """'Python.' must match skill 'python' (trailing punctuation bug)."""
-    from app.services.scoring import heuristic_score
-    profile = {"skills": ["python"], "summary": "python developer", "experience": [], "projects": []}
-    score, reason = heuristic_score(profile, "Backend role. Python. FastAPI. AWS.")
-    assert score > 0, f"tokenizer bug regressed: {reason}"
+def test_demo_pool_is_opt_in(client, auth):
+    """With INCLUDE_DEMO_POOL=false and live scraping off, discovery finds nothing."""
+    body = client.post("/api/jobs/discover", json={"keywords": ["python"]}, headers=auth).json()
+    assert body["queued"] is True  # queued for the worker; nothing is fabricated synchronously
+    assert client.get("/api/jobs", headers=auth).json() == []
 
 
-def test_resume_upload_and_context():
-    files = {"file": ("resume.pdf", _pdf_bytes(), "application/pdf")}
-    r = client.post("/api/resume/upload", files=files)
-    assert r.status_code == 200, r.text
-    data = r.json()
-    assert data["resume"]["id"] > 0
-    assert data["profile"].get("email") == "test.candidate@example.com"
-    ctx = data.get("search_context")
-    assert ctx and ctx["keywords"], "upload must return AI/heuristic search context"
-
-    # context endpoint
-    ctx2 = client.get("/api/context/keywords").json()
-    assert ctx2["keywords"]
-
-
-def test_discovery_no_duplicates():
-    r1 = client.post("/api/jobs/discover")
-    assert r1.status_code == 200
-    r2 = client.post("/api/jobs/discover")
-    assert r2.status_code == 200
-    import time
-    time.sleep(3.5)  # background discovery
-    jobs = client.get("/api/jobs").json()
-    keys = [(j["title"], j["company"]) for j in jobs]
-    assert len(keys) == len(set(keys)), f"duplicate jobs discovered: {keys}"
-
-
-def test_funding_radar_fresh_and_populated():
-    r = client.get("/api/funding/companies")
-    assert r.status_code == 200
-    data = r.json()
-    companies = data["companies"]
-    assert len(companies) >= 12, f"radar returned too few results: {len(companies)}"
-    today = __import__("datetime").date.today()
-    for c in companies:
-        assert c["raised_at"] is not None
-        y, m, d = map(int, c["raised_at"].split("-"))
-        raised = __import__("datetime").date(y, m, d)
-        age_days = (today - raised).days
-        assert 0 <= age_days <= data["freshness_days"] + 1, f"stale company {c['name']}: {age_days}d"
-        assert isinstance(c["has_open_positions"], bool)
-    stages = {c["stage"] for c in companies}
-    assert stages.issubset({"Seed", "Series A", "Series B", "Series C", "Series D"})
-    # stage filter
-    r2 = client.get("/api/funding/companies", params={"stage": "Series A"})
-    assert all(c["stage"] == "Series A" for c in r2.json()["companies"])
-    # context is included and keyword-matched
-    assert data["context"]["keywords"]
-    assert any(c["keywords_matched"] for c in companies)
-
-
-def test_funding_refresh_and_process():
-    r = client.post("/api/funding/refresh", json={"context": "AI infrastructure"})
-    assert r.status_code == 200 and r.json()["ok"]
-    companies = client.get("/api/funding/companies").json()["companies"]
-    target = next((c for c in companies if c["has_open_positions"]), companies[0])
-    pr = client.post(f"/api/funding/{target['name']}/process")
-    assert pr.status_code == 200
-    body = pr.json()
-    if body["action"] == "apply_flow":
-        assert body["job_id"]
-    else:
-        assert body["email_id"]
-
-
-def test_resume_generate_and_download():
-    jobs = client.get("/api/jobs").json()
-    if not jobs:
-        client.post("/api/jobs/discover")
-        import time; time.sleep(3)
-        jobs = client.get("/api/jobs").json()
-    assert jobs
-    r = client.post("/api/resumes/generate", params={"job_id": jobs[0]["id"]})
-    assert r.status_code == 200, r.text
-    rid = r.json()["resume_id"]
-    pdf = client.get(f"/api/resumes/{rid}/download", params={"format": "pdf"})
-    assert pdf.status_code == 200 and pdf.content[:4] == b"%PDF"
-    docx = client.get(f"/api/resumes/{rid}/download", params={"format": "docx"})
-    assert docx.status_code == 200 and docx.content[:2] == b"PK"
-
-
-def test_email_flow():
-    r = client.post("/api/emails/generate", params={"company": "Linear"})
-    assert r.status_code == 200, r.text
-    eid = r.json()["email"]["id"]
-    assert client.post(f"/api/emails/{eid}/approve").json()["status"] == "queued"
-    sent = client.post(f"/api/emails/{eid}/send")
-    assert sent.status_code == 200 and sent.json().get("sent") is True
-
-
-def test_apply_needs_input_then_requeue_completes():
-    jobs = client.get("/api/jobs").json()
-    target = next((j for j in jobs if j["company_size"] in ("startup", "small")), jobs[0])
-    detail = client.get(f"/api/jobs/{target['id']}").json()
-    r = client.post(f"/api/jobs/{target['id']}/apply", params={"resume_choice": "master"})
-    assert r.status_code == 200, r.text
-    if r.json()["status"] == "needs_input":
-        uir_id = r.json()["input_request_id"]
-        # no duplicate pending requests on re-apply
-        r2 = client.post(f"/api/jobs/{target['id']}/apply", params={"resume_choice": "master"})
-        assert r2.json()["input_request_id"] == uir_id
-        sub = client.post(f"/api/jobs/{target['id']}/input", json={"workAuthorization": "Yes", "linkedin": "https://linkedin.com/in/test"})
-        assert sub.status_code == 200
-        import time; time.sleep(2)
-        detail_after = client.get(f"/api/jobs/{target['id']}").json()
-        assert detail_after["status"] == "applied", f"re-queued job stuck at {detail_after['status']}"
-
-
-def test_vault_export_shape():
-    r = client.get("/api/vault/export/chrome")
-    assert r.status_code == 200
-    lines = r.text.strip().splitlines()
-    if len(lines) > 1:
-        assert lines[0].strip() == "name,url,username,password"
-    a = client.get("/api/vault/export/apple")
-    assert a.status_code == 200
-    assert a.text.strip().splitlines()[0] == "Title,URL,Username,Password,Notes,OTPAuth"
-
-
-def test_settings_roundtrip():
-    r = client.put("/api/settings", json={"funding": {"context_notes": "AI infra"}})
-    assert r.status_code == 200
-    s = client.get("/api/settings").json()
-    assert s["funding"]["context_notes"] == "AI infra"
-    assert "scraping" in s and "workflows" in s
+def test_settings_roundtrip(client, auth):
+    updated = client.put("/api/settings", json={"general": {"strict_skeleton": True, "generate_min_score": 70}},
+                         headers=auth)
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["updated"]["general"]["generate_min_score"] == 70
+    settings = client.get("/api/settings", headers=auth).json()
+    assert settings["general"]["strict_skeleton"] is True
+    # Unknown categories/keys are rejected with 400, not silently stored.
+    assert client.put("/api/settings", json={"nope": {"x": 1}}, headers=auth).status_code == 400

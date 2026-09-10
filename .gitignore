@@ -4,11 +4,30 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
+
+# Databases & user data
+*.db
+*.db-wal
+*.db-shm
 jobhunter.db
 uploads/
 generated/
+artifacts/
+backups/
+
+# Frontend
 frontend/node_modules/
 frontend/dist/
-.DS_Store
+frontend/.vite/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .coverage
+coverage.xml
+htmlcov/
+.DS_Store
 *.log

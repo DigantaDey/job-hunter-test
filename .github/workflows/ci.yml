@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+
+jobs:
+  backend:
+    name: Backend tests (SQLite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r backend/requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check backend
+
+      - name: Run test suite
+        working-directory: backend
+        env:
+          ENVIRONMENT: test
+          SECRET_KEY: ci-secret-key-that-is-long-enough-1234567890
+          ENCRYPTION_KEY: ci-encryption-key-that-is-long-enough-1234567890
+          AI_API_KEY: ""
+          LIVE_SCRAPING_ENABLED: "false"
+          AUTH_REQUIRED: "true"
+        run: PYTHONPATH=. python -m pytest tests/ -q --maxfail=1
+
+  backend-postgres:
+    name: Backend tests (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: jobhunter
+          POSTGRES_PASSWORD: jobhunter
+          POSTGRES_DB: jobhunter_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U jobhunter" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r backend/requirements-dev.txt
+
+      - name: Run test suite against PostgreSQL
+        working-directory: backend
+        env:
+          ENVIRONMENT: test
+          DATABASE_URL: postgresql+psycopg2://jobhunter:jobhunter@localhost:5432/jobhunter_test
+          SECRET_KEY: ci-secret-key-that-is-long-enough-1234567890
+          ENCRYPTION_KEY: ci-encryption-key-that-is-long-enough-1234567890
+          AI_API_KEY: ""
+          LIVE_SCRAPING_ENABLED: "false"
+        run: PYTHONPATH=. python -m pytest tests/ -q --maxfail=1
+
+  migrations:
+    name: Migrations apply cleanly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - run: pip install -r backend/requirements.txt
+      - name: alembic upgrade head (fresh SQLite)
+        working-directory: backend
+        env:
+          ENVIRONMENT: test
+          DATABASE_URL: sqlite:///./ci-migration.db
+          SECRET_KEY: ci-secret-key-that-is-long-enough-1234567890
+          ENCRYPTION_KEY: ci-encryption-key-that-is-long-enough-1234567890
+        run: |
+          python -m alembic upgrade head
+          python -m alembic upgrade head   # idempotent
+          python -m alembic current
+
+  frontend:
+    name: Frontend typecheck & build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
+      - name: Fail if the SPA build is empty
+        run: test -s dist/index.html
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build production image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: jobhunter:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install pip-audit
+      - run: pip-audit -r backend/requirements.txt --strict
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm audit --omit=dev --audit-level=high
+        working-directory: frontend
