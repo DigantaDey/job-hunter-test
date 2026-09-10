@@ -19,9 +19,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-import httpx
-
-from app.core.config import settings
+from app.services.ai_client import chat_completion, AIClientError, is_configured
 from app.utils.logger import log_info
 
 STAGES = ["Seed", "Series A", "Series B", "Series C", "Series D"]
@@ -131,9 +129,6 @@ async def _ai_scan(
     context: Dict[str, Any], stages: List[str], window_days: int, limit: int
 ) -> List[Dict[str, Any]]:
     """Ask the LLM for recently-funded companies aligned to the candidate."""
-    base_url = settings.ai_base_url
-    api_key = settings.ai_api_key
-    model = settings.ai_model
     prompt = f"""
 List {limit} realistic companies that raised a funding round in the last {window_days} days
 (stages: {', '.join(stages)}). Prioritize these industries for this candidate:
@@ -146,59 +141,38 @@ Return STRICT JSON: {{"companies": [{{"name","website","industry","stage","days_
 Respond ONLY with JSON.
 """
     try:
-        async with httpx.AsyncClient(timeout=settings.ai_timeout) as client:
-            resp = await client.post(
-                f"{base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.6,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            if resp.status_code == 200:
-                data = json_loads(resp.json()["choices"][0]["message"]["content"])
-                out: List[Dict[str, Any]] = []
-                for c in (data.get("companies") or [])[: limit * 2]:
-                    if not isinstance(c, dict) or not c.get("name"):
-                        continue
-                    stage = str(c.get("stage", "Series A"))
-                    if stage not in stages:
-                        stage = stages[0]
-                    days = c.get("days_ago", 7)
-                    try:
-                        days = max(1, min(window_days, int(days)))
-                    except Exception:
-                        days = 7
-                    name = re.sub(r"\s+", " ", str(c["name"]))[:60]
-                    out.append({
-                        "name": name,
-                        "website": str(c.get("website") or (name.lower().replace(" ", "") + ".com")),
-                        "industry": str(c.get("industry") or "saas").lower(),
-                        "stage": stage,
-                        "days_ago": days,
-                        "summary": str(c.get("summary") or "")[:240],
-                        "source": "ai",
-                    })
-                # de-dupe by name
-                seen, dedup = set(), []
-                for c in out:
-                    if c["name"].lower() not in seen:
-                        seen.add(c["name"].lower())
-                        dedup.append(c)
-                return dedup[:limit]
-    except Exception:
-        pass
-    return []
-
-
-def json_loads(text: str) -> Dict[str, Any]:
-    import json
-    try:
-        return json.loads(text)
-    except Exception:
-        return {}
+        data = await chat_completion("funding_scan", prompt, temperature=0.6)
+        out: List[Dict[str, Any]] = []
+        for c in (data.get("companies") or [])[: limit * 2]:
+            if not isinstance(c, dict) or not c.get("name"):
+                continue
+            stage = str(c.get("stage", "Series A"))
+            if stage not in stages:
+                stage = stages[0]
+            days = c.get("days_ago", 7)
+            try:
+                days = max(1, min(window_days, int(days)))
+            except Exception:
+                days = 7
+            name = re.sub(r"\s+", " ", str(c["name"]))[:60]
+            out.append({
+                "name": name,
+                "website": str(c.get("website") or (name.lower().replace(" ", "") + ".com")),
+                "industry": str(c.get("industry") or "saas").lower(),
+                "stage": stage,
+                "days_ago": days,
+                "summary": str(c.get("summary") or "")[:240],
+                "source": "ai",
+            })
+        # de-dupe by name
+        seen, dedup = set(), []
+        for c in out:
+            if c["name"].lower() not in seen:
+                seen.add(c["name"].lower())
+                dedup.append(c)
+        return dedup[:limit]
+    except (AIClientError, TypeError):
+        return []
 
 
 def heuristic_scan(
@@ -250,7 +224,7 @@ async def scan_funded_companies(
     limit = max(8, min(40, int(limit)))
 
     companies: List[Dict[str, Any]] = []
-    if settings.ai_api_key:
+    if is_configured("funding_scan"):
         companies = await _ai_scan(context, stages, window_days, limit)
         for c in companies:
             c.setdefault("raised_at", (datetime.utcnow() - timedelta(days=c["days_ago"])).date().isoformat())
@@ -261,7 +235,7 @@ async def scan_funded_companies(
             if c["name"].lower() not in have:
                 companies.append(c)
     for c in companies:
-        c.setdefault("source", "ai" if settings.ai_api_key else "curated-demo")
+        c.setdefault("source", "ai" if is_configured("funding_scan") else "curated-demo")
         c["keywords_matched"] = _match_score(c, context)
     companies.sort(key=lambda x: x.get("days_ago", 999))
     return companies[:limit]

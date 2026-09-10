@@ -57,7 +57,8 @@ export default function Jobs(){
       if(data.status==='needs_input'){
         setApplyMsg('Needs your input — check Queues → User Input Needed')
       } else {
-        setApplyMsg(`Status: ${data.status} ${data.vault_created ? '• vault credential created' : ''}`)
+        const decision = data.resume_decision ? `• resume: ${data.resume_decision}` : ''
+        setApplyMsg(`Status: ${data.status} ${decision} ${data.vault_created ? '• vault credential created' : ''}`)
       }
       load()
       const fresh = await client.get(`/api/jobs/${selected.id}`); setSelected(fresh.data)

@@ -8,6 +8,7 @@ services:
       - AI_BASE_URL=${AI_BASE_URL:-https://api.openai.com/v1}
       - AI_API_KEY=${AI_API_KEY:-}
       - AI_MODEL=${AI_MODEL:-gpt-4o-mini}
+      - LIVE_SCRAPING_ENABLED=${LIVE_SCRAPING_ENABLED:-true}
     volumes:
       - ./backend:/app
       - ./uploads:/app/uploads
@@ -20,4 +21,7 @@ services:
       - "5173:5173"
     depends_on:
       - backend
+    environment:
+      # Inside the compose network the backend is reachable as "backend".
+      - VITE_API_PROXY_TARGET=http://backend:8000
     command: npm run dev

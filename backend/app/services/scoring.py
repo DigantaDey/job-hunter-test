@@ -1,9 +1,8 @@
 import re
+import json
 import math
 from typing import Dict, Any, Tuple, List
-import httpx
-import json
-from app.core.config import settings
+from app.services.ai_client import chat_completion, AIClientError
 
 STOPWORDS = set(["the","and","for","with","a","an","in","on","of","to","is","are","as","at","by","from","or"])
 
@@ -70,11 +69,6 @@ def heuristic_score(profile: Dict[str,Any], jd: str) -> Tuple[float, str]:
     return score, reason
 
 async def ai_score(profile: Dict[str,Any], jd: str, ai_config: Dict[str,Any]=None) -> Tuple[float, str]:
-    if not settings.ai_api_key:
-        return heuristic_score(profile, jd)
-    base_url = (ai_config or {}).get("base_url") or settings.ai_base_url
-    api_key = (ai_config or {}).get("api_key") or settings.ai_api_key
-    model = (ai_config or {}).get("model") or settings.ai_model
     prompt = f"""
 You are a career matching engine. Score how well this candidate profile matches the job description from 0 to 100.
 Be strict, no hallucination. Consider skills, experience relevance, seniority, domain.
@@ -87,33 +81,33 @@ JD:
 \"\"\"{jd[:4000]}\"\"\"
 """
     try:
-        async with httpx.AsyncClient(timeout=settings.ai_timeout) as client:
-            resp = await client.post(f"{base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type":"application/json"},
-                json={
-                    "model": model,
-                    "messages":[{"role":"user","content": prompt}],
-                    "temperature": 0.2,
-                    "response_format": {"type":"json_object"}
-                })
-            if resp.status_code == 200:
-                content = resp.json()["choices"][0]["message"]["content"]
-                data = json.loads(content)
-                score = float(data.get("score", 50))
-                reason = data.get("reason","AI scored")
-                return max(0, min(100, score)), f"AI: {reason}"
-            else:
-                return heuristic_score(profile, jd)
-    except:
+        data = await chat_completion("scoring", prompt, temperature=0.2, ai_config=ai_config)
+        score = float(data.get("score", 50))
+        reason = data.get("reason", "AI scored")
+        return max(0.0, min(100.0, score)), f"AI: {reason}"
+    except (AIClientError, TypeError, ValueError, KeyError):
         return heuristic_score(profile, jd)
+
+
+def jd_similarity(jd_a: str, jd_b: str) -> float:
+    """Cosine similarity between two job descriptions (0–1). Used to decide
+    whether an already-generated, approved resume can be reused for a new JD."""
+    if not jd_a or not jd_b:
+        return 0.0
+    return round(cosine_sim(tf(jd_a), tf(jd_b)), 4)
+
 
 def should_generate_new_resume(score: float, best_existing_sim: float) -> bool:
     """
-    Decide when to use already available resume or create new one.
-    If score low (<60) or existing resumes not similar to JD (<0.75), generate new.
+    Decide whether to reuse an existing tagged resume or create a new one.
+
+    - Reuse when the candidate is a strong match AND an already-generated resume
+      was built for a very similar JD (similarity ≥ 0.85).
+    - Generate a new tailored resume for a solid match (score ≥ 65) when no
+      existing resume is close enough.
+    - Otherwise fall back to the master resume (weak match — don't burn AI calls
+      tailoring for roles the candidate barely fits).
     """
-    if score < 60:
-        return False  # don't waste generation if poor match? actually we may skip applying
-    if best_existing_sim < 0.75:
+    if score >= 65 and best_existing_sim < 0.85:
         return True
     return False

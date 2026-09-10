@@ -15,9 +15,7 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-import httpx
-
-from app.core.config import settings
+from app.services.ai_client import chat_completion, AIClientError
 
 STOPWORDS = {
     "the", "and", "for", "with", "a", "an", "in", "on", "of", "to", "is", "are",
@@ -79,7 +77,7 @@ def _normalize_skill(s: str) -> str:
 
 
 def _significant_tokens(text: str, top_n: int = 18) -> List[str]:
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z\+#\.]{1,30}", (text or "").lower())
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z\+\.]{1,30}", (text or "").lower())
     words = [t.strip(".") for t in tokens]
     words = [w for w in words if len(w) > 2 and w not in STOPWORDS and not w.isdigit()]
     counts = Counter(words)
@@ -170,12 +168,8 @@ async def ai_extract_context(
     always merges heuristic keywords so the result is never empty.
     """
     fallback = heuristic_context(profile, extra_context)
-    if not settings.ai_api_key or (not profile and not resume_text.strip() and not extra_context.strip()):
+    if not profile and not resume_text.strip() and not extra_context.strip():
         return fallback
-
-    base_url = (ai_config or {}).get("base_url") or settings.ai_base_url
-    api_key = (ai_config or {}).get("api_key") or settings.ai_api_key
-    model = (ai_config or {}).get("model") or settings.ai_model
 
     prompt = f"""
 You are a career-intelligence extractor. From the candidate profile, resume text and
@@ -209,23 +203,12 @@ Extra context from user:
 Respond ONLY with JSON.
 """
     try:
-        async with httpx.AsyncClient(timeout=settings.ai_timeout) as client:
-            resp = await client.post(
-                f"{base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            if resp.status_code == 200:
-                data = json.loads(resp.json()["choices"][0]["message"]["content"])
-                merged = _merge_context(fallback, data)
-                merged["source"] = "ai"
-                return merged
-    except Exception:
+        data = await chat_completion("keyword_extract", prompt, temperature=0.2, ai_config=ai_config)
+        if isinstance(data, dict):
+            merged = _merge_context(fallback, data)
+            merged["source"] = "ai"
+            return merged
+    except (AIClientError, TypeError):
         pass
     return fallback
 

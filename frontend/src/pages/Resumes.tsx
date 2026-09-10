@@ -41,6 +41,10 @@ export default function Resumes(){
     await client.put(`/api/resumes/${id}/tags`, JSON.parse(editTags[id] || '[]'))
     load()
   }
+  const approve = async(id:number)=>{
+    await client.post(`/api/resumes/${id}/approve`)
+    load()
+  }
 
   return (
     <div className="space-y-4">
@@ -107,10 +111,18 @@ export default function Resumes(){
                     <div className="text-xs mono text-zinc-500">{r.type} • {new Date(r.created_at).toLocaleDateString()} • {r.tags.join(', ') || 'no tags'}</div>
                   </div>
                   <span className={`text-[11px] px-2 py-1 rounded-full mono border ${r.type==='master'?'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900': 'bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300'}`}>{r.type}</span>
+                  {r.type==='generated' && (
+                    <span className={`text-[11px] px-2 py-1 rounded-full mono border ${r.status==='approved'?'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950 dark:border-emerald-800':'bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-950 dark:border-amber-800'}`}>
+                      {r.status==='approved' ? 'approved' : 'needs approval'}
+                    </span>
+                  )}
                 </div>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {r.tags.map((t:string)=> <span key={t} className="text-[11px] px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 mono inline-flex items-center gap-1"><Tag className="w-3 h-3"/>{t}</span>)}
                 </div>
+                {r.type==='generated' && r.status!=='approved' && (
+                  <button onClick={()=>approve(r.id)} className="mt-3 w-full py-1.5 rounded-full bg-emerald-600 text-white text-xs font-medium inline-flex items-center justify-center gap-1"><Check className="w-3 h-3"/> Approve for use in applications</button>
+                )}
                 <div className="mt-3 flex gap-2">
                   <a href={`/api/resumes/${r.id}/download?format=docx`} className="flex-1 py-1.5 rounded-full border dark:border-zinc-700 text-xs text-center inline-flex items-center justify-center gap-1"><Download className="w-3 h-3"/> DOCX</a>
                   <a href={`/api/resumes/${r.id}/download?format=pdf`} className="flex-1 py-1.5 rounded-full border dark:border-zinc-700 text-xs text-center inline-flex items-center justify-center gap-1"><Download className="w-3 h-3"/> PDF</a>

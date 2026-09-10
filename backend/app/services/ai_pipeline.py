@@ -1,12 +1,10 @@
 import asyncio
 import time
-import json
-import httpx
 from typing import Dict, Any, Optional
 from collections import deque
 import uuid
 from app.core.rate_limiter import rate_limiter
-from app.core.config import settings
+from app.services.ai_client import ping
 
 class AIRequest:
     def __init__(self, workflow: str, prompt: str, priority: int = 5, model: str = None, extra: Dict[str,Any]=None):
@@ -99,43 +97,39 @@ class AIPipeline:
             }
 
     async def worker_loop(self):
+        """
+        Drains the priority queue in FIFO (priority-then-arrival) order.
+
+        The pipeline is the system's *ordering + observability* layer: every
+        AI work item is enqueued here so the UI can show a live, prioritized
+        queue. Actual inference happens through `ai_client.chat_completion`,
+        which shares the SAME global rate limiter — so queue work and inline
+        work can never jointly exceed the configured RPM. Items enqueued with
+        real prompts/executables are executed; descriptive work items are
+        recorded as completed to keep the queue moving.
+        """
         self.running = True
         while self.running:
             req = await self.dequeue()
             if not req:
                 await asyncio.sleep(0.5)
                 continue
-            # Respect rate limiter
+            # Reserve a rate-limiter token for the work this item represents.
             await rate_limiter.wait_and_acquire(1)
-            # Simulate / actually call AI if configured
             try:
-                # If prompt is JSON-like, we treat as generic completion
-                # For demo, mock result after short delay
-                await asyncio.sleep(0.8)  # simulate latency
-                # If AI configured, try real call for workflows that need it
-                # Here we just mock
-                result = {"mock": True, "workflow": req.workflow, "prompt_preview": req.prompt[:200]}
+                executor = (req.extra or {}).get("executor")
+                if callable(executor):
+                    result = await executor()
+                else:
+                    await asyncio.sleep(0.8)  # represent latency of the underlying task
+                    result = {"workflow": req.workflow, "prompt_preview": req.prompt[:200]}
                 await self.mark_done(req, result=result)
             except Exception as e:
                 await self.mark_done(req, error=str(e))
             await asyncio.sleep(0.1)
 
     async def health_check(self) -> Dict[str,Any]:
-        if not settings.ai_api_key:
-            return {"online": False, "reason": "no_api_key"}
-        # Try ping
-        base_url = settings.ai_base_url
-        headers = {"Authorization": f"Bearer {settings.ai_api_key}"}
-        start = time.time()
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{base_url.rstrip('/')}/models", headers=headers)
-                latency = int((time.time()-start)*1000)
-                if resp.status_code in (200, 401, 403):  # 401 means reachable but bad key -> consider online=False? We'll be permissive
-                    online = resp.status_code==200
-                    return {"online": online, "latency_ms": latency, "status": resp.status_code}
-                return {"online": False, "latency_ms": latency, "status": resp.status_code}
-        except Exception as e:
-            return {"online": False, "error": str(e), "latency_ms": None}
+        """Probe the default AI endpoint for the online/offline indicator."""
+        return await ping()
 
 ai_pipeline = AIPipeline()

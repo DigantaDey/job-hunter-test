@@ -1,10 +1,8 @@
 import re
-import json
 from typing import Dict, Any, Tuple
 from pypdf import PdfReader
 from pdfminer.high_level import extract_text as pdfminer_extract
-import httpx
-from app.core.config import settings
+from app.services.ai_client import chat_completion, AIClientError
 
 # Heuristic layout extractor
 def extract_layout(filepath: str) -> Dict[str, Any]:
@@ -90,16 +88,11 @@ def heuristic_profile_extract(text: str) -> Dict[str, Any]:
 
 async def ai_extract_profile(text: str, ai_config: Dict[str, Any] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Calls OpenAI-compatible API to extract structured profile.
-    Falls back to heuristic if not configured.
+    Calls the OpenAI-compatible API to extract a structured profile.
+    Falls back to heuristic extraction when AI is unconfigured or fails.
     """
-    if not settings.ai_api_key or not text.strip():
-        return heuristic_profile_extract(text), {"ai_used": False, "reason": "no_api_key"}
-
-    # Use OpenAI-compatible chat completions
-    base_url = (ai_config or {}).get("base_url") or settings.ai_base_url
-    api_key = (ai_config or {}).get("api_key") or settings.ai_api_key
-    model = (ai_config or {}).get("model") or settings.ai_model
+    if not text.strip():
+        return heuristic_profile_extract(text), {"ai_used": False, "reason": "empty_text"}
 
     prompt = f"""
 You are a resume parser. Extract all possible profile details from the resume below as JSON.
@@ -109,27 +102,14 @@ Resume:
 Respond ONLY with JSON.
 """
     try:
-        async with httpx.AsyncClient(timeout=settings.ai_timeout) as client:
-            resp = await client.post(f"{base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type":"application/json"},
-                json={
-                    "model": model,
-                    "messages": [{"role":"user","content": prompt}],
-                    "temperature": 0.1,
-                    "response_format": {"type":"json_object"}
-                }
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                parsed = json.loads(content)
-                parsed["raw_text"] = text[:5000]
-                parsed["heuristic"] = False
-                return parsed, {"ai_used": True, "model": model}
-            else:
-                return heuristic_profile_extract(text), {"ai_used": False, "reason": f"ai_error {resp.status_code} {resp.text[:200]}"}
-    except Exception as e:
-        return heuristic_profile_extract(text), {"ai_used": False, "reason": str(e)}
+        parsed = await chat_completion("parse", prompt, temperature=0.1, ai_config=ai_config)
+        if not isinstance(parsed, dict):
+            raise AIClientError("unexpected_non_object_response")
+        parsed["raw_text"] = text[:5000]
+        parsed["heuristic"] = False
+        return parsed, {"ai_used": True, "model": (ai_config or {}).get("model") or "configured"}
+    except Exception as exc:
+        return heuristic_profile_extract(text), {"ai_used": False, "reason": str(exc)}
 
 def extract_text_from_pdf(filepath: str) -> str:
     try:
