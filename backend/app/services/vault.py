@@ -23,6 +23,9 @@ def save_vault_entry(db: Session, domain: str, username: str, password: str) -> 
     db.refresh(entry)
     return entry
 
+def get_vault_entry_for_domain(db: Session, domain: str) -> VaultEntry:
+    return db.query(VaultEntry).filter(VaultEntry.domain==domain).first()
+
 def list_vault_entries(db: Session):
     return db.query(VaultEntry).all()
 

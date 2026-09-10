@@ -119,15 +119,8 @@ def send_via_smtp(to_email: str, subject: str, body: str, smtp_config: Dict[str,
         return {"success": False, "error": str(e)}
 
 async def find_funded_companies(stage_filter: List[str] = None) -> List[Dict[str, Any]]:
-    # Mock funding data
-    mocks = [
-        {"name": "Perplexity AI", "stage": "Series B", "raised_at": "2024-02-15", "website": "perplexity.ai", "has_open_positions": False},
-        {"name": "Vercel", "stage": "Series D", "raised_at": "2024-01-10", "website": "vercel.com", "has_open_positions": True},
-        {"name": "Retool", "stage": "Series C", "raised_at": "2023-12-01", "website": "retool.com", "has_open_positions": True},
-        {"name": "Stealth Fintech", "stage": "Seed", "raised_at": "2024-03-01", "website": "stealthfintech.co", "has_open_positions": False},
-        {"name": "Harvey", "stage": "Series C", "raised_at": "2024-04-20", "website": "harvey.ai", "has_open_positions": True},
-    ]
-    if stage_filter:
-        mocks = [m for m in mocks if m["stage"] in stage_filter]
-    await asyncio.sleep(0.3)
-    return mocks
+    """Deprecated: moved to app/services/funding_radar.py (AI-context-driven, fresh)."""
+    from app.services.funding_radar import scan_funded_companies
+    from app.services.keyword_extractor import heuristic_context
+    companies = await scan_funded_companies(heuristic_context({}), stages=stage_filter)
+    return companies

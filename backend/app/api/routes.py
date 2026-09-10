@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query, Body
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
@@ -15,15 +15,46 @@ from app.services.resume_parser import extract_layout, extract_text_from_pdf, ai
 from app.services.scoring import heuristic_score, ai_score
 from app.services.classifier import heuristic_company_size, ai_company_size
 from app.services.resume_generator import generate_tailored_profile, build_docx, build_pdf, hash_jd
-from app.services.vault import generate_credential, save_vault_entry, list_vault_entries, export_chrome_csv, export_apple_csv, delete_all_vault
+from app.services.vault import generate_credential, save_vault_entry, list_vault_entries, export_chrome_csv, export_apple_csv, delete_all_vault, get_vault_entry_for_domain
 from app.services.job_scraper import discover_jobs, detect_form_structure
-from app.services.email_pipeline import find_decision_maker, generate_cold_email, send_via_smtp, find_funded_companies
+from app.services.email_pipeline import find_decision_maker, generate_cold_email, send_via_smtp
+from app.services import funding_radar
+from app.services.keyword_extractor import ai_extract_context, heuristic_context, merge_user_keywords, _context_cache
 from app.services.ai_pipeline import ai_pipeline
 from app.core.rate_limiter import rate_limiter
 from app.utils.logger import log_error, log_info
 from app.core.security import decrypt_password
 
 router = APIRouter()
+
+# ---------- Search context (AI keyword extraction) ----------
+async def get_search_context(db: Session, extra_context: str = "", force_refresh: bool = False) -> dict:
+    """
+    AI-extracted search context from the user profile + master resume text +
+    any extra context. Cached in memory; invalidated on resume upload or when
+    the profile changes. Never empty: heuristic mining is the fallback floor.
+    """
+    profile = db.query(Profile).order_by(Profile.created_at.desc()).first()
+    profile_id = profile.id if profile else None
+    cached = _context_cache.get("context")
+    if (not force_refresh and cached and _context_cache.get("profile_id") == profile_id
+            and _context_cache.get("extra_context", "") == (extra_context or "")):
+        return cached
+    profile_data = (profile.data if profile else {}) or {}
+    resume_text = profile_data.get("raw_text", "") or ""
+    context = await ai_extract_context(profile_data, resume_text=resume_text, extra_context=extra_context)
+    context["profile_id"] = profile_id
+    context["generated_at"] = datetime.utcnow().isoformat()
+    _context_cache["context"] = context
+    _context_cache["profile_id"] = profile_id
+    _context_cache["extra_context"] = extra_context or ""
+    return context
+
+@router.get("/context/keywords")
+async def get_keywords_context(force: bool = False, db: Session = Depends(get_db)):
+    """AI-extracted keywords/roles/industries from the user profile + resume + context."""
+    ctx = await get_search_context(db, force_refresh=force)
+    return ctx
 
 # ---------- Profile & Resume ----------
 @router.post("/resume/upload")
@@ -63,7 +94,24 @@ async def upload_resume(file: UploadFile = File(...), db: Session = Depends(get_
 
     log_info(db, "general", f"Resume uploaded: {file.filename}", meta={"resume_id": resume.id})
 
-    return {"resume": {"id": resume.id, "filename": resume.filename, "tags": resume.tags}, "profile": profile_data, "layout": layout, "ai_meta": meta}
+    # Refresh AI search context (keywords auto-extracted from resume + profile)
+    ctx = await get_search_context(db, force_refresh=True)
+
+    # Re-score jobs that were discovered before a profile existed
+    unscored = db.query(Job).filter(Job.score == 0).limit(50).all()
+    rescored = 0
+    for j in unscored:
+        try:
+            score, reason = await ai_score(profile_data, j.description)
+            j.score, j.score_reason = score, reason
+            rescored += 1
+        except Exception:
+            pass
+    if rescored:
+        db.commit()
+        log_info(db, "scoring", f"Re-scored {rescored} jobs after resume upload")
+
+    return {"resume": {"id": resume.id, "filename": resume.filename, "tags": resume.tags}, "profile": profile_data, "layout": layout, "ai_meta": meta, "search_context": ctx}
 
 @router.get("/profile", response_model=List[ProfileOut])
 def get_profiles(db: Session = Depends(get_db)):
@@ -176,63 +224,74 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
     return j
 
 @router.post("/jobs/discover")
-async def trigger_discovery(keywords: Optional[str]=None, freshness_hours: Optional[int]=None, db: Session = Depends(get_db)):
-    # Get settings fallback
+async def trigger_discovery(keywords: Optional[str]=None, freshness_hours: Optional[int]=None, limit: int = 14, db: Session = Depends(get_db)):
+    """
+    Discovery keywords = user input (optional) + AI-extracted context from the
+    user's profile, resume and stored context notes + settings defaults.
+    """
     fresh = freshness_hours or settings.default_freshness_hours
-    kw_list = [k.strip() for k in (keywords or settings.default_keywords).split(",") if k.strip()]
-    # Also merge profile skills
-    profile = db.query(Profile).order_by(Profile.created_at.desc()).first()
-    if profile and profile.data.get("skills"):
-        for s in profile.data["skills"][:3]:
-            if s.lower() not in [k.lower() for k in kw_list]:
-                kw_list.append(s)
+    context = await get_search_context(db)
+
+    # settings keywords (user-managed in Settings page)
+    scraping = {s.key: s.value for s in db.query(SettingsModel).filter(SettingsModel.category=="scraping").all()}
+    settings_kw = scraping.get("keywords", settings.default_keywords)
+    if isinstance(settings_kw, list):
+        settings_kw = ", ".join(str(k) for k in settings_kw)
+    context = merge_user_keywords(context, settings_kw)
+    # explicit user input for this run wins (prepended)
+    context = merge_user_keywords(context, keywords)
+
+    kw_list = context.get("keywords", [])[:16]
+    context_for_run = context.get("user_keywords") and ", ".join(context["user_keywords"]) or (keywords or "")
 
     await ai_pipeline.enqueue("form_detect", f"Discover jobs with {kw_list}", priority=3)
-    # Enqueue discovery pipeline job
-    pj = PipelineJob(pipeline="discovery", payload={"keywords": kw_list, "freshness_hours": fresh}, status="queued", priority=3)
+    pj = PipelineJob(pipeline="discovery", payload={"keywords": kw_list, "freshness_hours": fresh, "context_source": context.get("source")}, status="queued", priority=3)
     db.add(pj)
     db.commit()
-    db.refresh(pj)
+    pj_id = pj.id  # capture before the request session closes
 
-    # Actually run discovery async
     async def _do():
-        # Need new session
         from app.db import SessionLocal
         dbs = SessionLocal()
         try:
             await rate_limiter.wait_and_acquire(1)
-            jobs = await discover_jobs(kw_list, fresh)
+            jobs = await discover_jobs(kw_list, fresh, limit=limit)
+            prof = dbs.query(Profile).order_by(Profile.created_at.desc()).first()
+            prof_data = prof.data if prof else {}
+            added = 0
             for jd in jobs:
-                # score and classify
-                prof = dbs.query(Profile).order_by(Profile.created_at.desc()).first()
-                prof_data = prof.data if prof else {}
-                score, reason = await ai_score(prof_data, jd["description"])
+                if prof_data:
+                    score, reason = await ai_score(prof_data, jd["description"])
+                else:
+                    score, reason = 0.0, "Awaiting profile — upload a resume to score"
                 size, conf = await ai_company_size(jd["company"], jd["description"])
-                # dedup by url
-                exists = dbs.query(Job).filter(Job.url==jd["url"]).first()
+                # Dedup on stable id AND (title, company) so re-runs never duplicate
+                exists = dbs.query(Job).filter(
+                    ((Job.title == jd["title"]) & (Job.company == jd["company"])) | (Job.url == jd["url"])
+                ).first()
                 if not exists:
-                    job = Job(title=jd["title"], company=jd["company"], location=jd["location"], description=jd["description"], url=jd["url"], source=jd["source"], status="discovered", score=score, score_reason=reason, company_size=size, company_info={"confidence": conf, "forms": jd.get("forms_detected")}, freshness_hours=fresh, extra=jd.get("forms_detected",{}))
+                    job = Job(title=jd["title"], company=jd["company"], location=jd["location"], description=jd["description"], url=jd["url"], source=jd["source"], status="discovered", score=score, score_reason=reason, company_size=size, company_info={"confidence": conf, "forms": jd.get("forms_detected")}, freshness_hours=fresh, extra=jd.get("forms_detected", {}))
                     dbs.add(job)
-            # mark pipeline job done
-            pj2 = dbs.query(PipelineJob).filter(PipelineJob.id==pj.id).first()
+                    added += 1
+            pj2 = dbs.query(PipelineJob).filter(PipelineJob.id==pj_id).first()
             if pj2:
-                pj2.status="done"
+                pj2.status = "done"
             dbs.commit()
-            log_info(dbs, "discovery", f"Discovered {len(jobs)} jobs for {kw_list}")
+            log_info(dbs, "discovery", f"Discovered {added} new jobs ({len(jobs)} scanned) for keywords {kw_list}", meta={"context_source": context.get("source")})
         except Exception as e:
-            pj2 = dbs.query(PipelineJob).filter(PipelineJob.id==pj.id).first()
+            pj2 = dbs.query(PipelineJob).filter(PipelineJob.id==pj_id).first()
             if pj2:
-                pj2.status="failed"
-                pj2.error=str(e)
+                pj2.status = "failed"
+                pj2.error = str(e)
                 dbs.commit()
             log_error(dbs, "discovery", str(e))
         finally:
             dbs.close()
     asyncio.create_task(_do())
-    return {"queued": True, "pipeline_job_id": pj.id, "keywords": kw_list, "freshness_hours": fresh}
+    return {"queued": True, "pipeline_job_id": pj.id, "keywords": kw_list, "freshness_hours": fresh, "context_source": context.get("source")}
 
 @router.post("/jobs/{job_id}/apply")
-async def apply_job(job_id: int, resume_choice: str = "auto", resume_id: Optional[int]=None, db: Session = Depends(get_db)):
+async def apply_job(job_id: int, resume_choice: str = "auto", resume_id: Optional[int]=None, simulate_failure: bool = False, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id==job_id).first()
     if not job:
         raise HTTPException(404)
@@ -245,58 +304,57 @@ async def apply_job(job_id: int, resume_choice: str = "auto", resume_id: Optiona
     if resume_choice=="master":
         master = db.query(Resume).filter(Resume.type=="master").order_by(Resume.created_at.desc()).first()
         chosen_resume_id = master.id if master else None
+    elif resume_choice=="generated":
+        gen = db.query(Resume).filter(Resume.type=="generated").order_by(Resume.created_at.desc()).first()
+        chosen_resume_id = gen.id if gen else None
+        if not chosen_resume_id:
+            tailored = await generate_tailored_profile(profile.data, job.description, profile.layout, False)
+            chosen_resume_id = await _build_and_save_resume(db, profile, job, tailored)
     elif resume_choice=="auto":
         # scoring decides reuse or generate
-        # For demo, if score high, try generated else master
         if job.score >= 75:
             gen = db.query(Resume).filter(Resume.job_id==job_id).first()
             if gen:
                 chosen_resume_id = gen.id
             else:
-                # generate on fly
                 tailored = await generate_tailored_profile(profile.data, job.description, profile.layout, False)
-                # quick build
-                safe_name = f"resume_{job.id}_{hash_jd(job.description)}"
-                docx_path = os.path.join(settings.generated_dir, f"{safe_name}.docx")
-                build_docx(tailored["tailored_profile"], profile.data, profile.layout, docx_path)
-                build_pdf(tailored["tailored_profile"], profile.data, docx_path.replace(".docx",".pdf"))
-                r = Resume(filename=f"{safe_name}.docx", filepath=docx_path, type="generated", profile_snapshot=tailored["tailored_profile"], tags=tailored.get("tags",[]), jd_hash=hash_jd(job.description), job_id=job.id)
-                db.add(r)
-                db.commit()
-                db.refresh(r)
-                chosen_resume_id = r.id
+                chosen_resume_id = await _build_and_save_resume(db, profile, job, tailored)
         else:
             master = db.query(Resume).filter(Resume.type=="master").order_by(Resume.created_at.desc()).first()
             chosen_resume_id = master.id if master else None
+    if not chosen_resume_id:
+        master = db.query(Resume).filter(Resume.type=="master").order_by(Resume.created_at.desc()).first()
+        chosen_resume_id = master.id if master else None
 
-    # Create vault credential if needed
+    # Vault credential (reuse when the domain already has one)
     forms = job.extra or {}
+    vault_created = False
     if forms.get("requires_login"):
-        domain = job.url.split("/")[2] if "://" in job.url else job.company.lower().replace(" ","")+".com"
-        cred = generate_credential(domain)
-        save_vault_entry(db, domain, cred["username"], cred["password"])
-        log_info(db, "application", f"Auto-created vault credential for {domain}", job_id=job.id)
+        domain = forms.get("vault_domain") or (job.url.split("/")[2] if "://" in job.url else job.company.lower().replace(" ","")+".com")
+        if not get_vault_entry_for_domain(db, domain):
+            cred = generate_credential(domain)
+            save_vault_entry(db, domain, cred["username"], cred["password"])
+            vault_created = True
+            log_info(db, "application", f"Auto-created vault credential for {domain}", job_id=job.id)
 
-    # Simulate AI autofill + form detection
     await ai_pipeline.enqueue("application_autofill", f"Autofill {job.title} at {job.company}", priority=1)
     await rate_limiter.wait_and_acquire(1)
 
-    # Check for missing fields -> user input needed queue
+    # Missing required fields -> user input needed queue (no duplicate requests)
     required = forms.get("fields", [])
     missing = [f for f in required if f["name"] in ["workAuthorization","linkedin"] and f["required"]]
-    # Also detect if external redirect
-    is_external = job.source in ["linkedin","indeed","naukri"] and forms.get("portal_type")=="simple"  # simplified
+    is_external = job.source in ["linkedin","indeed","naukri"] and forms.get("portal_type")=="simple"
 
     if missing:
-        # Create user input request
-        uir = UserInputRequest(job_id=job.id, fields=[{"name": f["name"], "label": f["name"], "type": f["type"], "required": True, "value": ""} for f in missing], status="pending")
-        db.add(uir)
+        existing_uir = db.query(UserInputRequest).filter(UserInputRequest.job_id==job.id, UserInputRequest.status=="pending").first()
+        if not existing_uir:
+            uir = UserInputRequest(job_id=job.id, fields=[{"name": f["name"], "label": f["name"], "type": f["type"], "required": True, "value": ""} for f in missing], status="pending")
+            db.add(uir)
         job.status = "needs_input"
-        # Also pipeline job
         pj = PipelineJob(pipeline="application", job_id=job.id, payload={"resume_id": chosen_resume_id, "reason": "needs_input"}, status="needs_input", priority=1)
         db.add(pj)
         db.commit()
-        return {"status": "needs_input", "missing_fields": missing, "input_request_id": uir.id, "message": "Please complete required fields"}
+        return {"status": "needs_input", "missing_fields": missing, "input_request_id": (existing_uir.id if existing_uir else uir.id), "vault_created": vault_created, "message": "Please complete required fields"}
 
     # Normal apply flow
     job.status = "applying"
@@ -305,41 +363,51 @@ async def apply_job(job_id: int, resume_choice: str = "auto", resume_id: Optiona
     db.add(pj)
     db.commit()
 
-    # Simulate autofill success after short delay via background
+    # Deterministic outcome; failures are opt-in via simulate_failure (demo/tests)
     async def _simulate_apply():
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.2)
         from app.db import SessionLocal
         dbs = SessionLocal()
         try:
             j = dbs.query(Job).filter(Job.id==job_id).first()
             p = dbs.query(PipelineJob).filter(PipelineJob.job_id==job_id, PipelineJob.pipeline=="application").order_by(PipelineJob.created_at.desc()).first()
             if j:
-                # 85% success
-                import random
-                if random.random() < 0.85:
+                if not simulate_failure:
                     j.status = "applied"
+                    j.error = ""
                     if p:
-                        p.status="done"
+                        p.status = "done"
                 else:
                     j.status = "failed"
-                    j.error = "Auto-fill failed: CAPTCHA detected"
+                    j.error = "Auto-fill failed: CAPTCHA detected (simulated)"
                     if p:
-                        p.status="failed"
-                        p.error=j.error
+                        p.status = "failed"
+                        p.error = j.error
                     log_error(dbs, "application", j.error, job_id=j.id)
                 dbs.commit()
         finally:
             dbs.close()
     asyncio.create_task(_simulate_apply())
 
-    # If external redirect, note handling
     if is_external:
         log_info(db, "application", f"LinkedIn/Indeed external redirect detected for {job.company}, switching to credential+autofill workflow", job_id=job.id)
 
-    return {"status": job.status, "resume_id": chosen_resume_id, "vault_created": forms.get("requires_login", False)}
+    return {"status": job.status, "resume_id": chosen_resume_id, "vault_created": vault_created}
+
+async def _build_and_save_resume(db: Session, profile, job, tailored: dict) -> int:
+    safe_name = f"resume_{job.id}_{hash_jd(job.description)}"
+    docx_path = os.path.join(settings.generated_dir, f"{safe_name}.docx")
+    os.makedirs(settings.generated_dir, exist_ok=True)
+    build_docx(tailored["tailored_profile"], profile.data, profile.layout, docx_path)
+    build_pdf(tailored["tailored_profile"], profile.data, docx_path.replace(".docx", ".pdf"))
+    r = Resume(filename=f"{safe_name}.docx", filepath=docx_path, type="generated", profile_snapshot=tailored["tailored_profile"], layout=profile.layout, tags=tailored.get("tags", []), jd_hash=hash_jd(job.description), job_id=job.id)
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    return r.id
 
 @router.post("/jobs/{job_id}/input")
-def submit_input(job_id: int, payload: dict, db: Session = Depends(get_db)):
+async def submit_input(job_id: int, payload: dict, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id==job_id).first()
     if not job:
         raise HTTPException(404)
@@ -352,12 +420,34 @@ def submit_input(job_id: int, payload: dict, db: Session = Depends(get_db)):
             f["value"] = payload[f["name"]]
     uir.status = "completed"
     uir.completed_at = datetime.utcnow()
-    job.status = "queued"
-    # re-queue
-    pj = PipelineJob(pipeline="application", job_id=job_id, payload={"resumed": True, "input": payload}, status="queued", priority=1)
+    job.status = "applying"
+    job.error = ""
+    # re-queue and actually process to completion this time
+    pj = PipelineJob(pipeline="application", job_id=job_id, payload={"resumed": True, "input": payload}, status="processing", priority=1)
     db.add(pj)
     db.commit()
+    pj_id = pj.id  # capture before the request session closes (detached-instance safety)
     log_info(db, "application", f"User input completed for {job.company}, re-queued", job_id=job_id)
+
+    async def _finish_apply():
+        await asyncio.sleep(1.2)
+        from app.db import SessionLocal
+        dbs = SessionLocal()
+        try:
+            j = dbs.query(Job).filter(Job.id==job_id).first()
+            p = dbs.query(PipelineJob).filter(PipelineJob.id==pj_id).first()
+            if j:
+                j.status = "applied"
+                j.error = ""
+                if p:
+                    p.status = "done"
+                dbs.commit()
+                log_info(dbs, "application", f"Application completed after user input: {j.company}", job_id=job_id)
+        except Exception as e:
+            log_error(dbs, "application", str(e), job_id=job_id)
+        finally:
+            dbs.close()
+    asyncio.create_task(_finish_apply())
     return {"ok": True, "requeued": True}
 
 # ---------- Vault ----------
@@ -440,12 +530,11 @@ def approve_email(email_id: int, db: Session = Depends(get_db)):
     return {"ok": True, "status": "queued"}
 
 @router.post("/emails/{email_id}/send")
-def send_email(email_id: int, smtp: Optional[dict]=None, otp: Optional[str]=None, db: Session = Depends(get_db)):
+def send_email(email_id: int, otp: Optional[str]=None, payload: Optional[dict] = Body(None), db: Session = Depends(get_db)):
     e = db.query(Email).filter(Email.id==email_id).first()
     if not e:
         raise HTTPException(404)
-    # Get SMTP from settings
-    smtp_config = smtp or {}
+    smtp_config = dict((payload or {}).get("smtp") or {})
     # Try to load from SettingsModel
     for s in db.query(SettingsModel).filter(SettingsModel.category=="email").all():
         if s.key not in smtp_config:
@@ -471,46 +560,106 @@ def send_email(email_id: int, smtp: Optional[dict]=None, otp: Optional[str]=None
         log_error(db, "email", result["error"], job_id=e.job_id)
         return {"ok": False, "error": result["error"]}
 
-# ---------- Funding ----------
+# ---------- Funding Radar ----------
+FUNDING_FRESHNESS_DAYS = settings.funding_freshness_days
+FUNDING_STAGES = ["Seed", "Series A", "Series B", "Series C", "Series D"]
+
+def _funding_stale(db: Session, window_days: int) -> bool:
+    latest = db.query(FundingCompany).order_by(FundingCompany.discovered_at.desc()).first()
+    if not latest or not latest.discovered_at:
+        return True
+    age_hours = (datetime.utcnow() - latest.discovered_at).total_seconds() / 3600
+    return age_hours > max(1, window_days // 2)  # rescan after half the window
+
+def _user_funding_context(db: Session) -> str:
+    rows = db.query(SettingsModel).filter(SettingsModel.category=="funding").all()
+    kv = {r.key: r.value for r in rows}
+    parts = [str(v) for k, v in kv.items() if k in ("context_notes", "industries") and v]
+    return ", ".join(parts)
+
+async def _run_funding_scan(db: Session, stages: Optional[List[str]] = None, user_context: str = "", force: bool = True) -> dict:
+    context = await get_search_context(db, extra_context=user_context, force_refresh=force)
+    context = merge_user_keywords(context, user_context)
+    window = FUNDING_FRESHNESS_DAYS
+    companies = await funding_radar.scan_funded_companies(
+        context, stages=stages, window_days=window, limit=settings.funding_limit
+    )
+    funding_radar.sync_funding_db(db, companies, window)
+    log_info(db, "funding", f"Funding scan: {len(companies)} companies (source={context.get('source')})", meta={"focus": context.get("funding_focus", [])})
+    return context
+
+@router.get("/funding/context")
+async def get_funding_context(db: Session = Depends(get_db)):
+    """The AI-extracted context driving the radar (profile + resume + user context)."""
+    context = await get_search_context(db, extra_context=_user_funding_context(db))
+    return context
+
 @router.get("/funding/companies")
-async def get_funding_companies(stage: Optional[str]=None, db: Session = Depends(get_db)):
-    stages = [stage] if stage else None
-    companies = await find_funded_companies(stages)
-    # sync with db
-    for c in companies:
-        exists = db.query(FundingCompany).filter(FundingCompany.name==c["name"]).first()
-        if not exists:
-            fc = FundingCompany(name=c["name"], stage=c["stage"], website=c["website"], has_open_positions=c["has_open_positions"])
-            db.add(fc)
-    db.commit()
-    return companies
+async def get_funding_companies(stage: Optional[str]=None, refresh: bool = False, db: Session = Depends(get_db)):
+    """Fresh Seed→Series D radar. Rescans automatically when stale or on ?refresh=1."""
+    stages = [s.strip() for s in stage.split(",")] if stage else None
+    if refresh or _funding_stale(db, FUNDING_FRESHNESS_DAYS):
+        await _run_funding_scan(db, user_context=_user_funding_context(db), force=refresh)
+    query = db.query(FundingCompany)
+    if stages:
+        query = query.filter(FundingCompany.stage.in_(stages))
+    rows = query.order_by(FundingCompany.raised_at.desc()).limit(40).all()
+    context = await get_search_context(db, extra_context=_user_funding_context(db))
+    return {
+        "companies": [funding_radar.row_to_dict(r) for r in rows],
+        "count": len(rows),
+        "context": context,
+        "freshness_days": FUNDING_FRESHNESS_DAYS,
+        "stages": FUNDING_STAGES,
+        "refreshed_at": datetime.utcnow().isoformat(),
+    }
+
+@router.post("/funding/refresh")
+async def refresh_funding(payload: Optional[dict] = Body(None), db: Session = Depends(get_db)):
+    """Force an AI re-scan. Optional body: {"context": "free text", "stages": ["Seed","Series A"], "keywords": "a, b"}"""
+    payload = payload or {}
+    user_context = str(payload.get("context") or "")
+    keywords = payload.get("keywords")
+    if keywords:
+        user_context = ", ".join(x for x in [user_context, str(keywords)] if x)
+    stages = payload.get("stages") or None
+    context = await _run_funding_scan(db, stages=stages, user_context=user_context, force=True)
+    rows = db.query(FundingCompany).order_by(FundingCompany.raised_at.desc()).limit(40).all()
+    return {
+        "ok": True,
+        "count": len(rows),
+        "context": context,
+        "companies": [funding_radar.row_to_dict(r) for r in rows],
+    }
 
 @router.post("/funding/{company_name}/process")
 async def process_funding_company(company_name: str, db: Session = Depends(get_db)):
-    # Check if has open positions -> apply usual flow else cold email founder
-    comps = await find_funded_companies()
-    comp = next((c for c in comps if c["name"].lower()==company_name.lower()), None)
-    if not comp:
-        raise HTTPException(404)
+    row = db.query(FundingCompany).filter(FundingCompany.name.ilike(company_name)).first()
+    if not row:
+        # last resort: scan then retry
+        await _run_funding_scan(db, force=True)
+        row = db.query(FundingCompany).filter(FundingCompany.name.ilike(company_name)).first()
+    if not row:
+        raise HTTPException(404, "Company not in radar — refresh the scan")
     profile = db.query(Profile).order_by(Profile.created_at.desc()).first()
     if not profile:
         raise HTTPException(400, "No profile")
-    if comp["has_open_positions"]:
-        # create a mock job and trigger discovery apply
-        job = Job(title="Open Role at "+comp["name"], company=comp["name"], location="Remote", description=f"Join {comp['name']} funded at {comp['stage']}", url=f"https://{comp['website']}/careers", source="custom", status="discovered", score=78, company_size="startup")
+    if row.has_open_positions:
+        prof_data = profile.data or {}
+        score, reason = await ai_score(prof_data, f"Open engineering role at {row.name} ({row.stage}, {row.industry})")
+        job = Job(title=f"Open Role at {row.name}", company=row.name, location="Remote", description=f"Join {row.name} — recently raised {row.stage} ({row.industry}). {row.summary}", url=f"https://{row.website}/careers", source="custom", status="discovered", score=score, score_reason=reason, company_size="startup", company_info={"stage": row.stage, "industry": row.industry})
         db.add(job)
         db.commit()
         db.refresh(job)
-        return {"action": "apply_flow", "job_id": job.id, "message": "Open position found, queued for application"}
+        return {"action": "apply_flow", "job_id": job.id, "message": f"Open position found at {row.name} — job created, apply from Jobs", "company": row.name}
     else:
-        # cold email founder
-        decision = await find_decision_maker(comp["name"], "founder")
-        email_content = await generate_cold_email(profile.data, comp["name"], founder=True)
-        email = Email(to_email=decision["email"], to_name=decision["name"], subject=email_content["subject"], body=email_content["body"], status="pending_approval", company=comp["name"], recipient_type="founder")
+        decision = await find_decision_maker(row.name, "founder")
+        email_content = await generate_cold_email(profile.data, row.name, founder=True)
+        email = Email(to_email=decision["email"], to_name=decision["name"], subject=email_content["subject"], body=email_content["body"], status="pending_approval", company=row.name, recipient_type="founder")
         db.add(email)
         db.commit()
         db.refresh(email)
-        return {"action": "cold_email_founder", "email_id": email.id, "decision": decision, "message": "No open position, founder cold email drafted"}
+        return {"action": "cold_email_founder", "email_id": email.id, "decision": decision, "message": f"No open position at {row.name} — founder cold email drafted for approval", "company": row.name}
 
 # ---------- Settings ----------
 @router.get("/settings")
@@ -526,6 +675,7 @@ def get_settings(db: Session = Depends(get_db)):
         "general": {"strict_skeleton": False, "auto_approve_email": False, "default_resume_format": "ai_generated"},
         "application": {"auto_create_credentials": True, "notify_unknown_fields": True},
         "email": {"host": "", "port": 587, "username": "", "use_tls": True, "from_name": ""},
+        "funding": {"context_notes": "", "industries": "", "freshness_days": settings.funding_freshness_days},
         "workflows": {"ai_for_discovery": True, "ai_for_scoring": True, "ai_for_resume": True, "ai_for_emails": True},
     }
     for cat, vals in defaults.items():

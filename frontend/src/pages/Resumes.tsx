@@ -74,7 +74,7 @@ export default function Resumes(){
                 {jobs.map(j=> <option key={j.id} value={j.id}>{j.title} • {j.company} (score {j.score})</option>)}
               </select>
               <label className="flex items-center gap-2 text-xs mono"><input type="checkbox" checked={strict} onChange={e=>setStrict(e.target.checked)}/> Strictly maintain uploaded skeleton</label>
-              <label className="flex items-center gap-2 text-xs mono"><input type="checkbox" defaultChecked /> AI generated format option (toggle)</label>
+              <label className="flex items-center gap-2 text-xs mono"><input type="checkbox" checked={!strict} onChange={e=>setStrict(!e.target.checked)}/> AI-generated ATS-friendly format</label>
               <button onClick={generate} disabled={generating} className="w-full py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50">
                 {generating ? <Loader2 className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} Generate with JD fact guard
               </button>

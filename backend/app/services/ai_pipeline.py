@@ -38,6 +38,8 @@ class AIPipeline:
             "email_gen": 5,
             "form_detect": 3,
             "parse": 2,
+            "keyword_extract": 3,
+            "funding_scan": 3,
         }
 
     async def enqueue(self, workflow: str, prompt: str, priority: int = None, model: str = None, extra: Dict[str,Any]=None) -> AIRequest:
@@ -78,27 +80,6 @@ class AIPipeline:
             self.history.append(req)
             if self.processing and self.processing.id == req.id:
                 self.processing = None
-
-    def stats(self):
-        async def _stats():
-            async with self.lock:
-                queued = len(self.queue)
-                hist = list(self.history)
-                done = sum(1 for r in hist if r.status=="done")
-                failed = sum(1 for r in hist if r.status=="failed")
-                processing = 1 if self.processing else 0
-                return {
-                    "queued": queued,
-                    "processing": processing,
-                    "done": done,
-                    "failed": failed,
-                    "needs_input": 0,
-                    "queue_preview": [{"id": r.id, "workflow": r.workflow, "priority": r.priority, "status": r.status} for r in list(self.queue)[:10]],
-                    "processing_now": {"id": self.processing.id, "workflow": self.processing.workflow} if self.processing else None,
-                }
-        # sync wrapper for non-async callers: run via asyncio if needed
-        # But we will make caller await
-        return _stats
 
     async def get_stats(self):
         async with self.lock:

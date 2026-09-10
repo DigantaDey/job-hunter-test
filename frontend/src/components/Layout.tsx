@@ -64,7 +64,7 @@ export default function Layout() {
             <button onClick={()=>setTheme('dark')} className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-full text-xs ${theme==='dark'?'bg-zinc-900 shadow text-white':'text-zinc-500'}`}><Moon className="w-3.5 h-3.5"/> Dark</button>
             <button onClick={()=>setTheme('system')} className={`flex-1 flex items-center justify-center gap-1 py-1.5 rounded-full text-xs ${theme==='system'?'bg-white dark:bg-zinc-700 shadow':'text-zinc-500'}`}><Monitor className="w-3.5 h-3.5"/> Auto</button>
           </div>
-          <div className="mt-3 text-[11px] text-zinc-500 dark:text-zinc-400 mono text-center">v1.0 • three FIFO pipelines • JD fact guard</div>
+          <div className="mt-3 text-[11px] text-zinc-500 dark:text-zinc-400 mono text-center">v1.1 • three FIFO pipelines • AI keyword extraction • JD fact guard</div>
         </div>
       </aside>
 

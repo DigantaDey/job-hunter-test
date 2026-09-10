@@ -51,7 +51,7 @@ export default function Emails(){
         </div>
         <button onClick={generate} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium">Find decision maker & draft</button>
         <div className="ml-auto flex gap-1">
-          {['','pending_approval','queued','sent','needs_otp'].map(s=> <button key={s} onClick={()=>setFilter(s)} className={`text-xs px-3 py-1 rounded-full border mono ${filter===s?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800'}`}>{s||'all'}</button>)}
+          {['','pending_approval','queued','sent','needs_otp','failed'].map(s=> <button key={s} onClick={()=>setFilter(s)} className={`text-xs px-3 py-1 rounded-full border mono ${filter===s?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800'}`}>{s||'all'}</button>)}
         </div>
       </div>
 
