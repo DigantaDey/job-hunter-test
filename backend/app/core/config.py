@@ -303,6 +303,12 @@ class Settings(BaseSettings):
     access_log: bool = True
     metrics_enabled: bool = True
     metrics_token: str = ""
+    #: When > 0, metrics are served by a separate listener on this port instead
+    #: of ``GET /api/metrics`` on the public API (which then 404s). Bind by
+    #: default to loopback so the port is internal unless an operator — or the
+    #: compose file, for container networking — says otherwise.
+    metrics_port: int = 0
+    metrics_host: str = "127.0.0.1"
 
     # ------------------------------------------------------------------ #
     # Backups

@@ -72,13 +72,23 @@ Launch-hardening pass: fixes for defects found while booting a fresh checkout
 
 ### Added
 
+- **Metrics on a dedicated internal port** (`METRICS_PORT`, default `9464`,
+  `METRICS_HOST` defaulting to loopback). The app process serves `/metrics`
+  there and `GET /api/metrics` answers `404 {"code":"metrics_moved"}`, so the
+  exposition never has to be reachable from the internet. The listener lives in
+  the API/worker process (the registry is in-process state, so a sidecar would
+  report nothing); with several uvicorn workers the one that wins the bind
+  serves it and the others log a warning and continue.
+  `docker-compose.prod.yml` `expose:`s `9464` on the api and worker services
+  (never `ports:`), and the image exposes it for `docker run -p` users.
+
 - **`backend/scripts/create_user.py`** — create, reset, promote, deactivate and list
   accounts from the command line (the supported way to provision testers without
   opening registration). Documented in the README's "Accounts & test logins".
 - **The SPA explains a refused send** — a blocked or consent-gated send now shows
   *why* (compliance blockers, or the exact missing disclosure plus a button that
   records it and retries) instead of silently leaving the email in `queued`.
-- 35 regression tests pinning every defect above (`backend/tests/test_regressions.py`).
+- 40 regression tests pinning every defect above (`backend/tests/test_regressions.py`).
 
 ## [2.0.0] — 2026-09-11
 

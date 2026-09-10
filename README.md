@@ -185,7 +185,7 @@ stored encrypted where they are secret.
 
 ```bash
 # backend — hermetic: temp SQLite, no network, no AI key
-cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 244 tests
+cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 249 tests
 
 # lint
 ruff check backend

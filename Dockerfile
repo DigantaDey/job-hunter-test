@@ -46,6 +46,10 @@ RUN useradd --create-home --uid 10001 jobhunter \
 USER jobhunter
 
 EXPOSE 8000
+# Prometheus: metrics are served by the app process on its own port when
+# METRICS_PORT is set. docker-compose.prod.yml only *exposes* it (never
+# publishes it), so scrape it over the container network, e.g. api:9464.
+EXPOSE 9464
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health/live', timeout=4).status == 200 else 1)"

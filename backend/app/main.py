@@ -36,6 +36,7 @@ from app.core.middleware import (
     SecurityHeadersMiddleware,
 )
 from app.db import SessionLocal, init_db
+from app.metrics_server import start_metrics_server
 from app.services.ai_client import set_workflow_overrides
 from app.services.ai_pipeline import ai_pipeline
 from app.services.job_queue import recover_stalled
@@ -75,6 +76,8 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
+    metrics_listener = start_metrics_server()
+
     worker: Worker | None = None
     if settings.run_worker_in_api:
         worker = Worker()
@@ -91,6 +94,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if metrics_listener is not None:
+            metrics_listener.stop()
         if worker is not None:
             await worker.stop()
             task = getattr(app.state, "worker_task", None)

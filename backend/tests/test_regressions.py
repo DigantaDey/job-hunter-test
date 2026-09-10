@@ -7,6 +7,8 @@ security control or a config value that depended on the working directory.
 from __future__ import annotations
 
 import os
+import time
+import urllib.error
 
 import pytest
 
@@ -412,3 +414,96 @@ def test_metrics_endpoint_accepts_the_token_by_header(client, monkeypatch):
     ok = client.get("/api/metrics", headers={"Authorization": "Bearer scrape-secret"})
     assert ok.status_code == 200
     assert "jobhunter_info" in ok.text
+
+
+# --------------------------------------------------------------------------- #
+# 13. Metrics on their own internal port
+# --------------------------------------------------------------------------- #
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def test_metrics_text_includes_build_info_and_escapes_labels():
+    from app.core.metrics import metrics_text
+
+    body = metrics_text(version='2.0.0"', environment="production")
+    assert 'jobhunter_info{version="2.0.0\\"",environment="production"} 1' in body
+
+
+def test_internal_metrics_listener_serves_the_registry(monkeypatch):
+    import urllib.request
+
+    from app.core.config import settings
+    from app.metrics_server import MetricsServer
+
+    monkeypatch.setattr(settings, "metrics_token", "scrape-secret")
+    monkeypatch.setattr(settings, "metrics_enabled", True)
+    port = _free_port()
+    server = MetricsServer(host="127.0.0.1", port=port)
+    try:
+        assert server.start() is True
+        deadline = time.time() + 10
+        while time.time() < deadline and not server.running:
+            time.sleep(0.05)
+        assert server.running
+
+        def get(path: str, token: str | None = None) -> tuple[int, str]:
+            request = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+            if token:
+                request.add_header("Authorization", f"Bearer {token}")
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.status, response.read().decode()
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.read().decode()
+
+        assert get("/metrics")[0] == 401                      # no token
+        assert get("/metrics", "wrong")[0] == 401             # wrong token
+        status, body = get("/metrics", "scrape-secret")
+        assert status == 200
+        assert "jobhunter_info{" in body
+        assert get("/something-else", "scrape-secret")[0] == 404
+    finally:
+        server.stop()
+    assert not server.running
+
+
+def test_public_metrics_route_steps_aside_when_the_port_is_configured(client, monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "metrics_port", 9464)
+    response = client.get("/api/metrics")
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "metrics_moved"
+    assert "9464" in response.json()["detail"]["message"]
+
+
+def test_metrics_listener_is_a_noop_without_a_port(monkeypatch):
+    from app.core.config import settings
+    from app.metrics_server import MetricsServer
+
+    monkeypatch.setattr(settings, "metrics_port", 0)
+    assert MetricsServer().start() is False
+
+
+def test_second_listener_on_the_same_port_does_not_crash(monkeypatch):
+    """With `--workers N` only one worker can own the port; the rest stay quiet."""
+    from app.core.config import settings
+    from app.metrics_server import MetricsServer
+
+    monkeypatch.setattr(settings, "metrics_enabled", True)
+    port = _free_port()
+    first = MetricsServer(host="127.0.0.1", port=port)
+    try:
+        assert first.start() is True
+        time.sleep(1.0)  # let the first listener bind
+        second = MetricsServer(host="127.0.0.1", port=port)
+        second.start()   # must not raise even though the port is taken
+        time.sleep(0.5)
+        assert first.running is True
+    finally:
+        first.stop()

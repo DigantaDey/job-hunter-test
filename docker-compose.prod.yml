@@ -39,8 +39,14 @@ services:
       ENVIRONMENT: production
       RUN_WORKER_IN_API: "false"
       AUTO_MIGRATE: "true"
+      # Metrics on their own port, reachable only inside this compose network
+      # (0.0.0.0 inside the container, never published to the host).
+      METRICS_PORT: "9464"
+      METRICS_HOST: "0.0.0.0"
     ports:
       - "${API_PORT:-8000}:8000"
+    expose:
+      - "9464"
     volumes:
       - uploads:/app/backend/uploads
       - generated:/app/backend/generated
@@ -73,6 +79,12 @@ services:
       # failure. The worker waits for the API to be healthy before booting.
       AUTO_MIGRATE: "false"
       WORKER_CONCURRENCY: "2"
+      # The worker exposes its own queue metrics on the same internal port
+      # (scrape it as worker:9464).
+      METRICS_PORT: "9464"
+      METRICS_HOST: "0.0.0.0"
+    expose:
+      - "9464"
     volumes:
       - uploads:/app/backend/uploads
       - generated:/app/backend/generated
@@ -92,6 +104,7 @@ services:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-jobhunter}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jobhunter}
       # A backup job must never touch the schema.
       AUTO_MIGRATE: "false"
+      METRICS_PORT: "0"
     volumes:
       - backups:/backups
 
