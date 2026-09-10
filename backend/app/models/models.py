@@ -23,6 +23,7 @@ class Resume(Base):
     tags = Column(JSON, default=list)
     jd_hash = Column(String, nullable=True)
     job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
+    status = Column(String, default="approved")  # approved | pending (generated resumes await approval)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Job(Base):

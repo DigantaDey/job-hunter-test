@@ -7,6 +7,8 @@ from typing import List, Dict, Any, Optional
 import httpx
 from bs4 import BeautifulSoup
 
+from app.core.config import settings
+
 # Adapter pattern for job boards
 KNOWN_SOURCES = ["linkedin", "naukri", "indeed", "instahyre", "lever", "greenhouse", "workday", "custom"]
 
@@ -117,19 +119,181 @@ def _mock_generate_jobs(keywords: List[str], freshness_hours: int, limit: int = 
     return result
 
 
-async def discover_jobs(keywords: List[str], freshness_hours: int, sources: Optional[List[str]] = None, limit: int = 14) -> List[Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Live adapters — public, keyless JSON job APIs (ToS-respecting). When the
+# network is unavailable (offline/dev sandbox), they return [] and the curated
+# pool below keeps discovery working. In a real deployment with internet they
+# contribute genuine listings on top of the curated/synthetic pool.
+# ---------------------------------------------------------------------------
+LIVE_SOURCES = ["arbeitnow", "remotive"]
+
+_INDUSTRY_HINTS = {
+    "fintech": ["fintech", "payment", "banking", "lending", "trading", "insurance"],
+    "ai/ml": ["ai", "machine learning", "deep learning", "llm", "nlp", "ml", "data scientist", "artificial intelligence"],
+    "e-commerce": ["ecommerce", "e-commerce", "retail", "marketplace"],
+    "healthtech": ["health", "healthcare", "medical", "clinical", "biotech"],
+    "edtech": ["education", "edtech", "learning"],
+    "developer tools": ["developer tools", "devtools", "api", "sdk", "infrastructure", "open source"],
+    "cybersecurity": ["security", "cybersecurity", "auth", "encryption", "siem"],
+    "saas": ["saas", "b2b", "crm", "erp", "workflow", "productivity"],
+    "gaming": ["game", "gaming", "unity", "unreal"],
+    "web3": ["web3", "blockchain", "crypto", "solidity", "defi"],
+    "mobility": ["mobility", "automotive", "ev", "logistics", "supply chain"],
+    "climate": ["climate", "clean energy", "solar", "sustainability", "carbon"],
+    "data": ["data engineering", "analytics", "etl", "warehouse", "data platform"],
+}
+
+
+def _guess_industry(text: str) -> str:
+    """Map free text to an industry bucket.
+
+    Short tokens (e.g. "ai", "ml") are matched on whole words only, so they
+    don't false-positive inside words like "chain".
     """
-    Discovery across adapters (linkedin/naukri/indeed/instahyre/lever/greenhouse/workday).
-    Results are deduplicated by a stable (company,title) key upstream. In production
-    each adapter would use Playwright/BS4 + AI form detection; the demo dataset is
-    matched to the AI-extracted search context.
+    t = (text or "").lower()
+    tokens = set(re.findall(r"[a-z0-9+#.]+", t))
+    for ind, hints in _INDUSTRY_HINTS.items():
+        for h in hints:
+            h = h.lower()
+            if " " in h or len(h) > 3:
+                if h in t:
+                    return ind
+            elif h in tokens:
+                return ind
+    return "saas"
+
+
+def _normalize_live(raw: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+    """Map a raw API row from Arbeitnow / Remotive to the internal job shape."""
+    try:
+        if source == "arbeitnow":
+            title = (raw.get("title") or "").strip()
+            company = (raw.get("company_name") or "").strip()
+            location = (raw.get("location") or "").strip() or "Remote"
+            url = (raw.get("url") or "").strip()
+            desc = " ".join((raw.get("tags") or [])[:10]).strip()
+        elif source == "remotive":
+            title = (raw.get("title") or "").strip()
+            company = (raw.get("company_name") or "").strip()
+            location = (raw.get("candidate_required_location") or "").strip() or "Remote"
+            url = (raw.get("url") or "").strip()
+            desc = (raw.get("description") or "").strip()[:800]
+        else:
+            return None
+        if not title or not company:
+            return None
+        if not url:
+            url = f"https://{source}.com/jobs?search={_slug(title)}"
+        if not desc:
+            desc = title
+        return {
+            "title": title,
+            "company": company,
+            "location": location,
+            "source": source,
+            "industry": _guess_industry(f"{title} {desc}"),
+            "description": desc,
+            "url": url,
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_arbeitnow(keywords: List[str], limit: int = 10) -> List[Dict[str, Any]]:
+    query = " ".join((keywords or [])[:4])
+    url = "https://www.arbeitnow.com/api/job-board-api"
+    try:
+        async with httpx.AsyncClient(timeout=settings.live_scrape_timeout, headers={"User-Agent": "JobHunter/1.2"}) as client:
+            resp = await client.get(url)
+        if resp.status_code != 200:
+            return []
+        rows = (resp.json() or {}).get("data") or []
+        jobs: List[Dict[str, Any]] = []
+        for raw in rows:
+            norm = _normalize_live(raw, "arbeitnow")
+            if norm and (not query or any(k.lower() in f"{norm['title']} {norm['description']}".lower() for k in keywords or [])):
+                jobs.append(norm)
+            if len(jobs) >= limit:
+                break
+        return jobs
+    except Exception:
+        return []
+
+
+async def _fetch_remotive(keywords: List[str], limit: int = 10) -> List[Dict[str, Any]]:
+    query = " ".join((keywords or [])[:4])
+    url = "https://remotive.com/api/remote-jobs"
+    try:
+        params = {"search": query} if query else {}
+        async with httpx.AsyncClient(timeout=settings.live_scrape_timeout, headers={"User-Agent": "JobHunter/1.2"}) as client:
+            resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            return []
+        rows = (resp.json() or {}).get("jobs") or []
+        jobs: List[Dict[str, Any]] = []
+        for raw in rows:
+            norm = _normalize_live(raw, "remotive")
+            if norm:
+                jobs.append(norm)
+            if len(jobs) >= limit:
+                break
+        return jobs
+    except Exception:
+        return []
+
+
+async def fetch_live_jobs(keywords: List[str], sources: Optional[List[str]] = None, limit: int = 12, enabled: bool = True) -> List[Dict[str, Any]]:
+    """Fetch live listings from keyless public APIs; never raises.
+
+    Disabled by env (`LIVE_SCRAPING_ENABLED=false`) or per-run by the user's
+    Settings toggle (`scraping.live_enabled`).
     """
-    await asyncio.sleep(0.4 + random.random() * 0.4)
+    if not settings.live_scraping_enabled or not enabled:
+        return []
+    sources = [s for s in (sources or LIVE_SOURCES) if s in LIVE_SOURCES]
+    tasks = []
+    if "arbeitnow" in sources:
+        tasks.append(_fetch_arbeitnow(keywords, limit))
+    if "remotive" in sources:
+        tasks.append(_fetch_remotive(keywords, limit))
+    if not tasks:
+        return []
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    out: List[Dict[str, Any]] = []
+    for r in results:
+        if isinstance(r, list):
+            out.extend(r)
+    return out[:limit]
+
+
+async def discover_jobs(keywords: List[str], freshness_hours: int, sources: Optional[List[str]] = None, limit: int = 14, live_enabled: bool = True) -> List[Dict[str, Any]]:
+    """
+    Discovery across adapters (linkedin/naukri/indeed/instahyre/lever/greenhouse/workday
+    curated pool + live keyless APIs). Results are deduplicated by a stable
+    (company,title) key. In production each adapter would use Playwright/BS4 +
+    AI form detection; the curated/synthetic pool keeps the demo deterministic.
+    """
+    await asyncio.sleep(0.3 + random.random() * 0.3)
+
+    live: List[Dict[str, Any]] = await fetch_live_jobs(keywords, limit=max(4, limit // 2), enabled=live_enabled)
     jobs = _mock_generate_jobs(keywords, freshness_hours, limit=limit)
-    for j in jobs:
+
+    # Merge live first, then curated; dedupe by (company, title).
+    seen = set()
+    merged: List[Dict[str, Any]] = []
+    for j in live + jobs:
+        key = (j["company"].strip().lower(), j["title"].strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(j)
+    if len(merged) > limit:
+        merged = merged[:limit]
+
+    for j in merged:
         j["stable_id"] = _stable_id(j)
         j["forms_detected"] = await detect_form_structure(j["url"], source=j["source"])
-    return jobs
+    return merged
 
 
 async def detect_form_structure(url: str, source: Optional[str] = None) -> Dict[str, Any]:

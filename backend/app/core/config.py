@@ -7,7 +7,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 
 class Settings(BaseSettings):
     app_name: str = "JobHunter AI"
-    version: str = "1.1.0"
+    version: str = "1.2.0"
     secret_key: str = "dev-secret-key-change-in-production-32chars"
     database_url: str = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'jobhunter.db')}")
     upload_dir: str = os.getenv("UPLOAD_DIR", os.path.join(BASE_DIR, "uploads"))
@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     # Scraping
     default_freshness_hours: int = 24
     default_keywords: str = "software engineer, backend, python"
+    live_scraping_enabled: bool = os.getenv("LIVE_SCRAPING_ENABLED", "true").lower() in ("1", "true", "yes")
+    live_scrape_timeout: int = int(os.getenv("LIVE_SCRAPE_TIMEOUT", "8"))
 
     # Funding radar
     funding_freshness_days: int = 45

@@ -2,13 +2,25 @@ import { useEffect, useState } from 'react'
 import client from '../api/client'
 import { Settings as SettingsIcon, Save, Bot, Search, Sliders, Mail, Shield, Zap, TrendingUp } from 'lucide-react'
 
+const WORKFLOWS = ['parse','keyword_extract','scoring','resume_gen','classify','email_gen','funding_scan']
+
 export default function Settings(){
   const [data, setData]=useState<any>(null)
+  const [wfConfig, setWfConfig]=useState<any>({})
   const [saving, setSaving]=useState(false)
   const [msg, setMsg]=useState('')
 
-  const load=async()=>{ const {data}=await client.get('/api/settings'); setData(data)}
+  const load=async()=>{
+    const {data}=await client.get('/api/settings'); setData(data)
+    const {data:wfc}=await client.get('/api/ai/config'); setWfConfig(wfc||{})
+  }
   useEffect(()=>{ load() },[])
+
+  const updateWf = (wf:string, key:string, value:string)=> setWfConfig({...wfConfig, [wf]: {...(wfConfig[wf]||{}), [key]: value}})
+  const saveWf = async(wf:string)=>{
+    setSaving(true); setMsg('')
+    try{ await client.post('/api/ai/config', {[wf]: wfConfig[wf]||{}}); setMsg(`Saved workflow "${wf}" ✓`); setTimeout(()=>setMsg(''), 2000)} finally{ setSaving(false)}
+  }
 
   const save=async()=>{
     setSaving(true); setMsg('')
@@ -38,8 +50,26 @@ export default function Settings(){
             <div className="flex items-center gap-2 text-xs mono"><Shield className="w-3.5 h-3.5"/> API key: <span className="px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800">•••••••• set: {String(data.ai.api_key_set)}</span></div>
           </div>
           <div className="mt-4 p-3 bg-zinc-50 dark:bg-zinc-800 rounded-xl">
-            <div className="text-xs mono font-medium flex items-center gap-1"><Zap className="w-3.5 h-3.5"/> Per-workflow AI override</div>
-            <div className="text-[11px] mono text-zinc-500">Set different API for discovery vs resume vs email at <span className="underline">/api/ai/config</span> — UI for that is in this card for demo.</div>
+            <div className="text-xs mono font-medium flex items-center gap-1"><Zap className="w-3.5 h-3.5"/> Per-workflow AI override <span className="text-zinc-400">(optional — falls back to the main key)</span></div>
+            <div className="mt-2 space-y-2">
+              {WORKFLOWS.map(wf=>{
+                const cfg = wfConfig[wf] || {}
+                const active = !!(cfg.base_url || cfg.model || cfg.api_key)
+                return (
+                  <div key={wf} className="border dark:border-zinc-700 rounded-lg p-2 bg-white dark:bg-zinc-900">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] mono font-medium">{wf} {active && <span className="text-emerald-600">• override set</span>}</span>
+                      <button onClick={()=>saveWf(wf)} disabled={saving} className="text-[11px] px-2 py-1 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 disabled:opacity-50">Save</button>
+                    </div>
+                    <div className="mt-1.5 grid grid-cols-3 gap-1.5">
+                      <input value={cfg.base_url||''} onChange={e=>updateWf(wf,'base_url',e.target.value)} placeholder="Base URL" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700"/>
+                      <input value={cfg.model||''} onChange={e=>updateWf(wf,'model',e.target.value)} placeholder="Model" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700"/>
+                      <input value={cfg.api_key||''} onChange={e=>updateWf(wf,'api_key',e.target.value)} type="password" placeholder="API key" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700"/>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
           </div>
         </div>
 
@@ -49,6 +79,8 @@ export default function Settings(){
             <div><label className="text-xs mono">Keywords (comma-separated, extracted from resume + editable)</label><input value={data.scraping.keywords} onChange={e=>update('scraping','keywords',e.target.value)} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
             <div><label className="text-xs mono">Job freshness (hours)</label><input type="number" value={data.scraping.freshness_hours} onChange={e=>update('scraping','freshness_hours', Number(e.target.value))} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
             <div><label className="text-xs mono">Sources (clubbed)</label><div className="flex flex-wrap gap-1 mt-1">{(data.scraping.sources||[]).map((s:string)=> <span key={s} className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 mono">{s}</span>)}</div></div>
+            <label className="flex items-center gap-2 text-sm pt-1"><input type="checkbox" checked={!!data.scraping.live_enabled} onChange={e=>update('scraping','live_enabled', e.target.checked)}/> Live job sources (Arbeitnow + Remotive, keyless APIs)</label>
+            <div className="text-[11px] mono text-zinc-500 leading-relaxed">When on, discovery pulls real postings from public job APIs on top of the curated pool (falls back gracefully offline).</div>
           </div>
         </div>
 

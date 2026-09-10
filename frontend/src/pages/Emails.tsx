@@ -8,6 +8,8 @@ export default function Emails(){
   const [company, setCompany]=useState('')
   const [dept, setDept]=useState('engineering')
   const [jobs, setJobs]=useState<any[]>([])
+  const [otpFor, setOtpFor]=useState<number|null>(null)
+  const [otp, setOtp]=useState('')
 
   const load=async()=>{
     const {data}=await client.get('/api/emails', {params: filter?{status:filter}: {}})
@@ -26,12 +28,13 @@ export default function Emails(){
     load()
   }
   const approve=async(id:number)=>{ await client.post(`/api/emails/${id}/approve`); load()}
-  const send=async(id:number, otp?:string)=>{
-    const res=await client.post(`/api/emails/${id}/send`, null, {params: otp?{otp}:{}})
+  const send=async(id:number, code?:string)=>{
+    const res=await client.post(`/api/emails/${id}/send`, null, {params: code?{otp:code}:{}})
     if(res.data.needs_otp){
-      const code=prompt('SMTP 2FA required — enter OTP / app password:')
-      if(code) send(id, code)
-    } else load()
+      setOtpFor(id); setOtp('')
+    } else {
+      setOtpFor(null); setOtp(''); load()
+    }
   }
 
   return (
@@ -82,7 +85,13 @@ export default function Emails(){
             <div className="mt-3">
               <label className="text-xs mono flex items-center gap-1"><Pencil className="w-3.5 h-3.5"/> Body (editable)</label>
               <textarea defaultValue={e.body} onBlur={ev=>update(e,'body',ev.target.value)} rows={6} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700 leading-relaxed"/>
-              {e.status==='needs_otp' && <div className="mt-2 text-xs mono p-2 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 flex gap-2"><AlertTriangle className="w-3.5 h-3.5"/> SMTP 2FA needed — click Send and provide OTP / verify on device. Handles app passwords.</div>}
+              {e.status==='needs_otp' && <div className="mt-2 text-xs mono p-2 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 flex gap-2"><AlertTriangle className="w-3.5 h-3.5 shrink-0"/> SMTP 2FA needed — enter the OTP / app password from your provider (or verify on another device).</div>}
+              {otpFor===e.id && (
+                <div className="mt-2 flex gap-2">
+                  <input value={otp} onChange={ev=>setOtp(ev.target.value)} placeholder="OTP / app password" type="password" className="flex-1 border rounded-xl px-3 py-2 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700"/>
+                  <button onClick={()=>send(e.id, otp)} disabled={!otp} className="px-4 py-2 rounded-full bg-blue-600 text-white text-xs font-medium inline-flex items-center gap-1 disabled:opacity-50"><Send className="w-3.5 h-3.5"/> Retry with OTP</button>
+                </div>
+              )}
             </div>
           </div>
         ))}

@@ -73,7 +73,7 @@ export default function Queues(){
                   <div className="text-sm font-medium">Job #{req.job_id} • {req.fields.length} fields required</div>
                   <span className="text-xs mono px-2 py-1 rounded-full bg-amber-500 text-white">pending</span>
                 </div>
-                <InputForm req={req} onSubmit={(payload)=>submitInput(req,payload)} />
+                <InputForm req={req} onSubmit={(payload: any)=>submitInput(req,payload)} />
               </div>
             ))}
           </div>

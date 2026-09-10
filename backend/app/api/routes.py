@@ -12,7 +12,7 @@ from app.core.config import settings
 from app.models.models import Profile, Resume, Job, VaultEntry, Email, SettingsModel, ErrorLog, UserInputRequest, PipelineJob, FundingCompany
 from app.schemas.schemas import ProfileOut, ResumeOut, JobOut, JobDetail, VaultOut, EmailOut, ErrorLogOut
 from app.services.resume_parser import extract_layout, extract_text_from_pdf, ai_extract_profile
-from app.services.scoring import heuristic_score, ai_score
+from app.services.scoring import heuristic_score, ai_score, jd_similarity
 from app.services.classifier import heuristic_company_size, ai_company_size
 from app.services.resume_generator import generate_tailored_profile, build_docx, build_pdf, hash_jd
 from app.services.vault import generate_credential, save_vault_entry, list_vault_entries, export_chrome_csv, export_apple_csv, delete_all_vault, get_vault_entry_for_domain
@@ -21,6 +21,7 @@ from app.services.email_pipeline import find_decision_maker, generate_cold_email
 from app.services import funding_radar
 from app.services.keyword_extractor import ai_extract_context, heuristic_context, merge_user_keywords, _context_cache
 from app.services.ai_pipeline import ai_pipeline
+from app.services.ai_client import set_workflow_overrides
 from app.core.rate_limiter import rate_limiter
 from app.utils.logger import log_error, log_info
 from app.core.security import decrypt_password
@@ -55,6 +56,73 @@ async def get_keywords_context(force: bool = False, db: Session = Depends(get_db
     """AI-extracted keywords/roles/industries from the user profile + resume + context."""
     ctx = await get_search_context(db, force_refresh=force)
     return ctx
+
+
+# ---------- Shared helpers (settings lookup, resume selection) ----------
+def _get_setting(db: Session, category: str, key: str, default=None):
+    row = db.query(SettingsModel).filter(SettingsModel.category == category, SettingsModel.key == key).first()
+    return row.value if row is not None and row.value is not None else default
+
+
+def _master_resume(db: Session) -> Optional[Resume]:
+    return db.query(Resume).filter(Resume.type == "master").order_by(Resume.created_at.desc()).first()
+
+
+def _approved_generated_resumes(db: Session) -> List[Resume]:
+    return db.query(Resume).filter(Resume.type == "generated", Resume.status == "approved").all()
+
+
+async def _choose_resume(db: Session, profile, job, choice: str, resume_id: Optional[int] = None) -> tuple:
+    """
+    Decide which resume to use for an application.
+
+    Returns (resume_id, decision) where decision ∈ {master, selected, reused,
+    generated}. Logic (matches the scoring spec):
+
+    - "master"      → always the master resume.
+    - explicit id   → the user-selected, tagged resume.
+    - "generated"   → most recent APPROVED generated resume, else generate new.
+    - "auto"        → reuse an approved generated resume when the candidate is a
+                      strong match (score ≥ 65) AND that resume was built for a
+                      very similar JD (cosine ≥ 0.85); otherwise generate new for
+                      a solid match, or fall back to master for a weak match.
+    """
+    master = _master_resume(db)
+
+    if choice == "master":
+        return (master.id if master else None), "master"
+
+    if resume_id:
+        return resume_id, "selected"
+
+    if choice == "generated":
+        gen = db.query(Resume).filter(Resume.type == "generated", Resume.status == "approved").order_by(Resume.created_at.desc()).first()
+        if gen:
+            return gen.id, "generated"
+
+    # auto (or generated-with-nothing-approved)
+    score = float(job.score or 0)
+    best_resume, best_sim = None, 0.0
+    for r in _approved_generated_resumes(db):
+        if not r.job_id:
+            continue
+        src_job = db.query(Job).filter(Job.id == r.job_id).first()
+        if not src_job or not src_job.description:
+            continue
+        sim = jd_similarity(job.description, src_job.description)
+        if sim > best_sim:
+            best_sim, best_resume = sim, r
+
+    if score >= 65 and best_resume is not None and best_sim >= 0.85:
+        return best_resume.id, "reused"
+
+    if score >= 65:
+        strict = bool(_get_setting(db, "general", "strict_skeleton", False))
+        tailored = await generate_tailored_profile(profile.data, job.description, profile.layout, strict)
+        rid = await _build_and_save_resume(db, profile, job, tailored)
+        return rid, "generated"
+
+    return (master.id if master else None), "master"
 
 # ---------- Profile & Resume ----------
 @router.post("/resume/upload")
@@ -170,8 +238,9 @@ async def generate_resume(job_id: int, strict_skeleton: bool = False, use_ai_for
     build_docx(tailored_profile, profile.data, profile.layout, docx_path)
     build_pdf(tailored_profile, profile.data, pdf_path)
 
-    # Save as generated resume (point to docx)
-    resume = Resume(filename=f"{safe_name}.docx", filepath=docx_path, type="generated", profile_snapshot=tailored_profile, layout=profile.layout, tags=tags, jd_hash=hash_jd(job.description), job_id=job.id)
+    # Save as generated resume (point to docx) — pending user approval before it
+    # can be used in an application.
+    resume = Resume(filename=f"{safe_name}.docx", filepath=docx_path, type="generated", status="pending", profile_snapshot=tailored_profile, layout=profile.layout, tags=tags, jd_hash=hash_jd(job.description), job_id=job.id)
     db.add(resume)
     db.commit()
     db.refresh(resume)
@@ -179,7 +248,7 @@ async def generate_resume(job_id: int, strict_skeleton: bool = False, use_ai_for
     # Also enqueue tagging
     await ai_pipeline.enqueue("tagging", f"Tag resume {resume.id}", priority=4)
 
-    return {"resume_id": resume.id, "tags": tags, "score": score, "reason": reason, "tailored": tailored_profile, "files": {"docx": f"/api/resumes/{resume.id}/download?format=docx", "pdf": f"/api/resumes/{resume.id}/download?format=pdf"}}
+    return {"resume_id": resume.id, "tags": tags, "score": score, "reason": reason, "tailored": tailored_profile, "status": resume.status, "files": {"docx": f"/api/resumes/{resume.id}/download?format=docx", "pdf": f"/api/resumes/{resume.id}/download?format=pdf"}}
 
 @router.get("/resumes/{resume_id}/download")
 def download_resume(resume_id: int, format: str = "docx", db: Session = Depends(get_db)):
@@ -201,6 +270,17 @@ def update_tags(resume_id: int, tags: List[str], db: Session = Depends(get_db)):
     r.tags = tags
     db.commit()
     return {"ok": True}
+
+@router.post("/resumes/{resume_id}/approve")
+def approve_resume(resume_id: int, db: Session = Depends(get_db)):
+    """Approve a generated resume so the application pipeline may use it."""
+    r = db.query(Resume).filter(Resume.id==resume_id).first()
+    if not r:
+        raise HTTPException(404, "Resume not found")
+    r.status = "approved"
+    db.commit()
+    log_info(db, "resume", f"Resume #{resume_id} approved for use", meta={"resume_id": resume_id})
+    return {"ok": True, "status": r.status}
 
 # ---------- Jobs & Discovery ----------
 @router.get("/jobs", response_model=List[JobOut])
@@ -241,6 +321,10 @@ async def trigger_discovery(keywords: Optional[str]=None, freshness_hours: Optio
     # explicit user input for this run wins (prepended)
     context = merge_user_keywords(context, keywords)
 
+    # Live job-source toggle (Settings → Scraping)
+    live_enabled = bool(scraping.get("live_enabled", settings.live_scraping_enabled))
+    live_sources = [s for s in (scraping.get("live_sources") or ["arbeitnow", "remotive"]) if isinstance(s, str)]
+
     kw_list = context.get("keywords", [])[:16]
     context_for_run = context.get("user_keywords") and ", ".join(context["user_keywords"]) or (keywords or "")
 
@@ -255,7 +339,7 @@ async def trigger_discovery(keywords: Optional[str]=None, freshness_hours: Optio
         dbs = SessionLocal()
         try:
             await rate_limiter.wait_and_acquire(1)
-            jobs = await discover_jobs(kw_list, fresh, limit=limit)
+            jobs = await discover_jobs(kw_list, fresh, limit=limit, live_enabled=live_enabled)
             prof = dbs.query(Profile).order_by(Profile.created_at.desc()).first()
             prof_data = prof.data if prof else {}
             added = 0
@@ -299,32 +383,10 @@ async def apply_job(job_id: int, resume_choice: str = "auto", resume_id: Optiona
     if not profile:
         raise HTTPException(400, "Upload resume first")
 
-    # Decide resume
-    chosen_resume_id = resume_id
-    if resume_choice=="master":
-        master = db.query(Resume).filter(Resume.type=="master").order_by(Resume.created_at.desc()).first()
-        chosen_resume_id = master.id if master else None
-    elif resume_choice=="generated":
-        gen = db.query(Resume).filter(Resume.type=="generated").order_by(Resume.created_at.desc()).first()
-        chosen_resume_id = gen.id if gen else None
-        if not chosen_resume_id:
-            tailored = await generate_tailored_profile(profile.data, job.description, profile.layout, False)
-            chosen_resume_id = await _build_and_save_resume(db, profile, job, tailored)
-    elif resume_choice=="auto":
-        # scoring decides reuse or generate
-        if job.score >= 75:
-            gen = db.query(Resume).filter(Resume.job_id==job_id).first()
-            if gen:
-                chosen_resume_id = gen.id
-            else:
-                tailored = await generate_tailored_profile(profile.data, job.description, profile.layout, False)
-                chosen_resume_id = await _build_and_save_resume(db, profile, job, tailored)
-        else:
-            master = db.query(Resume).filter(Resume.type=="master").order_by(Resume.created_at.desc()).first()
-            chosen_resume_id = master.id if master else None
+    # Decide resume (master / selected / reuse approved generated / generate new)
+    chosen_resume_id, decision = await _choose_resume(db, profile, job, resume_choice, resume_id)
     if not chosen_resume_id:
-        master = db.query(Resume).filter(Resume.type=="master").order_by(Resume.created_at.desc()).first()
-        chosen_resume_id = master.id if master else None
+        raise HTTPException(400, "No resume available — upload a master resume first")
 
     # Vault credential (reuse when the domain already has one)
     forms = job.extra or {}
@@ -392,7 +454,7 @@ async def apply_job(job_id: int, resume_choice: str = "auto", resume_id: Optiona
     if is_external:
         log_info(db, "application", f"LinkedIn/Indeed external redirect detected for {job.company}, switching to credential+autofill workflow", job_id=job.id)
 
-    return {"status": job.status, "resume_id": chosen_resume_id, "vault_created": vault_created}
+    return {"status": job.status, "resume_id": chosen_resume_id, "resume_decision": decision, "vault_created": vault_created}
 
 async def _build_and_save_resume(db: Session, profile, job, tailored: dict) -> int:
     safe_name = f"resume_{job.id}_{hash_jd(job.description)}"
@@ -400,7 +462,7 @@ async def _build_and_save_resume(db: Session, profile, job, tailored: dict) -> i
     os.makedirs(settings.generated_dir, exist_ok=True)
     build_docx(tailored["tailored_profile"], profile.data, profile.layout, docx_path)
     build_pdf(tailored["tailored_profile"], profile.data, docx_path.replace(".docx", ".pdf"))
-    r = Resume(filename=f"{safe_name}.docx", filepath=docx_path, type="generated", profile_snapshot=tailored["tailored_profile"], layout=profile.layout, tags=tailored.get("tags", []), jd_hash=hash_jd(job.description), job_id=job.id)
+    r = Resume(filename=f"{safe_name}.docx", filepath=docx_path, type="generated", status="pending", profile_snapshot=tailored["tailored_profile"], layout=profile.layout, tags=tailored.get("tags", []), jd_hash=hash_jd(job.description), job_id=job.id)
     db.add(r)
     db.commit()
     db.refresh(r)
@@ -645,6 +707,12 @@ async def process_funding_company(company_name: str, db: Session = Depends(get_d
     if not profile:
         raise HTTPException(400, "No profile")
     if row.has_open_positions:
+        # Dedupe: re-processing the same funded company must not create a second job.
+        existing_job = db.query(Job).filter(
+            Job.company == row.name, Job.title == f"Open Role at {row.name}"
+        ).first()
+        if existing_job:
+            return {"action": "apply_flow", "job_id": existing_job.id, "message": f"Open position at {row.name} already queued", "company": row.name}
         prof_data = profile.data or {}
         score, reason = await ai_score(prof_data, f"Open engineering role at {row.name} ({row.stage}, {row.industry})")
         job = Job(title=f"Open Role at {row.name}", company=row.name, location="Remote", description=f"Join {row.name} — recently raised {row.stage} ({row.industry}). {row.summary}", url=f"https://{row.website}/careers", source="custom", status="discovered", score=score, score_reason=reason, company_size="startup", company_info={"stage": row.stage, "industry": row.industry})
@@ -671,7 +739,7 @@ def get_settings(db: Session = Depends(get_db)):
     # defaults if empty
     defaults = {
         "ai": {"base_url": settings.ai_base_url, "model": settings.ai_model, "rpm": settings.ai_rpm, "api_key_set": bool(settings.ai_api_key)},
-        "scraping": {"keywords": settings.default_keywords, "freshness_hours": settings.default_freshness_hours, "sources": ["linkedin","naukri","indeed","instahyre","lever","greenhouse","workday"]},
+        "scraping": {"keywords": settings.default_keywords, "freshness_hours": settings.default_freshness_hours, "sources": ["linkedin","naukri","indeed","instahyre","lever","greenhouse","workday"], "live_enabled": settings.live_scraping_enabled, "live_sources": ["arbeitnow", "remotive"]},
         "general": {"strict_skeleton": False, "auto_approve_email": False, "default_resume_format": "ai_generated"},
         "application": {"auto_create_credentials": True, "notify_unknown_fields": True},
         "email": {"host": "", "port": 587, "username": "", "use_tls": True, "from_name": ""},
@@ -802,14 +870,21 @@ def dashboard_summary(db: Session = Depends(get_db)):
 def update_ai_config(payload: dict, db: Session = Depends(get_db)):
     # Allow different AI api for different workflows
     # payload: {workflow: {base_url, api_key, model}}
+    normalized: dict = {}
     for workflow, cfg in payload.items():
+        if not isinstance(cfg, dict):
+            continue
         row = db.query(SettingsModel).filter(SettingsModel.category=="ai_workflows", SettingsModel.key==workflow).first()
         if row:
             row.value = cfg
         else:
             row = SettingsModel(category="ai_workflows", key=workflow, value=cfg)
             db.add(row)
+        normalized[workflow] = cfg
     db.commit()
+    # Keep the runtime registry in sync so subsequent AI calls honour the override.
+    set_workflow_overrides(normalized)
+    log_info(db, "ai", f"Per-workflow AI config updated for {', '.join(normalized) or 'no workflows'}")
     return {"ok": True}
 
 @router.get("/ai/config")

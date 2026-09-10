@@ -6,15 +6,32 @@ from fastapi.responses import FileResponse
 import os
 import asyncio
 from app.core.config import settings
-from app.db import init_db
+from app.db import init_db, SessionLocal
 from app.api.routes import router
 from app.services.ai_pipeline import ai_pipeline
+from app.services.ai_client import set_workflow_overrides
+
+
+def _load_workflow_overrides() -> None:
+    """Restore per-workflow AI config from the DB into the runtime registry."""
+    try:
+        db = SessionLocal()
+        try:
+            from app.models.models import SettingsModel
+            rows = db.query(SettingsModel).filter(SettingsModel.category == "ai_workflows").all()
+            set_workflow_overrides({r.key: r.value for r in rows if isinstance(r.value, dict)})
+        finally:
+            db.close()
+    except Exception:
+        pass
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     os.makedirs(settings.upload_dir, exist_ok=True)
     os.makedirs(settings.generated_dir, exist_ok=True)
+    _load_workflow_overrides()
     # start AI pipeline worker
     worker = asyncio.create_task(ai_pipeline.worker_loop())
     print(f"✅ {settings.app_name} v{settings.version} started")
@@ -24,10 +41,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, version=settings.version, docs_url="/api/docs", openapi_url="/api/openapi.json", lifespan=lifespan)
 
+# Same-origin by default (FastAPI serves the built frontend; Vite dev proxies /api).
+# If a wildcard origin is configured, credentials must be disabled per the CORS spec.
+_cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials="*" not in _cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

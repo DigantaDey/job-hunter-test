@@ -3,8 +3,7 @@ import json
 import re
 import hashlib
 from typing import Dict, Any, List, Tuple
-import httpx
-from app.core.config import settings
+from app.services.ai_client import chat_completion, AIClientError
 
 # DOCX / PDF generation
 from docx import Document
@@ -46,39 +45,34 @@ Return JSON with keys:
 Respond ONLY with JSON.
 """
 
-async def generate_tailored_profile(profile: Dict[str,Any], jd: str, layout: Dict[str,Any], strict_skeleton: bool, ai_config=None) -> Dict[str,Any]:
-    if not settings.ai_api_key:
-        # Fallback heuristic tailoring: prioritize skills matching JD
-        jd_words = set(re.findall(r"[a-zA-Z]+", jd.lower()))
-        skills = profile.get("skills", [])
-        prioritized = sorted(skills, key=lambda s: (s.lower() in jd_words), reverse=True)
-        tailored = {
-            "summary": profile.get("summary","")[:500] + " | Tailored for JD relevance.",
-            "skills": prioritized[:15],
-            "experience": profile.get("experience", [])[:3],
-            "education": profile.get("education", []),
-            "projects": profile.get("projects", [])[:3],
-        }
-        return {"tailored_profile": tailored, "tags": ["heuristic"] + prioritized[:2], "reasoning": "heuristic fallback, no AI key"}
+def _heuristic_tailoring(profile: Dict[str, Any], jd: str) -> Dict[str, Any]:
+    """Offline fallback: reorder existing skills to surface JD-relevant ones."""
+    jd_words = set(re.findall(r"[a-zA-Z]+", jd.lower()))
+    skills = profile.get("skills", []) or []
+    prioritized = sorted(skills, key=lambda s: (s.lower() in jd_words), reverse=True)
+    tailored = {
+        "summary": (profile.get("summary", "") or "")[:500] + " | Tailored for JD relevance.",
+        "skills": prioritized[:15],
+        "experience": (profile.get("experience") or [])[:3],
+        "education": profile.get("education", []),
+        "projects": (profile.get("projects") or [])[:3],
+    }
+    return {"tailored_profile": tailored, "tags": ["heuristic"] + prioritized[:2],
+            "reasoning": "heuristic fallback (AI not configured / unreachable)"}
 
-    base_url = (ai_config or {}).get("base_url") or settings.ai_base_url
-    api_key = (ai_config or {}).get("api_key") or settings.ai_api_key
-    model = (ai_config or {}).get("model") or settings.ai_model
+
+async def generate_tailored_profile(profile: Dict[str,Any], jd: str, layout: Dict[str,Any], strict_skeleton: bool, ai_config=None) -> Dict[str,Any]:
     prompt = jd_fact_guard_prompt(profile, jd, layout, strict_skeleton)
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
-            resp = await client.post(f"{base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type":"application/json"},
-                json={"model": model, "messages":[{"role":"user","content": prompt}], "temperature":0.3, "response_format":{"type":"json_object"}})
-            if resp.status_code==200:
-                content = resp.json()["choices"][0]["message"]["content"]
-                data = json.loads(content)
-                return data
-            else:
-                raise Exception(resp.text[:300])
-    except Exception as e:
-        # fallback
-        return {"tailored_profile": {"summary": profile.get("summary",""), "skills": profile.get("skills",[]), "experience": profile.get("experience",[])}, "tags":["fallback"], "reasoning": str(e)}
+        data = await chat_completion("resume_gen", prompt, temperature=0.3, timeout=45, ai_config=ai_config)
+        if isinstance(data, dict) and "tailored_profile" in data:
+            data.setdefault("tags", ["tailored"])
+            return data
+        raise AIClientError("missing_tailored_profile")
+    except Exception as exc:
+        fallback = _heuristic_tailoring(profile, jd)
+        fallback["reasoning"] = f"fallback ({exc})"
+        return fallback
 
 def _sanitize(text: str) -> str:
     if not isinstance(text, str):

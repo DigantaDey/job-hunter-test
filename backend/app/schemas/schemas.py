@@ -14,6 +14,7 @@ class ResumeOut(BaseModel):
     id: int
     filename: str
     type: str
+    status: Optional[str] = "approved"
     tags: List[str]
     created_at: datetime
     jd_hash: Optional[str]
