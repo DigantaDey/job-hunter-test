@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+jobhunter.db
+uploads/
+generated/
+frontend/node_modules/
+frontend/dist/
+.DS_Store
+.coverage
+*.log
