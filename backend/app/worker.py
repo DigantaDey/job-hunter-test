@@ -20,6 +20,7 @@ from app.core.config import settings
 from app.core.logging import LogContext, configure_logging, get_logger
 from app.core.metrics import inc, set_gauge
 from app.db import SessionLocal, init_db
+from app.metrics_server import start_metrics_server
 from app.services.ai_pipeline import ai_pipeline
 from app.services.handlers import HANDLERS
 from app.services.job_queue import (
@@ -142,6 +143,8 @@ async def run_forever(pipelines: Sequence[str] = PIPELINES, concurrency: Optiona
         except NotImplementedError:  # pragma: no cover - Windows
             pass
 
+    metrics_listener = start_metrics_server()
+
     task = asyncio.create_task(worker.start())
     await stop_event.wait()
     await worker.stop()
@@ -150,6 +153,8 @@ async def run_forever(pipelines: Sequence[str] = PIPELINES, concurrency: Optiona
         await task
     except asyncio.CancelledError:
         pass
+    if metrics_listener is not None:
+        metrics_listener.stop()
 
 
 def main() -> None:

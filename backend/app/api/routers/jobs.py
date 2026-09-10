@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession, search_context
 from app.core import audit
+from app.core.auth import require_consent
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.models import Job, JobEvent, Profile, UserInputRequest
@@ -62,6 +63,19 @@ def list_jobs(
     return query.order_by(Job.score.desc(), Job.discovered_at.desc()).offset(offset).limit(limit).all()
 
 
+# NOTE: static paths must be declared *before* ``/jobs/{job_id}`` — Starlette
+# matches routes in registration order, so a later ``/jobs/sources`` would be
+# swallowed by the integer path parameter and fail validation.
+@router.get("/jobs/sources")
+def job_sources(user: CurrentUser, db: DbSession):
+    """Available/blocked job sources + the user's current selection."""
+    from app.services.sources import list_sources
+
+    config = discovery_sources_config(db, user.id)
+    return {"sources": list_sources(), "selected": config["sources"], "live_enabled": config["live_enabled"],
+            "board_tokens": config["board_tokens"]}
+
+
 @router.get("/jobs/{job_id}", response_model=JobDetail)
 def get_job(job_id: int, user: CurrentUser, db: DbSession):
     return _job_or_404(db, user.id, job_id)
@@ -92,16 +106,6 @@ class DiscoveryRequest(BaseModel):
     limit: int = Field(default=40, ge=1, le=200)
     live_enabled: Optional[bool] = None
     sources: Optional[List[str]] = None
-
-
-@router.get("/jobs/sources")
-def job_sources(user: CurrentUser, db: DbSession):
-    """Available/blocked job sources + the user's current selection."""
-    from app.services.sources import list_sources
-
-    config = discovery_sources_config(db, user.id)
-    return {"sources": list_sources(), "selected": config["sources"], "live_enabled": config["live_enabled"],
-            "board_tokens": config["board_tokens"]}
 
 
 @router.post("/jobs/discover")
@@ -212,11 +216,13 @@ async def apply_job(
             "message": "Some required fields need your input before the application can be submitted",
         }
 
-    # Automation is opt-in twice over: platform config + user consent + user setting.
-    consents = user.consents or {}
-    automation_allowed = bool(consents.get("automation_accepted_at"))
-    if settings.autofill_enabled and automation_allowed and not settings.autofill_dry_run \
+    # Automation is opt-in three times over: platform config + user setting +
+    # the automation disclosure. Reaching this branch means the click really
+    # submits, so the consent is enforced here (preparing a dry run above must
+    # stay possible without it) — a 403 names the disclosure to accept.
+    if settings.autofill_enabled and not settings.autofill_dry_run \
             and bool(get_setting(db, user.id, "application", "allow_auto_submit", False)):
+        require_consent("automation")(user)
         item = enqueue(db, user_id=user.id, pipeline="application", job_id=job.id,
                        payload={"resume_choice": payload.resume_choice, "resume_id": payload.resume_id,
                                 "answers": payload.answers},

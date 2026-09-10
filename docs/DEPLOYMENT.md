@@ -15,7 +15,7 @@ for before calling the deployment production-grade.
 | 3 | `DATABASE_URL` points at PostgreSQL | `postgresql+psycopg2://user:pass@host:5432/db` |
 | 4 | `CORS_ORIGINS` and `ALLOWED_HOSTS` list your real domain(s) | e.g. `https://app.example.com` / `app.example.com` |
 | 5 | TLS terminates in front of the app | reverse proxy or platform LB; HSTS is on in production |
-| 6 | `METRICS_TOKEN` set if `/api/metrics` is reachable publicly | scrape with `Authorization: Bearer <token>` |
+| 6 | `METRICS_TOKEN` set (or `METRICS_ENABLED=false`) | **required**: production refuses to start with metrics enabled and no token. Scrape with `Authorization: Bearer <token>` |
 | 7 | Email block configured **only if** you send real mail | `EMAIL_SENDING_ENABLED`, `EMAIL_DRY_RUN=false`, `EMAIL_POSTAL_ADDRESS`, `EMAIL_UNSUBSCRIBE_BASE_URL`, SPF/DKIM/DMARC |
 | 8 | `EMAIL_WEBHOOK_TOKEN` set if your provider posts engagement events | `POST /api/track/events` |
 | 9 | `ALLOW_SYNTHETIC_FUNDING_DATA=false` | demo data must never reach users |
@@ -127,10 +127,26 @@ docker compose -f docker-compose.prod.yml run --rm backup
 |---|---|
 | Liveness | `GET /api/health/live` → 200 `{"status":"alive"}` |
 | Readiness | `GET /api/health/ready` → database + migration state + queue summary |
-| Metrics | `GET /api/metrics` (Prometheus text; `Authorization: Bearer $METRICS_TOKEN`) |
+| Metrics | `http://<host>:9464/metrics` — a dedicated internal port (see below) |
 | Queue depth / dead letters | `GET /api/ops/status`, `GET /api/pipelines/stats`, `POST /api/ops/queue/{recover,retry-dead}` |
 | Errors | `GET /api/logs?level=error`, and stdout (JSON when `LOG_JSON=true`) |
 | Audit | `GET /api/account/audit` per user; `audit_logs` table for the whole instance |
+
+### Metrics port
+
+`METRICS_PORT` (default `9464`) makes the app process serve `/metrics` on a second port instead of
+`GET /api/metrics`, which then answers `404 {"code":"metrics_moved"}`. Keep that port off the
+internet: the listener runs *inside* the app process because the registry is in-process state, so a
+sidecar cannot see it.
+
+* `docker-compose.prod.yml`: the API and worker containers `expose:` `9464` (never `ports:`), so
+  Prometheus scrapes `api:9464` and `worker:9464` over the compose network.
+* Bare metal / systemd: leave `METRICS_HOST=127.0.0.1` and scrape through localhost (or an SSH
+  tunnel); only set `0.0.0.0` on a network you control.
+* `METRICS_TOKEN` is still checked on this port — set the same token in the scrape config.
+* With `WEB_CONCURRENCY > 1` only the worker that wins the bind serves the port, so the series
+  cover one worker. Scale with the standalone worker container (each container exposes its own
+  metrics) rather than by raising `WEB_CONCURRENCY`.
 
 Suggested alerts: readiness failing for 2 minutes, `jobhunter_pipeline_jobs_total{status="dead"}`,
 queue age > 10 minutes, `jobhunter_ai_requests_total{status="breaker_open"}` rising, 5xx rate, disk
@@ -160,6 +176,7 @@ startup log prints the app version, environment, database driver and migration s
 | `alembic` says table already exists | a database from an older release: `python -m alembic stamp head` then upgrade (the app does this automatically for the v1.2 schema) |
 | All AI features report offline | no `AI_API_KEY` (global or per-workflow) — the app degrades to heuristics by design |
 | Emails stay `dry_run` | `EMAIL_DRY_RUN=true` — flip it deliberately, after configuring the postal address and unsubscribe URL |
-| `/api/metrics` returns 401 | `METRICS_TOKEN` is set — send `Authorization: Bearer <token>` |
+| `/api/metrics` returns 404 `metrics_moved` | `METRICS_PORT` is set — scrape `http://<host>:9464/metrics` instead |
+| Nothing answers on the metrics port | `METRICS_ENABLED=true`, and (in a container) `METRICS_HOST=0.0.0.0`; a second worker that lost the bind logs a warning and stays quiet |
 | Queue not draining | worker container not running (`RUN_WORKER_IN_API=false` on the API) |
 | Upload rejected with 413 | file larger than `MAX_UPLOAD_MB`, or the proxy's `client_max_body_size` |

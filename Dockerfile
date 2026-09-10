@@ -26,8 +26,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/backend \
     WORKDIR=/app/backend
 
+# libpq5: the psycopg2 runtime. postgresql-client: pg_dump, used by the
+# backup service in docker-compose.prod.yml (it exits non-zero without it).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libpq5 \
+    && apt-get install -y --no-install-recommends libpq5 postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -44,9 +46,17 @@ RUN useradd --create-home --uid 10001 jobhunter \
 USER jobhunter
 
 EXPOSE 8000
+# Prometheus: metrics are served by the app process on its own port when
+# METRICS_PORT is set. docker-compose.prod.yml only *exposes* it (never
+# publishes it), so scrape it over the container network, e.g. api:9464.
+EXPOSE 9464
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health/live', timeout=4).status == 200 else 1)"
 
-# WEB_CONCURRENCY controls uvicorn workers; the default suits a small instance.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*' --workers ${WEB_CONCURRENCY:-2}"]
+# WEB_CONCURRENCY controls uvicorn workers. It defaults to 1 because each API
+# process also runs the in-process pipeline worker (RUN_WORKER_IN_API): N
+# workers means N copies of every pipeline. To scale, run the standalone worker
+# container (docker-compose.prod.yml) with RUN_WORKER_IN_API=false and only then
+# raise this.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*' --workers ${WEB_CONCURRENCY:-1}"]

@@ -12,6 +12,7 @@ leases expire safely, and the HTTP client pool is closed.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -35,6 +36,7 @@ from app.core.middleware import (
     SecurityHeadersMiddleware,
 )
 from app.db import SessionLocal, init_db
+from app.metrics_server import start_metrics_server
 from app.services.ai_client import set_workflow_overrides
 from app.services.ai_pipeline import ai_pipeline
 from app.services.job_queue import recover_stalled
@@ -74,6 +76,8 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
+    metrics_listener = start_metrics_server()
+
     worker: Worker | None = None
     if settings.run_worker_in_api:
         worker = Worker()
@@ -90,6 +94,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if metrics_listener is not None:
+            metrics_listener.stop()
         if worker is not None:
             await worker.stop()
             task = getattr(app.state, "worker_task", None)
@@ -125,7 +131,10 @@ def create_app() -> FastAPI:
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_upload_mb * 1024 * 1024 + (2 * 1024 * 1024))
     app.add_middleware(RateLimitMiddleware, limit_per_minute=settings.api_rate_limit_per_minute,
                        exempt_paths={"/api/health", "/api/health/live", "/api/health/ready", "/api/metrics"})
-    app.add_middleware(SecurityHeadersMiddleware)
+    # HSTS is only correct once the deployment is actually served over https —
+    # sending it on a local/plain-http install makes the origin unreachable.
+    hsts = settings.is_production or settings.public_base_url.startswith("https://")
+    app.add_middleware(SecurityHeadersMiddleware, enable_hsts=hsts)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
@@ -145,9 +154,24 @@ def create_app() -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def validation_handler(request: Request, exc: RequestValidationError):
         inc("jobhunter_http_errors_total", kind="validation")
+        # ``exc.errors()`` carries live exception objects in ``ctx`` (pydantic
+        # puts the original ValueError there), which are not JSON serialisable —
+        # stringify anything unrepresentable instead of 500-ing on the error path.
+        try:
+            errors = json.loads(json.dumps(exc.errors()[:20], default=str))
+        except Exception:  # pragma: no cover - defensive
+            errors = []
+        # A bare "Validation error" is useless in the UI: surface the first
+        # human-readable message (and where it came from) alongside the details.
+        message = "Validation error"
+        if errors:
+            field = ".".join(str(part) for part in errors[0].get("loc", ()) if part != "body")
+            message = str(errors[0].get("msg") or message)
+            if field:
+                message = f"{field}: {message}"
         return JSONResponse(
             status_code=422,
-            content={"detail": "Validation error", "errors": exc.errors()[:20],
+            content={"detail": message, "message": message, "errors": errors,
                      "request_id": getattr(request.state, "request_id", "")},
         )
 
@@ -189,7 +213,15 @@ def create_app() -> FastAPI:
             app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
         @app.get("/{full_path:path}", include_in_schema=False)
-        async def spa(full_path: str):
+        async def spa(request: Request, full_path: str):
+            # Unknown /api/* paths must answer JSON: an HTML 200 here sends API
+            # clients (and their error handling) down a confusing path.
+            if full_path.startswith("api/") or full_path == "api":
+                return JSONResponse(
+                    status_code=404,
+                    content={"detail": f"No API route /{full_path}",
+                             "request_id": getattr(request.state, "request_id", "")},
+                )
             candidate = os.path.join(frontend_dist, full_path)
             if full_path and os.path.isfile(candidate) and os.path.abspath(candidate).startswith(frontend_dist):
                 return FileResponse(candidate)

@@ -82,12 +82,15 @@ fact that a deletion happened). Users can read their own trail at `GET /api/acco
 
 ## 6. Abuse limits on outbound behaviour
 
-* Outbound email is off by default and gated by a compliance report (consent, terms, suppression,
+* Outbound email is off by default and gated at two layers — `POST /api/emails/{id}/send` requires the
+  `outreach` disclosure (403 `consent_required`), and `compliance_report()` re-checks consent, terms, suppression,
   syntax/MX, daily limit, postal address, unsubscribe URL, SMTP configuration).
 * Contact discovery never behaves like a spam cannon: providers are rate-aware, heuristic guesses
   are labelled unverified, and SMTP probing is deliberately not implemented.
 * Scraping respects `robots.txt` and enforces a minimum interval per host.
-* Automation is dry-run by default and requires two explicit opt-ins plus a recorded consent.
+* Automation is dry-run by default and requires two explicit opt-ins plus a recorded consent:
+  `POST /api/jobs/{id}/apply` enforces the `automation` disclosure (403 `consent_required`) on the
+  branch that would really submit; dry-run preparation stays available without it.
 
 ## 7. Known risks & accepted trade-offs
 

@@ -136,6 +136,26 @@ class Timer:
 # --------------------------------------------------------------------------- #
 # Exposition
 # --------------------------------------------------------------------------- #
+def escape_label_value(value: str) -> str:
+    """Prometheus exposition escaping for a label value (see the text format spec)."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def metrics_text(*, version: str = "", environment: str = "") -> str:
+    """
+    The full exposition payload: every series plus the build-info gauge.
+
+    Shared by the public route and the internal metrics listener so both emit
+    byte-identical output.
+    """
+    payload = render_prometheus()
+    labels = f'version="{escape_label_value(version)}",environment="{escape_label_value(environment)}"'
+    payload += "# HELP jobhunter_info Build and environment information.\n"
+    payload += "# TYPE jobhunter_info gauge\n"
+    payload += f"jobhunter_info{{{labels}}} 1\n"
+    return payload
+
+
 def render_prometheus() -> str:
     lines: List[str] = []
     with _LOCK:

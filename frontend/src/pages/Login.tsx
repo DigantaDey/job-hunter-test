@@ -15,7 +15,10 @@ export default function Login() {
   const [busy, setBusy] = useState(false)
 
   const bootstrapRequired = status?.bootstrap_required === true
-  const canRegister = status?.registration_open === true
+  // The API reports both keys (registration_open is canonical) — accept either
+  // so an older backend still renders the register link.
+  const canRegister = status?.registration_open === true || status?.allow_registration === true
+  const minLength = status?.password_min_length || 10
   const activeMode = bootstrapRequired ? 'bootstrap' : mode || 'login'
 
   const submit = async (event: FormEvent) => {
@@ -100,13 +103,13 @@ export default function Login() {
                   value={form.password}
                   onChange={(e) => setForm({ ...form, password: e.target.value })}
                   className="flex-1 bg-transparent text-sm outline-none"
-                  placeholder="At least 10 characters"
+                  placeholder={`At least ${minLength} characters`}
                   autoComplete={activeMode === 'login' ? 'current-password' : 'new-password'}
                 />
               </div>
               {activeMode !== 'login' && (
                 <span className="text-[11px] mono text-zinc-500">
-                  Minimum 10 characters; a passphrase beats a short password.
+                  Minimum {minLength} characters; a passphrase beats a short password.
                 </span>
               )}
             </label>

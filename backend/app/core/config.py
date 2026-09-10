@@ -12,6 +12,7 @@ settings for outbound email, and (by default) SQLite as the primary database.
 
 from __future__ import annotations
 
+import json
 import os
 from functools import lru_cache
 from typing import Any, Dict, List
@@ -63,12 +64,38 @@ LIVE_SOURCES = (
 CREDENTIALED_SOURCES = ("adzuna", "jooble", "usajobs", "linkedin", "naukri", "indeed", "instahyre")
 
 
+def _maybe_json(value: str) -> Any:
+    """
+    Return the decoded object when ``value`` is a JSON array/object, else ``None``.
+
+    Settings that hold lists are documented as comma separated. ``pydantic-settings``
+    would otherwise try ``json.loads`` on them first (and crash on ``CORS_ORIGINS=``),
+    so :class:`Settings` disables that decoding and parses everything itself — while
+    still accepting JSON for anyone who already wrote it that way.
+    """
+    text = (value or "").strip()
+    if text[:1] in ("[", "{"):
+        try:
+            return json.loads(text)
+        except ValueError:
+            return None
+    return None
+
+
 def _csv(value: Any) -> List[str]:
     if value is None:
         return []
     if isinstance(value, (list, tuple, set)):
         return [str(v).strip() for v in value if str(v).strip()]
-    return [part.strip() for part in str(value).replace(";", ",").split(",") if part.strip()]
+    if isinstance(value, (dict, int, float, bool)):
+        return [str(value).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    decoded = _maybe_json(text)
+    if decoded is not None:
+        return _csv(decoded)
+    return [part.strip() for part in text.replace(";", ",").split(",") if part.strip()]
 
 
 def _csv_lower(value: Any) -> List[str]:
@@ -81,6 +108,14 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        # Normalise the defaults too (relative SQLite paths / data directories),
+        # not just values that arrive from the environment.
+        validate_default=True,
+        # List settings are documented (and used) as comma separated values, so
+        # pydantic-settings must hand us the raw string instead of json.loads-ing
+        # it — that raised SettingsError for every empty or CSV list value.
+        # Our own ``mode="before"`` validators do the parsing (and still accept JSON).
+        enable_decoding=False,
     )
 
     # ------------------------------------------------------------------ #
@@ -268,6 +303,12 @@ class Settings(BaseSettings):
     access_log: bool = True
     metrics_enabled: bool = True
     metrics_token: str = ""
+    #: When > 0, metrics are served by a separate listener on this port instead
+    #: of ``GET /api/metrics`` on the public API (which then 404s). Bind by
+    #: default to loopback so the port is internal unless an operator — or the
+    #: compose file, for container networking — says otherwise.
+    metrics_port: int = 0
+    metrics_host: str = "127.0.0.1"
 
     # ------------------------------------------------------------------ #
     # Backups
@@ -343,7 +384,31 @@ class Settings(BaseSettings):
             url = url.replace("postgres://", "postgresql+psycopg2://", 1)
         elif url.startswith("postgresql://") and "+psycopg2" not in url:
             url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        elif url.startswith("sqlite") and "://" in url:
+            # A relative SQLite path resolves against the *working directory*,
+            # so `./run.sh` (cwd=backend), `python -m app.worker` and the CLI
+            # scripts would each open a different database. Pin it next to the
+            # backend package instead. Four slashes (`sqlite:////abs/path`) and
+            # `:memory:` are already unambiguous and are left alone.
+            scheme, _, rest = url.partition("://")
+            candidate = rest.lstrip("/")
+            if (
+                candidate
+                and not rest.startswith("//")          # already absolute (sqlite:////abs/path)
+                and not candidate.startswith(":memory:")
+                and not os.path.isabs(candidate)
+            ):
+                url = f"{scheme}:///{os.path.abspath(os.path.join(BACKEND_DIR, candidate))}"
         return url or "sqlite:///./jobhunter.db"
+
+    @field_validator("upload_dir", "generated_dir", "artifact_dir", "screenshot_dir", "backup_dir")
+    @classmethod
+    def _absolutise_data_dir(cls, value: str) -> str:
+        """Same reason as the database: data dirs must not depend on the cwd."""
+        path = (value or "").strip()
+        if not path or os.path.isabs(path):
+            return path
+        return os.path.abspath(os.path.join(BACKEND_DIR, path))
 
     @model_validator(mode="after")
     def _reject_unsafe_production(self) -> "Settings":
@@ -518,6 +583,11 @@ class Settings(BaseSettings):
                 )
         if self.autofill_allow_submit and not self.autofill_enabled:
             problems.append("AUTOFILL_ALLOW_SUBMIT requires AUTOFILL_ENABLED=true")
+        if self.metrics_enabled and not (self.metrics_token or "").strip():
+            problems.append(
+                "METRICS_TOKEN must be set when METRICS_ENABLED=true (/api/metrics is otherwise "
+                "readable by anyone) — or set METRICS_ENABLED=false and scrape nothing"
+            )
         if not self.public_base_url or "localhost" in self.public_base_url:
             problems.append("PUBLIC_BASE_URL must be the public https URL of this deployment")
         if problems:

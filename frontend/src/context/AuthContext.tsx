@@ -12,8 +12,11 @@ export type SessionUser = {
 
 type AuthStatus = {
   bootstrap_required: boolean
-  registration_open: boolean
+  /** `registration_open` is the canonical key; `allow_registration` is kept by the API for older clients. */
+  registration_open?: boolean
+  allow_registration?: boolean
   auth_required: boolean
+  password_min_length?: number
   version?: string
   environment?: string
 }

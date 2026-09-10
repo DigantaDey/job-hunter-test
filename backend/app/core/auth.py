@@ -40,7 +40,7 @@ def _active_user(db: Session, user_id: int) -> Optional[User]:
     return user
 
 
-def _user_from_api_key(db: Session, raw_key: str) -> Optional[User]:
+def _user_from_api_key(db: Session, raw_key: str) -> Optional[ApiKey]:
     row = (
         db.query(ApiKey)
         .filter(ApiKey.key_hash == sha256_hex(raw_key), ApiKey.revoked_at.is_(None))
@@ -50,7 +50,30 @@ def _user_from_api_key(db: Session, raw_key: str) -> Optional[User]:
         return None
     row.last_used_at = datetime.utcnow()
     db.commit()
-    return _active_user(db, row.user_id)
+    return row
+
+
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_SCOPE_DENIED = HTTPException(
+    status_code=status.HTTP_403_FORBIDDEN,
+    detail={"code": "insufficient_scope",
+            "message": "This API key does not allow write operations — create a key with the 'write' scope."},
+)
+
+
+def _api_key_allows(method: str, row: ApiKey) -> bool:
+    """
+    Enforce the scopes stored on the key.
+
+    Scopes are recorded when a key is created, so honouring them is what makes a
+    read-only machine credential read-only. Keys created before scopes existed
+    (empty list) stay unrestricted rather than silently breaking clients.
+    """
+    scopes = {str(scope).strip().lower() for scope in (row.scopes or []) if str(scope).strip()}
+    if not scopes or "admin" in scopes:
+        return True
+    required = "write" if method.upper() in _WRITE_METHODS else "read"
+    return required in scopes
 
 
 def get_current_user(
@@ -61,19 +84,27 @@ def get_current_user(
     header_key = request.headers.get("x-api-key")
 
     if credentials and credentials.credentials.startswith("jh_"):
-        user = _user_from_api_key(db, credentials.credentials)
-        if user:
-            user_id_var.set(str(user.id))
-            request.state.user_id = user.id
-            return user
+        row = _user_from_api_key(db, credentials.credentials)
+        if row:
+            user = _active_user(db, row.user_id)
+            if user and not _api_key_allows(request.method, row):
+                raise _SCOPE_DENIED
+            if user:
+                user_id_var.set(str(user.id))
+                request.state.user_id = user.id
+                return user
         raise _UNAUTHENTICATED
 
     if header_key and header_key.startswith("jh_"):
-        user = _user_from_api_key(db, header_key)
-        if user:
-            user_id_var.set(str(user.id))
-            request.state.user_id = user.id
-            return user
+        row = _user_from_api_key(db, header_key)
+        if row:
+            user = _active_user(db, row.user_id)
+            if user and not _api_key_allows(request.method, row):
+                raise _SCOPE_DENIED
+            if user:
+                user_id_var.set(str(user.id))
+                request.state.user_id = user.id
+                return user
         raise _UNAUTHENTICATED
 
     if credentials and credentials.credentials:

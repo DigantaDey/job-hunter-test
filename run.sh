@@ -39,6 +39,16 @@ pathlib.Path(".env").write_text(template)
 PYEOF
 fi
 
+cat <<'HINT'
+→ First account (the owner): open http://localhost:8000 and fill in the
+  bootstrap form — or, from another terminal:
+
+    python backend/scripts/create_user.py --email you@example.com --password 'a-long-passphrase'
+
+  Extra tester accounts need ALLOW_REGISTRATION=true in .env (then use the
+  SPA's register link), or the same script with --role member.
+HINT
+
 echo "→ Starting backend on http://localhost:8000 (API docs at /api/docs)…"
 cd backend
 PYTHONPATH=. ../"$PYTHON_BIN" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

@@ -11,7 +11,9 @@ from app.core import metrics
 from app.core.auth import require_owner
 from app.core.config import settings
 from app.core.rate_limiter import rate_limiter
+from app.core.security import constant_time_equals
 from app.db import check_db_health, migration_state
+from app.metrics_server import TEXT_CONTENT_TYPE
 from app.models.models import Email, ErrorLog, Job, PipelineJob, Resume, UserInputRequest, VaultEntry
 from app.schemas.schemas import ErrorLogOut
 from app.services.ai_client import breaker_snapshot, is_configured, ping
@@ -60,15 +62,23 @@ def prometheus(
     authorization: Optional[str] = Header(default=None, description="Bearer <METRICS_TOKEN>"),
 ):
     """Prometheus exposition. Protected when METRICS_TOKEN is set."""
+    if settings.metrics_port:
+        # Metrics live on their own (internal) port — see METRICS_PORT.
+        raise HTTPException(404, {"code": "metrics_moved",
+                                  "message": f"Metrics are served on port {settings.metrics_port} "
+                                             f"({settings.metrics_host}) at /metrics"})
     if not settings.metrics_enabled:
         raise HTTPException(404, "Metrics are disabled")
     if settings.metrics_token:
+        # Two accepted shapes: `Authorization: Bearer <token>` (preferred — a
+        # query string ends up in access logs, proxy logs and browser history)
+        # and `?metrics_token=` for scrapers that cannot set headers.
         bearer = (authorization or "").removeprefix("Bearer ").strip()
-        if metrics_token != settings.metrics_token and bearer != settings.metrics_token:
+        supplied = metrics_token or bearer
+        if not constant_time_equals(supplied, settings.metrics_token):
             raise HTTPException(401, "Metrics token required")
-    payload = metrics.render_prometheus()
-    payload += f"jobhunter_info{{version=\"{settings.version}\",environment=\"{settings.environment}\"}} 1\n"
-    return Response(content=payload, media_type="text/plain; version=0.0.4")
+    payload = metrics.metrics_text(version=settings.version, environment=settings.environment)
+    return Response(content=payload, media_type=TEXT_CONTENT_TYPE)
 
 
 @router.get("/logs", response_model=List[ErrorLogOut])

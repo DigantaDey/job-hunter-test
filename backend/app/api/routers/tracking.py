@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.security import constant_time_equals
 from app.db import get_db
 from app.services.outreach import handle_unsubscribe, record_open, record_webhook_event
 
@@ -73,8 +74,20 @@ def unsubscribe_one_click(token: str):
 
 @router.post("/events")
 def provider_webhook(request: Request, payload: dict, x_webhook_token: str = Header(default="")):
-    """Webhook sink for an email provider (bounce/complaint → suppression)."""
-    if settings.email_webhook_token and x_webhook_token != settings.email_webhook_token:
+    """
+    Webhook sink for an email provider (bounce/complaint → suppression).
+
+    This endpoint writes to the suppression list, so it must not be open to the
+    internet: in production a missing ``EMAIL_WEBHOOK_TOKEN`` disables it rather
+    than leaving it unauthenticated.
+    """
+    if not settings.email_webhook_token:
+        if settings.is_production:
+            raise HTTPException(503, {"code": "webhook_not_configured",
+                                      "message": "Set EMAIL_WEBHOOK_TOKEN to enable provider webhooks"})
+        log.warning("provider webhook accepted without EMAIL_WEBHOOK_TOKEN configured (env=%s)",
+                    settings.environment)
+    elif not constant_time_equals(x_webhook_token, settings.email_webhook_token):
         raise HTTPException(401, "Invalid webhook token")
     db = next(get_db())
     try:

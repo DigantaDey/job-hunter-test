@@ -6,6 +6,7 @@ demo environments. It is disabled by default in production
 (``INCLUDE_DEMO_POOL=false``) and every job it produces is labelled
 ``source="demo"`` in the UI so it can never be mistaken for a live posting.
 """
+import hashlib
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -353,7 +354,11 @@ def demo_jobs(keywords: List[str], freshness_hours: int, limit: int = 14) -> Lis
         hours = _FRESHNESS_OFFSETS[index % len(_FRESHNESS_OFFSETS)]
         entry = dict(job)
         entry["source"] = "demo"
-        entry["external_id"] = f"demo-{index}-{abs(hash(job['company'] + job['title'])) % 100000}"
+        # A stable digest, not the builtin ``hash()``: PYTHONHASHSEED is
+        # randomised per process, which would give every demo job a new id (and
+        # so a new dedupe key) on each restart and pile up duplicates.
+        digest = hashlib.sha1(f"{job['company']}|{job['title']}".encode("utf-8")).hexdigest()[:10]
+        entry["external_id"] = f"demo-{index}-{digest}"
         entry["posted_at"] = now - timedelta(hours=hours)
         entry["url"] = f"https://demo.jobhunter.local/{job['company'].lower().replace(' ', '-')}/{index}"
         entry["remote"] = "remote" in (job.get("location", "") + job.get("description", "")).lower()
