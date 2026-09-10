@@ -62,6 +62,19 @@ def list_jobs(
     return query.order_by(Job.score.desc(), Job.discovered_at.desc()).offset(offset).limit(limit).all()
 
 
+# NOTE: static paths must be declared *before* ``/jobs/{job_id}`` — Starlette
+# matches routes in registration order, so a later ``/jobs/sources`` would be
+# swallowed by the integer path parameter and fail validation.
+@router.get("/jobs/sources")
+def job_sources(user: CurrentUser, db: DbSession):
+    """Available/blocked job sources + the user's current selection."""
+    from app.services.sources import list_sources
+
+    config = discovery_sources_config(db, user.id)
+    return {"sources": list_sources(), "selected": config["sources"], "live_enabled": config["live_enabled"],
+            "board_tokens": config["board_tokens"]}
+
+
 @router.get("/jobs/{job_id}", response_model=JobDetail)
 def get_job(job_id: int, user: CurrentUser, db: DbSession):
     return _job_or_404(db, user.id, job_id)
@@ -92,16 +105,6 @@ class DiscoveryRequest(BaseModel):
     limit: int = Field(default=40, ge=1, le=200)
     live_enabled: Optional[bool] = None
     sources: Optional[List[str]] = None
-
-
-@router.get("/jobs/sources")
-def job_sources(user: CurrentUser, db: DbSession):
-    """Available/blocked job sources + the user's current selection."""
-    from app.services.sources import list_sources
-
-    config = discovery_sources_config(db, user.id)
-    return {"sources": list_sources(), "selected": config["sources"], "live_enabled": config["live_enabled"],
-            "board_tokens": config["board_tokens"]}
 
 
 @router.post("/jobs/discover")

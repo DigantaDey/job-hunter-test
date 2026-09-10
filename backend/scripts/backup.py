@@ -79,8 +79,11 @@ def prune(out_dir: Path, keep: int) -> int:
 
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description="Back up the JobHunter database")
-    parser.add_argument("--out", default=os.environ.get("BACKUP_DIR", "./backups"), help="destination directory")
-    parser.add_argument("--keep", type=int, default=int(os.environ.get("BACKUP_KEEP", "14")),
+    # Defaults come from Settings so BACKUP_DIR/BACKUP_KEEP in .env are honoured
+    # (os.environ alone would miss them: .env is loaded into Settings, not the
+    # process environment).
+    parser.add_argument("--out", default=settings.backup_dir, help="destination directory")
+    parser.add_argument("--keep", type=int, default=settings.backup_keep,
                         help="how many backups to retain")
     args = parser.parse_args(argv)
 

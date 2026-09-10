@@ -4,6 +4,61 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.0.1] — 2026-09-10
+
+Launch-hardening pass: fixes for defects found while booting a fresh checkout
+(`./run.sh`), provisioning test accounts and reviewing the production topology.
+
+### Fixed
+
+- **Startup crash with a generated `.env`** — every list-typed setting
+  (`CORS_ORIGINS`, `ALLOWED_HOSTS`, `ENABLED_SOURCES`, board tokens …) was handed to
+  `json.loads` by `pydantic-settings`, so an empty or comma-separated value aborted
+  the process with `SettingsError: error parsing value for field "cors_origins"`.
+  List settings are now parsed from the raw string (CSV or JSON) by the app itself.
+- **`GET /api/jobs/sources` returned 422** — the route was registered after
+  `/jobs/{job_id}`, so the literal segment was matched as an integer path parameter.
+- **The SPA never offered registration** — the UI read `registration_open` while
+  `/api/auth/status` returned `allow_registration`; both keys are now returned and
+  the UI accepts either. The status payload also carries `version` and
+  `password_min_length` (the password hint is no longer hard-coded to 10).
+- **422 responses crashed their own handler** — pydantic puts the original exception
+  in `ctx`, which is not JSON serialisable, so some validation errors returned 500.
+  Error bodies are now sanitised and include a human-readable `message`.
+- **Password policy mismatch** — the API accepted a 422 from pydantic's floor of 8
+  characters before the configured `PASSWORD_MIN_LENGTH` was ever checked; sign-up
+  now fails with the real policy and a readable message.
+- **Data paths depended on the working directory** — a relative SQLite URL and the
+  upload/generated/screenshot/backup directories now resolve next to the backend
+  package, so the API, worker and CLI share one database instead of silently
+  creating a new one per working directory.
+- **Concurrent startup migrations** — the API container (`--workers N`) and the
+  worker container both ran Alembic. Postgres migrations now take an advisory lock
+  and the compose worker runs with `AUTO_MIGRATE=false`. A failed migration on a
+  populated database no longer falls back to `create_all` (which forked the schema).
+- **Unauthenticated webhook sink** — `POST /api/track/events` accepted bounce events
+  from anyone when `EMAIL_WEBHOOK_TOKEN` was unset; it is now disabled in production
+  unless a token is configured, and compares the token in constant time.
+- **API key scopes were stored but never enforced** — a key created with
+  `["read"]` could queue jobs and send mail. Writes now require the `write` scope
+  (keys with no scopes keep working, so existing clients are unaffected).
+- **Demo jobs appeared by default** — `INCLUDE_DEMO_POOL` was read with `os.getenv`
+  (which ignores `.env`) and defaulted to *on* outside production. It now honours the
+  documented setting and is off everywhere by default. Demo ids were also built with
+  the salted builtin `hash()`, so every restart produced new dedupe keys and duplicate
+  rows; they use a stable SHA-1 digest now.
+- Misc: HSTS is sent when the deployment is production/https; unknown `/api/*` paths
+  answer JSON 404 instead of the SPA's HTML; the backup CLI takes its defaults from
+  Settings (so `BACKUP_DIR` in `.env` works) and the production image now ships
+  `postgresql-client` so `pg_dump` backups are possible at all.
+
+### Added
+
+- **`backend/scripts/create_user.py`** — create, reset, promote, deactivate and list
+  accounts from the command line (the supported way to provision testers without
+  opening registration). Documented in the README's "Accounts & test logins".
+- 28 regression tests pinning every defect above (`backend/tests/test_regressions.py`).
+
 ## [2.0.0] — 2026-09-11
 
 Production-readiness pass: the v1.2 prototype becomes a deployable, multi-tenant

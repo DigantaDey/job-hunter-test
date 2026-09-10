@@ -103,6 +103,11 @@ def migration_state() -> dict:
         return {"applied": None}
 
 
+#: Fixed key for the Postgres advisory lock that serialises startup migrations.
+#: (api with ``--workers N`` plus a worker container all boot at the same time.)
+_MIGRATION_LOCK_KEY = 8_242_017_337
+
+
 def run_migrations() -> None:
     """Apply Alembic migrations up to head (no-op if the script dir is absent)."""
     from alembic import command
@@ -117,7 +122,15 @@ def run_migrations() -> None:
     cfg = Config(os.path.join(here, "..", "alembic.ini"))
     cfg.set_main_option("script_location", os.path.abspath(script_location))
     cfg.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
-    command.upgrade(cfg, "head")
+    if IS_SQLITE:
+        command.upgrade(cfg, "head")
+        return
+    with engine.begin() as connection:
+        connection.execute(text(f"SELECT pg_advisory_lock({_MIGRATION_LOCK_KEY})"))
+        try:
+            command.upgrade(cfg, "head")
+        finally:
+            connection.execute(text(f"SELECT pg_advisory_unlock({_MIGRATION_LOCK_KEY})"))
 
 
 def stamp_migrations() -> None:
@@ -148,6 +161,15 @@ def _legacy_sqlite_migrate() -> None:
             col_type = col.type.compile(engine.dialect)
             with engine.begin() as conn:
                 conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {col_type}'))
+
+
+def _has_any_tables() -> bool:
+    """True when the database already holds application tables."""
+    try:
+        insp = inspect(engine)
+        return bool(set(insp.get_table_names()) - {"alembic_version"})
+    except Exception:  # pragma: no cover - unreachable database
+        return False
 
 
 def _has_alembic_version() -> bool:
@@ -218,7 +240,17 @@ def init_db() -> None:
             run_migrations()
             return
         except Exception as exc:
-            log.warning("alembic upgrade failed (%s); falling back to create_all", exc)
+            log.warning("alembic upgrade failed (%s)", exc)
+            if not IS_SQLITE and _has_any_tables():
+                # create_all() would happily add half a schema and leave the
+                # alembic revision unset — a silent fork that is painful to
+                # unpick later. Fail loudly so a deploy stops instead.
+                log.error(
+                    "refusing to fall back to create_all on a populated database — "
+                    "fix the migration (or back up and run `alembic stamp`) before starting"
+                )
+                raise
+            log.warning("falling back to create_all (empty database)")
 
     Base.metadata.create_all(bind=engine)
     try:

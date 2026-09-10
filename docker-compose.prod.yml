@@ -68,6 +68,10 @@ services:
       # A standalone worker must not run its own API; the API container never
       # runs pipelines. One place to look when a queue backs up.
       RUN_WORKER_IN_API: "false"
+      # The API container owns schema changes: two processes running Alembic at
+      # the same time is the classic "duplicate key on alembic_version" startup
+      # failure. The worker waits for the API to be healthy before booting.
+      AUTO_MIGRATE: "false"
       WORKER_CONCURRENCY: "2"
     volumes:
       - uploads:/app/backend/uploads
@@ -86,6 +90,8 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-jobhunter}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jobhunter}
+      # A backup job must never touch the schema.
+      AUTO_MIGRATE: "false"
     volumes:
       - backups:/backups
 

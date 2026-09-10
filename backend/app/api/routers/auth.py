@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Request, status
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from app.api.deps import CurrentUser, DbSession, client_ip
 from app.core import audit
@@ -34,11 +34,22 @@ _WINDOW_SECONDS = 300
 
 class Credentials(BaseModel):
     email: EmailStr
+    # Login keeps the permissive floor: an account created under an older
+    # PASSWORD_MIN_LENGTH must still be able to sign in.
     password: str = Field(min_length=8, max_length=256)
 
 
 class RegisterRequest(Credentials):
     name: str = Field(default="", max_length=200)
+
+    @field_validator("password")
+    @classmethod
+    def _meets_password_policy(cls, value: str) -> str:
+        """Fail with the *configured* policy, not with pydantic's floor of 8."""
+        problems = password_problems(value)
+        if problems:
+            raise ValueError("; ".join(problems))
+        return value
 
 
 class SessionUser(BaseModel):
@@ -84,13 +95,21 @@ def _throttle(email: str) -> None:
 
 @router.get("/status")
 def auth_status(db: DbSession):
-    """Public: tells the SPA whether to show setup, login or register."""
+    """
+    Public: tells the SPA whether to show setup, login or register.
+
+    ``registration_open`` is the key the SPA reads; ``allow_registration`` is
+    kept so older clients (and scripts) that read the raw setting keep working.
+    """
     return {
         "bootstrap_required": db.query(User).count() == 0,
         "auth_required": settings.auth_required,
         "allow_registration": settings.allow_registration,
+        "registration_open": settings.allow_registration,
         "password_min_length": settings.password_min_length,
         "environment": settings.environment,
+        "app_name": settings.app_name,
+        "version": settings.version,
     }
 
 

@@ -74,6 +74,31 @@ python -c "import secrets; print('SECRET_KEY=' + secrets.token_hex(32)); print('
 Open http://localhost:5173 — the first screen is the **owner bootstrap** form. The first account
 created becomes the owner; later accounts need `ALLOW_REGISTRATION=true` (default: closed).
 
+### Accounts & test logins
+
+Three supported ways in — pick whichever fits:
+
+| Goal | How |
+|---|---|
+| First account (owner) | Open the app and fill in the bootstrap form, or `POST /api/auth/bootstrap` |
+| Extra testers, scripted/CI | `python backend/scripts/create_user.py --email tester@example.com --password 'a-long-passphrase'` |
+| Self-service sign-up | Set `ALLOW_REGISTRATION=true` in `.env` (then the SPA shows the register link) |
+
+```bash
+# create / reset / promote / list — see --help for everything
+python backend/scripts/create_user.py --email you@example.com --password 'correct horse battery' --role owner
+python backend/scripts/create_user.py --email you@example.com --password 'new-passphrase-123' --reset   # also revokes sessions
+python backend/scripts/create_user.py --email you@example.com --password-file ./pw.txt                  # keep it out of shell history
+python backend/scripts/create_user.py --email you@example.com --random-password                          # prints it once
+python backend/scripts/create_user.py --list                                                             # who exists?
+```
+
+Passwords are checked against the configured policy (`PASSWORD_MIN_LENGTH`, default 10). The first
+account created on an empty database is always the owner, whether it comes from the API or the CLI.
+Local runs use SQLite at `backend/jobhunter.db` (relative paths are pinned next to the backend
+package, so the API, the worker and the CLI all open the *same* database regardless of your shell's
+working directory).
+
 Production-shaped stack (PostgreSQL + API + worker):
 
 ```bash
@@ -158,7 +183,7 @@ stored encrypted where they are secret.
 
 ```bash
 # backend — hermetic: temp SQLite, no network, no AI key
-cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 209 tests
+cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 237 tests
 
 # lint
 ruff check backend

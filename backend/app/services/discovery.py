@@ -34,10 +34,15 @@ FORM_DETECT_TOP = 8
 
 
 def _demo_pool_enabled() -> bool:
-    import os
+    """
+    Demo seed data is opt-in — in *every* environment.
 
-    default = "false" if settings.is_production else "true"
-    return os.getenv("INCLUDE_DEMO_POOL", default).lower() in ("1", "true", "yes")
+    This used to default to enabled outside production and to read
+    ``os.getenv`` directly, which meant the documented ``INCLUDE_DEMO_POOL``
+    setting in ``.env`` was ignored and a plain local install silently mixed
+    fabricated postings into real results.
+    """
+    return bool(settings.include_demo_pool)
 
 
 async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[str, Any]], use_ai: bool) -> None:
