@@ -1,56 +1,141 @@
+"""
+Credential vault.
+
+Every entry is encrypted with a **per-user** key derived from the master key
+(HKDF-SHA256) and can only be read by its owner. Values written by older
+versions (encrypted with the single global key) are transparently re-encrypted on
+first read, so upgrading does not lose credentials.
+"""
+from __future__ import annotations
+
 import csv
 import io
 import secrets
 import string
-from typing import List, Dict
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
 from sqlalchemy.orm import Session
-from app.models.models import VaultEntry
-from app.core.security import encrypt_password, decrypt_password
 
-def generate_credential(domain: str) -> Dict[str,str]:
-    # Generate username and password
-    username = f"user_{secrets.token_hex(4)}@jobhunter.local"
-    # or could use profile email, but for auto-create we generate
-    alphabet = string.ascii_letters + string.digits + "!@#$%"
-    password = "".join(secrets.choice(alphabet) for _ in range(16))
-    return {"username": username, "password": password, "domain": domain}
+from app.core.logging import get_logger
+from app.core.security import decrypt_secret, encrypt_secret, needs_reencrypt
+from app.models.models import Profile, VaultEntry
 
-def save_vault_entry(db: Session, domain: str, username: str, password: str) -> VaultEntry:
-    enc = encrypt_password(password)
-    entry = VaultEntry(domain=domain, username=username, password_enc=enc)
+log = get_logger("app.vault")
+
+PASSWORD_ALPHABET = string.ascii_letters + string.digits + "!@#$%^&*"
+
+
+def vault_scope(user_id: int) -> str:
+    return f"user:{user_id}:vault"
+
+
+def generate_password(length: int = 20) -> str:
+    return "".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(length))
+
+
+def generate_credential(domain: str, username_hint: Optional[str] = None) -> Dict[str, str]:
+    """Create a credential. Uses the applicant's own email when available."""
+    username = username_hint or f"applicant_{secrets.token_hex(4)}@example.invalid"
+    return {"username": username, "password": generate_password(), "domain": domain}
+
+
+def _encrypt(user_id: int, password: str) -> str:
+    return encrypt_secret(password, vault_scope(user_id))
+
+
+def reveal_password(entry: VaultEntry) -> str:
+    """Decrypt (and opportunistically re-key) an entry's password."""
+    scope = vault_scope(entry.user_id)
+    try:
+        password = decrypt_secret(entry.password_enc, scope)
+    except Exception:
+        log.warning("vault entry %s could not be decrypted", entry.id)
+        return ""
+    if needs_reencrypt(entry.password_enc, scope):
+        entry.password_enc = _encrypt(entry.user_id, password)
+        entry.origin = "auto" if entry.origin == "auto" else entry.origin
+    return password
+
+
+def save_vault_entry(db: Session, user_id: int, domain: str, username: str, password: str,
+                     origin: str = "auto") -> VaultEntry:
+    entry = VaultEntry(user_id=user_id, domain=domain, username=username,
+                       password_enc=_encrypt(user_id, password), origin=origin)
     db.add(entry)
     db.commit()
     db.refresh(entry)
     return entry
 
-def get_vault_entry_for_domain(db: Session, domain: str) -> VaultEntry:
-    return db.query(VaultEntry).filter(VaultEntry.domain==domain).first()
 
-def list_vault_entries(db: Session):
-    return db.query(VaultEntry).all()
+def get_vault_entry_for_domain(db: Session, user_id: int, domain: str) -> Optional[VaultEntry]:
+    if not domain:
+        return None
+    return (
+        db.query(VaultEntry)
+        .filter(VaultEntry.user_id == user_id, VaultEntry.domain == domain)
+        .first()
+    )
+
+
+def credential_for_application(db: Session, *, user_id: int, domain: str, company: str = "") -> Tuple[Optional[Dict[str, str]], bool]:
+    """
+    Reuse the existing credential for a portal domain, or create a new one.
+
+    Returns ``(credential, created)``; the password is only decrypted in memory.
+    """
+    existing = get_vault_entry_for_domain(db, user_id, domain)
+    if existing:
+        existing.last_used_at = datetime.utcnow()
+        db.commit()
+        return {"username": existing.username, "password": reveal_password(existing), "domain": domain}, False
+
+    profile = db.query(Profile).filter(Profile.user_id == user_id).order_by(Profile.created_at.desc()).first()
+    email = ((profile.data or {}).get("email") if profile else "") or None
+    credential = generate_credential(domain, username_hint=email)
+    save_vault_entry(db, user_id, domain, credential["username"], credential["password"], origin="auto")
+    return credential, True
+
+
+def list_vault_entries(db: Session, user_id: int) -> List[VaultEntry]:
+    return db.query(VaultEntry).filter(VaultEntry.user_id == user_id).order_by(VaultEntry.created_at.desc()).all()
+
 
 def export_chrome_csv(entries: List[VaultEntry]) -> str:
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["name","url","username","password"])
-    for e in entries:
-        pwd = decrypt_password(e.password_enc)
-        # Chrome expects url
-        url = e.domain if e.domain.startswith("http") else f"https://{e.domain}"
-        writer.writerow([e.domain, url, e.username, pwd])
+    writer.writerow(["name", "url", "username", "password"])
+    for entry in entries:
+        url = entry.domain if entry.domain.startswith("http") else f"https://{entry.domain}"
+        writer.writerow([entry.domain, url, entry.username, reveal_password(entry)])
     return output.getvalue()
+
 
 def export_apple_csv(entries: List[VaultEntry]) -> str:
-    # Apple Keychain via CSV: Title, URL, Username, Password, Notes, OTPAuth
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Title","URL","Username","Password","Notes","OTPAuth"])
-    for e in entries:
-        pwd = decrypt_password(e.password_enc)
-        url = e.domain if e.domain.startswith("http") else f"https://{e.domain}"
-        writer.writerow([e.domain, url, e.username, pwd, "Generated by JobHunter", ""])
+    writer.writerow(["Title", "URL", "Username", "Password", "Notes", "OTPAuth"])
+    for entry in entries:
+        url = entry.domain if entry.domain.startswith("http") else f"https://{entry.domain}"
+        writer.writerow([entry.domain, url, entry.username, reveal_password(entry),
+                         "Generated by JobHunter AI", ""])
     return output.getvalue()
 
-def delete_all_vault(db: Session):
-    db.query(VaultEntry).delete()
+
+def delete_all_vault(db: Session, user_id: int) -> int:
+    """Irreversibly delete every credential for a user. Returns the count."""
+    entries = db.query(VaultEntry).filter(VaultEntry.user_id == user_id).all()
+    count = len(entries)
+    for entry in entries:
+        db.delete(entry)
     db.commit()
+    return count
+
+
+def delete_entry(db: Session, user_id: int, entry_id: int) -> bool:
+    entry = db.query(VaultEntry).filter(VaultEntry.id == entry_id, VaultEntry.user_id == user_id).first()
+    if not entry:
+        return False
+    db.delete(entry)
+    db.commit()
+    return True

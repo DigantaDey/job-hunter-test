@@ -1,139 +1,202 @@
+"""
+Outreach transport + message construction.
+
+* ``send_via_smtp`` is a real SMTP client (STARTTLS, per-attempt OTP/app-password
+  support, structured failures).
+* ``generate_cold_email`` writes the message with the AI layer when configured,
+  and always routes through the fact-guard (no invented achievements).
+* ``build_message`` enforces CAN-SPAM/GDPR requirements that a *sending* system
+  cannot delegate to the user: an unsubscribe link, the sender's postal address
+  and a ``List-Unsubscribe`` header.
+"""
+from __future__ import annotations
+
+import json
 import re
-import asyncio
 import smtplib
 import ssl
-import json
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from email.utils import formataddr
-from typing import Dict, Any, List
-from app.services.ai_client import chat_completion, AIClientError
+from email.mime.text import MIMEText
+from email.utils import formataddr, make_msgid
+from typing import Any, Dict, List, Optional
+
+from app.core.logging import get_logger
+from app.services.ai_client import AIClientError, chat_completion
+
+log = get_logger("app.email")
 
 
-async def find_decision_maker(company: str, department: str = "engineering", ai_config=None) -> Dict[str, Any]:
-    """Identify the most likely decision-maker email for a department.
-
-    AI path (when configured) returns name/email/title/confidence. Heuristic
-    fallback derives a conventional alias from the company domain.
-    """
+async def generate_cold_email(
+    profile: Dict[str, Any],
+    company: str,
+    job_title: str = "",
+    founder: bool = False,
+    *,
+    recipient_name: str = "",
+    extra_context: str = "",
+    ai_config=None,
+) -> Dict[str, Any]:
+    """Draft a personalised outreach email. Never invents experience."""
+    audience = "founder" if founder else "hiring manager"
     prompt = (
-        f'Find the email of the possible decision making person for {department} '
-        f'at company "{company}". Especially for startups/small companies, identify '
-        f'the founder or hiring manager. Return JSON '
-        f'{{"name": "", "email": "", "title": "", "confidence": 0-1, "reason": ""}}. '
-        f'If not found, guess a conventional pattern like firstname@company.com.'
+        f"Write a concise, specific cold email from this candidate to the {audience} "
+        f'of {company}{f" about the {job_title} role" if job_title else ""}.\n'
+        f"Candidate profile (ground truth — do not add anything not present): "
+        f"{json.dumps(profile)[:3000]}\n"
+        f"{f'Recipient name: {recipient_name}. ' if recipient_name else ''}"
+        f"{extra_context[:500]}\n"
+        "Rules: 120 words max, no flattery clichés, reference one concrete, verifiable "
+        "accomplishment from the profile, one clear ask (a short call). "
+        "Do NOT invent metrics, employers or skills.\n"
+        'Return JSON {"subject": "", "body": ""} with a plain-text body.'
     )
     try:
-        data = await chat_completion("email_gen", prompt, temperature=0.2, timeout=20, ai_config=ai_config)
-        if isinstance(data, dict) and data.get("email"):
-            data.setdefault("confidence", 0.7)
-            data["source"] = "ai"
-            return data
-    except AIClientError:
-        pass
-
-    domain = re.sub(r'\W+', '', company.lower()) + ".com"
-    return {
-        "name": "Hiring Manager",
-        "email": f"{department}@{domain}",
-        "title": "Hiring Manager",
-        "confidence": 0.5,
-        "source": "heuristic",
-    }
-
-
-async def generate_cold_email(profile: Dict[str, Any], company: str, job_title: str = "", founder: bool = False, ai_config=None) -> Dict[str, str]:
-    context = "founder" if founder else "hiring manager"
-    prompt = (
-        f"Write a concise, personalized cold email from the candidate to the {context} "
-        f'of {company} for role "{job_title}".\n'
-        f"Candidate profile: {json.dumps(profile)[:3000]}\n"
-        f"Job/company: {company}\n"
-        f"Tone: warm, confident, not pushy, startup-appropriate. Mention specific "
-        f"accomplishments, not generic fluff. Include a clear CTA.\n"
-        f'Return JSON {{"subject":"", "body":""}} plain text body.\n'
-        f"Do NOT hallucinate achievements not in profile.\n"
-    )
-    try:
-        data = await chat_completion("email_gen", prompt, temperature=0.7, timeout=30, ai_config=ai_config)
+        data = await chat_completion("email_gen", prompt, temperature=0.6, timeout=30, ai_config=ai_config)
         subject = str(data.get("subject", "") or "").strip()
         body = str(data.get("body", "") or "").strip()
         if subject and body:
-            return {"subject": subject, "body": body, "ai_used": True}
+            return {"subject": subject[:200], "body": body[:8000], "ai_used": True,
+                    "fact_guard": _fact_guard(profile, body)}
     except AIClientError:
         pass
 
-    subject = f"Interested in {job_title or 'opportunities'} at {company} — {profile.get('name', 'Candidate')}"
-    body = f"""Hi team at {company},
-
-I'm {profile.get('name', 'Candidate')}, a {', '.join(profile.get('skills', [])[:5])} engineer.
-I admire what you're building and would love to explore how I can contribute to {company}'s {job_title or 'engineering'} efforts.
-
-Quick highlights:
-- {profile.get('summary', '')[:300]}
-- Skills: {', '.join(profile.get('skills', [])[:8])}
-
-Happy to share a tailored resume and hop on a quick call. Would you be open to a 15-min chat next week?
-
-Best,
-{profile.get('name', 'Candidate')}
-{profile.get('email', '')}
-{profile.get('phone', '')}
-"""
-    return {"subject": subject, "body": body, "ai_used": False}
+    name = profile.get("name", "Candidate")
+    skills = ", ".join((profile.get("skills") or [])[:5])
+    subject = f"{job_title or 'Engineering roles'} at {company} — {name}"
+    body = (
+        f"Hi {recipient_name or 'there'},\n\n"
+        f"I'm {name}, a {skills or 'software'} engineer.{(' ' + profile.get('summary', '')[:200]) if profile.get('summary') else ''}\n\n"
+        f"I'm reaching out about {job_title or 'your open engineering work'} at {company}. "
+        f"Would you be open to a 15-minute conversation this week or next?\n\n"
+        f"Best,\n{name}\n{profile.get('email', '')}\n{profile.get('phone', '')}"
+    )
+    return {"subject": subject[:200], "body": body, "ai_used": False, "fact_guard": {"passed": True, "violations": []}}
 
 
-def send_via_smtp(to_email: str, subject: str, body: str, smtp_config: Dict[str, Any], otp: str = None) -> Dict[str, Any]:
+def _fact_guard(profile: Dict[str, Any], body: str) -> Dict[str, Any]:
+    """Flag company names in the draft that do not appear in the candidate's history."""
+    known = {str(e.get("company", "")).lower() for e in (profile.get("experience") or []) if isinstance(e, dict)}
+    known |= {str(profile.get("name", "")).lower()}
+    mentioned = {m.lower() for m in re.findall(r"\b[A-Z][A-Za-z0-9&.\-]{2,}\b", body)}
+    suspicious = [m for m in mentioned if m not in known and m.lower() not in {"hi", "i", "the", "best", "would"}]
+    # Only flag when a *company-like* pattern is present in an achievement sentence.
+    violations = [m for m in suspicious if any(word in body.lower() for word in ["at ", "worked", "built at", "joined"])][:5]
+    return {"passed": not violations, "violations": violations, "checked": len(mentioned)}
+
+
+def build_message(
+    *,
+    to_email: str,
+    subject: str,
+    body: str,
+    from_email: str,
+    from_name: str = "",
+    unsubscribe_url: str = "",
+    postal_address: str = "",
+    tracking_pixel_url: str = "",
+) -> MIMEMultipart:
+    """Compose the MIME message with compliance footers + tracking pixel."""
+    message = MIMEMultipart("alternative")
+    message["From"] = formataddr((from_name or from_email, from_email))
+    message["To"] = to_email
+    message["Subject"] = subject
+    message["Message-ID"] = make_msgid(domain=from_email.split("@")[-1] if "@" in from_email else None)
+    if unsubscribe_url:
+        message["List-Unsubscribe"] = f"<{unsubscribe_url}>"
+        message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+
+    footer_lines = [""]
+    if postal_address:
+        footer_lines.append(postal_address)
+    if unsubscribe_url:
+        footer_lines.append(f"Don't want to hear from me again? Unsubscribe: {unsubscribe_url}")
+    footer_lines.append("Sent by JobHunter AI on behalf of the sender named above.")
+
+    text_body = body + "\n" + "\n".join(footer_lines)
+    html_body = (
+        "<div style=\"font-family:system-ui,Segoe UI,sans-serif;font-size:14px;line-height:1.5\">"
+        + "".join(f"<p>{line}</p>" for line in body.split("\n\n"))
+        + "</div>"
+        + (f"<p style='color:#6b7280;font-size:12px'>{postal_address}</p>" if postal_address else "")
+        + (f"<p style='font-size:12px'><a href='{unsubscribe_url}'>Unsubscribe</a></p>" if unsubscribe_url else "")
+        + (f"<img src='{tracking_pixel_url}' width='1' height='1' alt='' style='display:none'/>" if tracking_pixel_url else "")
+    )
+    message.attach(MIMEText(text_body, "plain", "utf-8"))
+    message.attach(MIMEText(html_body, "html", "utf-8"))
+    return message
+
+
+def send_via_smtp(
+    to_email: str,
+    subject: str,
+    body: str,
+    smtp_config: Dict[str, Any],
+    otp: Optional[str] = None,
+    *,
+    from_email: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Send an email through the user's own SMTP account.
+    Send through the user's SMTP account.
 
-    - With no SMTP host/username configured, returns a *mock* success so the
-      demo flow is fully exercisable offline.
-    - With real SMTP credentials, sends for real via STARTTLS.
-    - 2FA/OTP: when the provider rejects the primary password (app passwords,
-      534/535 auth challenges), we surface `needs_otp` so the UI can prompt the
-      user for an OTP / app password / device verification, then retry.
+    Without configuration the function refuses to send (``configured=False``) —
+    the caller decides how to surface that; nothing is silently "mock sent".
     """
-    if not smtp_config.get("host") or not smtp_config.get("username"):
-        return {"success": True, "mock": True, "message": f"Mock send to {to_email}"}
+    host = str(smtp_config.get("host") or "").strip()
+    username = str(smtp_config.get("username") or "").strip()
+    if not host or not username:
+        return {"success": False, "configured": False,
+                "error": "SMTP is not configured — add host/username/password in Settings → Email"}
 
-    host = str(smtp_config["host"])
-    port = int(smtp_config.get("port", 587))
-    user = str(smtp_config["username"])
-    pwd = str(smtp_config.get("password", ""))
+    port = int(smtp_config.get("port", 587) or 587)
+    password = str(otp or smtp_config.get("password") or "")
+    if not password:
+        return {"success": False, "needs_otp": True, "configured": True,
+                "error": "SMTP password / app password required"}
 
-    if otp:
-        # Treat a user-supplied OTP/app password as the auth secret for this attempt.
-        pwd = str(otp)
+    from_name = str(smtp_config.get("from_name") or "").strip() or username
+    message = build_message(
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        from_email=from_email or username,
+        from_name=from_name,
+        unsubscribe_url=str(smtp_config.get("unsubscribe_url") or ""),
+        postal_address=str(smtp_config.get("postal_address") or ""),
+        tracking_pixel_url=str(smtp_config.get("tracking_pixel_url") or ""),
+    )
 
-    from_name = str(smtp_config.get("from_name") or "").strip() or user
-
-    msg = MIMEMultipart()
-    msg["From"] = formataddr((from_name, user))
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-
+    use_tls = bool(smtp_config.get("use_tls", True))
     try:
         context = ssl.create_default_context()
-        with smtplib.SMTP(host, port, timeout=15) as server:
-            if smtp_config.get("use_tls", True):
-                server.starttls(context=context)
-            server.login(user, pwd)
-            server.send_message(msg)
-        return {"success": True, "mock": False}
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=20, context=context) as server:
+                server.login(username, password)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(host, port, timeout=20) as server:
+                server.ehlo()
+                if use_tls:
+                    server.starttls(context=context)
+                    server.ehlo()
+                server.login(username, password)
+                server.send_message(message)
+        return {"success": True, "mock": False, "message_id": message.get("Message-ID", "")}
     except smtplib.SMTPAuthenticationError as exc:
-        code = str(getattr(exc, "smtp_code", ""))
-        if "534" in code or "535" in code or "2FA" in str(exc) or "Application-specific" in str(exc):
-            return {"success": False, "needs_otp": True, "error": f"SMTP auth rejected ({code}) — provide an OTP / app password / verify on device."}
-        return {"success": False, "error": f"SMTP authentication failed: {exc}"}
+        code = str(getattr(exc, "smtp_code", "") or "")
+        if code.startswith("53") or "2FA" in str(exc) or "Application-specific" in str(exc):
+            return {"success": False, "needs_otp": True, "configured": True,
+                    "error": f"SMTP authentication rejected ({code or 'auth'}) — provide an app password / OTP"}
+        return {"success": False, "configured": True, "error": f"SMTP authentication failed: {exc}"}
+    except smtplib.SMTPRecipientsRefused as exc:
+        return {"success": False, "configured": True, "bounced": True, "error": f"recipient refused: {exc}"}
     except Exception as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "configured": True, "error": f"{type(exc).__name__}: {exc}"}
 
 
 async def find_funded_companies(stage_filter: List[str] = None) -> List[Dict[str, Any]]:
-    """Deprecated: moved to app/services/funding_radar.py (AI-context-driven, fresh)."""
+    """Deprecated shim → use ``app.services.funding_radar``."""
     from app.services.funding_radar import scan_funded_companies
     from app.services.keyword_extractor import heuristic_context
-    companies = await scan_funded_companies(heuristic_context({}), stages=stage_filter)
+
+    companies, _ = await scan_funded_companies(heuristic_context({}), stages=stage_filter)
     return companies

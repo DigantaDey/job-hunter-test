@@ -15,7 +15,7 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-from app.services.ai_client import chat_completion, AIClientError
+from app.services.ai_client import AIClientError, chat_completion
 
 STOPWORDS = {
     "the", "and", "for", "with", "a", "an", "in", "on", "of", "to", "is", "are",
@@ -120,9 +120,6 @@ def heuristic_context(profile: Dict[str, Any], extra_context: str = "") -> Dict[
         extra_context,
     ]).lower()
     industries = [ind for ind, hints in INDUSTRY_HINTS.items() if any(h in all_text for h in hints)]
-
-    raw_text = profile.get("raw_text", "") or ""
-    mined = [t for t in _significant_tokens(raw_text + " " + extra_context, 24) if t not in [s.lower() for s in skills]]
 
     keywords: List[str] = []
     for kw in (skills[:8] + tech_stack[:6] + roles[:3] + industries[:3]):
@@ -243,7 +240,7 @@ def merge_user_keywords(context: Dict[str, Any], user_keywords: Optional[str]) -
     existing_lower = [str(x).lower() for x in context.get("keywords", [])]
     new_ones = [e for e in extras if e.lower() not in existing_lower]
     # user intent first, preserving the user's own order
-    context["keywords"] = (new_ones + [k for k in context.get("keywords", [])])[:18]
+    context["keywords"] = (new_ones + list(context.get("keywords", [])))[:18]
     context["user_keywords"] = extras
     return context
 

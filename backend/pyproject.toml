@@ -1,0 +1,20 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = ["migrations/versions", ".venv", "frontend"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "C4"]
+ignore = [
+    "E501",   # line length is handled by the formatter
+    "B008",   # FastAPI dependencies use function calls in defaults by design
+    "SIM105", # explicit try/except-pass is clearer than contextlib.suppress in places
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F401", "F841", "C408"]  # fixtures/imports are intentionally loose in tests
+"**/__init__.py" = ["F401"]                   # packages re-export their public surface
+"scripts/*" = ["E402"]                # sys.path bootstrap before app imports
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]

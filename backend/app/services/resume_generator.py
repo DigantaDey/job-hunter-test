@@ -1,18 +1,19 @@
-import os
+import hashlib
 import json
 import re
-import hashlib
-from typing import Dict, Any, List, Tuple
-from app.services.ai_client import chat_completion, AIClientError
+from typing import Any, Dict, List
 
 # DOCX / PDF generation
 from docx import Document
-from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt, RGBColor
 from reportlab.lib.pagesizes import LETTER
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+from app.services.ai_client import AIClientError, chat_completion
+
 
 def jd_fact_guard_prompt(profile: Dict[str,Any], jd: str, layout: Dict[str,Any], strict_skeleton: bool) -> str:
     skeleton_instruction = ""
@@ -232,3 +233,43 @@ def build_pdf(tailored: Dict[str,Any], profile: Dict[str,Any], out_path: str):
 
 def hash_jd(jd: str) -> str:
     return hashlib.sha256(jd.encode()).hexdigest()[:12]
+
+
+async def tag_resume(profile: Dict[str, Any], ai_config=None) -> List[str]:
+    """
+    Auto-tag a resume so it can be found and reused later.
+
+    AI first (3-5 short tags), heuristic fallback derived from skills/roles so
+    tagging always produces something meaningful offline.
+    """
+    prompt = (
+        "Create 3-5 short, lowercase, hyphenated tags describing this resume "
+        "(e.g. backend-python, fintech, aws). Return JSON {\"tags\": []}.\n"
+        f"Profile: {json.dumps(profile)[:3000]}"
+    )
+    try:
+        data = await chat_completion("tagging", prompt, temperature=0.2, timeout=20, ai_config=ai_config)
+        tags = data.get("tags") if isinstance(data, dict) else None
+        if isinstance(tags, list) and tags:
+            cleaned = [re.sub(r"[^a-z0-9\-+]", "-", str(t).lower()).strip("-") for t in tags]
+            cleaned = [t for t in cleaned if t][:5]
+            if cleaned:
+                return cleaned
+    except (AIClientError, Exception):
+        pass
+
+    skills = [str(s).lower().replace(" ", "-") for s in (profile.get("skills") or [])[:3]]
+    tags = ["tailored"] + skills
+    if profile.get("summary"):
+        words = re.findall(r"[a-z]{5,}", profile["summary"].lower())
+        for word in words:
+            if word not in tags and len(tags) < 5:
+                tags.append(word)
+    return tags[:5]
+
+
+def resume_plain_text(tailored: Dict[str, Any], profile: Dict[str, Any]) -> str:
+    """Deterministic text rendering of a tailored resume (used for diffs)."""
+    from app.services.resume_service import render_profile_text
+
+    return render_profile_text(tailored or profile or {})

@@ -1,311 +1,228 @@
-# JobHunter AI — Autonomous Job Application System
+# JobHunter AI v2.0
 
-> **"Remove the pain of applying to multiple jobs. Give every candidate an AI boost — with career-grade accuracy."**
+**A self-hosted, multi-user job-search platform**: it discovers real job postings, scores them
+against your profile, keeps your portal credentials in an encrypted vault, prepares (and, when you
+explicitly allow it, performs) applications, and runs compliant cold outreach — with an audit trail
+for everything it does on your behalf.
 
-A production-grade, full-stack **autonomous job-hunting platform** that ingests a master resume, extracts profile + layout with an OpenAI-compatible AI layer, **auto-extracts search keywords from your resume/profile/context**, discovers jobs (live keyless APIs + a curated pool), scores them, tailors resumes with a **JD fact-guard**, auto-creates vault credentials, auto-fills portals, handles the *User Input Needed* queue, cold-emails hiring managers/founders, runs an **AI-driven Funding Radar** (Seed→Series D), and runs **three parallel FIFO pipelines** (Discovery • Application • AI) under a single configurable rate limiter.
-
-Built with product, engineering, AI, and design rigor — minimalist dashboard, dark/light/system theme, one-click Chrome/Apple Keychain vault export, error logs, and an offline-first heuristic fallback for every AI flow.
-
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
-![Stack](https://img.shields.io/badge/stack-FastAPI%20%7C%20React%20%7C%20Vite%20%7C%20Tailwind-black)
-![AI](https://img.shields.io/badge/AI-OpenAI%20compatible-emerald)
-![Pipelines](https://img.shields.io/badge/pipelines-3%20parallel%20FIFO-violet)
-![Tests](https://img.shields.io/badge/tests-18%20passing-green)
-
----
-
-## ⚠️ Honest status (read this first)
-
-This is a **fully-runnable v1.2 product-grade prototype**, not a finished SaaS. Every flow in the feature matrix has a working vertical slice, but the following are **simulated or delegated to public APIs** rather than fully automated:
-
-| Area | Reality today |
-|---|---|
-| Job discovery | Live keyless APIs (**Arbeitnow**, **Remotive**) + a curated/synthetic pool. LinkedIn/Naukri/Indeed/Workday/Instahyre have *no real adapter* yet (ToS/anti-bot). |
-| Application submit | Deterministic simulation (status machine + vault + needs-input queue are real; the browser autofill itself is not). |
-| Decision-maker discovery | AI + conventional-alias heuristic (no people-data API). |
-| Funding radar | AI mode intentionally proposes **synthetic** companies to avoid fabricating real funding claims; heuristic mode uses a clearly-labeled demo dataset. |
-| Email sending | Real SMTP path implemented, plus a `needs_otp` flow; without SMTP config it returns a labeled *mock* success for the demo. |
-
-See **[docs/LAUNCH_READINESS.md](docs/LAUNCH_READINESS.md)** for the full requirement-by-requirement assessment, blockers, and roadmap.
-
----
-
-## ✨ Feature Matrix
-
-| Requirement | Implementation |
-|---|---|
-| **Master resume upload** | PDF/DOCX, `pdfminer` + `pypdf` text, layout extractor (margins, lines, capitals, hyperlink style/color/underline, bullet style/count, borders, colors, fonts) |
-| **AI extraction** | `ai_extract_profile()` → OpenAI-compatible `chat/completions` (JSON mode), fallback heuristic (regex + keyword) when no key |
-| **Job scraping** | Adapter pattern (`linkedin/naukri/indeed/instahyre/lever/greenhouse/workday/custom`) + **live keyless APIs** (Arbeitnow, Remotive) + AI form-structure detection + freshness filter |
-| **AI keyword extraction** | `keyword_extractor.py` — AI derives `keywords/roles/industries/tech_stack/locations/seniority/funding_focus` from profile + resume + free-form context (heuristic TF mining fallback). User input is **merged on top**. `GET /api/context/keywords` |
-| **Editable settings (clubbed)** | `GET/PUT /api/settings` — categories `ai`, `scraping`, `general`, `application`, `email`, `funding`, `workflows`; RPM slider, keywords, freshness, live-source toggle, skeleton toggle, additional questions |
-| **3 pipelines / FIFO / parallel** | DB `PipelineJob` + in-memory `AIPipeline` priority queue + `asyncio.create_task` + shared `rate_limiter`; `/api/pipelines/stats` |
-| **Unified AI gateway** | `ai_client.py` — **every** AI call resolves per-workflow config and acquires a rate-limiter token *before* hitting the wire (the "never exceed RPM" guarantee now actually holds) |
-| **Per-workflow AI API** | `GET/POST /api/ai/config` + a working editor in Settings — different `base_url/model/api_key` per workflow, default single key |
-| **Auto-fill + User Input Needed queue** | missing `workAuthorization/linkedin` → `UserInputRequest(pending)` (deduped) → `POST /api/jobs/{id}/input` → re-queued and processed to completion |
-| **Vault auto-credential** | `generate_credential()` + Fernet encrypt, per-portal-domain reuse; exports Chrome CSV + Apple CSV; `DELETE /api/vault` deletes forever |
-| **Big platforms auto-submit** | source detection; `linkedin/naukri/indeed` → `is_external` → logs redirect, switches to credential+profile workflow |
-| **AI resume generator** | `jd_fact_guard_prompt()` — memory + JD + “never hallucinate” rule; `strict_skeleton` toggle; DOCX/PDF build + download |
-| **Resume approval gate** | generated resumes start `pending`; `POST /api/resumes/{id}/approve` unlocks them for the application pipeline (UI approve button + status chip) |
-| **Resume reuse decision** | `_choose_resume()` — reuse an approved resume when score ≥ 65 **and** JD↔JD cosine ≥ 0.85, else generate new, else fall back to master |
-| **Auto-tagging** | AI `{"tags": [...]}` + heuristic fallback; editable via `PUT /api/resumes/{id}/tags` |
-| **AI form structure find** | `detect_form_structure(url)` — portal type + fields + confidence (mocked high-confidence; real HTML+LLM parsing is roadmap) |
-| **Scoring (with/without AI)** | `heuristic_score()` TF-IDF cosine + coverage + bonus (tokenizer bug fixed) → `ai_score()` LLM JSON → fallback heuristic |
-| **AI rate limiter** | `TokenBucketRateLimiter` 60/min default, rolling 60s window, `update_rpm()` from settings, precise sleeps, stats + throttled count |
-| **AI online dot** | `GET /api/settings/ai/status` → pings `/models`, returns `online` + latency; frontend polls every 4s, green/red pulse |
-| **Company classifier** | `heuristic_company_size()` + `ai_company_size()` → `big/medium/small/startup` |
-| **Email pipeline (SMTP + 2FA)** | `find_decision_maker()` + `generate_cold_email()` (AI), `send_via_smtp()` real `smtplib` + `needs_otp` branch, inline OTP retry in the UI |
-| **Funding radar (≤ Series D)** | AI scan matched to extracted `funding_focus`; dates always relative to *now*; DB upsert + auto-prune; stage filters; process → Job (open roles) or founder cold-email draft |
-| **Email approval bucket** | `pending_approval → queued → sent/failed/needs_otp`; editable subject/body/to; `POST /approve` + `POST /send` |
-| **Dashboard** | summary cards, recent jobs, pipeline mini, profile; job click → drawer with score, company size, forms, vault, resume choice, apply |
-| **Error logs** | `ErrorLog` + `log_error/log_info` + `GET /api/logs` |
-| **Theme** | light/dark/system via `prefers-color-scheme`, `localStorage`, Tailwind `dark:` variant |
-
----
-
-## 🏗 Architecture
+Built with FastAPI + SQLAlchemy 2 + Alembic on the backend and React 18 + Vite + Tailwind on the
+frontend. PostgreSQL is the production database; SQLite is supported for a single-user install.
 
 ```
-                ┌─────────────┐
-     Resume PDF ━▶ Resume Parser ━┳━▶ Profile JSON
-                └─────────────┘  ┃   Layout JSON (margins, bullets, colors…)
-                                 ┃
-                ┌────────────────▼──────────────────────┐
-                │   Unified AI Gateway (ai_client)     │◀── per-workflow base_url/model/key
-                │   rate-limiter token BEFORE every    │◀── Settings.rpm
-                │   call · JSON mode · offline fallback│
-                └──────────────┬───────────────────────┘
-                               │  green/red health dot
-                ┌──────────────▼──────────────┐
-                │  Discovery Pipeline (FIFO)  │──▶ discover_jobs(keywords,freshness)
-                │  live: arbeitnow/remotive   │    + curated pool + AI form detect
-                │  curated: linkedin/naukri…  │    + scoring + classifier
-                └──────────────┬──────────────┘
-                               ▼
-                          Jobs (DB)
-                               │
-                ┌──────────────▼──────────────┐
-                │ Application Pipeline (FIFO) │──▶ vault credential (Fernet)
-                │  autofill via AI + profile  │    + resume choose (reuse/generate/master)
-                │  external redirect handled  │    + approval gate
-                └──────────────┬──────────────┘
-                               │
-                ┌──────────────▼──────────────┐
-                │  Email Pipeline             │──▶ find decision maker
-                │  approval bucket → SMTP     │    + founder cold email (+2FA/OTP)
-                └──────────────┬──────────────┘
-                               │
-                ┌──────────────▼──────────────┐
-                │  Funding Pipeline           │──▶ AI keyword extraction
-                │  Seed→D • fresh ≤45d •      │    (profile+resume+context)
-                │  auto-refresh • pruned      │    → jobs or founder email
-                └─────────────────────────────┘
-
-Frontend: Vite + React 18 + TypeScript + Tailwind + React Router
-         Dashboard / Jobs / Queues / Resume Studio / Email Bucket / Funding / Vault / Settings / Logs
-Backend: FastAPI + SQLAlchemy (SQLite) + Pydantic + httpx + python-docx/reportlab + cryptography
-```
-
-**Resume decision:**
-```
-score ≥ 65 AND best JD-similarity ≥ 0.85  → reuse approved generated resume
-score ≥ 65 (no close match)               → generate new tailored resume (pending approval)
-otherwise                                 → use master resume
+┌──────────────────────── SPA (React + Vite) ─────────────────────────┐
+│ Dashboard · Jobs · Queues · Resume Studio · Email Bucket · Funding   │
+│ Vault · Account & privacy · Settings · Logs                          │
+└───────────────▲──────────────────────────────────────────────────────┘
+                │ JSON API (JWT / API key) — served by the same process
+┌───────────────┴──────────────────────────────────────────────────────┐
+│ FastAPI                                                              │
+│  middleware: request-id → security headers → rate limit → body limit │
+│  routers: auth · account · resumes · jobs · vault · emails · funding  │
+│           settings · ops · tracking                                  │
+│  pipeline worker: discovery · application · email · funding · ai      │
+└───┬──────────┬──────────────┬───────────────┬───────────────┬────────┘
+    │          │              │               │               │
+ Postgres   real job      AI gateway      encrypted        SMTP +
+ + Alembic  sources       (rate-limited,  per-user vault   tracking
+            (13 live,     per-workflow)   (Fernet, HKDF)    + suppression
+            7 gated)
 ```
 
 ---
 
-## 🚀 Quick Start
+## 1. What v2.0 adds over the v1.2 demo
 
-### Prereqs
-- Python 3.11+, Node 20+, `pip`, `npm`
-- OpenAI-compatible API key (optional — every flow has a heuristic fallback)
+The v1.2 build was a working single-user prototype. v2.0 closes the gaps that block real use:
 
-### 1. Clone & env
-```bash
-git clone <your-fork>
-cd job-hunter-test
-cp .env.example .env
-# edit .env: AI_API_KEY, AI_BASE_URL, AI_MODEL (leave AI_API_KEY empty for offline mode)
-```
-
-### 2. Backend (FastAPI)
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r backend/requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --app-dir backend
-# → http://localhost:8000/api/docs
-```
-
-### 3. Frontend (Vite)
-```bash
-cd frontend
-npm install
-npm run dev          # → http://localhost:5173  (proxies /api → :8000)
-npm run build        # → frontend/dist (served by FastAPI at /)
-```
-
-### One-shot dev (builds frontend, serves everything on :8000)
-```bash
-./run.sh
-```
-
-### Docker
-```bash
-docker-compose up --build   # backend :8000, frontend :5173
-```
-
----
-
-## 🔌 API Reference
-
-Base: `http://localhost:8000` · interactive docs at `/api/docs`
-
-| Method | Path | Description |
+| Area | v1.2 | v2.0 |
 |---|---|---|
-| `GET` | `/api/health` | Health |
-| `GET` | `/api/meta` | Feature list |
-| `POST` | `/api/resume/upload` | Upload PDF/DOCX → profile+layout+context |
-| `GET` | `/api/profile/current` | Current profile |
-| `GET` | `/api/resumes` | List resumes (incl. `status`) |
-| `POST` | `/api/resumes/generate?job_id=&strict_skeleton=` | Tailored DOCX/PDF (starts `pending`) |
-| `POST` | `/api/resumes/{id}/approve` | Approve a generated resume for use |
-| `GET` | `/api/resumes/{id}/download?format=docx\|pdf` | Download |
-| `PUT` | `/api/resumes/{id}/tags` | Edit tags |
-| `GET` | `/api/jobs` | List (filter `status,source,company_size,q`) |
-| `GET` | `/api/jobs/{id}` | Detail + score + forms |
-| `POST` | `/api/jobs/discover` | Trigger discovery (live + curated, AI keywords) |
-| `GET` | `/api/context/keywords` | AI-extracted search context |
-| `POST` | `/api/jobs/{id}/apply?resume_choice=auto\|master\|generated&resume_id=` | Autofill + vault + queue (returns `resume_decision`) |
-| `POST` | `/api/jobs/{id}/input` | Submit User Input Needed |
-| `GET` | `/api/vault` · `/api/vault/export/chrome` · `/api/vault/export/apple` · `DELETE /api/vault` | Vault list / exports / delete-forever |
-| `GET` | `/api/emails` · `POST /api/emails/generate` · `PUT /api/emails/{id}` · `POST /api/emails/{id}/approve` · `POST /api/emails/{id}/send?otp=` | Email bucket |
-| `GET` | `/api/funding/companies?stage=&refresh=` · `POST /api/funding/refresh` · `GET /api/funding/context` · `POST /api/funding/{name}/process` | Funding radar |
-| `GET/PUT` | `/api/settings` · `GET /api/settings/ai/status` | Grouped settings + AI health |
-| `GET/POST` | `/api/ai/config` | Per-workflow AI override |
-| `GET` | `/api/pipelines/stats` · `/api/pipelines/jobs` · `/api/user-input-queue` | Pipelines & queues |
-| `GET` | `/api/logs` | Error logs |
-| `POST` | `/api/classify/company?company=&jd=` | Company size |
-| `GET` | `/api/dashboard/summary` | Dashboard cards |
+| Accounts | single implicit user | **multi-user auth** — bootstrap owner, registration policy, JWT access + rotating refresh tokens, API keys, per-user row scoping on every table |
+| Secrets | one process-wide Fernet key | **HKDF-derived per-user keys**, encrypted SMTP credentials, `SECRET_KEY`/`ENCRYPTION_KEY` validation, no hardcoded defaults in production |
+| Data | `create_all`, SQLite only | **Alembic migrations**, PostgreSQL + SQLite, legacy v1.2 schema adoption, connection pooling, health/readiness probes |
+| Pipelines | in-process `asyncio` tasks lost on restart | **durable queue** with leasing, retries/backoff, dead-letter, `python -m app.worker`, startup recovery of stalled items |
+| Job sources | 2 keyless APIs + demo pool | **13 live adapters** (Greenhouse, Lever, Ashby, Workable, SmartRecruiters, Workday, Remotive, Arbeitnow, Jobicy, RemoteOK, Himalayas, The Muse, WeWorkRemotely) with robots.txt compliance, per-host politeness, caching and honest "unavailable" reporting for gated sources |
+| Forms | mocked detection | **real HTML form parsing** (labels, required flags, ATS fingerprints) + optional Playwright autofill that is dry-run by default |
+| Resume | approve gate | **diff against the master, polished-version upload, fact guard, per-JD reuse decisions** |
+| Email | send or not | **compliance gate** (consent, suppression list, daily limit, postal address, unsubscribe URL), dry-run default, open pixel, unsubscribe endpoint, webhook ingestion |
+| Funding | AI-synthesised | **SEC EDGAR Form D** (real), optional Crunchbase/Tracxn/imported feeds, synthetic data only when explicitly opted into and labelled |
+| Contacts | AI guess | **Hunter/Apollo + DNS MX verification**, heuristic fallbacks always marked `verified=false` |
+| Ops | none | structured JSON logs, Prometheus metrics, `/api/health/{live,ready}`, audit trail, usage counters, backup script, CI, hardened container |
 
 ---
 
-## 🔒 Vault Export Format
+## 2. Quick start
 
-**Chrome** (`chrome_passwords.csv`):
-```
-name,url,username,password
-lever.co,https://lever.co,user_a1b2@jobhunter.local,Strong!Pass123
-```
-
-**Apple** (`apple_passwords.csv`):
-```
-Title,URL,Username,Password,Notes,OTPAuth
-lever.co,https://lever.co,user_a1b2@jobhunter.local,Strong!Pass123,Generated by JobHunter,
-```
-
-Import via `chrome://settings/passwords` → Import or macOS Keychain → Import.
-
-> ⚠️ In production, set a strong `VAULT_KEY` (or better, a KMS-backed secret) — the
-> default is a dev-only placeholder.
-
----
-
-## 🤖 AI Layer (OpenAI-Compatible)
-
-All AI calls flow through `backend/app/services/ai_client.py`:
-
-- One gateway → resolves `base_url/api_key/model` (per-workflow override wins, then env), acquires a **rate-limiter token**, then POSTs `/chat/completions`.
-- JSON mode by default; every service keeps a deterministic heuristic fallback (works fully offline).
-- Health probe (`/models`) powers the green/red dot.
-
-**Workflows:** `parse`, `keyword_extract`, `scoring`, `resume_gen`, `classify`, `email_gen`, `form_detect`, `funding_scan`, `tagging`.
-
-**Per-workflow override** (Settings UI, or API):
-```json
-POST /api/ai/config
-{ "resume_gen": {"base_url":"https://api.openai.com/v1","model":"gpt-4o","api_key":"sk-..."} }
-```
-
----
-
-## 📁 Project Structure
-
-```
-backend/
-  app/
-    main.py               # FastAPI, CORS, startup (AI worker + override load), SPA fallback
-    core/config.py        # Settings (env)
-    core/security.py      # Fernet encrypt
-    core/rate_limiter.py  # TokenBucket
-    db.py                 # SQLAlchemy engine + init (+ lightweight SQLite migration)
-    models/models.py      # Profile, Resume, Job, VaultEntry, Email, Settings, ErrorLog, PipelineJob, FundingCompany, UserInputRequest
-    schemas/schemas.py    # Pydantic
-    services/
-      ai_client.py        # unified, rate-limited OpenAI-compatible gateway
-      resume_parser.py    # layout + AI extract
-      resume_generator.py # tailor + docx/pdf + tags
-      scoring.py          # heuristic + AI + reuse decision
-      classifier.py       # company size
-      job_scraper.py      # live (arbeitnow/remotive) + curated pool + form detect
-      vault.py            # generate + Chrome/Apple CSV
-      email_pipeline.py   # finder + cold email + SMTP 2FA + funding shim
-      ai_pipeline.py      # FIFO priority queue + worker + health
-      keyword_extractor.py# AI/heuristic search context
-      funding_radar.py    # Seed→D radar
-    api/routes.py         # All endpoints
-    utils/logger.py       # ErrorLog helper
-  tests/                  # 18 tests (hermetic, offline)
-  requirements.txt  Dockerfile
-frontend/
-  src/
-    components/Layout.tsx # Sidebar, AI dot, theme
-    pages/  Dashboard Jobs Queues Resumes Emails Funding Vault Settings Logs
-    hooks/useTheme.tsx  api/client.ts  App.tsx  main.tsx  index.css
-  vite.config.ts  tailwind.config.js  package.json  Dockerfile
-docs/LAUNCH_READINESS.md # full launch assessment + roadmap
-```
-
----
-
-## 🧪 Testing
+### Local development
 
 ```bash
-# Backend (offline, no AI key needed)
-cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q
+# backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r backend/requirements-dev.txt
+cp .env.example .env                     # fill SECRET_KEY + ENCRYPTION_KEY (see below)
+cd backend && PYTHONPATH=. uvicorn app.main:app --reload --port 8000
 
-# Frontend type-check + build
+# frontend (second terminal)
+cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /api to :8000
+```
+
+Generate the two secrets once:
+
+```bash
+python -c "import secrets; print('SECRET_KEY=' + secrets.token_hex(32)); print('ENCRYPTION_KEY=' + secrets.token_hex(32))"
+```
+
+Open http://localhost:5173 — the first screen is the **owner bootstrap** form. The first account
+created becomes the owner; later accounts need `ALLOW_REGISTRATION=true` (default: closed).
+
+Production-shaped stack (PostgreSQL + API + worker):
+
+```bash
+cp .env.example .env      # ENVIRONMENT=production, set POSTGRES_PASSWORD, secrets, domain
+docker compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml run --rm backup   # on-demand backup
+```
+
+Full checklist: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
+---
+
+## 3. Feature tour
+
+**Discovery** — keyword context is mined from your resume + preferences (optionally by AI), then
+each enabled source is queried concurrently. Every posting is normalised to one shape, deduplicated
+(`source:external_id`, falling back to `company:title`), scored (AI or calibrated heuristic),
+classified by company size and persisted with its source, salary and remote flags. Sources that
+need a key report *why* they are unavailable instead of silently returning nothing.
+
+**Applications** — a job's apply flow detects the portal (Greenhouse/Lever/Workday/custom), detects
+required fields from the real HTML, maps them from your profile, and either:
+* reuses a previously approved tailored resume (JD similarity ≥ 0.85),
+* generates a new one that must be approved (fact guard: never invents employers, titles or dates),
+* creates/reuses a vault credential for the portal,
+* asks **you** for anything it cannot determine (the User-Input queue), then re-queues itself.
+
+Submitting through a browser requires the optional Playwright extra and *two* explicit opt-ins
+(`AUTOFILL_ENABLED`, `AUTOFILL_ALLOW_SUBMIT`, plus the automation consent). Without them the run is
+dry-run: fields are mapped and a screenshot is stored, but nothing is submitted.
+
+**Outreach** — draft → compliance check → send. The gate blocks on missing consent, missing terms,
+suppressed recipients, invalid addresses, daily limits, missing SMTP, missing postal address and
+missing unsubscribe URL. Real sends are off by default (`EMAIL_SENDING_ENABLED=false`,
+`EMAIL_DRY_RUN=true`). Opens are tracked with a 1×1 pixel and unsubscribes are honoured immediately
+via a one-click endpoint and the suppression list.
+
+**Funding radar** — real Form D filings from SEC EDGAR (no key needed, descriptive User-Agent
+required) plus optional Crunchbase/Tracxn/operator-imported feeds. Companies with open roles go to
+the application flow; the rest can be cold-emailed. Synthetic demo companies exist but are opt-in
+and labelled `DEMO DATA`.
+
+**Vault** — credentials are encrypted with a key derived per user (`HKDF(master, "user:{id}:vault")`)
+and rotated on read from the legacy global key. Reveals, exports and deletions are audited; exports
+are available in Chrome and Apple Passwords CSV formats.
+
+---
+
+## 4. API surface (highlights)
+
+| Area | Endpoints |
+|---|---|
+| Auth | `GET /api/auth/status`, `POST /api/auth/{bootstrap,register,login,refresh,logout}`, `GET /api/auth/me`, `POST /api/auth/password`, `GET/POST/DELETE /api/auth/api-keys` |
+| Account | `GET /api/account/{disclosures,consent,audit,export,runtime,billing-usage}`, `POST /api/account/consent`, `DELETE /api/account?confirm=<email>` |
+| Resumes | `POST /api/resume/upload`, `GET /api/profile/current`, `POST /api/resumes/generate`, `POST /api/resumes/{id}/{approve,reject}`, `GET /api/resumes/{id}/{preview,diff,download}`, `POST /api/resumes/{id}/polish`, `PUT /api/resumes/{id}/tags` |
+| Jobs | `POST /api/jobs/discover`, `GET /api/jobs`, `POST /api/jobs/{id}/{apply,input,mark-applied,retry,skip}`, `GET /api/user-input-queue`, `POST /api/classify/company`, `GET /api/pipelines/{stats,jobs}` |
+| Vault | `GET/POST/DELETE /api/vault`, `GET /api/vault/{id}/reveal`, `GET /api/vault/export/{chrome,apple}` |
+| Email | `POST /api/emails/generate`, `GET /api/emails`, `POST /api/emails/{id}/{approve,send,check}`, `GET /api/emails/{id}/events`, `GET/POST/DELETE /api/emails/suppressions` |
+| Funding | `GET /api/funding/{companies,providers,context}`, `POST /api/funding/refresh`, `POST /api/funding/{name}/process` |
+| Settings | `GET/PUT /api/settings`, `GET /api/settings/{ai/status,runtime}`, `GET/POST/DELETE /api/ai/config` |
+| Ops | `GET /api/health`, `/api/health/live`, `/api/health/ready`, `/api/metrics`, `/api/meta`, `/api/logs`, `/api/dashboard/summary`, `GET/POST /api/ops/queue/*` |
+| Tracking | `GET /api/track/open/{token}.png`, `GET/POST /api/track/unsubscribe/{token}`, `POST /api/track/events` |
+
+Interactive docs: `/api/docs`. Machine-readable spec: `/api/openapi.json`.
+
+---
+
+## 5. Configuration
+
+Everything is environment-driven; see [`.env.example`](.env.example) for the annotated list. The
+values you must set in production are `SECRET_KEY`, `ENCRYPTION_KEY`, `DATABASE_URL`,
+`CORS_ORIGINS`, `ALLOWED_HOSTS` and (for real outreach) the `EMAIL_*` block. The config validator
+refuses to boot in `ENVIRONMENT=production` with placeholder secrets, wildcard CORS or SQLite
+unless you explicitly override with `ALLOW_SQLITE_IN_PROD=true`.
+
+Per-user settings (AI keys, SMTP, sources, thresholds) live in the app under **Settings** and are
+stored encrypted where they are secret.
+
+---
+
+## 6. Testing & quality gates
+
+```bash
+# backend — hermetic: temp SQLite, no network, no AI key
+cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 209 tests
+
+# lint
+ruff check backend
+
+# frontend
 cd frontend && npx tsc --noEmit && npm run build
 ```
 
-**Happy path (curl):**
+CI (`.github/workflows/ci.yml`) runs the suite twice (SQLite **and** PostgreSQL 16), applies
+Alembic migrations on a fresh database, typechecks and builds the frontend, builds the production
+image and audits dependencies (pip-audit + npm audit).
+
+Test coverage includes: auth/tenancy isolation, vault encryption + re-keying, queue leasing and
+worker execution, discovery/source adapters, form detection, autofill planning, resume generation
++ fact guard + diff/polish, outreach compliance gates, suppression/unsubscribe/open tracking,
+funding providers (including the anti-fabrication guard), GDPR export/delete, metrics and health.
+
+---
+
+## 7. Honest limitations
+
+* **LinkedIn, Indeed, Naukri and Instahyre are not scraped.** They prohibit it in their terms and
+  block automation; the app reports them as gated rather than pretending. Workers/partners with a
+  licence can add an adapter in `app/services/sources/adapters.py`.
+* **Browser submission needs Playwright**, which is an optional extra
+  (`backend/requirements-autofill.txt` + `playwright install chromium`). Automating an application
+  may violate a portal's terms — the automation consent text says exactly that, and the default is
+  dry-run.
+* **Funding data is Form D-level.** SEC EDGAR gives you company + filing date + link, but Form D
+  filings do not disclose round sizes. Paid providers are wired but need your licence key.
+* **Contact data quality depends on your provider key.** Without Hunter/Apollo the app only
+  proposes role mailboxes and marks them unverified; it never invents a personal address.
+* **Email deliverability is your responsibility.** Configure SPF/DKIM/DMARC for the sending domain;
+  the app supplies the unsubscribe header/footer, suppression list and rate limiting.
+* **Compliance sign-off is still a human step.** `docs/COMPLIANCE.md` documents the built-in
+  controls and the questions your counsel should answer before you enable automation for real
+  users.
+
+---
+
+## 8. Operations
+
 ```bash
-curl -F "file=@/tmp/test_resume.pdf" http://localhost:8000/api/resume/upload
-curl -X POST http://localhost:8000/api/jobs/discover
-curl http://localhost:8000/api/jobs | jq
-curl -X POST "http://localhost:8000/api/resumes/generate?job_id=1"
-curl -X POST http://localhost:8000/api/resumes/2/approve
-curl -X POST "http://localhost:8000/api/jobs/1/apply?resume_choice=auto"
-curl http://localhost:8000/api/vault/export/chrome
-curl -X POST "http://localhost:8000/api/emails/generate?company=Linear"
-curl http://localhost:8000/api/funding/companies
+# apply migrations / inspect state
+cd backend && python -m alembic upgrade head && python -m alembic current
+
+# run the pipeline worker separately from the API
+cd backend && PYTHONPATH=. python -m app.worker
+
+# nightly backup (SQLite: online backup + integrity check; Postgres: pg_dump | gzip)
+python backend/scripts/backup.py --out /backups --keep 14
+
+# scrape metrics
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://localhost:8000/api/metrics
 ```
 
----
-
-## 🔮 Roadmap
-
-- Playwright headless for real Workday/Lever/Greenhouse form autofill + CAPTCHA handling
-- OAuth for LinkedIn/Indeed/Instahyre + Naukri session handling
-- Real funding + people-data integrations (Crunchbase/Tracxn, Hunter/Clearbit) with compliance
-- Resume diff/preview + "upload polished version" as a first-class flow
-- Multi-user auth + tenancy, Alembic migrations, Postgres, CI (GitHub Actions), structured logs + metrics
-- Vector DB for resume↔JD similarity (reuse vs new)
-
-See **[docs/LAUNCH_READINESS.md](docs/LAUNCH_READINESS.md)** for the detailed blockers and milestones.
+Health probes: `/api/health/live` (process up), `/api/health/ready` (database + migrations + queue).
+Logs are JSON when `LOG_JSON=true`; every record carries `request_id` and `user_id` when known.
 
 ---
 
-## 📄 License
+## 9. License & disclaimer
 
-MIT — do what you want, but keep the fact-guard.
+No license file is included in this repository; treat it as proprietary until you add one. The
+software automates actions on third-party sites — you are responsible for complying with each
+site's terms of service and with the anti-spam and privacy laws that apply where you and your
+contacts are located.

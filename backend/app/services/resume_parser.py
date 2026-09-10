@@ -1,8 +1,11 @@
 import re
-from typing import Dict, Any, Tuple
-from pypdf import PdfReader
+from typing import Any, Dict, Tuple
+
 from pdfminer.high_level import extract_text as pdfminer_extract
-from app.services.ai_client import chat_completion, AIClientError
+from pypdf import PdfReader
+
+from app.services.ai_client import AIClientError, chat_completion
+
 
 # Heuristic layout extractor
 def extract_layout(filepath: str) -> Dict[str, Any]:
@@ -19,15 +22,15 @@ def extract_layout(filepath: str) -> Dict[str, Any]:
         # pdfminer for more detail
         try:
             raw = pdfminer_extract(filepath, maxpages=1)
-        except:
+        except Exception:
             raw = text
         # Heuristics
         lines = raw.splitlines() if raw else []
-        has_bullets = sum(1 for l in lines if l.strip().startswith(("•", "-", "*", "·")))
+        has_bullets = sum(1 for line in lines if line.strip().startswith(("•", "-", "*", "·")))
         caps_ratio = sum(1 for c in raw if c.isupper()) / max(1, len(raw))
         hyperlinks = re.findall(r"https?://\S+|www\.\S+|\S+@\S+", raw)
         # crude margin guess: leading spaces
-        leading_spaces = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+        leading_spaces = [len(line) - len(line.lstrip()) for line in lines if line.strip()]
         avg_margin = sum(leading_spaces)/max(1, len(leading_spaces))
         colors = ["#1a1a1a"]  # default; real would parse operators
         # try to detect fonts
@@ -35,13 +38,13 @@ def extract_layout(filepath: str) -> Dict[str, Any]:
         try:
             if page and "/Resources" in page:
                 fonts = list(page["/Resources"].get("/Font", {}).keys())
-        except:
+        except Exception:
             pass
         return {
             "page_count": len(reader.pages) if reader.pages else 0,
             "avg_margin_pt": round(avg_margin * 3, 2),
             "margins": {"top": 36, "bottom": 36, "left": 54, "right": 54, "estimated": True},
-            "lines": {"total": len(lines), "avg_chars_per_line": round(sum(len(l) for l in lines)/max(1,len(lines)),2)},
+            "lines": {"total": len(lines), "avg_chars_per_line": round(sum(len(line) for line in lines)/max(1,len(lines)),2)},
             "capitals_ratio": round(caps_ratio,3),
             "all_caps_sections": caps_ratio > 0.3,
             "hyperlink_style": {"count": len(hyperlinks), "color": "#2563eb", "underline": True, "samples": hyperlinks[:3]},
@@ -114,9 +117,56 @@ Respond ONLY with JSON.
 def extract_text_from_pdf(filepath: str) -> str:
     try:
         return pdfminer_extract(filepath) or ""
-    except:
+    except Exception:
         try:
             reader = PdfReader(filepath)
             return "\n".join([p.extract_text() or "" for p in reader.pages])
-        except Exception as e:
+        except Exception:
             return ""
+
+
+def extract_text(filepath: str) -> str:
+    """
+    Extract plain text from a PDF or Word document.
+
+    PDF: pdfminer first (best layout fidelity), pypdf as a fallback.
+    DOCX/DOC: python-docx paragraphs + tables; DOC falls back to a raw byte
+    scan so at least *something* is recovered from legacy files.
+    """
+    lower = (filepath or "").lower()
+    if lower.endswith(".pdf"):
+        for reader in (
+            lambda: pdfminer_extract(filepath),
+            lambda: "\n".join((page.extract_text() or "") for page in PdfReader(filepath).pages),
+        ):
+            try:
+                text = reader() or ""
+                if text.strip():
+                    return text
+            except Exception:
+                continue
+        return ""
+
+    if lower.endswith((".docx", ".doc")):
+        try:
+            from docx import Document
+
+            document = Document(filepath)
+            parts = [p.text for p in document.paragraphs if p.text]
+            for table in document.tables:
+                for row in table.rows:
+                    parts.append(" | ".join(cell.text for cell in row.cells))
+            text = "\n".join(parts)
+            if text.strip():
+                return text
+        except Exception:
+            pass
+        try:  # last resort for .doc without converters installed
+            with open(filepath, "rb") as handle:
+                raw = handle.read()
+            decoded = raw.decode("latin-1", errors="ignore")
+            words = re.findall(r"[A-Za-z0-9@._%+\-/ ]{4,}", decoded)
+            return "\n".join(words)[:50000]
+        except Exception:
+            return ""
+    return ""

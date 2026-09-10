@@ -1,18 +1,41 @@
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
-sqlalchemy==2.0.27
-pydantic==2.6.0
-pydantic-settings==2.1.0
-python-multipart==0.0.9
-pypdf==4.1.0
-python-docx==1.1.2
-reportlab==4.1.0
-httpx==0.27.0
-cryptography==42.0.2
-aiofiles==23.2.1
-jinja2==3.1.3
-beautifulsoup4==4.12.3
-lxml==5.1.0
-pdfminer.six==20221105
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
+# Runtime dependencies (pinned). Install: pip install -r requirements.txt
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+
+# Data layer — SQLAlchemy 2.x + Alembic migrations. PostgreSQL is the production
+# target; SQLite remains supported for single-user/self-host deployments.
+sqlalchemy==2.0.52
+alembic==1.19.2
+psycopg2-binary==2.9.13
+
+# Validation / settings — email-validator is required by pydantic EmailStr.
+pydantic==2.13.5
+pydantic-settings==2.15.0
+email-validator==2.3.0
+python-multipart==0.0.32
+
+# Documents: PDF/DOCX parsing and generation.
+pypdf==6.18.0
+python-docx==1.2.0
+reportlab==5.0.1
+pdfminer.six==20260107
+
+# HTTP + scraping primitives.
+httpx==0.28.1
+beautifulsoup4==4.15.0
+lxml==6.1.3
+aiofiles==25.1.0
+jinja2==3.1.6
+
+# Security: JWT signing (PyJWT), symmetric encryption for the vault, password
+# hashing. NOTE: passlib is deliberately NOT used (incompatible with bcrypt>=5)
+# and python-jose was replaced by PyJWT to drop its unmaintained ecdsa dependency.
+PyJWT==2.13.0
+cryptography==50.0.1
+bcrypt==5.0.0
+
+# DNS MX verification for contact discovery (no SMTP probing).
+dnspython==2.8.0
+
+# Transitive but security-relevant: pinned so the dependency audit is meaningful.
+starlette==1.6.0

@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import client from '../api/client'
+import client, { apiError as apiErrorMessage } from '../api/client'
 import { Settings as SettingsIcon, Save, Bot, Search, Sliders, Mail, Shield, Zap, TrendingUp } from 'lucide-react'
 
-const WORKFLOWS = ['parse','keyword_extract','scoring','resume_gen','classify','email_gen','funding_scan']
+const WORKFLOWS = ['parse','keyword_extract','scoring','resume_gen','classify','email_gen','form_detect','funding_scan','tagging']
 
 export default function Settings(){
   const [data, setData]=useState<any>(null)
@@ -24,7 +24,19 @@ export default function Settings(){
 
   const save=async()=>{
     setSaving(true); setMsg('')
-    try{ await client.put('/api/settings', data); setMsg('Saved ✓'); setTimeout(()=>setMsg(''), 2000)} finally{ setSaving(false)}
+    try{
+      // The API validates against a whitelist; `_meta` and read-only flags
+      // (api_key_set, configured, password_set…) must never be echoed back.
+      const writable = (data._meta?.writable || {}) as Record<string, string[]>
+      const payload: Record<string, Record<string, unknown>> = {}
+      Object.entries(writable).forEach(([cat, keys])=>{
+        const values: Record<string, unknown> = {}
+        keys.forEach((key: string)=>{ if(data[cat] && key in data[cat]) values[key] = data[cat][key] })
+        if(Object.keys(values).length) payload[cat] = values
+      })
+      await client.put('/api/settings', payload)
+      setMsg('Saved ✓'); setTimeout(()=>setMsg(''), 2000)
+    }catch(e){ setMsg(apiErrorMessage(e)) }finally{ setSaving(false)}
   }
   const update=(cat:string, key:string, value:any)=> setData({...data, [cat]: {...data[cat], [key]: value}})
 

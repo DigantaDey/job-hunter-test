@@ -1,7 +1,8 @@
-import re
 import json
-from typing import Dict, Any, Tuple
-from app.services.ai_client import chat_completion, AIClientError
+from typing import Any, Dict, Tuple
+
+from app.services.ai_client import AIClientError, chat_completion
+
 
 def heuristic_company_size(company_info: Dict[str,Any], job: Dict[str,Any]) -> str:
     text = (job.get("description","") + " " + job.get("company","") + " " + json.dumps(company_info)).lower()

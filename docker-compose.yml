@@ -1,18 +1,25 @@
-version: "3.8"
+# Development topology: hot-reload API + Vite dev server with HMR.
+#
+#   docker compose up --build
+#
+# For a production-like stack (PostgreSQL, migrations, standalone worker) use
+#   docker compose -f docker-compose.prod.yml up -d --build
+
 services:
   backend:
     build: ./backend
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
-      - AI_BASE_URL=${AI_BASE_URL:-https://api.openai.com/v1}
-      - AI_API_KEY=${AI_API_KEY:-}
-      - AI_MODEL=${AI_MODEL:-gpt-4o-mini}
-      - LIVE_SCRAPING_ENABLED=${LIVE_SCRAPING_ENABLED:-true}
+      DATABASE_URL: sqlite:////app/data/jobhunter.db
+      UPLOAD_DIR: /app/data/uploads
+      GENERATED_DIR: /app/data/generated
+      SCREENSHOT_DIR: /app/data/screenshots
     volumes:
       - ./backend:/app
-      - ./uploads:/app/uploads
-      - ./generated:/app/generated
+      - backend-data:/app/data
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:
@@ -24,4 +31,10 @@ services:
     environment:
       # Inside the compose network the backend is reachable as "backend".
       - VITE_API_PROXY_TARGET=http://backend:8000
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
     command: npm run dev
+
+volumes:
+  backend-data:

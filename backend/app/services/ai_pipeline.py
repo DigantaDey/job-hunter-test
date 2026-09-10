@@ -1,10 +1,12 @@
 import asyncio
 import time
-from typing import Dict, Any, Optional
-from collections import deque
 import uuid
+from collections import deque
+from typing import Any, Dict, Optional
+
 from app.core.rate_limiter import rate_limiter
 from app.services.ai_client import ping
+
 
 class AIRequest:
     def __init__(self, workflow: str, prompt: str, priority: int = 5, model: str = None, extra: Dict[str,Any]=None):
