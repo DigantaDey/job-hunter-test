@@ -52,12 +52,33 @@ Launch-hardening pass: fixes for defects found while booting a fresh checkout
   Settings (so `BACKUP_DIR` in `.env` works) and the production image now ships
   `postgresql-client` so `pg_dump` backups are possible at all.
 
+### Changed
+
+- **Consent gates now live on the routes** — `require_consent()` was defined but
+  never wired, so the "consents gate automation/outreach" claim was only enforced
+  per call site. `POST /api/emails/{id}/send` now requires the `outreach`
+  disclosure and `POST /api/jobs/{id}/apply` requires the `automation` disclosure
+  on the branch that would really submit (both answer 403 `consent_required`,
+  naming the disclosure). Dry-run preparation is unaffected, and
+  `compliance_report()` still re-checks consent inside `send_email()`, which is
+  what protects queued/worker sends that never touch the route.
+  ⚠️ API contract change: `/send` without consent was `200 {sent: false, blocked:
+  true}` and is now `403`.
+- **`METRICS_TOKEN` is required in production** while `METRICS_ENABLED=true`
+  (otherwise `/api/metrics` is anonymous *and* exempt from rate limiting). Set
+  `METRICS_ENABLED=false` to opt out. The token is now compared in constant time
+  and the header form is preferred over `?metrics_token=` (query strings leak
+  into access logs).
+
 ### Added
 
 - **`backend/scripts/create_user.py`** — create, reset, promote, deactivate and list
   accounts from the command line (the supported way to provision testers without
   opening registration). Documented in the README's "Accounts & test logins".
-- 28 regression tests pinning every defect above (`backend/tests/test_regressions.py`).
+- **The SPA explains a refused send** — a blocked or consent-gated send now shows
+  *why* (compliance blockers, or the exact missing disclosure plus a button that
+  records it and retries) instead of silently leaving the email in `queued`.
+- 35 regression tests pinning every defect above (`backend/tests/test_regressions.py`).
 
 ## [2.0.0] — 2026-09-11
 

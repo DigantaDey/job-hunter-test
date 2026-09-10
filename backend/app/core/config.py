@@ -577,6 +577,11 @@ class Settings(BaseSettings):
                 )
         if self.autofill_allow_submit and not self.autofill_enabled:
             problems.append("AUTOFILL_ALLOW_SUBMIT requires AUTOFILL_ENABLED=true")
+        if self.metrics_enabled and not (self.metrics_token or "").strip():
+            problems.append(
+                "METRICS_TOKEN must be set when METRICS_ENABLED=true (/api/metrics is otherwise "
+                "readable by anyone) — or set METRICS_ENABLED=false and scrape nothing"
+            )
         if not self.public_base_url or "localhost" in self.public_base_url:
             problems.append("PUBLIC_BASE_URL must be the public https URL of this deployment")
         if problems:

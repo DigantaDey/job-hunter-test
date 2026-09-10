@@ -1,15 +1,16 @@
 """Email approval bucket, compliance, sending and engagement endpoints."""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import CurrentUser, DbSession
 from app.core import audit
+from app.core.auth import require_consent
 from app.core.logging import get_logger
-from app.models.models import Email, EmailEvent, EmailOptOut, Job
+from app.models.models import Email, EmailEvent, EmailOptOut, Job, User
 from app.schemas.schemas import EmailOut
 from app.services.job_queue import enqueue
 from app.services.outreach import compliance_report, draft_email, send_email, suppress, tracking_urls
@@ -123,7 +124,17 @@ class SendRequest(BaseModel):
 
 
 @router.post("/{email_id}/send")
-def send_now(email_id: int, payload: SendRequest, request: Request, user: CurrentUser, db: DbSession):
+def send_now(
+    email_id: int,
+    payload: SendRequest,
+    request: Request,
+    # The consent gate lives at the route so it cannot be forgotten: this is the
+    # only endpoint that puts mail on the wire. `compliance_report()` inside
+    # outreach.send_email() re-checks it, which is what protects the worker path
+    # (queued sends) that never goes through this route.
+    user: Annotated[User, Depends(require_consent("outreach"))],
+    db: DbSession,
+):
     row = _email_or_404(db, user.id, email_id)
     result = send_email(db, user, row, otp=payload.otp, allow_real=payload.allow_real)
     if result.get("sent"):

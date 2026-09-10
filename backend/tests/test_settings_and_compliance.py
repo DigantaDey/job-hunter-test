@@ -104,8 +104,26 @@ def test_outreach_consent_blocks_send(client, auth, uploaded_resume, db):
     report = client.post(f"/api/emails/{email_id}/check", headers=auth).json()
     assert "outreach_consent_missing" in report["blockers"]
     assert "terms_not_accepted" in report["blockers"]
-    blocked = client.post(f"/api/emails/{email_id}/send", json={}, headers=auth).json()
-    assert blocked["sent"] is False
+
+    # The route itself is gated: a missing disclosure is a 403 that names it,
+    # not a 200 the UI can silently ignore.
+    denied = client.post(f"/api/emails/{email_id}/send", json={}, headers=auth)
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "consent_required"
+    assert denied.json()["detail"]["consent"] == "outreach"
+    db.expire_all()
+    assert db.query(Email).filter(Email.id == email_id).first().status == "pending_approval"
+
+
+def test_send_succeeds_the_consent_gate_once_accepted(client, auth, uploaded_resume, db):
+    """After accepting the disclosure the gate passes (dry run still blocks the send)."""
+    draft = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=auth).json()
+    email_id = draft["email"]["id"]
+    assert client.post("/api/account/consent", json={"outreach": True}, headers=auth).status_code == 200
+    result = client.post(f"/api/emails/{email_id}/send", json={}, headers=auth)
+    assert result.status_code == 200
+    assert result.json()["sent"] is False
+    assert "consent" not in (result.json().get("error") or "")
 
 
 def test_dry_run_reports_no_transmission(client, full_consent, uploaded_resume, monkeypatch):

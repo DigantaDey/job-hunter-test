@@ -15,7 +15,7 @@ for before calling the deployment production-grade.
 | 3 | `DATABASE_URL` points at PostgreSQL | `postgresql+psycopg2://user:pass@host:5432/db` |
 | 4 | `CORS_ORIGINS` and `ALLOWED_HOSTS` list your real domain(s) | e.g. `https://app.example.com` / `app.example.com` |
 | 5 | TLS terminates in front of the app | reverse proxy or platform LB; HSTS is on in production |
-| 6 | `METRICS_TOKEN` set if `/api/metrics` is reachable publicly | scrape with `Authorization: Bearer <token>` |
+| 6 | `METRICS_TOKEN` set (or `METRICS_ENABLED=false`) | **required**: production refuses to start with metrics enabled and no token. Scrape with `Authorization: Bearer <token>` |
 | 7 | Email block configured **only if** you send real mail | `EMAIL_SENDING_ENABLED`, `EMAIL_DRY_RUN=false`, `EMAIL_POSTAL_ADDRESS`, `EMAIL_UNSUBSCRIBE_BASE_URL`, SPF/DKIM/DMARC |
 | 8 | `EMAIL_WEBHOOK_TOKEN` set if your provider posts engagement events | `POST /api/track/events` |
 | 9 | `ALLOW_SYNTHETIC_FUNDING_DATA=false` | demo data must never reach users |

@@ -312,3 +312,103 @@ def test_backup_defaults_come_from_settings(monkeypatch, tmp_path):
     assert backup_script.main([]) == 0
     assert (tmp_path / "from-settings").is_dir()
     assert len(list((tmp_path / "from-settings").glob("jobhunter-*"))) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 11. Consent gates live on the routes that act on the outside world
+# --------------------------------------------------------------------------- #
+def test_sending_email_requires_the_outreach_disclosure(client, auth, uploaded_resume):
+    draft = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=auth).json()
+    email_id = draft["email"]["id"]
+
+    denied = client.post(f"/api/emails/{email_id}/send", json={}, headers=auth)
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["consent"] == "outreach"
+
+    assert client.post("/api/account/consent", json={"outreach": True}, headers=auth).status_code == 200
+    assert client.post(f"/api/emails/{email_id}/send", json={}, headers=auth).status_code == 200
+
+
+def test_auto_submit_requires_the_automation_disclosure(client, auth, db, uploaded_resume, monkeypatch):
+    """Dry-run preparation stays available; only a real submission is gated."""
+    from app.core.config import settings
+    from app.models.models import Job, User
+
+    owner = db.query(User).order_by(User.id).first()
+    job = Job(user_id=owner.id, title="Backend Engineer", company="FinCo", location="Remote",
+              description="Python, FastAPI, PostgreSQL, AWS, Kubernetes.",
+              url="https://jobs.lever.co/finco/1", source="lever", dedupe_key="lever:1",
+              status="discovered", score=80.0)
+    db.add(job)
+    db.commit()
+
+    client.put("/api/settings", json={"application": {"allow_auto_submit": True}}, headers=auth)
+    monkeypatch.setattr(settings, "autofill_enabled", True)
+    monkeypatch.setattr(settings, "autofill_dry_run", False)
+
+    denied = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth)
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "consent_required"
+    assert denied.json()["detail"]["consent"] == "automation"
+
+    assert client.post("/api/account/consent", json={"automation": True}, headers=auth).status_code == 200
+    accepted = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth)
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "queued"
+
+
+def test_dry_run_apply_does_not_require_automation_consent(client, auth, db, uploaded_resume, monkeypatch):
+    """A platform that only prepares applications must not demand the disclosure."""
+    from app.core.config import settings
+    from app.models.models import Job, User
+
+    owner = db.query(User).order_by(User.id).first()
+    job = Job(user_id=owner.id, title="Backend Engineer", company="FinCo", location="Remote",
+              description="Python, FastAPI, PostgreSQL.", url="https://jobs.lever.co/finco/2",
+              source="lever", dedupe_key="lever:2", status="discovered", score=70.0)
+    db.add(job)
+    db.commit()
+
+    monkeypatch.setattr(settings, "autofill_enabled", True)
+    monkeypatch.setattr(settings, "autofill_dry_run", True)  # prepare only
+    response = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth)
+    assert response.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# 12. /api/metrics must not be left open in production
+# --------------------------------------------------------------------------- #
+def _production(**overrides):
+    values = dict(
+        environment="production",
+        secret_key="a-very-long-and-unique-production-secret-key-1234567890",
+        encryption_key="another-long-and-unique-encryption-key-1234567890",
+        database_url="postgresql+psycopg2://user:pass@db:5432/jobhunter",
+        cors_origins="https://app.example.com",
+        allowed_hosts="app.example.com",
+        metrics_token="metrics-token",
+    )
+    values.update(overrides)
+    return Settings(**values)
+
+
+def test_production_requires_a_metrics_token():
+    with pytest.raises(ValueError) as excinfo:
+        _production(metrics_token="")
+    assert "METRICS_TOKEN" in str(excinfo.value)
+
+
+def test_metrics_may_be_switched_off_instead():
+    config = _production(metrics_token="", metrics_enabled=False)
+    assert config.metrics_enabled is False
+
+
+def test_metrics_endpoint_accepts_the_token_by_header(client, monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "metrics_token", "scrape-secret")
+    assert client.get("/api/metrics").status_code == 401
+    assert client.get("/api/metrics", params={"metrics_token": "scrape-secret"}).status_code == 200
+    ok = client.get("/api/metrics", headers={"Authorization": "Bearer scrape-secret"})
+    assert ok.status_code == 200
+    assert "jobhunter_info" in ok.text

@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
-import client from '../api/client'
-import { Mail, Send, Check, Pencil, Search, Building2, User, Clock, AlertTriangle } from 'lucide-react'
+import client, { apiError } from '../api/client'
+import { Mail, Send, Check, Pencil, Search, Building2, User, Clock, AlertTriangle, Loader2 } from 'lucide-react'
+
+/** A per-email message: a blocked send or a missing disclosure, with an action. */
+type Notice = { id: number; kind: 'err' | 'warn'; text: string; consent?: string }
 
 export default function Emails(){
   const [emails, setEmails]=useState<any[]>([])
@@ -10,6 +13,8 @@ export default function Emails(){
   const [jobs, setJobs]=useState<any[]>([])
   const [otpFor, setOtpFor]=useState<number|null>(null)
   const [otp, setOtp]=useState('')
+  const [notice, setNotice]=useState<Notice|null>(null)
+  const [busyId, setBusyId]=useState<number|null>(null)
 
   const load=async()=>{
     const {data}=await client.get('/api/emails', {params: filter?{status:filter}: {}})
@@ -28,13 +33,39 @@ export default function Emails(){
     load()
   }
   const approve=async(id:number)=>{ await client.post(`/api/emails/${id}/approve`); load()}
+
+  /** Record one disclosure (the user clicks it — never accepted silently). */
+  const acceptDisclosure=async(id:number, kind:string)=>{
+    setBusyId(id)
+    try{
+      await client.post('/api/account/consent', {[kind]: true})
+      setNotice(null)
+      await send(id)
+    }catch(e:any){ setNotice({id, kind:'err', text: apiError(e, 'Could not record consent')}) }
+    finally{ setBusyId(null) }
+  }
+
   const send=async(id:number, code?:string)=>{
-    const res=await client.post(`/api/emails/${id}/send`, null, {params: code?{otp:code}:{}})
-    if(res.data.needs_otp){
-      setOtpFor(id); setOtp('')
-    } else {
-      setOtpFor(null); setOtp(''); load()
-    }
+    setBusyId(id)
+    try{
+      const res=await client.post(`/api/emails/${id}/send`, null, {params: code?{otp:code}:{}})
+      if(res.data.blocked){
+        // The compliance gate refused it: say which gate, instead of looking like nothing happened.
+        const blockers:string[]=res.data.compliance?.blockers || []
+        setNotice({id, kind:'warn', text: `Not sent — ${blockers.join(', ') || 'blocked by the compliance gate'}`})
+        return
+      }
+      if(res.data.needs_otp){ setOtpFor(id); setOtp(''); setNotice(null); return }
+      setOtpFor(null); setOtp(''); setNotice(null); load()
+    }catch(e:any){
+      const detail=e?.response?.data?.detail
+      if(detail?.code==='consent_required'){
+        // 403 from the consent gate: offer the exact disclosure that is missing.
+        setNotice({id, kind:'err', text: detail.message || `Accept the '${detail.consent}' disclosure to send.`, consent: detail.consent})
+        return
+      }
+      setNotice({id, kind:'err', text: apiError(e, 'Send failed')})
+    }finally{ setBusyId(null) }
   }
 
   return (
@@ -60,7 +91,10 @@ export default function Emails(){
 
       <div className="grid gap-3">
         {emails.length===0 ? <div className="card p-8 text-center mono text-sm text-zinc-500">No emails in bucket. Generate for startups/small companies — finds hiring manager via AI + hunter pattern, drafts with SMTP (handles 2FA OTP).</div> :
-        emails.map(e=> (
+        emails.map(e=> {
+          // Captured once per row so TypeScript keeps the null-check below.
+          const rowNotice = notice && notice.id===e.id ? notice : null
+          return (
           <div key={e.id} className="card p-4">
             <div className="flex flex-wrap gap-3 items-start justify-between">
               <div>
@@ -69,7 +103,7 @@ export default function Emails(){
               </div>
               <div className="flex gap-2">
                 {e.status==='pending_approval' && <button onClick={()=>approve(e.id)} className="px-3 py-1.5 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-xs inline-flex items-center gap-1"><Check className="w-3.5 h-3.5"/> Approve → queue</button>}
-                {(e.status==='queued' || e.status==='needs_otp') && <button onClick={()=>send(e.id)} className="px-3 py-1.5 rounded-full bg-blue-600 text-white text-xs inline-flex items-center gap-1"><Send className="w-3.5 h-3.5"/> Send via SMTP</button>}
+                {(e.status==='queued' || e.status==='needs_otp') && <button onClick={()=>send(e.id)} disabled={busyId===e.id} className="px-3 py-1.5 rounded-full bg-blue-600 text-white text-xs inline-flex items-center gap-1 disabled:opacity-50">{busyId===e.id ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <Send className="w-3.5 h-3.5"/>} Send via SMTP</button>}
               </div>
             </div>
             <div className="mt-3 grid lg:grid-cols-[1fr_1.4fr] gap-3">
@@ -86,6 +120,23 @@ export default function Emails(){
               <label className="text-xs mono flex items-center gap-1"><Pencil className="w-3.5 h-3.5"/> Body (editable)</label>
               <textarea defaultValue={e.body} onBlur={ev=>update(e,'body',ev.target.value)} rows={6} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700 leading-relaxed"/>
               {e.status==='needs_otp' && <div className="mt-2 text-xs mono p-2 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 flex gap-2"><AlertTriangle className="w-3.5 h-3.5 shrink-0"/> SMTP 2FA needed — enter the OTP / app password from your provider (or verify on another device).</div>}
+              {rowNotice && (
+                <div className={`mt-2 text-xs mono p-2 rounded-lg border flex flex-wrap items-center gap-2 ${
+                  rowNotice.kind==='warn'
+                    ? 'bg-amber-50 dark:bg-amber-950 border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200'
+                    : 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-900 text-red-700 dark:text-red-300'}`}>
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0"/>
+                  <span className="flex-1">{rowNotice.text}</span>
+                  {rowNotice.consent && (
+                    <button onClick={()=>acceptDisclosure(e.id, rowNotice.consent!)} disabled={busyId===e.id}
+                            className="px-3 py-1 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-[11px] inline-flex items-center gap-1 disabled:opacity-50">
+                      {busyId===e.id && <Loader2 className="w-3 h-3 animate-spin"/>}
+                      Accept the “{rowNotice.consent}” disclosure &amp; send
+                    </button>
+                  )}
+                  <button onClick={()=>setNotice(null)} className="text-[11px] underline opacity-70">dismiss</button>
+                </div>
+              )}
               {otpFor===e.id && (
                 <div className="mt-2 flex gap-2">
                   <input value={otp} onChange={ev=>setOtp(ev.target.value)} placeholder="OTP / app password" type="password" className="flex-1 border rounded-xl px-3 py-2 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700"/>
@@ -94,7 +145,8 @@ export default function Emails(){
               )}
             </div>
           </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )

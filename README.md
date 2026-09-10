@@ -130,9 +130,11 @@ Submitting through a browser requires the optional Playwright extra and *two* ex
 (`AUTOFILL_ENABLED`, `AUTOFILL_ALLOW_SUBMIT`, plus the automation consent). Without them the run is
 dry-run: fields are mapped and a screenshot is stored, but nothing is submitted.
 
-**Outreach** — draft → compliance check → send. The gate blocks on missing consent, missing terms,
-suppressed recipients, invalid addresses, daily limits, missing SMTP, missing postal address and
-missing unsubscribe URL. Real sends are off by default (`EMAIL_SENDING_ENABLED=false`,
+**Outreach** — draft → disclosure → compliance check → send. `POST /api/emails/{id}/send` requires the
+`outreach` disclosure (403 `consent_required`, and the SPA offers to record it and retry); the
+compliance gate then blocks on missing terms, suppressed recipients, invalid addresses, daily
+limits, missing SMTP, missing postal address and missing unsubscribe URL. Both layers are enforced
+in code — the second one is what protects worker/queued sends that never touch the route. Real sends are off by default (`EMAIL_SENDING_ENABLED=false`,
 `EMAIL_DRY_RUN=true`). Opens are tracked with a 1×1 pixel and unsubscribes are honoured immediately
 via a one-click endpoint and the suppression list.
 
@@ -183,7 +185,7 @@ stored encrypted where they are secret.
 
 ```bash
 # backend — hermetic: temp SQLite, no network, no AI key
-cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 237 tests
+cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 244 tests
 
 # lint
 ruff check backend
