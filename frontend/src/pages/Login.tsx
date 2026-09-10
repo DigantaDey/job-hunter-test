@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react'
+import { Navigate, useLocation } from 'react-router-dom'
 import { Loader2, LockKeyhole, Mail, ShieldCheck, User as UserIcon } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 
@@ -9,10 +10,17 @@ import { useAuth } from '../context/AuthContext'
  * instance still needs its owner account and whether open registration is on.
  */
 export default function Login() {
-  const { status, login, bootstrap, register, error } = useAuth()
+  const { user, status, loading, login, bootstrap, register, error } = useAuth()
+  const location = useLocation()
   const [mode, setMode] = useState<'login' | 'register' | null>(null)
   const [form, setForm] = useState({ email: '', password: '', name: '' })
   const [busy, setBusy] = useState(false)
+
+  // Send an already-authenticated visitor to the page they came from (or the
+  // dashboard). This also performs the post-login redirect: a successful
+  // sign-in sets `user`, which re-renders this route into the <Navigate>.
+  const from = (location.state as { from?: { pathname: string } } | null)?.from?.pathname || '/'
+  if (!loading && user) return <Navigate to={from} replace />
 
   const bootstrapRequired = status?.bootstrap_required === true
   // The API reports both keys (registration_open is canonical) — accept either
