@@ -4,6 +4,7 @@ import { LayoutDashboard, Briefcase, FileText, Mail, Vault, Settings, ScrollText
 import { useTheme } from '../hooks/useTheme'
 import client from '../api/client'
 import { useAuth } from '../context/AuthContext'
+import { ErrorBoundary } from './ErrorBoundary'
 
 const nav = [
   {to:'/', label:'Dashboard', icon: LayoutDashboard},
@@ -100,7 +101,11 @@ export default function Layout() {
           {nav.map(n=> <NavLink key={n.to} to={n.to} className={({isActive})=> `px-3 py-1.5 rounded-full text-xs whitespace-nowrap border ${isActive?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`}>{n.label}</NavLink>)}
         </div>
         <main className="flex-1 p-4 lg:p-6 max-w-[1600px] w-full mx-auto">
-          <Outlet />
+          {/* Keyed by pathname: a page that throws is contained here — the
+              sidebar, session and other routes keep working. */}
+          <ErrorBoundary scope="route" resetKey={loc.pathname}>
+            <Outlet />
+          </ErrorBoundary>
         </main>
         <footer className="px-6 py-4 text-[11px] mono text-zinc-500 dark:text-zinc-500 text-center border-t dark:border-zinc-800 bg-white/50 dark:bg-zinc-900/50">
           JobHunter AI v2.0 — accurate by design • per-user encrypted vault • resume fact guard • consent-gated automation • audit trail

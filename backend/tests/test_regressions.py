@@ -507,3 +507,35 @@ def test_second_listener_on_the_same_port_does_not_crash(monkeypatch):
         assert first.running is True
     finally:
         first.stop()
+
+
+# --------------------------------------------------------------------------- #
+# N. Account page: /billing-usage returns nested objects, not flat counters.
+#
+# The Account screen used to render `usage[key]` straight into JSX for
+# ('jobs', 'resumes', 'emails'). Two of those are objects, so React threw
+# "Objects are not valid as a React child (found: object with keys
+# {sent_today, pending_approval})" — minified error #31 — and the error
+# boundary replaced the whole page with "Something went wrong".
+#
+# The UI now flattens the payload explicitly. These assertions pin the shape it
+# flattens, so a backend change that alters the contract fails here instead of
+# blanking the page in production.
+# --------------------------------------------------------------------------- #
+def test_billing_usage_shape_is_stable_for_the_account_page(client, auth):
+    body = client.get("/api/account/billing-usage", headers=auth).json()
+
+    # Nested buckets — the UI must read a named field out of each, never render
+    # the bucket itself.
+    assert isinstance(body["jobs"], dict)
+    assert {"total", "today", "applied"} <= set(body["jobs"])
+    assert isinstance(body["emails"], dict)
+    assert {"sent_today", "pending_approval"} <= set(body["emails"])
+
+    # Scalars — safe to render directly.
+    assert isinstance(body["resumes"], int)
+    assert isinstance(body["vault_entries"], int)
+
+    for bucket in ("jobs", "emails"):
+        for key, value in body[bucket].items():
+            assert isinstance(value, int), f"{bucket}.{key} must be an int"

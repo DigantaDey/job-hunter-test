@@ -9,6 +9,49 @@ type AuditRow = { id: number; action: string; target: string; created_at: string
 type ApiKeyRow = { id: number; name: string; prefix: string; last_used_at?: string; revoked_at?: string }
 
 /**
+ * Shape of `GET /api/account/billing-usage`.
+ *
+ * `jobs` and `emails` are *objects*, not counters — typing them honestly is
+ * what stops a `{usage[key]}` style render from compiling (rendering an object
+ * as a React child throws the infamous minified error #31 at runtime).
+ */
+type UsageResponse = {
+  jobs: { total: number; today: number; applied: number }
+  emails: { sent_today: number; pending_approval: number }
+  resumes: number
+  vault_entries: number
+  ai_tokens: Record<string, Record<string, number>>
+}
+
+/**
+ * Coerce an API value into a number that is always safe to render.
+ * Accepts either a plain counter or a `{ total: n }`-style bucket so an older
+ * or newer backend can never blank the page.
+ */
+function count(value: unknown, key = 'total'): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (value && typeof value === 'object') {
+    const inner = (value as Record<string, unknown>)[key]
+    if (typeof inner === 'number' && Number.isFinite(inner)) return inner
+  }
+  return 0
+}
+
+/** Flatten the nested usage payload into scalar cards the UI can render. */
+function usageCards(usage: UsageResponse) {
+  return [
+    { label: 'jobs', value: count(usage.jobs), hint: `${count(usage.jobs, 'applied')} applied` },
+    { label: 'resumes', value: count(usage.resumes) },
+    {
+      label: 'emails',
+      value: count(usage.emails, 'sent_today'),
+      hint: `${count(usage.emails, 'pending_approval')} pending`
+    },
+    { label: 'vault', value: count(usage.vault_entries) }
+  ]
+}
+
+/**
  * Account & privacy: consent management, GDPR export, API keys and the
  * irreversible delete. Everything here maps to a documented API endpoint.
  */
@@ -20,24 +63,35 @@ export default function Account() {
   const [keys, setKeys] = useState<ApiKeyRow[]>([])
   const [newKeyName, setNewKeyName] = useState('')
   const [freshKey, setFreshKey] = useState<string | null>(null)
-  const [usage, setUsage] = useState<Record<string, number> | null>(null)
+  const [usage, setUsage] = useState<UsageResponse | null>(null)
   const [confirmEmail, setConfirmEmail] = useState('')
   const [banner, setBanner] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [busy, setBusy] = useState(false)
 
   const load = useCallback(async () => {
-    const [d, c, a, k, u] = await Promise.all([
+    // `allSettled`, not `all`: one flaky panel (usage counters, API keys…)
+    // must not blank the consent controls or the delete form.
+    const [d, c, a, k, u] = await Promise.allSettled([
       client.get('/api/account/disclosures'),
       client.get('/api/account/consent'),
       client.get('/api/account/audit?limit=50'),
       client.get('/api/auth/api-keys'),
       client.get('/api/account/billing-usage')
     ])
-    setDisclosures(d.data.disclosures || {})
-    setConsent(c.data)
-    setAudit(a.data || [])
-    setKeys(k.data || [])
-    setUsage(u.data || null)
+
+    if (d.status === 'fulfilled') setDisclosures(d.value.data?.disclosures || {})
+    if (c.status === 'fulfilled') {
+      setConsent({
+        consents: c.value.data?.consents || {},
+        granted: c.value.data?.granted || {}
+      })
+    }
+    if (a.status === 'fulfilled') setAudit(Array.isArray(a.value.data) ? a.value.data : [])
+    if (k.status === 'fulfilled') setKeys(Array.isArray(k.value.data) ? k.value.data : [])
+    if (u.status === 'fulfilled') setUsage((u.value.data as UsageResponse) || null)
+
+    const failed = [d, c, a, k, u].find((r) => r.status === 'rejected')
+    if (failed?.status === 'rejected') throw failed.reason
   }, [])
 
   useEffect(() => {
@@ -167,11 +221,12 @@ export default function Account() {
             Download JSON export
           </button>
           {usage && (
-            <div className="mt-4 grid grid-cols-3 gap-2 text-center">
-              {['jobs', 'resumes', 'emails'].map((key) => (
-                <div key={key} className="p-2 rounded-xl bg-zinc-50 dark:bg-zinc-800">
-                  <div className="text-lg font-semibold">{usage[key] ?? 0}</div>
-                  <div className="text-[11px] mono text-zinc-500">{key}</div>
+            <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+              {usageCards(usage).map((card) => (
+                <div key={card.label} className="p-2 rounded-xl bg-zinc-50 dark:bg-zinc-800">
+                  <div className="text-lg font-semibold">{card.value}</div>
+                  <div className="text-[11px] mono text-zinc-500">{card.label}</div>
+                  {card.hint && <div className="text-[10px] mono text-zinc-400 mt-0.5">{card.hint}</div>}
                 </div>
               ))}
             </div>
