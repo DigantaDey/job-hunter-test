@@ -50,15 +50,15 @@ PLANS: Dict[str, Dict[str, Any]] = {
             "tailored_resumes_per_month": 5,
             "cover_letters_per_month": 5,
             "resume_polish_per_month": 3,
-            # Applications
+            # Applications - core, free gets low limit not blocked
             "applications_per_month": 20,
             "automation_runs_per_month": 5,
-            "autofill_enabled": False,
+            "autofill_enabled": True,
             # Outreach
             "outreach_per_month": 10,
             "outreach_per_day": 3,
             "contact_discovery_per_month": 20,
-            # Analytics
+            # Analytics - basic for free, advanced for pro
             "advanced_analytics": False,
             "company_intel_per_month": 10,
             # Interview
@@ -77,12 +77,12 @@ PLANS: Dict[str, Dict[str, Any]] = {
             "can_run_automation": True,
             "can_send_outreach": True,
             "can_use_advanced_matching": False,
-            "can_access_analytics": False,
+            "can_access_analytics": True,
             "can_access_advanced_analytics": False,
-            "can_use_company_intel": False,
+            "can_use_company_intel": True,
             "can_use_interview_prep": True,
             "can_use_funding_radar": True,
-            "can_use_autofill": False,
+            "can_use_autofill": True,
             "can_use_scheduled_workflows": False,
             "can_use_api_keys": False,
             "can_export_data": True,
@@ -228,16 +228,13 @@ def get_user_plan(db: Session, user_id: int) -> str:
     sub = db.query(Subscription).filter(Subscription.user_id == user_id).first()
     if not sub:
         return "free"
-    # Handle expired / canceled beyond grace
     if sub.status in ("canceled", "expired"):
         if sub.grace_until and sub.grace_until > datetime.utcnow():
             return sub.plan
         return "free"
     if sub.status == "past_due":
-        # Allow grace period
         if sub.grace_until and sub.grace_until > datetime.utcnow():
             return sub.plan
-        # Past grace -> downgrade to free but keep subscription record
         return "free"
     return sub.plan or "free"
 
@@ -281,15 +278,9 @@ def limit_for(db: Session, user_id: int, limit_key: str) -> int:
 
 
 def usage_for(db: Session, user_id: int, capability_or_limit: str, period: Optional[str] = None) -> Tuple[int, int]:
-    """
-    Returns (used, limit) for a given capability/limit key.
-    For boolean limits (e.g., advanced_matching) returns (0, 1) if allowed.
-    """
     period = period or current_period()
-    # Resolve limit key
     limit_key = CAPABILITY_TO_LIMIT.get(capability_or_limit, capability_or_limit)
     limit_val = limit_for(db, user_id, limit_key)
-    # Boolean features
     if isinstance(limit_val, bool):
         return (0, 1) if limit_val else (0, 0)
 
@@ -307,17 +298,8 @@ def usage_for(db: Session, user_id: int, capability_or_limit: str, period: Optio
 
 
 def check_limit(db: Session, user_id: int, limit_key: str) -> Tuple[bool, int, int, str]:
-    """
-    Check if user is within limit.
-    Returns (allowed, used, limit, hint)
-    """
     used, lim = usage_for(db, user_id, limit_key)
     if lim == 0:
-        # 0 means unlimited? In our config 0 means not allowed for boolean? Let's treat 0 as blocked for boolean, but for numeric 0 means unlimited? We use bool separately.
-        # For numeric limits, 0 should be treated as unlimited only if plan explicitly says 0? We have no unlimited numeric; use large number.
-        # For safety: if limit is 0 and it's a boolean capability check, it's blocked.
-        # If it's numeric and 0, treat as blocked (free plan should have >0).
-        # Check if it's boolean feature
         plan = get_user_plan(db, user_id)
         cfg = get_plan_config(plan)
         raw = cfg["limits"].get(limit_key)
@@ -325,11 +307,7 @@ def check_limit(db: Session, user_id: int, limit_key: str) -> Tuple[bool, int, i
             allowed = bool(raw)
             hint = UPGRADE_HINTS.get(limit_key, "Upgrade to unlock this feature")
             return allowed, used, 1 if allowed else 0, hint
-        # Numeric 0 = unlimited? Let's treat 0 as unlimited for safety only if explicitly allowed capability
-        # But our plans have no 0 numeric limits except price. So block.
         if raw == 0:
-            # If capability is allowed but limit 0, treat as unlimited
-            # Actually for free plan all numeric >0, so 0 means unlimited
             return True, used, 0, ""
     allowed = used < lim if lim > 0 else True
     hint = UPGRADE_HINTS.get(limit_key, "") if not allowed else ""
@@ -340,7 +318,6 @@ def increment_usage(db: Session, user_id: int, capability: str, amount: int = 1)
     """Increment usage counter atomically (SELECT FOR UPDATE)."""
     period = current_period()
     limit_key = CAPABILITY_TO_LIMIT.get(capability, capability)
-    # Try to get existing with FOR UPDATE
     counter = (
         db.query(UsageCounter)
         .filter(
@@ -355,7 +332,6 @@ def increment_usage(db: Session, user_id: int, capability: str, amount: int = 1)
         counter.count += amount
         counter.updated_at = datetime.utcnow()
     else:
-        # Get limit snapshot
         lim = limit_for(db, user_id, limit_key)
         if isinstance(lim, bool):
             lim = 1 if lim else 0
@@ -373,13 +349,8 @@ def increment_usage(db: Session, user_id: int, capability: str, amount: int = 1)
 
 
 def enforce(db: Session, user_id: int, capability_or_limit: str):
-    """
-    Enforce entitlement, raise 402/429 if exceeded.
-    Use in routers before performing action.
-    """
     from fastapi import HTTPException
 
-    # First check capability boolean
     if capability_or_limit in CAPABILITY_TO_LIMIT:
         cap = capability_or_limit
         if not can(db, user_id, cap):
@@ -395,7 +366,6 @@ def enforce(db: Session, user_id: int, capability_or_limit: str):
         limit_key = CAPABILITY_TO_LIMIT[cap]
     else:
         limit_key = capability_or_limit
-        # If it's a boolean limit like advanced_matching
         plan = get_user_plan(db, user_id)
         cfg = get_plan_config(plan)
         raw = cfg["limits"].get(limit_key)
@@ -405,7 +375,6 @@ def enforce(db: Session, user_id: int, capability_or_limit: str):
                 status_code=402,
                 detail={"code": "upgrade_required", "limit": limit_key, "message": hint},
             )
-        # If it's a capability that maps to boolean
         if capability_or_limit in get_plan_config("free")["capabilities"]:
             if not can(db, user_id, capability_or_limit):
                 raise HTTPException(
@@ -416,7 +385,7 @@ def enforce(db: Session, user_id: int, capability_or_limit: str):
                         "message": UPGRADE_HINTS.get(limit_key, "Upgrade required"),
                     },
                 )
-            return  # boolean capability passed
+            return
 
     allowed, used, lim, hint = check_limit(db, user_id, limit_key)
     if not allowed:
@@ -434,7 +403,6 @@ def enforce(db: Session, user_id: int, capability_or_limit: str):
 
 
 def entitlements_snapshot(db: Session, user_id: int) -> Dict[str, Any]:
-    """Full snapshot for UI: plan, limits, usage, capabilities."""
     plan = get_user_plan(db, user_id)
     cfg = get_plan_config(plan)
     sub = get_subscription(db, user_id)
@@ -442,7 +410,6 @@ def entitlements_snapshot(db: Session, user_id: int) -> Dict[str, Any]:
     usage = {}
     for key in cfg["limits"].keys():
         used, lim = usage_for(db, user_id, key, period=period)
-        # For bool, show allowed
         if isinstance(cfg["limits"][key], bool):
             usage[key] = {"allowed": bool(cfg["limits"][key]), "used": 0, "limit": 1 if cfg["limits"][key] else 0}
         else:

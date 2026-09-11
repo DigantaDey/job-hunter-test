@@ -164,8 +164,15 @@ def test_ai_credit_ledger_cost_tracking(db):
 def test_entitlements_free_cannot_use_pro_features(db):
     user = make_user(db)
     ent = entitlements_snapshot(db, user.id)
+    # Free should NOT have advanced matching, scheduled workflows, api keys (Pro features)
+    # But SHOULD have basic autofill and analytics (core features with limits)
     assert ent["capabilities"]["can_use_advanced_matching"] is False
-    assert ent["capabilities"]["can_use_autofill"] is False
+    assert ent["capabilities"]["can_use_scheduled_workflows"] is False
+    assert ent["capabilities"]["can_use_api_keys"] is False
+    assert ent["capabilities"]["can_access_advanced_analytics"] is False
+    # Core features should be available even in free
+    assert ent["capabilities"]["can_use_autofill"] is True
+    assert ent["capabilities"]["can_access_analytics"] is True
 
     user2 = make_user(db)
     sub = Subscription(user_id=user2.id, plan="pro_plus", status="active", provider="manual", current_period_start=datetime.now(timezone.utc))
@@ -174,3 +181,4 @@ def test_entitlements_free_cannot_use_pro_features(db):
     ent_plus = entitlements_snapshot(db, user2.id)
     assert ent_plus["capabilities"]["can_use_advanced_matching"] is True
     assert ent_plus["capabilities"]["can_use_autofill"] is True
+    assert ent_plus["capabilities"]["can_use_scheduled_workflows"] is True

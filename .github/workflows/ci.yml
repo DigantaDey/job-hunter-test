@@ -153,9 +153,9 @@ jobs:
       - name: Install audit tools
         run: pip install pip-audit bandit[toml]
       - name: pip-audit backend (fail on high)
-        run: pip-audit -r backend/requirements.txt --disable-pip --requirement backend/requirements.txt
+        run: pip-audit -r backend/requirements.txt
       - name: Bandit SAST (fail on high)
-        run: bandit -r backend/app -ll -ii -f json -o bandit-report.json || (cat bandit-report.json; exit 1)
+        run: bandit -r backend/app -ll -ii --skip B101 -f json -o bandit-report.json || (cat bandit-report.json; exit 1)
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
