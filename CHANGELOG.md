@@ -4,6 +4,78 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.0.3] — 2026-09-11
+
+Fixes the "AI offline / `invalid_api_key` even after adding an API key in
+Settings" defect class. Four independent root causes were found; each one alone
+can make the app claim the key is invalid or ignore it entirely.
+
+### Fixed
+
+- **Real AI features never used the key saved in Settings.** Every pipeline
+  (scoring, resume parsing, email generation, keyword extraction, …) called the
+  AI gateway without user context, so configuration resolved from *env only* —
+  the per-user key stored via Settings → AI API was consulted solely by the
+  status dot. AI calls therefore failed with `no_api_key` and silently fell
+  back to heuristics ("AI still offline") even with a valid key saved. The
+  gateway now resolves the ambient request/worker user (the `user_id_var`
+  context the auth layer and worker already maintain), so the user's key —
+  with owner and env fallback — powers every call, and per-user credit
+  accounting/entitlements finally see all operations.
+- **The status probe reported `invalid_api_key` for keys that work.** The dot
+  was judged purely by `GET {base_url}/models`: providers that restrict or do
+  not implement the models listing (Azure-style gateways, scoped keys, some
+  proxies) returned 401/403 and the UI declared the key invalid forever. The
+  probe now falls back to a minimal `POST /chat/completions` verification
+  (that is the endpoint the product uses); only a chat rejection is reported
+  as `invalid_api_key`, now including the provider's actual error message in
+  `detail`. Results are cached 60s so the 15s UI poll never burns tokens.
+- **An undecryptable stored key silently fell back to another key.** If the
+  server's `ENCRYPTION_KEY` changed after a key was saved, the settings reader
+  swallowed the decrypt failure, pinged with the env key (or none), and the UI
+  still showed "Key set: ***" — the app appeared to reject a key it was never
+  sending. The status endpoint now reports `stored_key_unreadable` with a
+  re-enter-the-key hint, the settings page shows `api_key_error`, and re-saving
+  the key recovers immediately.
+- **Per-workflow overrides were global and unencrypted.** `ai_workflows` rows
+  held plaintext API keys (contrary to the encrypted-at-rest design) in one
+  process-global map — one user's override key hijacked every other user's AI
+  calls, and `set_workflow_overrides` replaced the whole map per save, so
+  other users' overrides silently vanished until restart. Overrides are now
+  tenant-scoped (read fresh from the DB per call — also multi-worker safe) and
+  encrypted at rest; legacy plaintext rows are migrated on startup.
+- **Paste-artifact and masked-placeholder keys were accepted.** `base_url`,
+  `model` and `api_key` are trimmed on save, and writing back a masked
+  placeholder (`***`, `••••`) is rejected with a clear 400 instead of
+  overwriting a working key with the literal mask (a guaranteed provider 401).
+- A malformed settings cell (invalid JSON in one row) no longer 500s
+  `GET /api/settings`; unreadable rows are skipped and reported.
+- `GET /api/settings` and `/api/ops/status` reported `configured`/AI state
+  from env-only config; both now reflect the caller's actual (per-user)
+  configuration. `/api/health/ready`'s `ai_configured` also counts keys saved
+  in the DB.
+- Tests are hermetic again: an operator's checkout-level `.env` (created by
+  `run.sh`, which ships `METRICS_PORT=9464`) no longer moves the metrics
+  endpoint and fails three metrics tests locally.
+
+### Added
+
+- `backend/tests/test_ai_key_resolution.py` — end-to-end regression tests
+  against a local fake OpenAI-compatible provider: ambient user-key resolution
+  for pipeline calls, two-stage health probe (restricted `/models` + working
+  chat), invalid-key reporting with provider detail, undecryptable-key
+  surfacing and recovery, masked-placeholder rejection, key trimming, owner
+  fallback attribution, and per-user override isolation with
+  encryption-at-rest.
+- `backend/scripts/fake_openai_provider.py` — a tiny OpenAI-compatible server
+  (modes: `normal`, `restricted`, `invalid`) to verify any deployment's AI
+  wiring offline; it logs the `Authorization` header it receives so you can
+  confirm exactly which key the app sends.
+- `GET /api/settings/ai/status` now returns `key_source` (user/owner/env/
+  workflow_override), `key_preview` (safe masked form), `detail` (provider
+  error message), `probe` and `stored_key_error`; the Settings page surfaces
+  all of them in the status banner.
+
 ## [2.0.2] — 2026-09-11
 
 Closes the two holes the frontend-contract PR could not reach: the input

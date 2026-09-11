@@ -23,16 +23,17 @@ Guarantees (in order of importance):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from app.core.config import settings
-from app.core.logging import get_logger
+from app.core.logging import get_logger, user_id_var
 from app.core.metrics import inc, observe, set_gauge
 from app.core.rate_limiter import rate_limiter
 
@@ -62,7 +63,7 @@ WORKFLOWS = {
     "company_intel": "company intelligence",
 }
 
-_workflow_overrides: Dict[str, Dict[str, str]] = {}
+_workflow_overrides: Dict[Tuple[int, str], Dict[str, str]] = {}
 _semaphore: Optional[asyncio.Semaphore] = None
 
 
@@ -144,28 +145,39 @@ def _sem() -> asyncio.Semaphore:
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-def set_workflow_overrides(overrides: Dict[str, Dict[str, str]]) -> None:
+def set_workflow_overrides(overrides: Dict[str, Dict[str, str]], user_id: int = 0) -> None:
+    """Update the in-memory override cache (bucket 0 = system-level legacy path).
+
+    Per-user overrides are resolved fresh from the DB by
+    ``resolve_config_for_user`` — this cache only short-circuits the env-only
+    ``resolve_config`` path and the status listing.
+    """
     for workflow, cfg in (overrides or {}).items():
         if workflow not in WORKFLOWS:
             continue
         if isinstance(cfg, dict):
-            cleaned = {k: (str(v) if v else "") for k, v in cfg.items() if k in ("base_url", "api_key", "model")}
+            cleaned = {k: (str(v).strip() if v else "") for k, v in cfg.items() if k in ("base_url", "api_key", "model")}
             if any(cleaned.values()):
-                _workflow_overrides[workflow] = cleaned
+                _workflow_overrides[(user_id, workflow)] = cleaned
             else:
-                _workflow_overrides.pop(workflow, None)
+                _workflow_overrides.pop((user_id, workflow), None)
 
 
-def get_workflow_overrides() -> Dict[str, Dict[str, str]]:
-    return {k: dict(v) for k, v in _workflow_overrides.items()}
+def get_workflow_overrides(user_id: Optional[int] = None) -> Dict[str, Dict[str, str]]:
+    if user_id is None:
+        return {k[1]: dict(v) for k, v in _workflow_overrides.items()}
+    return {k[1]: dict(v) for k, v in _workflow_overrides.items() if k[0] == user_id}
 
 
 def resolve_config(workflow: Optional[str] = None) -> Dict[str, str]:
-    override = _workflow_overrides.get(workflow or "", {}) if workflow else {}
+    """Env-level config (no user context). Includes the legacy system bucket."""
+    override = _workflow_overrides.get((0, workflow or ""), {}) if workflow else {}
+    api_key = (override.get("api_key") or settings.ai_api_key or "").strip()
     return {
-        "base_url": (override.get("base_url") or settings.ai_base_url).rstrip("/"),
-        "api_key": override.get("api_key") or settings.ai_api_key,
-        "model": override.get("model") or settings.ai_model,
+        "base_url": (override.get("base_url") or settings.ai_base_url).strip().rstrip("/"),
+        "api_key": api_key,
+        "model": (override.get("model") or settings.ai_model).strip(),
+        "key_source": "workflow_override" if override.get("api_key") else ("env" if api_key else None),
     }
 
 
@@ -173,45 +185,113 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
     """
     Resolve AI config for a specific user, including per-user DB settings and owner fallback.
     Resolution order:
-    1. Per-workflow override (from DB ai_workflows table, in-memory _workflow_overrides)
+    1. Per-workflow override (from DB ai_workflows rows — tenant-scoped, read
+       fresh so multi-worker deployments never serve stale keys)
     2. Per-user default AI settings (from SettingsModel category=ai)
     3. Owner's default AI settings as global fallback
     4. Env defaults
     All are OpenAI compatible: base_url, model, api_key
     """
-    # Start with env defaults
+    key_source: Optional[str] = None
+    key_error: Optional[str] = None
     try:
         from app.services.user_settings import get_user_ai_config
         user_cfg = get_user_ai_config(db, user_id)
         base_url = user_cfg.get("base_url") or settings.ai_base_url
         model = user_cfg.get("model") or settings.ai_model
         api_key = user_cfg.get("api_key") or settings.ai_api_key
-    except Exception:
+        key_source = user_cfg.get("key_source") or ("env" if api_key else None)
+        key_error = user_cfg.get("api_key_error")
+    except Exception as exc:
+        log.warning("per-user AI config resolution failed for user %s, using env defaults: %s", user_id, exc)
         base_url = settings.ai_base_url
         model = settings.ai_model
         api_key = settings.ai_api_key
+        key_source = "env" if api_key else None
 
     # Apply per-workflow override if present (overrides per-user and env)
-    override = _workflow_overrides.get(workflow or "", {}) if workflow else {}
-    if override:
-        base_url = override.get("base_url") or base_url
-        api_key = override.get("api_key") or api_key
-        model = override.get("model") or model
+    if workflow:
+        try:
+            from app.services.user_settings import read_workflow_override
+            override = read_workflow_override(db, user_id, workflow)
+            if override:
+                base_url = override.get("base_url") or base_url
+                api_key = override.get("api_key") or api_key
+                model = override.get("model") or model
+                if override.get("api_key"):
+                    key_source = "workflow_override"
+                    key_error = None
+        except Exception as exc:
+            log.warning("could not read workflow override for user %s/%s: %s", user_id, workflow, exc)
 
     return {
-        "base_url": (base_url or "").rstrip("/"),
-        "api_key": api_key or "",
-        "model": model or "",
+        "base_url": (base_url or "").strip().rstrip("/"),
+        "api_key": (api_key or "").strip(),
+        "model": (model or "").strip(),
+        "key_source": key_source,
+        "key_error": key_error,
     }
+
+
+def _ambient_user_id() -> Optional[int]:
+    """User id bound to the current request / worker job by the auth layer.
+
+    ``get_current_user`` sets it for every API request and the worker's
+    ``LogContext`` sets it per queue item, so AI calls made deep inside
+    pipelines (which historically had no user context) can still resolve the
+    *user's* configured key instead of falling back to env-only config.
+    """
+    raw = user_id_var.get()
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class _ResolvedAI:
+    cfg: Dict[str, str]
+    db: Optional[Any] = None
+    user_id: Optional[int] = None
+    owned_session: bool = False  # caller must close db (ambient lookup)
+
+
+def _resolve_ai_config(workflow: Optional[str], db, user_id: Optional[int]) -> _ResolvedAI:
+    """Explicit (db, user_id) → per-user config; else ambient request/worker user; else env."""
+    if db is not None and user_id is not None:
+        try:
+            return _ResolvedAI(resolve_config_for_user(db, user_id, workflow), db, user_id, False)
+        except Exception as exc:
+            log.warning("AI config resolution failed, falling back: %s", exc)
+    ambient = _ambient_user_id()
+    if ambient is not None:
+        from app.db import SessionLocal
+
+        session = SessionLocal()
+        try:
+            cfg = resolve_config_for_user(session, ambient, workflow)
+            return _ResolvedAI(cfg, session, ambient, True)
+        except Exception as exc:
+            log.warning("ambient AI config resolution failed for user %s: %s", ambient, exc)
+            session.close()
+    return _ResolvedAI(resolve_config(workflow), None, None, False)
 
 
 def is_configured(workflow: Optional[str] = None, db=None, user_id: Optional[int] = None) -> bool:
     if db is not None and user_id is not None:
         try:
-            cfg = resolve_config_for_user(db, user_id, workflow)
-            return bool(cfg["api_key"])
+            return bool(resolve_config_for_user(db, user_id, workflow)["api_key"])
         except Exception:
             pass
+    if _ambient_user_id() is not None:
+        resolved = _resolve_ai_config(workflow, None, None)
+        try:
+            return bool(resolved.cfg["api_key"])
+        finally:
+            if resolved.owned_session:
+                resolved.db.close()
     return bool(resolve_config(workflow)["api_key"])
 
 
@@ -320,160 +400,165 @@ async def chat_completion(
     user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Send a chat completion. Raises ``AIClientError`` on failure."""
-    # Resolution order: explicit ai_config > per-user DB config (with owner fallback) > workflow override > env
-    if db is not None and user_id is not None:
-        try:
-            cfg = resolve_config_for_user(db, user_id, workflow)
-        except Exception:
-            cfg = resolve_config(workflow)
-    else:
-        cfg = resolve_config(workflow)
+    # Resolution order: explicit ai_config > per-user DB config (explicit or
+    # ambient request/worker user, with owner fallback) > env defaults.
+    resolved = _resolve_ai_config(workflow, db, user_id)
+    cfg = resolved.cfg
+    db, user_id = resolved.db, resolved.user_id
+    try:
+        if ai_config:
+            cfg = {
+                "base_url": (ai_config.get("base_url") or cfg["base_url"]).rstrip("/"),
+                "api_key": (ai_config.get("api_key") or cfg["api_key"]).strip(),
+                "model": (ai_config.get("model") or cfg["model"]).strip(),
+                "key_source": "explicit" if ai_config.get("api_key") else cfg.get("key_source"),
+                "key_error": cfg.get("key_error"),
+            }
+        if not cfg["api_key"]:
+            raise AIClientError("no_api_key: AI is not configured (set AI_API_KEY in Settings or per-workflow override — OpenAI compatible format: base_url like https://api.openai.com/v1, model like gpt-4o-mini)")
 
-    if ai_config:
-        cfg = {
-            "base_url": (ai_config.get("base_url") or cfg["base_url"]).rstrip("/"),
-            "api_key": ai_config.get("api_key") or cfg["api_key"],
-            "model": ai_config.get("model") or cfg["model"],
-        }
-    if not cfg["api_key"]:
-        raise AIClientError("no_api_key: AI is not configured (set AI_API_KEY in Settings or per-workflow override — OpenAI compatible format: base_url like https://api.openai.com/v1, model like gpt-4o-mini)")
+        # Per-user entitlement pre-check if db/user_id provided
+        if db is not None and user_id is not None:
+            try:
+                from app.core.entitlements import enforce
+                enforce(db, user_id, "ai_operations_per_month")
+                enforce(db, user_id, "ai_credits_per_month")
+            except Exception as e:
+                # If enforcement fails (limit exceeded), raise as client error
+                # to be caught and fallback to heuristic
+                raise AIClientError(f"limit_exceeded: {e}", retryable=False) from e
 
-    # Per-user entitlement pre-check if db/user_id provided
-    if db is not None and user_id is not None:
-        try:
-            from app.core.entitlements import enforce
-            enforce(db, user_id, "ai_operations_per_month")
-            enforce(db, user_id, "ai_credits_per_month")
-        except Exception as e:
-            # If enforcement fails (limit exceeded), raise as client error
-            # to be caught and fallback to heuristic
-            raise AIClientError(f"limit_exceeded: {e}", retryable=False) from e
+        if budget_exhausted():
+            inc("jobhunter_ai_requests_total", workflow=workflow, status="budget_exhausted")
+            raise AIClientError(
+                f"budget_exhausted: daily AI token budget of {settings.ai_daily_token_budget} reached",
+                retryable=True,
+            )
 
-    if budget_exhausted():
-        inc("jobhunter_ai_requests_total", workflow=workflow, status="budget_exhausted")
-        raise AIClientError(
-            f"budget_exhausted: daily AI token budget of {settings.ai_daily_token_budget} reached",
-            retryable=True,
-        )
+        breaker = _breaker(workflow)
+        if breaker.is_open():
+            inc("jobhunter_ai_requests_total", workflow=workflow, status="breaker_open")
+            raise AIClientError(f"circuit_open: {breaker.last_error}", retryable=True)
 
-    breaker = _breaker(workflow)
-    if breaker.is_open():
-        inc("jobhunter_ai_requests_total", workflow=workflow, status="breaker_open")
-        raise AIClientError(f"circuit_open: {breaker.last_error}", retryable=True)
+        messages: List[Dict[str, str]] = []
+        if system:
+            # Sanitize system prompt — treat external data as untrusted
+            safe_system = system.replace("```", "")[:2000]
+            messages.append({"role": "system", "content": safe_system})
+        # Sanitize user prompt: remove potential injection
+        safe_prompt = prompt.replace("SYSTEM:", "").replace("Ignore previous", "")[:12000]
+        messages.append({"role": "user", "content": safe_prompt})
 
-    messages: List[Dict[str, str]] = []
-    if system:
-        # Sanitize system prompt — treat external data as untrusted
-        safe_system = system.replace("```", "")[:2000]
-        messages.append({"role": "system", "content": safe_system})
-    # Sanitize user prompt: remove potential injection
-    safe_prompt = prompt.replace("SYSTEM:", "").replace("Ignore previous", "")[:12000]
-    messages.append({"role": "user", "content": safe_prompt})
+        payload: Dict[str, Any] = {"model": cfg["model"], "messages": messages, "temperature": temperature}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        payload["max_tokens"] = max_tokens or settings.ai_max_output_tokens
 
-    payload: Dict[str, Any] = {"model": cfg["model"], "messages": messages, "temperature": temperature}
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    payload["max_tokens"] = max_tokens or settings.ai_max_output_tokens
+        headers = {"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}
+        url = f"{cfg['base_url']}/chat/completions"
+        attempts = max(1, settings.ai_max_retries)
+        last_error: Optional[str] = None
 
-    headers = {"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}
-    url = f"{cfg['base_url']}/chat/completions"
-    attempts = max(1, settings.ai_max_retries)
-    last_error: Optional[str] = None
+        for attempt in range(1, attempts + 1):
+            await rate_limiter.wait_and_acquire(1)
+            started = time.perf_counter()
+            try:
+                async with _sem():
+                    async with httpx.AsyncClient(timeout=timeout or settings.ai_timeout) as client:
+                        response = await client.post(url, headers=headers, json=payload)
+            except httpx.HTTPError as exc:
+                last_error = f"http_error: {exc}"
+                inc("jobhunter_ai_requests_total", workflow=workflow, status="network_error")
+                if attempt < attempts:
+                    await _sleep_backoff(attempt)
+                    continue
+                breaker.record_failure(last_error)
+                if db and user_id:
+                    track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error)
+                raise AIClientError(last_error, retryable=True) from exc
+            finally:
+                observe("jobhunter_ai_latency_seconds", time.perf_counter() - started, workflow=workflow)
 
-    for attempt in range(1, attempts + 1):
-        await rate_limiter.wait_and_acquire(1)
-        started = time.perf_counter()
-        try:
-            async with _sem():
-                async with httpx.AsyncClient(timeout=timeout or settings.ai_timeout) as client:
-                    response = await client.post(url, headers=headers, json=payload)
-        except httpx.HTTPError as exc:
-            last_error = f"http_error: {exc}"
-            inc("jobhunter_ai_requests_total", workflow=workflow, status="network_error")
-            if attempt < attempts:
-                await _sleep_backoff(attempt)
+            if response.status_code == 200:
+                breaker.record_success()
+                break
+
+            body = response.text[:300]
+            last_error = f"status {response.status_code}: {body}"
+            retryable = response.status_code == 429 or 500 <= response.status_code < 600
+            inc("jobhunter_ai_requests_total", workflow=workflow, status=str(response.status_code))
+            if retryable and attempt < attempts:
+                delay = _retry_delay(response, attempt)
+                log.warning("AI %s -> %s, retrying in %.1fs", workflow, response.status_code, delay)
+                await asyncio.sleep(delay)
                 continue
+            if not retryable:
+                breaker.record_failure(last_error) if response.status_code in (401, 403) else None
+                if db and user_id:
+                    track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error, latency_ms=int((time.perf_counter() - started)*1000))
+                raise AIClientError(last_error, status=response.status_code, retryable=False)
+
             breaker.record_failure(last_error)
             if db and user_id:
                 track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error)
-            raise AIClientError(last_error, retryable=True) from exc
-        finally:
-            observe("jobhunter_ai_latency_seconds", time.perf_counter() - started, workflow=workflow)
+            raise AIClientError(last_error, status=response.status_code, retryable=True)
+        else:  # pragma: no cover - loop always breaks or raises
+            raise AIClientError(last_error or "unknown error", retryable=True)
 
-        if response.status_code == 200:
-            breaker.record_success()
-            break
-
-        body = response.text[:300]
-        last_error = f"status {response.status_code}: {body}"
-        retryable = response.status_code == 429 or 500 <= response.status_code < 600
-        inc("jobhunter_ai_requests_total", workflow=workflow, status=str(response.status_code))
-        if retryable and attempt < attempts:
-            delay = _retry_delay(response, attempt)
-            log.warning("AI %s -> %s, retrying in %.1fs", workflow, response.status_code, delay)
-            await asyncio.sleep(delay)
-            continue
-        if not retryable:
-            breaker.record_failure(last_error) if response.status_code in (401, 403) else None
+        try:
+            data = response.json()
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+        except (KeyError, IndexError, ValueError) as exc:
+            breaker.record_failure(f"malformed_response: {exc}")
             if db and user_id:
-                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error, latency_ms=int((time.perf_counter() - started)*1000))
-            raise AIClientError(last_error, status=response.status_code, retryable=False)
+                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=str(exc))
+            raise AIClientError(f"malformed_response: {exc}") from exc
 
-        breaker.record_failure(last_error)
+        usage = data.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        latency_ms = int((time.perf_counter() - started) * 1000) if 'started' in locals() else 0
+
+        _spend_tokens(total_tokens)
+        bucket = _usage.setdefault(workflow, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0})
+        bucket["calls"] += 1
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            if isinstance(usage.get(key), int):
+                bucket[key] += usage[key]
+        set_gauge("jobhunter_ai_tokens_total", bucket["total_tokens"], workflow=workflow)
+        inc("jobhunter_ai_requests_total", workflow=workflow, status="200")
+
+        # Track per-user
         if db and user_id:
-            track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error)
-        raise AIClientError(last_error, status=response.status_code, retryable=True)
-    else:  # pragma: no cover - loop always breaks or raises
-        raise AIClientError(last_error or "unknown error", retryable=True)
+            track_ai_usage(
+                db=db,
+                user_id=user_id,
+                workflow=workflow,
+                model=cfg["model"],
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                success=True,
+                latency_ms=latency_ms,
+            )
 
-    try:
-        data = response.json()
-        choice = data["choices"][0]
-        content = choice["message"]["content"]
-    except (KeyError, IndexError, ValueError) as exc:
-        breaker.record_failure(f"malformed_response: {exc}")
-        if db and user_id:
-            track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=str(exc))
-        raise AIClientError(f"malformed_response: {exc}") from exc
+        if not json_mode:
+            return {"content": content, "raw": data, "usage": usage}
 
-    usage = data.get("usage") or {}
-    prompt_tokens = int(usage.get("prompt_tokens") or 0)
-    completion_tokens = int(usage.get("completion_tokens") or 0)
-    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-    latency_ms = int((time.perf_counter() - started) * 1000) if 'started' in locals() else 0
-
-    _spend_tokens(total_tokens)
-    bucket = _usage.setdefault(workflow, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0})
-    bucket["calls"] += 1
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        if isinstance(usage.get(key), int):
-            bucket[key] += usage[key]
-    set_gauge("jobhunter_ai_tokens_total", bucket["total_tokens"], workflow=workflow)
-    inc("jobhunter_ai_requests_total", workflow=workflow, status="200")
-
-    # Track per-user
-    if db and user_id:
-        track_ai_usage(
-            db=db,
-            user_id=user_id,
-            workflow=workflow,
-            model=cfg["model"],
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            success=True,
-            latency_ms=latency_ms,
-        )
-
-    if not json_mode:
-        return {"content": content, "raw": data, "usage": usage}
-
-    try:
-        return json.loads(content)
-    except (json.JSONDecodeError, TypeError) as exc:
-        if db and user_id:
-            track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=f"invalid_json: {exc}")
-        raise AIClientError(f"invalid_json: {exc}") from exc
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, TypeError) as exc:
+            if db and user_id:
+                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=f"invalid_json: {exc}")
+            raise AIClientError(f"invalid_json: {exc}") from exc
+    finally:
+        if resolved.owned_session and resolved.db is not None:
+            try:
+                resolved.db.close()
+            except Exception:
+                pass
 
 
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
@@ -495,31 +580,136 @@ async def chat_text(workflow: str, prompt: str, **kwargs) -> str:
     return str(result.get("content", ""))
 
 
-async def ping(workflow: Optional[str] = None, timeout: int = 5, db=None, user_id: Optional[int] = None) -> Dict[str, Any]:
-    """Health probe for the green/red status dot. Never raises."""
-    if db is not None and user_id is not None:
-        try:
-            cfg = resolve_config_for_user(db, user_id, workflow)
-        except Exception:
-            cfg = resolve_config(workflow)
-    else:
-        cfg = resolve_config(workflow)
+def _key_preview(key: str) -> str:
+    """Safe display form of a key (never the full secret)."""
+    if not key:
+        return ""
+    if len(key) <= 12:
+        return f"{key[:3]}***"
+    return f"{key[:6]}…{key[-4:]}"
 
-    if not cfg["api_key"]:
-        return {"online": False, "reason": "no_api_key", "latency_ms": None, "hint": "Set API key in Settings → AI API (OpenAI compatible: base_url like https://api.openai.com/v1)"}
-    start = time.perf_counter()
+
+def _provider_error(response: Optional[httpx.Response]) -> str:
+    """Best-effort human-readable error from a provider response."""
+    if response is None:
+        return ""
+    try:
+        data = response.json()
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict):
+            return str(err.get("message") or "")[:200]
+        if err:
+            return str(err)[:200]
+    except Exception:
+        pass
+    return (response.text or "")[:200]
+
+
+# The status probe is polled every ~15s by the SPA; cache results so a
+# provider without a /models endpoint doesn't trigger a billable chat probe
+# on every poll. Re-saving a (different) key/base_url/model changes the cache
+# key, so fixing config still reflects immediately.
+_PING_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_PING_TTL_SECONDS = 60.0
+
+
+async def ping(workflow: Optional[str] = None, timeout: int = 5, db=None, user_id: Optional[int] = None) -> Dict[str, Any]:
+    """Health probe for the green/red status dot. Never raises.
+
+    Two-stage probe: ``GET /models`` is cheap and works on most providers, but
+    a 401/403/404 there does NOT prove the key is invalid — some providers
+    restrict or don't implement the models listing while chat completions work
+    fine. Only a rejected *chat completion* is reported as ``invalid_api_key``.
+    """
+    resolved = _resolve_ai_config(workflow, db, user_id)
+    try:
+        return await _ping_with_config(resolved.cfg, timeout)
+    finally:
+        if resolved.owned_session and resolved.db is not None:
+            try:
+                resolved.db.close()
+            except Exception:
+                pass
+
+
+async def _ping_with_config(cfg: Dict[str, str], timeout: int) -> Dict[str, Any]:
+    key = (cfg.get("api_key") or "").strip()
+    base = (cfg.get("base_url") or "").strip().rstrip("/")
+    model = (cfg.get("model") or "").strip()
+    meta = {
+        "base_url": base,
+        "model": model,
+        "key_source": cfg.get("key_source"),
+        "key_preview": _key_preview(key),
+    }
+
+    if cfg.get("key_error"):
+        return {"online": False, "reason": "stored_key_unreadable", "latency_ms": None,
+                "hint": "The saved API key could not be decrypted on this server (its ENCRYPTION_KEY changed since the key was saved). Re-enter the key in Settings → AI API to fix it.",
+                **meta}
+    if not key:
+        return {"online": False, "reason": "no_api_key", "latency_ms": None,
+                "hint": "Set API key in Settings → AI API (OpenAI compatible: base_url like https://api.openai.com/v1)",
+                **meta}
+
+    cache_key = f"{base}|{model}|{hashlib.sha256(key.encode()).hexdigest()[:16]}"
+    now = time.monotonic()
+    cached = _PING_CACHE.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    started = time.perf_counter()
+
+    # Stage 1 — cheap models listing (sufficient on most providers).
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(f"{cfg['base_url']}/models",
-                                        headers={"Authorization": f"Bearer {cfg['api_key']}"})
+            response = await client.get(f"{base}/models", headers=headers)
     except httpx.HTTPError as exc:
-        return {"online": False, "error": str(exc), "latency_ms": None, "base_url": cfg["base_url"], "model": cfg["model"]}
-    latency_ms = int((time.perf_counter() - start) * 1000)
+        # Transient network errors are NOT cached — connectivity can recover
+        # at any moment, unlike a definitive auth rejection.
+        return {"online": False, "reason": "unreachable", "error": str(exc), "latency_ms": None,
+                "hint": f"Could not reach {base} — check the base URL and network connectivity.", **meta}
+
     if response.status_code == 200:
-        return {"online": True, "latency_ms": latency_ms, "status": 200, "base_url": cfg["base_url"],
-                "model": cfg["model"]}
-    if response.status_code in (401, 403):
-        return {"online": False, "latency_ms": latency_ms, "status": response.status_code,
-                "reason": "invalid_api_key", "base_url": cfg["base_url"], "model": cfg["model"]}
-    return {"online": False, "latency_ms": latency_ms, "status": response.status_code,
-            "reason": f"status_{response.status_code}", "base_url": cfg["base_url"], "model": cfg["model"]}
+        result = {"online": True, "latency_ms": int((time.perf_counter() - started) * 1000),
+                  "status": 200, "probe": "models", **meta}
+        _PING_CACHE[cache_key] = (now + _PING_TTL_SECONDS, result)
+        return result
+
+    # Stage 2 — /models did not answer 200. The key may still be perfectly
+    # valid for chat completions (restricted/unimplemented models endpoint),
+    # so verify with the endpoint the product actually uses. A minimal
+    # request keeps the cost at ~1 token.
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            probe = await client.post(
+                f"{base}/chat/completions",
+                headers=headers,
+                json={"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+            )
+    except httpx.HTTPError:
+        # Chat endpoint unreachable: report what /models told us.
+        result = {"online": False, "latency_ms": int((time.perf_counter() - started) * 1000),
+                  "status": response.status_code, "reason": f"status_{response.status_code}",
+                  "detail": _provider_error(response), "probe": "models", **meta}
+        _PING_CACHE[cache_key] = (now + _PING_TTL_SECONDS, result)
+        return result
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    if probe.status_code == 200:
+        result = {"online": True, "latency_ms": latency_ms, "status": 200, "probe": "chat_completions",
+                  "note": "models endpoint unavailable/restricted — chat completions verified working",
+                  **meta}
+    elif probe.status_code in (401, 403):
+        result = {"online": False, "reason": "invalid_api_key", "status": probe.status_code,
+                  "latency_ms": latency_ms, "probe": "chat_completions",
+                  "detail": _provider_error(probe) or _provider_error(response),
+                  "hint": f"The provider rejected this key for {base}. Double-check the key, and that base_url + model belong to the same provider.",
+                  **meta}
+    else:
+        result = {"online": False, "reason": f"status_{probe.status_code}", "status": probe.status_code,
+                  "latency_ms": latency_ms, "probe": "chat_completions",
+                  "detail": _provider_error(probe), **meta}
+    _PING_CACHE[cache_key] = (now + _PING_TTL_SECONDS, result)
+    return result

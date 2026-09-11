@@ -12,17 +12,33 @@ as global default.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.core.security import decrypt_secret, encrypt_secret
 from app.models.models import SettingsModel, User
 
+log = get_logger("app.settings")
+
 CATEGORY = "email"
 SECRET_KEYS = {("email", "password"), ("ai", "api_key")}
+
+#: Values that must never be persisted as a secret — they look like the masked
+#: placeholders the API hands back to the UI. Accepting one would silently
+#: overwrite a working key with the literal string ``***`` (and the provider
+#: would then reject every request with 401 ``invalid_api_key``).
+_MASKED_CHARS = {"*", "•", "·", "x", "X"}
+
+
+def _looks_masked(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    stripped = value.strip()
+    return len(stripped) >= 3 and set(stripped) <= _MASKED_CHARS
 
 
 def _secret_scope(user_id: int) -> str:
@@ -139,20 +155,46 @@ def validate_openai_compatible(base_url: str, model: str, api_key: str = "") -> 
     return None
 
 
-def get_setting(db: Session, user_id: int, category: str, key: str, default: Any = None) -> Any:
-    row = (
-        db.query(SettingsModel)
-        .filter(SettingsModel.user_id == user_id, SettingsModel.category == category, SettingsModel.key == key)
-        .first()
-    )
+def get_secret_setting(db: Session, user_id: int, category: str, key: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Read a secret column. Returns ``(value, error)``:
+
+    * ``(None, None)`` — nothing stored;
+    * ``(value, None)`` — decrypted successfully;
+    * ``(None, "unreadable")`` — a value IS stored but cannot be decrypted
+      (typically the server's ``ENCRYPTION_KEY`` changed after the secret was
+      saved). The caller must surface this instead of silently falling back —
+      otherwise the app keeps sending some *other* key while the UI still
+      claims a key is configured.
+    """
+    try:
+        row = (
+            db.query(SettingsModel)
+            .filter(SettingsModel.user_id == user_id, SettingsModel.category == category, SettingsModel.key == key)
+            .first()
+        )
+    except Exception as exc:  # e.g. a malformed JSON cell — treat as unreadable, never 500
+        log.warning("settings row %s.%s for user %s could not be read: %s", category, key, user_id, exc)
+        return None, "unreadable"
     if row is None or row.value is None:
-        return default
-    if (category, key) in SECRET_KEYS:
-        try:
-            return decrypt_secret(str(row.value), _secret_scope(user_id))
-        except Exception:
-            return ""
-    return row.value
+        return None, None
+    if (category, key) not in SECRET_KEYS:
+        value = row.value
+        return (value if value is not None else None), None
+    try:
+        return decrypt_secret(str(row.value), _secret_scope(user_id)), None
+    except Exception as exc:
+        log.warning(
+            "stored secret settings.%s.%s for user %s could not be decrypted: %s — "
+            "it will be ignored until re-entered (ENCRYPTION_KEY changed?)",
+            category, key, user_id, exc,
+        )
+        return None, "unreadable"
+
+
+def get_setting(db: Session, user_id: int, category: str, key: str, default: Any = None) -> Any:
+    value, _error = get_secret_setting(db, user_id, category, key)
+    return default if value is None else value
 
 
 def set_setting(db: Session, user_id: int, category: str, key: str, value: Any) -> SettingsModel:
@@ -172,10 +214,80 @@ def set_setting(db: Session, user_id: int, category: str, key: str, value: Any) 
     return row
 
 
+# --------------------------------------------------------------------------- #
+# Per-workflow AI overrides (category "ai_workflows", key = workflow name)
+#
+# The value is a JSON object {base_url, model, api_key}. The api_key is
+# encrypted at rest with the same per-user scope as the default AI key.
+# Rows written by older versions stored the key in plaintext; readers accept
+# both (``read_workflow_override``) and writers always encrypt.
+# --------------------------------------------------------------------------- #
+_OVERRIDE_KEYS = ("base_url", "model", "api_key")
+
+
+def read_workflow_override(db: Session, user_id: int, workflow: str) -> Dict[str, str]:
+    """Decrypted, trimmed override for one workflow (empty dict when unset)."""
+    try:
+        row = (
+            db.query(SettingsModel)
+            .filter(SettingsModel.user_id == user_id, SettingsModel.category == "ai_workflows", SettingsModel.key == workflow)
+            .first()
+        )
+    except Exception as exc:  # malformed JSON cell — treat as no override, never 500
+        log.warning("workflow override row for user %s/%s could not be read: %s", user_id, workflow, exc)
+        return {}
+    if row is None or not isinstance(row.value, dict):
+        return {}
+    raw = row.value
+    cfg = {k: str(raw.get(k) or "").strip() for k in _OVERRIDE_KEYS}
+    stored_key = str(raw.get("api_key") or "")
+    if stored_key.startswith("gAAAA"):  # Fernet token — decrypt
+        try:
+            cfg["api_key"] = decrypt_secret(stored_key, _secret_scope(user_id))
+        except Exception as exc:
+            log.warning("workflow override api_key for user %s/%s could not be decrypted: %s", user_id, workflow, exc)
+            cfg["api_key"] = ""
+    return cfg
+
+
+def write_workflow_override(db: Session, user_id: int, workflow: str, cfg: Dict[str, Any]) -> Dict[str, str]:
+    """Persist an override (api_key encrypted at rest). Returns the cleaned, decrypted view."""
+    cleaned = {k: str((cfg or {}).get(k) or "").strip() for k in _OVERRIDE_KEYS}
+    if cleaned["api_key"] and _looks_masked(cleaned["api_key"]):
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            400,
+            {"code": "masked_api_key",
+             "message": "That looks like a masked placeholder — paste the full API key (it is never displayed back in full)."},
+        )
+    stored = dict(cleaned)
+    if cleaned["api_key"]:
+        stored["api_key"] = encrypt_secret(cleaned["api_key"], _secret_scope(user_id))
+    row = (
+        db.query(SettingsModel)
+        .filter(SettingsModel.user_id == user_id, SettingsModel.category == "ai_workflows", SettingsModel.key == workflow)
+        .first()
+    )
+    if row is None:
+        db.add(SettingsModel(user_id=user_id, category="ai_workflows", key=workflow, value=stored))
+    else:
+        row.value = stored
+    return cleaned
+
+
+def delete_workflow_override(db: Session, user_id: int, workflow: str) -> None:
+    db.query(SettingsModel).filter(
+        SettingsModel.user_id == user_id, SettingsModel.category == "ai_workflows", SettingsModel.key == workflow
+    ).delete(synchronize_session=False)
+
+
 def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
     """
     Resolve per-user AI config from DB (owner fallback as global default).
-    Returns dict with base_url, model, api_key (decrypted), api_key_set bool.
+    Returns dict with base_url, model, api_key (decrypted), api_key_set bool,
+    key_source ("user" | "owner" | "env") and api_key_error (set when a stored
+    key exists but cannot be decrypted).
     Resolution order:
     1. Current user's DB settings
     2. Owner's DB settings (first owner user) as global default
@@ -184,28 +296,34 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
     # Current user
     base_url = get_setting(db, user_id, "ai", "base_url", None)
     model = get_setting(db, user_id, "ai", "model", None)
-    api_key = get_setting(db, user_id, "ai", "api_key", None)
+    api_key, api_key_error = get_secret_setting(db, user_id, "ai", "api_key")
+    key_source: Optional[str] = "user" if api_key else None
 
     # If current user doesn't have api_key, try owner fallback
     if not api_key:
         try:
             owner = db.query(User).filter(User.role == "owner").order_by(User.id.asc()).first()
             if owner and owner.id != user_id:
-                owner_key = get_setting(db, owner.id, "ai", "api_key", None)
-                owner_base = get_setting(db, owner.id, "ai", "base_url", None)
-                owner_model = get_setting(db, owner.id, "ai", "model", None)
+                owner_key, _owner_err = get_secret_setting(db, owner.id, "ai", "api_key")
                 if owner_key:
-                    api_key = api_key or owner_key
-                    base_url = base_url or owner_base
-                    model = model or owner_model
+                    api_key = owner_key
+                    base_url = base_url or get_setting(db, owner.id, "ai", "base_url", None)
+                    model = model or get_setting(db, owner.id, "ai", "model", None)
+                    key_source = "owner"
         except Exception:
             pass
+
+    if not api_key and settings.ai_api_key:
+        api_key = settings.ai_api_key
+        key_source = "env"
 
     return {
         "base_url": base_url or settings.ai_base_url,
         "model": model or settings.ai_model,
-        "api_key": api_key or settings.ai_api_key,
-        "api_key_set": bool(api_key or settings.ai_api_key),
+        "api_key": api_key or "",
+        "api_key_set": bool(api_key),
+        "key_source": key_source,
+        "api_key_error": api_key_error,
         "rpm": get_setting(db, user_id, "ai", "rpm", settings.ai_rpm),
         "max_retries": get_setting(db, user_id, "ai", "max_retries", settings.ai_max_retries),
     }
@@ -214,41 +332,37 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
 def grouped(db: Session, user: User, *, reveal_secrets: bool = False) -> Dict[str, Dict[str, Any]]:
     """Return all settings for a user, defaults filled in, secrets redacted."""
     result = defaults()
-    rows = db.query(SettingsModel).filter(SettingsModel.user_id == user.id).all()
-    has_ai_key_in_db = False
+
+    # Secrets go through the decrypting accessor so the UI reflects what the
+    # app can actually use (a stored-but-undecryptable key is reported, not
+    # silently reported as "set").
+    ai_key, ai_key_error = get_secret_setting(db, user.id, "ai", "api_key")
+    email_password, _email_error = get_secret_setting(db, user.id, "email", "password")
+
+    try:
+        rows = db.query(SettingsModel).filter(SettingsModel.user_id == user.id).all()
+    except Exception as exc:  # a single malformed cell must not take the page down
+        log.warning("settings rows for user %s could not be listed: %s", user.id, exc)
+        rows = []
     for row in rows:
         if row.category == "ai_workflows":
             continue
         bucket = result.setdefault(row.category, {})
         if (row.category, row.key) in SECRET_KEYS:
-            if row.category == "ai" and row.key == "api_key":
-                has_ai_key_in_db = bool(row.value)
-                bucket["api_key_set"] = has_ai_key_in_db or bool(settings.ai_api_key)
-                if has_ai_key_in_db:
-                    bucket["api_key_masked"] = "***"
-                if reveal_secrets:
-                    try:
-                        bucket[row.key] = decrypt_secret(str(row.value), _secret_scope(row.user_id))
-                    except Exception:
-                        bucket[row.key] = ""
-                continue
-            else:
-                bucket["password_set"] = bool(row.value)
-                if reveal_secrets:
-                    try:
-                        bucket[row.key] = decrypt_secret(str(row.value), _secret_scope(row.user_id))
-                    except Exception:
-                        bucket[row.key] = ""
-                continue
+            continue  # handled above from the decrypted values
         bucket[row.key] = row.value
 
-    # Ensure api_key_set reflects DB or env
-    if not has_ai_key_in_db:
-        result["ai"]["api_key_set"] = bool(settings.ai_api_key)
-    else:
-        result["ai"]["api_key_set"] = True
+    result["ai"]["api_key_set"] = bool(ai_key or settings.ai_api_key)
+    if ai_key:
+        result["ai"]["api_key_masked"] = "***"
+    if ai_key_error:
+        result["ai"]["api_key_error"] = "unreadable"
+    if reveal_secrets and ai_key is not None:
+        result["ai"]["api_key"] = ai_key
 
-    result["email"]["password_set"] = bool(result["email"].get("password_set"))
+    result["email"]["password_set"] = bool(email_password)
+    if reveal_secrets and email_password is not None:
+        result["email"]["password"] = email_password
 
     # If owner, also expose global defaults info
     if user.role == "owner":
@@ -260,7 +374,7 @@ def grouped(db: Session, user: User, *, reveal_secrets: bool = False) -> Dict[st
             owner = db.query(User).filter(User.role == "owner").order_by(User.id.asc()).first()
             if owner:
                 owner_has_key = bool(get_setting(db, owner.id, "ai", "api_key", None))
-                if owner_has_key and not has_ai_key_in_db and not settings.ai_api_key:
+                if owner_has_key and not ai_key and not settings.ai_api_key:
                     result["ai"]["using_owner_default"] = True
                     result["ai"]["owner_base_url"] = get_setting(db, owner.id, "ai", "base_url", settings.ai_base_url)
                     result["ai"]["owner_model"] = get_setting(db, owner.id, "ai", "model", settings.ai_model)
@@ -315,6 +429,23 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
                     value = int(value)
                 except (TypeError, ValueError) as exc:
                     raise HTTPException(400, f"'{category}.{key}' must be an integer") from exc
+            # Hygiene for AI connection fields: paste artifacts (trailing
+            # whitespace/newlines) and masked placeholders are the two classic
+            # ways a *valid* key ends up rejected by the provider.
+            if category == "ai" and key in ("base_url", "model", "api_key") and value is not None:
+                value = str(value).strip()
+                if key == "api_key" and value and _looks_masked(value):
+                    raise HTTPException(
+                        400,
+                        {"code": "masked_api_key",
+                         "message": "That looks like a masked placeholder — paste the full API key (it is never displayed back in full)."},
+                    )
+            if (category, key) in SECRET_KEYS and _looks_masked(value):
+                raise HTTPException(
+                    400,
+                    {"code": "masked_secret",
+                     "message": "That looks like a masked placeholder — paste the full value (secrets are never displayed back in full)."},
+                )
             # Empty api_key means keep existing (UI never receives full key)
             if (category, key) in SECRET_KEYS and key == "api_key" and (value == "" or value is None):
                 # Skip if empty — keep existing

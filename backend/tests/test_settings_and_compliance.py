@@ -42,8 +42,9 @@ def test_smtp_password_is_encrypted_at_rest_and_never_returned(client, auth, db)
     assert "password" not in me["settings"]["email"]
 
 
-def test_ai_workflow_config_validation_and_masking(client, auth):
+def test_ai_workflow_config_validation_and_masking(client, auth, db, owner):
     assert client.post("/api/ai/config", json={"not_a_workflow": {"model": "x"}}, headers=auth).status_code == 400
+    assert client.post("/api/ai/config", json={"resume_gen": "not-an-object"}, headers=auth).status_code == 400
     ok = client.post("/api/ai/config",
                      json={"resume_gen": {"base_url": "https://api.example.com/v1", "model": "gpt-4o",
                                           "api_key": "sk-secret"}},
@@ -55,13 +56,36 @@ def test_ai_workflow_config_validation_and_masking(client, auth):
     assert override["model"] == "gpt-4o"
     assert override["api_key"] == "" and override["api_key_set"] is True
 
-    from app.services.ai_client import resolve_config
+    # The key is encrypted at rest — never the plaintext in the DB row.
+    row = db.query(SettingsModel).filter(
+        SettingsModel.category == "ai_workflows", SettingsModel.key == "resume_gen"
+    ).first()
+    assert row is not None
+    assert "sk-secret" not in str(row.value)
+    assert str(row.value["api_key"]).startswith("gAAAA")
 
-    assert resolve_config("resume_gen")["model"] == "gpt-4o"
-    assert resolve_config("resume_gen")["api_key"] == "sk-secret"
+    # Resolution is tenant-scoped: the owner's override applies to their calls…
+    from app.models.models import User
+    from app.services.ai_client import resolve_config, resolve_config_for_user
+
+    owner_user = db.query(User).filter(User.email == owner["email"]).first()
+    cfg = resolve_config_for_user(db, owner_user.id, "resume_gen")
+    assert cfg["model"] == "gpt-4o"
+    assert cfg["api_key"] == "sk-secret"
+    assert cfg["key_source"] == "workflow_override"
+    # …but never leaks into the env-level/system resolution.
+    assert resolve_config("resume_gen")["api_key"] == ""
+    assert resolve_config("resume_gen")["model"] == resolve_config()["model"]
+
+    # Blank api_key on update keeps the stored one.
+    keep = client.post("/api/ai/config", json={"resume_gen": {"model": "gpt-4-turbo"}}, headers=auth)
+    assert keep.status_code == 200
+    db.expire_all()  # the API committed through its own session — drop our stale snapshot
+    cfg = resolve_config_for_user(db, owner_user.id, "resume_gen")
+    assert cfg["model"] == "gpt-4-turbo" and cfg["api_key"] == "sk-secret"
 
     assert client.delete("/api/ai/config/resume_gen", headers=auth).status_code == 200
-    assert resolve_config("resume_gen")["api_key"] == ""
+    assert resolve_config_for_user(db, owner_user.id, "resume_gen")["api_key"] == ""
 
 
 def test_ai_status_reports_offline_without_key(client, auth):
