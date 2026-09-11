@@ -4,6 +4,45 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.0.2] — 2026-09-11
+
+Closes the two holes the frontend-contract PR could not reach: the input
+queue's *consumption* half (stored answers never fed back into the autofill
+plan) and the dedupe no-op that stranded jobs after a parked queue item.
+
+### Fixed
+
+- **User answers were stored but never used on the re-queued run.** The SPA
+  and `POST /api/jobs/{id}/input` key answers by the form field `name`
+  (e.g. `salary_expectation`), while `build_autofill_plan` looked
+  profile-mapped fields up by their canonical `profile_key`
+  (e.g. `salaryExpectation`). Every re-run therefore came back
+  `needs_input` with the same blank fields — the job looped through the
+  input queue forever, silently discarding the user's data each cycle.
+  `build_autofill_plan` now accepts answers keyed by either the profile key
+  (preferred) or the raw field name, so a submitted answer can no longer be
+  orphaned.
+- **Answer submissions could silently no-op.** `enqueue()` treats an active
+  item with the same dedupe key as a duplicate and returns `None`. Once a
+  run parked the application item in `needs_input`, every further answer
+  submission was dropped and the job sat `queued` with nothing left to
+  process it. `submit_input` now re-activates the parked item with the
+  merged answers (resetting its attempt counter, so iterating on answers
+  cannot dead-letter the item) and folds newest answers into a not-yet-
+  claimed duplicate instead of stacking a second item.
+- **The `requeued` flag lied.** It was hard-coded `true` even when no work
+  item existed; it now reflects the actual queue state.
+
+### Added
+
+- `test_user_answers_survive_the_requeue_round_trip` — drives the full loop
+  (apply → needs_input → answer → worker re-run via `handle_application`)
+  and asserts the answer reaches the stored autofill plan and no fresh blank
+  input request is created.
+- `test_parked_item_is_requeued_with_fresh_answers` — asserts a
+  `needs_input`-parked item is re-queued in place (no duplicate, attempts
+  reset, fresh payload) and that the re-run completes.
+
 ## [2.0.1] — 2026-09-10
 
 Launch-hardening pass: fixes for defects found while booting a fresh checkout
