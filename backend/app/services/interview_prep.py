@@ -8,8 +8,6 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy.orm import Session
-
 from app.core.logging import get_logger
 from app.services.ai_client import AIClientError, chat_completion
 

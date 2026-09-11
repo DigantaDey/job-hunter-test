@@ -5,14 +5,13 @@ Notifications system — in-app alerts for job matches, automation failures, etc
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Optional, List
 
 from fastapi import APIRouter, Query
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession
-from app.models.models import Notification, Job
 from app.core.entitlements import enforce
+from app.models.models import Job, Notification
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -21,7 +20,7 @@ router = APIRouter(prefix="/notifications", tags=["notifications"])
 def list_notifications(user: CurrentUser, db: DbSession, unread_only: bool = False, limit: int = Query(50, le=200)):
     q = db.query(Notification).filter(Notification.user_id == user.id)
     if unread_only:
-        q = q.filter(Notification.read == False)
+        q = q.filter(Notification.read.is_(False))
     rows = q.order_by(Notification.created_at.desc()).limit(limit).all()
     return [
         {
@@ -50,7 +49,7 @@ def mark_read(notification_id: int, user: CurrentUser, db: DbSession):
 
 @router.post("/read-all")
 def mark_all_read(user: CurrentUser, db: DbSession):
-    db.query(Notification).filter(Notification.user_id == user.id, Notification.read == False).update({"read": True})
+    db.query(Notification).filter(Notification.user_id == user.id, Notification.read.is_(False)).update({"read": True})
     db.commit()
     return {"ok": True}
 
@@ -124,7 +123,7 @@ def generate_weekly_summary(user: CurrentUser, db: DbSession):
     week_ago = datetime.utcnow() - timedelta(days=7)
     jobs = db.query(Job).filter(Job.user_id == user.id, Job.discovered_at >= week_ago).all()
     high_match = [j for j in jobs if j.score >= 75]
-    applied = db.query(Job).filter(Job.user_id == user.id, Job.applied_at != None, Job.applied_at >= week_ago).count() if hasattr(Job, 'applied_at') else 0
+    applied = db.query(Job).filter(Job.user_id == user.id, Job.applied_at.is_not(None), Job.applied_at >= week_ago).count() if hasattr(Job, 'applied_at') else 0
 
     title = f"Weekly Summary: {len(jobs)} new jobs, {len(high_match)} high matches"
     body = f"You discovered {len(jobs)} jobs this week. {len(high_match)} are high priority (score >=75). Applied to {applied} jobs."

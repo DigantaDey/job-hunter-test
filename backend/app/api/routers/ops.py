@@ -143,7 +143,7 @@ def dashboard(user: CurrentUser, db: DbSession):
     response_rate = round(interview_estimate / max(1, applied) * 100, 1) if applied else 0
 
     # Notifications
-    unread_notifications = db.query(Notification).filter(Notification.user_id == user.id, Notification.read == False).count()
+    unread_notifications = db.query(Notification).filter(Notification.user_id == user.id, Notification.read.is_(False)).count()
 
     # Entitlements
     entitlements = entitlements_snapshot(db, user.id)

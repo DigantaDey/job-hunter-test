@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from app.api.deps import CurrentUser, DbSession, get_owned_profile, invalidate_context, search_context
 from app.core import audit
 from app.core.config import settings
-from app.core.entitlements import enforce, increment_usage, get_user_plan
+from app.core.entitlements import enforce, increment_usage
 from app.core.logging import get_logger
 from app.models.models import Job, Profile, Resume
 from app.schemas.schemas import ProfileOut, ResumeOut

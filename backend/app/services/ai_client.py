@@ -267,8 +267,8 @@ def track_ai_usage(
     if db is None or user_id is None:
         return
     try:
-        from app.models.models import AICreditLedger, utcnow
         from app.core.entitlements import increment_usage
+        from app.models.models import AICreditLedger, utcnow
 
         ledger = AICreditLedger(
             user_id=user_id,

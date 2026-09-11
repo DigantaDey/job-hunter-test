@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger
 from app.models.models import CompanyIntel
-from app.services.ai_client import chat_completion, AIClientError
+from app.services.ai_client import AIClientError, chat_completion
 
 log = get_logger("app.company_intel")
 

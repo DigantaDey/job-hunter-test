@@ -8,11 +8,18 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.models.models import Base, User, Subscription, BillingEvent, AICreditLedger, UsageCounter
 from app.core.entitlements import (
-    PLANS, get_plan_config, get_user_plan, can, enforce, check_limit, increment_usage,
-    entitlements_snapshot, current_period,
+    PLANS,
+    can,
+    check_limit,
+    current_period,
+    enforce,
+    entitlements_snapshot,
+    get_plan_config,
+    get_user_plan,
+    increment_usage,
 )
+from app.models.models import AICreditLedger, Base, BillingEvent, Subscription, UsageCounter, User
 
 CAP_JOBS = "jobs_discovered_per_month"
 CAP_TAILORED = "tailored_resumes_per_month"

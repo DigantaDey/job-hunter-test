@@ -11,14 +11,12 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
 
 from fastapi import APIRouter
-from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession
-from app.models.models import Job, Resume, Email, AICreditLedger
 from app.core.entitlements import enforce
+from app.models.models import AICreditLedger, Job
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -174,7 +172,7 @@ def performance_analytics(user: CurrentUser, db: DbSession):
 def funnel_analytics(user: CurrentUser, db: DbSession):
     jobs = db.query(Job).filter(Job.user_id == user.id).all()
     stages = ["discovered", "queued", "needs_input", "applying", "applied", "failed", "emailed"]
-    funnel = {stage: 0 for stage in stages}
+    funnel = dict.fromkeys(stages, 0)
     for job in jobs:
         if job.status in funnel:
             funnel[job.status] += 1

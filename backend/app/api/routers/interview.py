@@ -5,7 +5,7 @@ Interview preparation endpoints.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from app.api.deps import CurrentUser, DbSession
 from app.core.entitlements import enforce
 from app.models.models import InterviewPrep, Job, Profile
-from app.services.interview_prep import generate_interview_questions, generate_feedback
+from app.services.interview_prep import generate_feedback, generate_interview_questions
 
 router = APIRouter(prefix="/interview", tags=["interview"])
 

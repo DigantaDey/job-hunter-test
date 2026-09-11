@@ -95,7 +95,6 @@ def _detailed_breakdown(profile: Dict[str, Any], jd: str) -> Dict[str, Any]:
     prof_tokens = set(tokenize(profile_text))
     common = jd_tokens & prof_tokens
     # Try to extract skill-like tokens from JD (simple heuristic)
-    skill_candidates = [t for t in jd_tokens if len(t) > 2 and t not in STOPWORDS]
     # Strong matches: profile skills present in JD
     strong_matches = [s for s in profile_skills if s.lower() in jd_lower]
     # Missing: JD tokens that look like tech but not in profile

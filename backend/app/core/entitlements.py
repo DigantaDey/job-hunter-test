@@ -15,12 +15,11 @@ All features remain available in Free tier — limits differentiate.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
-from app.models.models import Subscription, UsageCounter, User
+from app.models.models import Subscription, UsageCounter
 
 # --------------------------------------------------------------------------- #
 # Plan definitions — single source of truth for limits

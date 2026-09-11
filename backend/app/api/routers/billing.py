@@ -16,25 +16,21 @@ import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Query
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 
 from app.api.deps import CurrentUser, DbSession
 from app.core import audit
 from app.core.config import settings
 from app.core.entitlements import (
     PLANS,
-    entitlements_snapshot,
-    get_user_plan,
-    get_plan_config,
-    usage_for,
     current_period,
+    entitlements_snapshot,
 )
-from app.models.models import AICreditLedger, BillingEvent, Subscription, UsageCounter
+from app.models.models import AICreditLedger, BillingEvent, Subscription
 from app.services.billing import (
+    create_or_update_subscription_manual,
     get_provider,
     handle_billing_event,
-    create_or_update_subscription_manual,
 )
 
 router = APIRouter(prefix="/billing", tags=["billing"])
