@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import client from '../api/client'
+import client, { apiError } from '../api/client'
 import { TrendingUp, ExternalLink, Mail, Briefcase, Loader2, Sparkles, RefreshCw, Calendar, Target, Building2, CheckCircle2 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 
@@ -40,6 +40,7 @@ export default function Funding() {
   const [contextInput, setContextInput] = useState('')
   const [showContextInput, setShowContextInput] = useState(false)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
 
   const load = useCallback(async (refresh = false) => {
     setError('')
@@ -50,7 +51,7 @@ export default function Funding() {
       setContext(data.context || null)
       setRefreshedAt(data.refreshed_at || '')
     } catch (e: any) {
-      setError(e.response?.data?.detail || 'Failed to load funding radar')
+      setError(apiError(e, 'Failed to load funding radar'))
     } finally {
       setLoading(false)
       setScanning(false)
@@ -60,16 +61,24 @@ export default function Funding() {
   useEffect(() => { load() }, [load])
 
   const rescan = async () => {
-    setScanning(true); setResult(null)
+    setScanning(true); setResult(null); setError('')
     try {
-      const body: any = {}
+      const body: Record<string, unknown> = {}
       if (contextInput.trim()) body.context = contextInput.trim()
-      const { data } = await client.post('/api/funding/refresh', Object.keys(body).length ? body : null)
-      setCompanies(data.companies || [])
-      setContext(data.context || null)
+      // /funding/refresh only *queues* a scan — it returns a receipt
+      // ({queued, pipeline_job_id, duplicate}), not companies. Treating the
+      // receipt as a result used to blank the whole radar. Re-read the list
+      // instead so the user keeps seeing their current companies.
+      const { data } = await client.post('/api/funding/refresh', body)
+      setNotice(
+        data.duplicate
+          ? 'A scan is already running — results will appear here shortly.'
+          : 'Scan queued — results appear as the worker finishes.'
+      )
+      await load(false)
       setRefreshedAt(new Date().toISOString())
     } catch (e: any) {
-      setError(e.response?.data?.detail || 'Re-scan failed')
+      setError(apiError(e, 'Re-scan failed'))
     } finally { setScanning(false) }
   }
 
@@ -80,7 +89,7 @@ export default function Funding() {
       setResult(data)
       await load(false)
     } catch (e: any) {
-      setError(e.response?.data?.detail || 'Action failed')
+      setError(apiError(e, 'Action failed'))
     } finally { setBusy('') }
   }
 
@@ -155,6 +164,7 @@ export default function Funding() {
       </div>
 
       {error && <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-sm mono text-red-700 dark:text-red-300">{error}</div>}
+      {notice && <div className="p-3 rounded-xl bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 text-sm mono text-blue-700 dark:text-blue-300">{notice}</div>}
       {result && (
         <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950 border border-emerald-200 dark:border-emerald-800 text-sm text-emerald-800 dark:text-emerald-200 flex flex-wrap items-center gap-2">
           <CheckCircle2 className="w-4 h-4" />

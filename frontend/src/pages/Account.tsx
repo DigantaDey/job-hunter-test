@@ -6,7 +6,15 @@ import { useAuth } from '../context/AuthContext'
 type Disclosures = Record<string, { title: string; summary: string }>
 type ConsentState = { consents: Record<string, string>; granted: Record<string, boolean> }
 type AuditRow = { id: number; action: string; target: string; created_at: string; ip?: string }
-type ApiKeyRow = { id: number; name: string; prefix: string; last_used_at?: string; revoked_at?: string }
+type ApiKeyRow = {
+  id: number
+  name: string
+  prefix: string
+  last_used_at?: string | null
+  /** Boolean flag from the API; `revoked_at` carries the timestamp. */
+  revoked?: boolean
+  revoked_at?: string | null
+}
 
 /**
  * Shape of `GET /api/account/billing-usage`.
@@ -263,7 +271,7 @@ export default function Account() {
                 <span>
                   {key.name} <span className="text-zinc-400">{key.prefix}…</span>
                 </span>
-                {key.revoked_at ? (
+                {key.revoked || key.revoked_at ? (
                   <span className="text-zinc-400">revoked</span>
                 ) : (
                   <button onClick={() => void revokeKey(key.id)} className="text-red-600 dark:text-red-400">

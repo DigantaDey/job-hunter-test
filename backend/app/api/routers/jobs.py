@@ -253,9 +253,18 @@ async def submit_input(job_id: int, payload: InputPayload, user: CurrentUser, db
     if not request_row:
         raise HTTPException(404, "No pending input request for this job")
 
+    # Rebuild the list instead of mutating it in place: `fields` is a plain JSON
+    # column, so SQLAlchemy only detects a *reassignment* as a change. Mutating
+    # the nested dicts left the answers unsaved — the request was marked
+    # completed and the job re-queued with the very fields still blank, which
+    # looked like the application silently ignoring the user.
+    updated_fields = []
     for field in request_row.fields or []:
-        if field["name"] in payload.answers:
+        field = dict(field)
+        if field.get("name") in payload.answers:
             field["value"] = payload.answers[field["name"]]
+        updated_fields.append(field)
+    request_row.fields = updated_fields
     request_row.status = "completed"
     request_row.completed_at = datetime.utcnow()
     db.commit()

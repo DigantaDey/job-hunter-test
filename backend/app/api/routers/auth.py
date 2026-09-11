@@ -250,7 +250,11 @@ def list_api_keys(user: CurrentUser, db: DbSession):
     rows = db.query(ApiKey).filter(ApiKey.user_id == user.id).order_by(ApiKey.created_at.desc()).all()
     return [
         {"id": r.id, "name": r.name, "prefix": r.prefix, "scopes": r.scopes,
-         "created_at": r.created_at, "last_used_at": r.last_used_at, "revoked": r.revoked_at is not None}
+         "created_at": r.created_at, "last_used_at": r.last_used_at,
+         "revoked": r.revoked_at is not None,
+         # Expose the timestamp too: the UI needs to know *when* a key was
+         # revoked, and a bare boolean cannot answer that.
+         "revoked_at": r.revoked_at}
         for r in rows
     ]
 

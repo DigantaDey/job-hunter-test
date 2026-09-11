@@ -314,7 +314,15 @@ def diff_resume(resume_id: int, user: CurrentUser, db: DbSession, against_id: Op
     if against_id:
         other = db.query(Resume).filter(Resume.id == against_id, Resume.user_id == user.id).first()
     elif resume.parent_resume_id:
-        other = db.query(Resume).filter(Resume.id == resume.parent_resume_id).first()
+        # The user filter is not optional: without it a row whose
+        # parent_resume_id points at another tenant's resume would render that
+        # resume's full text (name, email, phone, employment history) into the
+        # diff. Every lookup in this endpoint stays inside the caller's tenant.
+        other = (
+            db.query(Resume)
+            .filter(Resume.id == resume.parent_resume_id, Resume.user_id == user.id)
+            .first()
+        )
     else:
         other = (
             db.query(Resume)
