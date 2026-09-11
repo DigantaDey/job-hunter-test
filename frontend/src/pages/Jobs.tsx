@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import client from '../api/client'
+import client, { apiError } from '../api/client'
 import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader2, Wand2, CheckCircle, AlertCircle, Eye, Brain } from 'lucide-react'
 
 export default function Jobs(){
@@ -33,7 +33,9 @@ export default function Jobs(){
   const discover = async()=>{
     setDiscoverBusy(true)
     try{
-      const {data} = await client.post('/api/jobs/discover')
+      // DiscoveryRequest is a JSON body — every field is optional, but the
+      // body itself is required, so `{}` is the correct "use my defaults" call.
+      const {data} = await client.post('/api/jobs/discover', {})
       setDiscoverMsg(`${(data.keywords || []).slice(0, 8).join(' • ')} — extracted from your ${data.context_source === 'ai' ? 'profile by AI' : 'profile (heuristic)'}`)
       setTimeout(load, 2000)
       setTimeout(load, 4500)
@@ -46,14 +48,15 @@ export default function Jobs(){
       const {data} = await client.post('/api/resumes/generate', null, {params:{job_id: selected.id}})
       setGenerateMsg('Tailored resume ready')
       setGeneratedLinks(data.files)
-    }catch(e:any){ setGenerateMsg(e.response?.data?.detail || 'Generation failed') }
+    }catch(e:any){ setGenerateMsg(apiError(e, 'Generation failed')) }
     finally{ setGenerating(false) }
   }
   const apply = async()=>{
     if(!selected) return
     setBusy(true); setApplyMsg('')
     try{
-      const {data}=await client.post(`/api/jobs/${selected.id}/apply`, null, {params:{resume_choice: resumeChoice}})
+      // ApplyRequest is a JSON body, not query params.
+      const {data}=await client.post(`/api/jobs/${selected.id}/apply`, {resume_choice: resumeChoice})
       if(data.status==='needs_input'){
         setApplyMsg('Needs your input — check Queues → User Input Needed')
       } else {
@@ -62,7 +65,7 @@ export default function Jobs(){
       }
       load()
       const fresh = await client.get(`/api/jobs/${selected.id}`); setSelected(fresh.data)
-    }catch(e:any){ setApplyMsg(e.response?.data?.detail || 'Apply failed') }
+    }catch(e:any){ setApplyMsg(apiError(e, 'Apply failed')) }
     finally{ setBusy(false)}
   }
 
@@ -185,7 +188,14 @@ export default function Jobs(){
                     <a href={generatedLinks.pdf} className="flex-1 py-1.5 rounded-full border dark:border-zinc-700 text-center">Download .pdf</a>
                   </div>
                 )}
-                <button onClick={async()=>{ await client.post('/api/emails/generate', null, {params:{company: selected.company, job_id: selected.id}}); alert('Email drafted → check Email Bucket')}} className="w-full py-2 rounded-full border dark:border-zinc-700">Cold email</button>
+                <button onClick={async()=>{
+                  setApplyMsg('')
+                  try{
+                    // JSON body — see EmailGenerate on the backend.
+                    await client.post('/api/emails/generate', {company: selected.company, job_id: selected.id})
+                    setApplyMsg('Email drafted → check the Email Bucket')
+                  }catch(e:any){ setApplyMsg(apiError(e, 'Could not draft the email')) }
+                }} className="w-full py-2 rounded-full border dark:border-zinc-700">Cold email</button>
               </div>
             </div>
           )}

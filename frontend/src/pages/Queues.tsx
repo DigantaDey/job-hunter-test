@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import client from '../api/client'
+import client, { apiError } from '../api/client'
 import { Layers, Bot, Search, Send, Clock, CheckCircle, AlertTriangle, Pause, Play, ArrowRight, UserCheck } from 'lucide-react'
 
 export default function Queues(){
@@ -7,6 +7,7 @@ export default function Queues(){
   const [jobs, setJobs] = useState<any[]>([])
   const [inputQueue, setInputQueue] = useState<any[]>([])
   const [filter, setFilter] = useState('application')
+  const [inputError, setInputError] = useState<string | null>(null)
 
   const load = async()=>{
     const {data}=await client.get('/api/pipelines/stats')
@@ -18,9 +19,15 @@ export default function Queues(){
   }
   useEffect(()=>{ load(); const id=setInterval(load, 3000); return ()=>clearInterval(id)},[filter])
 
-  const submitInput = async(item:any, payload:any)=>{
-    await client.post(`/api/jobs/${item.job_id}/input`, payload)
-    load()
+  const submitInput = async(item:any, values:Record<string, any>)=>{
+    // The endpoint expects InputPayload = {answers: {...}}. Posting the bare
+    // values object returned 200 while silently discarding every answer, so the
+    // job was re-queued with the same missing fields and failed again.
+    setInputError(null)
+    try{
+      await client.post(`/api/jobs/${item.job_id}/input`, { answers: values })
+      load()
+    }catch(e:any){ setInputError(apiError(e, 'Could not submit your answers')) }
   }
 
   if(!stats) return <div className="p-8 mono text-sm">Loading queues…</div>
@@ -65,6 +72,7 @@ export default function Queues(){
       {/* user input needed queue */}
       <div className="card p-5">
         <h3 className="font-medium flex items-center gap-2"><UserCheck className="w-4 h-4"/> User Input Needed Queue <span className="text-xs mono font-normal text-zinc-500">remains until you complete • then re-queued to application</span></h3>
+        {inputError && <div className="mt-2 text-xs mono p-2 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-900 text-red-700 dark:text-red-300">{inputError}</div>}
         {inputQueue.length===0 ? <div className="py-6 text-center text-sm mono text-zinc-500">No pending inputs. When autofill hits unknown fields, jobs pause here.</div> :
           <div className="mt-3 grid gap-3">
             {inputQueue.map((req:any)=> (

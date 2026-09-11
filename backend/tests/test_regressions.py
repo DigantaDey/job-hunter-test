@@ -507,3 +507,143 @@ def test_second_listener_on_the_same_port_does_not_crash(monkeypatch):
         assert first.running is True
     finally:
         first.stop()
+
+
+# --------------------------------------------------------------------------- #
+# N. Account page: /billing-usage returns nested objects, not flat counters.
+#
+# The Account screen used to render `usage[key]` straight into JSX for
+# ('jobs', 'resumes', 'emails'). Two of those are objects, so React threw
+# "Objects are not valid as a React child (found: object with keys
+# {sent_today, pending_approval})" — minified error #31 — and the error
+# boundary replaced the whole page with "Something went wrong".
+#
+# The UI now flattens the payload explicitly. These assertions pin the shape it
+# flattens, so a backend change that alters the contract fails here instead of
+# blanking the page in production.
+# --------------------------------------------------------------------------- #
+def test_billing_usage_shape_is_stable_for_the_account_page(client, auth):
+    body = client.get("/api/account/billing-usage", headers=auth).json()
+
+    # Nested buckets — the UI must read a named field out of each, never render
+    # the bucket itself.
+    assert isinstance(body["jobs"], dict)
+    assert {"total", "today", "applied"} <= set(body["jobs"])
+    assert isinstance(body["emails"], dict)
+    assert {"sent_today", "pending_approval"} <= set(body["emails"])
+
+    # Scalars — safe to render directly.
+    assert isinstance(body["resumes"], int)
+    assert isinstance(body["vault_entries"], int)
+
+    for bucket in ("jobs", "emails"):
+        for key, value in body[bucket].items():
+            assert isinstance(value, int), f"{bucket}.{key} must be an int"
+
+
+# --------------------------------------------------------------------------- #
+# N+1. The SPA↔API request contract.
+#
+# Four core journeys were unusable from the UI because the SPA sent query
+# strings to endpoints that declare a pydantic *body* (FastAPI answered 422
+# before any handler ran, and the pages showed no error):
+#
+#   POST /api/jobs/discover          DiscoveryRequest
+#   POST /api/jobs/{id}/apply        ApplyRequest
+#   POST /api/emails/generate        EmailGenerate
+#   POST /api/emails/{id}/send       SendRequest
+#
+# The backend tests passed because they always posted `json=...`. These
+# assertions pin the body contract itself, so a signature change that would
+# break the SPA fails here.
+# --------------------------------------------------------------------------- #
+def test_core_write_endpoints_accept_a_json_body(client, db, full_consent, uploaded_resume):
+    from app.models.models import Email, Job, User
+
+    user = db.query(User).first()
+    job = Job(user_id=user.id, title="Engineer", company="Acme", dedupe_key="contract-1",
+              description="python", url="https://boards.greenhouse.io/acme/jobs/1",
+              status="discovered", score=80)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    email = Email(user_id=user.id, to_email="someone@example.com", subject="s", body="b",
+                  status="pending_approval")
+    db.add(email)
+    db.commit()
+    db.refresh(email)
+
+    # Exactly the payloads the SPA sends.
+    assert client.post("/api/jobs/discover", json={}, headers=full_consent).status_code == 200
+    assert client.post(f"/api/jobs/{job.id}/apply", json={"resume_choice": "auto"},
+                       headers=full_consent).status_code == 200
+    assert client.post("/api/emails/generate", json={"company": "Acme", "department": "engineering"},
+                       headers=full_consent).status_code == 200
+    assert client.post(f"/api/emails/{email.id}/send", json={"otp": None, "allow_real": True},
+                       headers=full_consent).status_code == 200
+
+
+def test_user_input_answers_are_persisted(client, db, auth):
+    """
+    ``UserInputRequest.fields`` is a plain JSON column. The handler used to
+    mutate the nested dicts in place, which SQLAlchemy never flags as dirty:
+    the endpoint returned 200, marked the request completed and re-queued the
+    application with every answer still blank.
+    """
+    from app.models.models import Job, User, UserInputRequest
+
+    user = db.query(User).first()
+    job = Job(user_id=user.id, title="T", company="C", dedupe_key="input-1", description="d",
+              status="needs_input")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    request_row = UserInputRequest(
+        user_id=user.id, job_id=job.id, status="pending",
+        fields=[{"name": "phone", "label": "Phone", "required": True, "value": ""}],
+    )
+    db.add(request_row)
+    db.commit()
+    db.refresh(request_row)
+
+    response = client.post(f"/api/jobs/{job.id}/input", json={"answers": {"phone": "+91 90000 00001"}},
+                           headers=auth)
+    assert response.status_code == 200, response.text
+
+    db.expire_all()
+    saved = db.query(UserInputRequest).filter(UserInputRequest.id == request_row.id).one()
+    assert saved.fields[0]["value"] == "+91 90000 00001", "the user's answer was dropped"
+    assert saved.status == "completed"
+
+
+def test_resume_diff_cannot_reach_another_tenant(client, db, auth, uploaded_resume, member):
+    """
+    ``/resumes/{id}/diff`` followed ``parent_resume_id`` without scoping the
+    lookup to the caller, so a row pointing at someone else's resume rendered
+    that resume's full text (name, email, phone, history) into the diff.
+    """
+    from app.models.models import Resume, User
+
+    victim = db.query(Resume).order_by(Resume.id.desc()).first()
+    attacker_user = db.query(User).filter(User.email == "member@example.com").one()
+    attacker = {"Authorization": f"Bearer {member['access_token']}"}
+
+    planted = Resume(user_id=attacker_user.id, filename="mine.pdf", filepath="/tmp/mine.pdf",
+                     type="tailored", status="approved", text_snapshot="attacker text",
+                     parent_resume_id=victim.id)
+    db.add(planted)
+    db.commit()
+    db.refresh(planted)
+
+    response = client.get(f"/api/resumes/{planted.id}/diff", headers=attacker)
+    assert response.status_code == 404
+    assert "Test Candidate" not in response.text
+
+
+def test_api_key_listing_reports_revocation(client, auth):
+    """The UI needs both the flag and the timestamp to render 'revoked'."""
+    created = client.post("/api/auth/api-keys", json={"name": "ci"}, headers=auth).json()
+    client.delete(f"/api/auth/api-keys/{created['id']}", headers=auth)
+    row = client.get("/api/auth/api-keys", headers=auth).json()[0]
+    assert row["revoked"] is True
+    assert row["revoked_at"], "revoked_at must be exposed for the UI"

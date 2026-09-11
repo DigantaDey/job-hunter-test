@@ -24,9 +24,14 @@ export default function Emails(){
   useEffect(()=>{ load(); const id=setInterval(load, 4000); return ()=>clearInterval(id)},[filter])
 
   const generate=async()=>{
-    if(!company) return alert('Enter company')
-    await client.post('/api/emails/generate', null, {params:{company, department: dept}})
-    setCompany(''); load()
+    if(!company) return setNotice({id:-1, kind:'err', text:'Enter a company name first'})
+    setBusyId(-1)
+    try{
+      // The endpoint takes a JSON body (EmailGenerate), not query params.
+      await client.post('/api/emails/generate', {company, department: dept})
+      setCompany(''); setNotice(null); load()
+    }catch(e:any){ setNotice({id:-1, kind:'err', text: apiError(e, 'Could not draft the email')}) }
+    finally{ setBusyId(null) }
   }
   const update=async(e:any, field:string, value:string)=>{
     await client.put(`/api/emails/${e.id}`, {[field]: value})
@@ -48,7 +53,9 @@ export default function Emails(){
   const send=async(id:number, code?:string)=>{
     setBusyId(id)
     try{
-      const res=await client.post(`/api/emails/${id}/send`, null, {params: code?{otp:code}:{}})
+      // SendRequest is a JSON body: {otp, allow_real}. Sending it as query
+      // params made every send fail with a 422 before it reached the gate.
+      const res=await client.post(`/api/emails/${id}/send`, {otp: code ?? null, allow_real: true})
       if(res.data.blocked){
         // The compliance gate refused it: say which gate, instead of looking like nothing happened.
         const blockers:string[]=res.data.compliance?.blockers || []
@@ -83,11 +90,23 @@ export default function Emails(){
             <option>engineering</option><option>product</option><option>design</option><option>data</option>
           </select>
         </div>
-        <button onClick={generate} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium">Find decision maker & draft</button>
+        <button onClick={generate} disabled={busyId===-1} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium disabled:opacity-50">
+          {busyId===-1 ? 'Drafting…' : 'Find decision maker & draft'}
+        </button>
         <div className="ml-auto flex gap-1">
           {['','pending_approval','queued','sent','needs_otp','failed'].map(s=> <button key={s} onClick={()=>setFilter(s)} className={`text-xs px-3 py-1 rounded-full border mono ${filter===s?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800'}`}>{s||'all'}</button>)}
         </div>
       </div>
+
+      {/* Errors from the drafting form itself (id -1) belong at page level —
+          the per-row notices below are keyed to an existing email. */}
+      {notice && notice.id===-1 && (
+        <div className={`text-sm mono p-2 rounded-lg border ${
+          notice.kind==='err'
+            ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-900 text-red-700 dark:text-red-300'
+            : 'bg-amber-50 dark:bg-amber-950 border-amber-200 dark:border-amber-900 text-amber-700 dark:text-amber-300'
+        }`}>{notice.text}</div>
+      )}
 
       <div className="grid gap-3">
         {emails.length===0 ? <div className="card p-8 text-center mono text-sm text-zinc-500">No emails in bucket. Generate for startups/small companies — finds hiring manager via AI + hunter pattern, drafts with SMTP (handles 2FA OTP).</div> :
