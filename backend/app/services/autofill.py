@@ -41,9 +41,16 @@ PROFILE_PATHS = {
 }
 
 
-def _value_for(key: str, profile: Dict[str, Any], answers: Dict[str, Any]) -> Optional[str]:
-    if key in answers and answers[key] not in (None, ""):
-        return str(answers[key])
+def _value_for(key: str, profile: Dict[str, Any], answers: Dict[str, Any],
+               field_name: Optional[str] = None) -> Optional[str]:
+    # User answers arrive keyed by whatever the input queue showed — the raw
+    # form field *name* (e.g. "salary_expectation") — while canonical fields
+    # also have a *profile key* (e.g. "salaryExpectation"). Accept both,
+    # canonical first, so a submitted answer can never be silently orphaned
+    # on the re-queued run.
+    for candidate in (key, field_name):
+        if candidate and candidate in answers and answers[candidate] not in (None, ""):
+            return str(answers[candidate])
     for candidate in PROFILE_PATHS.get(key, (key,)):
         if profile.get(candidate) not in (None, "", []):
             value = profile[candidate]
@@ -91,7 +98,7 @@ def build_autofill_plan(
                 value = resume_path
                 source = "resume_file"
         elif key:
-            value = _value_for(key, profile, answers)
+            value = _value_for(key, profile, answers, field_name=name)
         elif field.get("type") == "password":
             value = (credential or {}).get("password")
             source = "vault"

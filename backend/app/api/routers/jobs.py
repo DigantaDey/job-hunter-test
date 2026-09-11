@@ -13,7 +13,7 @@ from app.core import audit
 from app.core.auth import require_consent
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.models.models import Job, JobEvent, Profile, UserInputRequest
+from app.models.models import Job, JobEvent, PipelineJob, Profile, UserInputRequest
 from app.schemas.schemas import JobDetail, JobOut
 from app.services.apply_flow import mark_applied, prepare_application
 from app.services.classifier import ai_company_size, heuristic_company_size
@@ -235,6 +235,56 @@ async def apply_job(
     return result
 
 
+def _requeue_application(db: Session, user_id: int, job: Job, answers: Dict[str, Any]) -> Optional[PipelineJob]:
+    """
+    Ensure a runnable application item exists for ``job`` carrying the merged
+    ``answers`` — re-activating the active duplicate instead of no-op'ing on
+    its dedupe key.
+
+    A previous run can leave the item parked in ``needs_input`` (the worker's
+    waiting-for-user state). ``enqueue`` treats that as a duplicate and would
+    return ``None``: the job would then sit ``queued`` forever with the
+    answers stored but nothing left to process them. The new answers *are* the
+    unblock signal, so the parked item is re-queued with the fresh payload.
+    The attempt counter resets with it — user-driven re-runs start a new
+    retry cycle, so iterating on answers cannot dead-letter the item.
+    """
+    dedupe_key = f"apply:{job.id}"
+    existing = (
+        db.query(PipelineJob)
+        .filter(PipelineJob.user_id == user_id, PipelineJob.dedupe_key == dedupe_key,
+                PipelineJob.status.in_(("queued", "processing", "needs_input")))
+        .order_by(PipelineJob.id.asc())
+        .first()
+    )
+    if existing is None:
+        return enqueue(db, user_id=user_id, pipeline="application", job_id=job.id,
+                       payload={"resume_choice": "auto", "answers": answers}, priority=1,
+                       dedupe_key=dedupe_key)
+    if existing.status == "needs_input":
+        # Reassign the payload wholesale: it is a plain JSON column, so an
+        # in-place mutation would not be flagged as a change.
+        existing.payload = {**(existing.payload or {}), "resume_choice": "auto", "answers": answers}
+        existing.status = "queued"
+        existing.attempts = 0
+        existing.scheduled_at = datetime.utcnow()
+        existing.error = ""
+        existing.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(existing)
+        return existing
+    if existing.status == "queued":
+        # Not claimed yet — fold the newest answers in so a quick re-submit is
+        # not clobbered by the stale payload.
+        existing.payload = {**(existing.payload or {}), "resume_choice": "auto", "answers": answers}
+        db.commit()
+        db.refresh(existing)
+    # "processing": a worker is running it right now; it re-prepares from its
+    # own payload and will re-open the input request if anything is still
+    # missing, which the user can then answer again.
+    return existing
+
+
 class InputPayload(BaseModel):
     answers: Dict[str, Any] = Field(default_factory=dict)
 
@@ -280,12 +330,14 @@ async def submit_input(job_id: int, payload: InputPayload, user: CurrentUser, db
 
     record_job_event(db, user_id=user.id, job_id=job.id, stage="user_input", status="success",
                      message=f"User provided {len(payload.answers)} field(s); application re-queued")
-    item = enqueue(db, user_id=user.id, pipeline="application", job_id=job.id,
-                   payload={"resume_choice": "auto", "answers": answers}, priority=1,
-                   dedupe_key=f"apply:{job.id}")
+    item = _requeue_application(db, user.id, job, answers)
     audit.audit(db, "job.input_submitted", user=user, target=f"job:{job.id}",
                 detail={"fields": list(payload.answers)}, request=None)
-    return {"ok": True, "requeued": True, "pipeline_job_id": item.id if item else None}
+    return {
+        "ok": True,
+        "requeued": item is not None and item.status in ("queued", "processing"),
+        "pipeline_job_id": item.id if item else None,
+    }
 
 
 @router.post("/jobs/{job_id}/mark-applied")
