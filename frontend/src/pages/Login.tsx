@@ -15,6 +15,7 @@ export default function Login() {
   const [mode, setMode] = useState<'login' | 'register' | null>(null)
   const [form, setForm] = useState({ email: '', password: '', name: '' })
   const [busy, setBusy] = useState(false)
+  const [localError, setLocalError] = useState<string | null>(null)
 
   // Send an already-authenticated visitor to the page they came from (or the
   // dashboard). This also performs the post-login redirect: a successful
@@ -31,11 +32,33 @@ export default function Login() {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
+    setLocalError(null)
+
+    // Client-side validation before we hit the API (saves a round trip and
+    // surfaces the most common mistakes immediately).
+    const email = form.email.trim()
+    const password = form.password
+    const name = form.name.trim()
+    if (!email || !password) {
+      setLocalError('Email and password are required')
+      return
+    }
+    if (activeMode !== 'login' && password.length < minLength) {
+      setLocalError(`Password must be at least ${minLength} characters`)
+      return
+    }
+    if (activeMode !== 'login' && !name) {
+      setLocalError('Please enter your name')
+      return
+    }
+
     setBusy(true)
     try {
-      if (activeMode === 'bootstrap') await bootstrap(form.email, form.password, form.name)
-      else if (activeMode === 'register') await register(form.email, form.password, form.name)
-      else await login(form.email, form.password)
+      if (activeMode === 'bootstrap') await bootstrap(email, password, name)
+      else if (activeMode === 'register') await register(email, password, name)
+      else await login(email, password)
+      // On success AuthContext sets `user`; the <Navigate> above fires on the
+      // next render and sends us to `from` (default /dashboard at "/").
     } catch {
       /* the context already stored a readable error */
     } finally {
@@ -43,6 +66,7 @@ export default function Login() {
     }
   }
 
+  const displayedError = localError || error
   const title = activeMode === 'bootstrap' ? 'Create the owner account' : activeMode === 'register' ? 'Create your account' : 'Sign in'
 
   return (
@@ -58,101 +82,115 @@ export default function Login() {
           </div>
         </div>
 
-        <div className="card p-6">
-          <h1 className="text-lg font-semibold flex items-center gap-2">
-            <LockKeyhole className="w-4 h-4" /> {title}
-          </h1>
-          {bootstrapRequired && (
-            <p className="text-xs mono text-zinc-500 mt-2">
-              This instance has no users yet. The first account becomes the owner.
-            </p>
-          )}
+        {loading && !status ? (
+          <div className="card p-6 mono text-sm text-zinc-500 flex items-center justify-center gap-2">
+            <Loader2 className="w-4 h-4 animate-spin" /> Loading…
+          </div>
+        ) : (
+          <div className="card p-6">
+            <h1 className="text-lg font-semibold flex items-center gap-2">
+              <LockKeyhole className="w-4 h-4" /> {title}
+            </h1>
+            {bootstrapRequired && (
+              <p className="text-xs mono text-zinc-500 mt-2">
+                This instance has no users yet. The first account becomes the owner.
+              </p>
+            )}
 
-          <form onSubmit={submit} className="mt-5 space-y-4">
-            {activeMode !== 'login' && (
+            <form onSubmit={submit} className="mt-5 space-y-4">
+              {activeMode !== 'login' && (
+                <label className="block">
+                  <span className="text-xs mono text-zinc-500">Name</span>
+                  <div className="mt-1 flex items-center gap-2 border rounded-xl px-3 py-2 bg-white dark:bg-zinc-900 dark:border-zinc-700">
+                    <UserIcon className="w-4 h-4 text-zinc-400" />
+                    <input
+                      value={form.name}
+                      onChange={(e) => setForm({ ...form, name: e.target.value })}
+                      className="flex-1 bg-transparent text-sm outline-none"
+                      placeholder="Ada Lovelace"
+                      autoComplete="name"
+                      disabled={busy}
+                    />
+                  </div>
+                </label>
+              )}
+
               <label className="block">
-                <span className="text-xs mono text-zinc-500">Name</span>
+                <span className="text-xs mono text-zinc-500">Email</span>
                 <div className="mt-1 flex items-center gap-2 border rounded-xl px-3 py-2 bg-white dark:bg-zinc-900 dark:border-zinc-700">
-                  <UserIcon className="w-4 h-4 text-zinc-400" />
+                  <Mail className="w-4 h-4 text-zinc-400" />
                   <input
-                    value={form.name}
-                    onChange={(e) => setForm({ ...form, name: e.target.value })}
+                    type="email"
+                    required
+                    value={form.email}
+                    onChange={(e) => setForm({ ...form, email: e.target.value })}
                     className="flex-1 bg-transparent text-sm outline-none"
-                    placeholder="Ada Lovelace"
-                    autoComplete="name"
+                    placeholder="you@example.com"
+                    autoComplete="email"
+                    disabled={busy}
                   />
                 </div>
               </label>
-            )}
 
-            <label className="block">
-              <span className="text-xs mono text-zinc-500">Email</span>
-              <div className="mt-1 flex items-center gap-2 border rounded-xl px-3 py-2 bg-white dark:bg-zinc-900 dark:border-zinc-700">
-                <Mail className="w-4 h-4 text-zinc-400" />
-                <input
-                  type="email"
-                  required
-                  value={form.email}
-                  onChange={(e) => setForm({ ...form, email: e.target.value })}
-                  className="flex-1 bg-transparent text-sm outline-none"
-                  placeholder="you@example.com"
-                  autoComplete="email"
-                />
-              </div>
-            </label>
+              <label className="block">
+                <span className="text-xs mono text-zinc-500">Password</span>
+                <div className="mt-1 flex items-center gap-2 border rounded-xl px-3 py-2 bg-white dark:bg-zinc-900 dark:border-zinc-700">
+                  <LockKeyhole className="w-4 h-4 text-zinc-400" />
+                  <input
+                    type="password"
+                    required
+                    minLength={activeMode === 'login' ? undefined : minLength}
+                    value={form.password}
+                    onChange={(e) => setForm({ ...form, password: e.target.value })}
+                    className="flex-1 bg-transparent text-sm outline-none"
+                    placeholder={`At least ${minLength} characters`}
+                    autoComplete={activeMode === 'login' ? 'current-password' : 'new-password'}
+                    disabled={busy}
+                  />
+                </div>
+                {activeMode !== 'login' && (
+                  <span className="text-[11px] mono text-zinc-500">
+                    Minimum {minLength} characters; a passphrase beats a short password.
+                  </span>
+                )}
+              </label>
 
-            <label className="block">
-              <span className="text-xs mono text-zinc-500">Password</span>
-              <div className="mt-1 flex items-center gap-2 border rounded-xl px-3 py-2 bg-white dark:bg-zinc-900 dark:border-zinc-700">
-                <LockKeyhole className="w-4 h-4 text-zinc-400" />
-                <input
-                  type="password"
-                  required
-                  value={form.password}
-                  onChange={(e) => setForm({ ...form, password: e.target.value })}
-                  className="flex-1 bg-transparent text-sm outline-none"
-                  placeholder={`At least ${minLength} characters`}
-                  autoComplete={activeMode === 'login' ? 'current-password' : 'new-password'}
-                />
-              </div>
-              {activeMode !== 'login' && (
-                <span className="text-[11px] mono text-zinc-500">
-                  Minimum {minLength} characters; a passphrase beats a short password.
-                </span>
+              {displayedError && (
+                <div className="text-xs mono rounded-lg p-2 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-900 text-red-700 dark:text-red-300">
+                  {displayedError}
+                </div>
               )}
-            </label>
 
-            {error && (
-              <div className="text-xs mono rounded-lg p-2 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-900 text-red-700 dark:text-red-300">
-                {error}
-              </div>
+              <button
+                type="submit"
+                disabled={busy}
+                className="w-full py-2.5 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50"
+              >
+                {busy && <Loader2 className="w-4 h-4 animate-spin" />}
+                {activeMode === 'bootstrap' ? 'Create owner account' : activeMode === 'register' ? 'Create account &amp; continue' : 'Sign in'}
+              </button>
+            </form>
+
+            {!bootstrapRequired && canRegister && (
+              <button
+                onClick={() => {
+                  setMode(activeMode === 'login' ? 'register' : 'login')
+                  setLocalError(null)
+                }}
+                className="mt-4 text-xs mono text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+                disabled={busy}
+              >
+                {activeMode === 'login' ? 'Need an account? Register →' : '← Back to sign in'}
+              </button>
             )}
 
-            <button
-              type="submit"
-              disabled={busy}
-              className="w-full py-2.5 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50"
-            >
-              {busy && <Loader2 className="w-4 h-4 animate-spin" />}
-              {activeMode === 'bootstrap' ? 'Create owner account' : activeMode === 'register' ? 'Create account' : 'Sign in'}
-            </button>
-          </form>
-
-          {!bootstrapRequired && canRegister && (
-            <button
-              onClick={() => setMode(activeMode === 'login' ? 'register' : 'login')}
-              className="mt-4 text-xs mono text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
-            >
-              {activeMode === 'login' ? 'Need an account? Register →' : '← Back to sign in'}
-            </button>
-          )}
-
-          {!bootstrapRequired && !canRegister && (
-            <p className="mt-4 text-[11px] mono text-zinc-500">
-              Registration is closed on this instance — ask the owner for an account.
-            </p>
-          )}
-        </div>
+            {!bootstrapRequired && !canRegister && (
+              <p className="mt-4 text-[11px] mono text-zinc-500">
+                Registration is closed on this instance — ask the owner for an account.
+              </p>
+            )}
+          </div>
+        )}
 
         <p className="mt-4 text-[11px] mono text-zinc-500 flex items-start gap-2">
           <ShieldCheck className="w-3.5 h-3.5 mt-0.5 shrink-0" />

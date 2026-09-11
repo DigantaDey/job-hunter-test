@@ -36,6 +36,7 @@ client.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 })
 
 let refreshInFlight: Promise<string | null> | null = null
+let authExpiredDispatched = false
 
 /** Refresh once per burst of 401s — concurrent failures share one request. */
 async function refreshAccessToken(): Promise<string | null> {
@@ -76,7 +77,16 @@ client.interceptors.response.use(
         config.headers = { ...(config.headers || {}), Authorization: `Bearer ${token}` }
         return client(config)
       }
-      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT))
+      // Dispatch the auth-expired event exactly once per "burst" — otherwise
+      // every concurrent 401 would re-clear the user in AuthContext and cause
+      // thrash / redirect races.
+      if (!authExpiredDispatched) {
+        authExpiredDispatched = true
+        window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT))
+        // Re-arm after a tick so a genuine subsequent expiry (e.g. after a
+        // fresh login) still fires.
+        setTimeout(() => { authExpiredDispatched = false }, 500)
+      }
     }
     return Promise.reject(error)
   }

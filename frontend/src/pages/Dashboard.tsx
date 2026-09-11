@@ -10,19 +10,29 @@ export default function Dashboard() {
   const [profile, setProfile] = useState<any>(null)
 
   useEffect(()=>{
-    client.get('/api/dashboard/summary').then(r=>setSummary(r.data)).catch(()=>{})
-    client.get('/api/jobs').then(r=>setJobs(r.data.slice(0,5))).catch(()=>{})
-    client.get('/api/pipelines/stats').then(r=>setPipeline(r.data)).catch(()=>{})
-    client.get('/api/profile/current').then(r=>setProfile(r.data)).catch(()=>{})
+    let cancelled = false
+    client.get('/api/dashboard/summary')
+      .then(r=>{ if (!cancelled) setSummary(r.data) })
+      .catch(()=>{ if (!cancelled) setSummary({ jobs: {}, emails: {}, resumes: {total:0,pending_approval:0}, vault: 0, user_input: 0 }) })
+    client.get('/api/jobs')
+      .then(r=>{ if (!cancelled) setJobs((r.data || []).slice(0, 5)) })
+      .catch(()=>{ if (!cancelled) setJobs([]) })
+    client.get('/api/pipelines/stats')
+      .then(r=>{ if (!cancelled) setPipeline(r.data) })
+      .catch(()=>{ if (!cancelled) setPipeline(null) })
+    client.get('/api/profile/current')
+      .then(r=>{ if (!cancelled) setProfile(r.data) })
+      .catch(()=>{ if (!cancelled) setProfile(null) })
+    return ()=>{ cancelled = true }
   },[])
 
   if(!summary) return <div className="p-8 mono text-sm">Loading dashboard…</div>
 
   const statCards = [
-    {label:'Discovered', value: summary.jobs.discovered, icon: Search, color:'text-blue-600', bg:'bg-blue-50 dark:bg-blue-950'},
-    {label:'Applied', value: summary.jobs.applied, icon: CheckCircle, color:'text-emerald-600', bg:'bg-emerald-50 dark:bg-emerald-950'},
-    {label:'Needs Input', value: summary.jobs.needs_input, icon: AlertTriangle, color:'text-amber-600', bg:'bg-amber-50 dark:bg-amber-950'},
-    {label:'Failed', value: summary.jobs.failed, icon: Clock, color:'text-red-600', bg:'bg-red-50 dark:bg-red-950'},
+    {label:'Discovered', value: summary.jobs?.discovered ?? 0, icon: Search, color:'text-blue-600', bg:'bg-blue-50 dark:bg-blue-950'},
+    {label:'Applied', value: summary.jobs?.applied ?? 0, icon: CheckCircle, color:'text-emerald-600', bg:'bg-emerald-50 dark:bg-emerald-950'},
+    {label:'Needs Input', value: summary.jobs?.needs_input ?? 0, icon: AlertTriangle, color:'text-amber-600', bg:'bg-amber-50 dark:bg-amber-950'},
+    {label:'Failed', value: summary.jobs?.failed ?? 0, icon: Clock, color:'text-red-600', bg:'bg-red-50 dark:bg-red-950'},
   ]
 
   return (
@@ -73,12 +83,12 @@ export default function Dashboard() {
           <div className="mt-4 space-y-2">
             {jobs.length===0 ? <div className="text-sm text-zinc-500 py-8 text-center mono">No jobs yet. Trigger discovery in Jobs →</div> : jobs.map(j=> (
               <Link key={j.id} to="/jobs" className="flex items-center gap-3 p-3 rounded-xl border dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 transition">
-                <div className="w-9 h-9 rounded-lg bg-zinc-900 dark:bg-zinc-800 text-white flex items-center justify-center text-xs font-bold">{j.company.slice(0,2).toUpperCase()}</div>
+                <div className="w-9 h-9 rounded-lg bg-zinc-900 dark:bg-zinc-800 text-white flex items-center justify-center text-xs font-bold">{(j.company || '??').slice(0,2).toUpperCase()}</div>
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium truncate">{j.title} <span className="text-zinc-500 font-normal">• {j.company}</span></div>
-                  <div className="text-xs text-zinc-500 mono flex gap-2"><span>{j.source}</span><span>•</span><span>{j.company_size}</span><span>•</span><span>score {j.score}</span></div>
+                  <div className="text-sm font-medium truncate">{j.title || 'Untitled'} <span className="text-zinc-500 font-normal">• {j.company || ''}</span></div>
+                  <div className="text-xs text-zinc-500 mono flex gap-2"><span>{j.source || ''}</span><span>•</span><span>{j.company_size || ''}</span><span>•</span><span>score {j.score ?? 0}</span></div>
                 </div>
-                <div className={`text-[11px] px-2 py-1 rounded-full border mono ${j.status==='applied'?'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950 dark:border-emerald-800 dark:text-emerald-300': j.status==='needs_input'?'bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-950': 'bg-zinc-50 dark:bg-zinc-800'}`}>{j.status}</div>
+                <div className={`text-[11px] px-2 py-1 rounded-full border mono ${j.status==='applied'?'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950 dark:border-emerald-800 dark:text-emerald-300': j.status==='needs_input'?'bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-950': 'bg-zinc-50 dark:bg-zinc-800'}`}>{j.status || ''}</div>
               </Link>
             ))}
           </div>
@@ -102,10 +112,10 @@ export default function Dashboard() {
             <div className="mt-2 text-xs mono text-zinc-500">
               {profile ? <><div>Skills: {profile.data.skills?.slice(0,6).join(', ')}</div><div className="mt-1">{profile.data.email}</div></> : 'No master resume uploaded yet.'}
             </div>
-            <div className="mt-3 flex gap-2">
-              <div className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 mono flex items-center gap-1"><FileText className="w-3 h-3"/>{summary.resumes} resumes</div>
-              <div className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 mono flex items-center gap-1"><Vault className="w-3 h-3"/>{summary.vault} vault</div>
-            </div>
+              <div className="mt-3 flex gap-2">
+                <div className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 mono flex items-center gap-1"><FileText className="w-3 h-3"/>{typeof summary.resumes === 'object' ? (summary.resumes.total ?? 0) : (summary.resumes ?? 0)} resumes</div>
+                <div className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 mono flex items-center gap-1"><Vault className="w-3 h-3"/>{summary.vault ?? 0} vault</div>
+              </div>
           </div>
         </div>
       </div>

@@ -24,15 +24,20 @@ export default function Layout() {
   const [ai, setAi] = useState<{online:boolean, rpm:number, remaining:number, latency_ms?:number} | null>(null)
   const loc = useLocation()
   useEffect(()=>{
+    let cancelled = false
     let id = setInterval(async ()=>{
       try {
         const {data} = await client.get('/api/settings/ai/status')
-        setAi(data)
-      } catch { setAi({online:false, rpm:60, remaining:0}) }
+        if (!cancelled) setAi(data)
+      } catch {
+        if (!cancelled) setAi({online:false, rpm:60, remaining:0, latency_ms: undefined})
+      }
     }, 15000)
     // immediate
-    client.get('/api/settings/ai/status').then(r=>setAi(r.data)).catch(()=>{})
-    return ()=> clearInterval(id)
+    client.get('/api/settings/ai/status')
+      .then(r=>{ if (!cancelled) setAi(r.data) })
+      .catch(()=>{ if (!cancelled) setAi({online:false, rpm:60, remaining:0, latency_ms: undefined}) })
+    return ()=> { cancelled = true; clearInterval(id) }
   }, [])
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex">

@@ -57,8 +57,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return
     }
     try {
-      const { data } = await client.get<SessionUser>('/api/auth/me')
-      setUser(data)
+      const { data } = await client.get<SessionUser & { consents?: Record<string, unknown>; settings?: unknown }>('/api/auth/me')
+      // Normalise: /me omits is_owner, so derive it from role to keep the shape
+      // identical to what login/bootstrap/register send inline.
+      const normalized: SessionUser = {
+        id: data.id,
+        email: data.email,
+        name: data.name || '',
+        role: data.role || 'member',
+        is_owner: data.is_owner ?? (data.role || '').toLowerCase() === 'owner',
+        is_active: data.is_active ?? true,
+      }
+      setUser(normalized)
     } catch {
       tokenStore.clear()
       setUser(null)
@@ -75,22 +85,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [loadSession, refreshStatus])
 
   useEffect(() => {
-    const onExpired = () => setUser(null)
+    const onExpired = () => {
+      tokenStore.clear()
+      setUser(null)
+    }
     window.addEventListener(AUTH_EXPIRED_EVENT, onExpired)
     return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onExpired)
   }, [])
 
-  const finishAuth = useCallback((payload: { access_token: string; refresh_token: string }) => {
+  const finishAuth = useCallback((payload: { access_token: string; refresh_token: string; user?: SessionUser | null }) => {
     tokenStore.set(payload.access_token, payload.refresh_token)
     setError(null)
+    // Normalise the user shape so is_owner is always present.
+    if (payload.user) {
+      const u = payload.user
+      const normalized: SessionUser = {
+        id: u.id,
+        email: u.email,
+        name: u.name || '',
+        role: u.role || 'member',
+        is_owner: u.is_owner ?? (u.role || '').toLowerCase() === 'owner',
+        is_active: u.is_active ?? true,
+      }
+      setUser(normalized)
+    }
   }, [])
 
   const bootstrap = useCallback(
     async (email: string, password: string, name: string) => {
+      setError(null)
       try {
         const { data } = await client.post('/api/auth/bootstrap', { email, password, name })
         finishAuth(data)
-        setUser(data.user)
         await refreshStatus()
       } catch (err) {
         setError(apiError(err, 'Could not create the owner account'))
@@ -102,10 +128,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(
     async (email: string, password: string) => {
+      setError(null)
       try {
         const { data } = await client.post('/api/auth/login', { email, password })
         finishAuth(data)
-        setUser(data.user)
       } catch (err) {
         setError(apiError(err, 'Sign-in failed'))
         throw err
@@ -116,10 +142,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const register = useCallback(
     async (email: string, password: string, name: string) => {
+      setError(null)
       try {
         const { data } = await client.post('/api/auth/register', { email, password, name })
         finishAuth(data)
-        setUser(data.user)
       } catch (err) {
         setError(apiError(err, 'Registration failed'))
         throw err
