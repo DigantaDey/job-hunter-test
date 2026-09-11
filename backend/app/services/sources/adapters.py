@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Dict, List, Optional
-from xml.etree import ElementTree
+
+from defusedxml import ElementTree
 
 from app.core.config import settings
 from app.core.logging import get_logger

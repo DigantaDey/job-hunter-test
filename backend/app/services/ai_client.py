@@ -16,7 +16,10 @@ Guarantees (in order of importance):
    as metrics and surfaced through ``/api/settings/ai/status``.
 5. **Per-workflow config.** Different base_url/model/key per workflow, resolved
    from the DB overrides with env defaults.
+6. **Per-user credit tracking.** Every successful call can be attributed to a
+   user for billing, limits and cost control.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -55,6 +58,8 @@ WORKFLOWS = {
     "form_detect": "job-portal form-structure detection",
     "funding_scan": "funding radar scan",
     "tagging": "resume auto-tagging",
+    "interview": "interview preparation",
+    "company_intel": "company intelligence",
 }
 
 _workflow_overrides: Dict[str, Dict[str, str]] = {}
@@ -164,7 +169,49 @@ def resolve_config(workflow: Optional[str] = None) -> Dict[str, str]:
     }
 
 
-def is_configured(workflow: Optional[str] = None) -> bool:
+def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) -> Dict[str, str]:
+    """
+    Resolve AI config for a specific user, including per-user DB settings and owner fallback.
+    Resolution order:
+    1. Per-workflow override (from DB ai_workflows table, in-memory _workflow_overrides)
+    2. Per-user default AI settings (from SettingsModel category=ai)
+    3. Owner's default AI settings as global fallback
+    4. Env defaults
+    All are OpenAI compatible: base_url, model, api_key
+    """
+    # Start with env defaults
+    try:
+        from app.services.user_settings import get_user_ai_config
+        user_cfg = get_user_ai_config(db, user_id)
+        base_url = user_cfg.get("base_url") or settings.ai_base_url
+        model = user_cfg.get("model") or settings.ai_model
+        api_key = user_cfg.get("api_key") or settings.ai_api_key
+    except Exception:
+        base_url = settings.ai_base_url
+        model = settings.ai_model
+        api_key = settings.ai_api_key
+
+    # Apply per-workflow override if present (overrides per-user and env)
+    override = _workflow_overrides.get(workflow or "", {}) if workflow else {}
+    if override:
+        base_url = override.get("base_url") or base_url
+        api_key = override.get("api_key") or api_key
+        model = override.get("model") or model
+
+    return {
+        "base_url": (base_url or "").rstrip("/"),
+        "api_key": api_key or "",
+        "model": model or "",
+    }
+
+
+def is_configured(workflow: Optional[str] = None, db=None, user_id: Optional[int] = None) -> bool:
+    if db is not None and user_id is not None:
+        try:
+            cfg = resolve_config_for_user(db, user_id, workflow)
+            return bool(cfg["api_key"])
+        except Exception:
+            pass
     return bool(resolve_config(workflow)["api_key"])
 
 
@@ -174,6 +221,86 @@ def usage_snapshot() -> Dict[str, Dict[str, int]]:
 
 def breaker_snapshot() -> Dict[str, Dict[str, Any]]:
     return {k: v.state() for k, v in _breakers.items()}
+
+
+# --------------------------------------------------------------------------- #
+# Per-user AI credit tracking (SaaS)
+# --------------------------------------------------------------------------- #
+MODEL_COSTS = {
+    "gpt-4": {"input": 0.03, "output": 0.06},
+    "gpt-4o": {"input": 0.005, "output": 0.015},
+    "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+    "gpt-3.5-turbo": {"input": 0.0005, "output": 0.0015},
+    "claude-3-opus": {"input": 0.015, "output": 0.075},
+    "claude-3-sonnet": {"input": 0.003, "output": 0.015},
+    "claude-3-haiku": {"input": 0.00025, "output": 0.00125},
+    "default": {"input": 0.001, "output": 0.002},
+}
+
+def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    m = (model or "").lower()
+    cost_entry = MODEL_COSTS["default"]
+    for key, val in MODEL_COSTS.items():
+        if key in m:
+            cost_entry = val
+            break
+    return (prompt_tokens / 1000.0) * cost_entry["input"] + (completion_tokens / 1000.0) * cost_entry["output"]
+
+def track_ai_usage(
+    db=None,
+    user_id: Optional[int] = None,
+    workflow: str = "",
+    model: str = "",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    success: bool = True,
+    latency_ms: int = 0,
+    error: str = "",
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    if total_tokens == 0:
+        total_tokens = prompt_tokens + completion_tokens
+    cost = estimate_cost(model or "default", prompt_tokens, completion_tokens)
+    _spend_tokens(total_tokens)
+
+    if db is None or user_id is None:
+        return
+    try:
+        from app.core.entitlements import increment_usage
+        from app.models.models import AICreditLedger, utcnow
+
+        ledger = AICreditLedger(
+            user_id=user_id,
+            workflow=workflow,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            estimated_cost_usd=cost,
+            success=success,
+            latency_ms=latency_ms,
+            error=(error or "")[:2000],
+            meta=meta or {},
+            created_at=utcnow(),
+        )
+        db.add(ledger)
+        db.commit()
+        try:
+            increment_usage(db, user_id, "ai_operations_per_month", 1)
+            increment_usage(db, user_id, "ai_credits_per_month", total_tokens)
+            if workflow == "scoring":
+                increment_usage(db, user_id, "job_analysis_per_month", 1)
+            elif workflow == "resume_gen":
+                increment_usage(db, user_id, "tailored_resumes_per_month", 1)
+            elif workflow == "parse":
+                increment_usage(db, user_id, "resume_parses_per_month", 1)
+            elif workflow == "email_gen":
+                increment_usage(db, user_id, "outreach_per_month", 1)
+        except Exception:
+            pass
+    except Exception as exc:
+        log.warning("failed to track AI usage: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -189,9 +316,19 @@ async def chat_completion(
     max_tokens: Optional[int] = None,
     ai_config: Optional[Dict[str, str]] = None,
     system: Optional[str] = None,
+    db=None,
+    user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Send a chat completion. Raises ``AIClientError`` on failure."""
-    cfg = resolve_config(workflow)
+    # Resolution order: explicit ai_config > per-user DB config (with owner fallback) > workflow override > env
+    if db is not None and user_id is not None:
+        try:
+            cfg = resolve_config_for_user(db, user_id, workflow)
+        except Exception:
+            cfg = resolve_config(workflow)
+    else:
+        cfg = resolve_config(workflow)
+
     if ai_config:
         cfg = {
             "base_url": (ai_config.get("base_url") or cfg["base_url"]).rstrip("/"),
@@ -199,7 +336,18 @@ async def chat_completion(
             "model": ai_config.get("model") or cfg["model"],
         }
     if not cfg["api_key"]:
-        raise AIClientError("no_api_key: AI is not configured (set AI_API_KEY or a per-workflow override)")
+        raise AIClientError("no_api_key: AI is not configured (set AI_API_KEY in Settings or per-workflow override — OpenAI compatible format: base_url like https://api.openai.com/v1, model like gpt-4o-mini)")
+
+    # Per-user entitlement pre-check if db/user_id provided
+    if db is not None and user_id is not None:
+        try:
+            from app.core.entitlements import enforce
+            enforce(db, user_id, "ai_operations_per_month")
+            enforce(db, user_id, "ai_credits_per_month")
+        except Exception as e:
+            # If enforcement fails (limit exceeded), raise as client error
+            # to be caught and fallback to heuristic
+            raise AIClientError(f"limit_exceeded: {e}", retryable=False) from e
 
     if budget_exhausted():
         inc("jobhunter_ai_requests_total", workflow=workflow, status="budget_exhausted")
@@ -215,8 +363,12 @@ async def chat_completion(
 
     messages: List[Dict[str, str]] = []
     if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+        # Sanitize system prompt — treat external data as untrusted
+        safe_system = system.replace("```", "")[:2000]
+        messages.append({"role": "system", "content": safe_system})
+    # Sanitize user prompt: remove potential injection
+    safe_prompt = prompt.replace("SYSTEM:", "").replace("Ignore previous", "")[:12000]
+    messages.append({"role": "user", "content": safe_prompt})
 
     payload: Dict[str, Any] = {"model": cfg["model"], "messages": messages, "temperature": temperature}
     if json_mode:
@@ -229,7 +381,6 @@ async def chat_completion(
     last_error: Optional[str] = None
 
     for attempt in range(1, attempts + 1):
-        # Never exceed the configured RPM budget, regardless of concurrency.
         await rate_limiter.wait_and_acquire(1)
         started = time.perf_counter()
         try:
@@ -243,6 +394,8 @@ async def chat_completion(
                 await _sleep_backoff(attempt)
                 continue
             breaker.record_failure(last_error)
+            if db and user_id:
+                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error)
             raise AIClientError(last_error, retryable=True) from exc
         finally:
             observe("jobhunter_ai_latency_seconds", time.perf_counter() - started, workflow=workflow)
@@ -262,9 +415,13 @@ async def chat_completion(
             continue
         if not retryable:
             breaker.record_failure(last_error) if response.status_code in (401, 403) else None
+            if db and user_id:
+                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error, latency_ms=int((time.perf_counter() - started)*1000))
             raise AIClientError(last_error, status=response.status_code, retryable=False)
 
         breaker.record_failure(last_error)
+        if db and user_id:
+            track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error)
         raise AIClientError(last_error, status=response.status_code, retryable=True)
     else:  # pragma: no cover - loop always breaks or raises
         raise AIClientError(last_error or "unknown error", retryable=True)
@@ -275,10 +432,17 @@ async def chat_completion(
         content = choice["message"]["content"]
     except (KeyError, IndexError, ValueError) as exc:
         breaker.record_failure(f"malformed_response: {exc}")
+        if db and user_id:
+            track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=str(exc))
         raise AIClientError(f"malformed_response: {exc}") from exc
 
     usage = data.get("usage") or {}
-    _spend_tokens(int(usage.get("total_tokens") or 0))
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+    latency_ms = int((time.perf_counter() - started) * 1000) if 'started' in locals() else 0
+
+    _spend_tokens(total_tokens)
     bucket = _usage.setdefault(workflow, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0})
     bucket["calls"] += 1
     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
@@ -287,12 +451,28 @@ async def chat_completion(
     set_gauge("jobhunter_ai_tokens_total", bucket["total_tokens"], workflow=workflow)
     inc("jobhunter_ai_requests_total", workflow=workflow, status="200")
 
+    # Track per-user
+    if db and user_id:
+        track_ai_usage(
+            db=db,
+            user_id=user_id,
+            workflow=workflow,
+            model=cfg["model"],
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            success=True,
+            latency_ms=latency_ms,
+        )
+
     if not json_mode:
         return {"content": content, "raw": data, "usage": usage}
 
     try:
         return json.loads(content)
     except (json.JSONDecodeError, TypeError) as exc:
+        if db and user_id:
+            track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=f"invalid_json: {exc}")
         raise AIClientError(f"invalid_json: {exc}") from exc
 
 
@@ -315,24 +495,31 @@ async def chat_text(workflow: str, prompt: str, **kwargs) -> str:
     return str(result.get("content", ""))
 
 
-async def ping(workflow: Optional[str] = None, timeout: int = 5) -> Dict[str, Any]:
+async def ping(workflow: Optional[str] = None, timeout: int = 5, db=None, user_id: Optional[int] = None) -> Dict[str, Any]:
     """Health probe for the green/red status dot. Never raises."""
-    cfg = resolve_config(workflow)
+    if db is not None and user_id is not None:
+        try:
+            cfg = resolve_config_for_user(db, user_id, workflow)
+        except Exception:
+            cfg = resolve_config(workflow)
+    else:
+        cfg = resolve_config(workflow)
+
     if not cfg["api_key"]:
-        return {"online": False, "reason": "no_api_key", "latency_ms": None}
+        return {"online": False, "reason": "no_api_key", "latency_ms": None, "hint": "Set API key in Settings → AI API (OpenAI compatible: base_url like https://api.openai.com/v1)"}
     start = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(f"{cfg['base_url']}/models",
                                         headers={"Authorization": f"Bearer {cfg['api_key']}"})
     except httpx.HTTPError as exc:
-        return {"online": False, "error": str(exc), "latency_ms": None, "base_url": cfg["base_url"]}
+        return {"online": False, "error": str(exc), "latency_ms": None, "base_url": cfg["base_url"], "model": cfg["model"]}
     latency_ms = int((time.perf_counter() - start) * 1000)
     if response.status_code == 200:
         return {"online": True, "latency_ms": latency_ms, "status": 200, "base_url": cfg["base_url"],
                 "model": cfg["model"]}
     if response.status_code in (401, 403):
         return {"online": False, "latency_ms": latency_ms, "status": response.status_code,
-                "reason": "invalid_api_key", "base_url": cfg["base_url"]}
+                "reason": "invalid_api_key", "base_url": cfg["base_url"], "model": cfg["model"]}
     return {"online": False, "latency_ms": latency_ms, "status": response.status_code,
-            "reason": f"status_{response.status_code}", "base_url": cfg["base_url"]}
+            "reason": f"status_{response.status_code}", "base_url": cfg["base_url"], "model": cfg["model"]}

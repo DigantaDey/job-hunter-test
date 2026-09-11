@@ -12,9 +12,13 @@ import Logs from './pages/Logs'
 import Funding from './pages/Funding'
 import Account from './pages/Account'
 import Login from './pages/Login'
+import Pricing from './pages/Pricing'
+import Billing from './pages/Billing'
+import Analytics from './pages/Analytics'
+import Interview from './pages/Interview'
+import Notifications from './pages/Notifications'
 import { AuthProvider, useAuth } from './context/AuthContext'
 
-/** Everything except /login requires a session; the backend enforces it too. */
 function RequireAuth({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth()
   const location = useLocation()
@@ -45,6 +49,11 @@ export default function App() {
             <Route path="/emails" element={<Emails />} />
             <Route path="/funding" element={<Funding />} />
             <Route path="/vault" element={<Vault />} />
+            <Route path="/interview" element={<Interview />} />
+            <Route path="/analytics" element={<Analytics />} />
+            <Route path="/notifications" element={<Notifications />} />
+            <Route path="/billing" element={<Billing />} />
+            <Route path="/pricing" element={<Pricing />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/account" element={<Account />} />
             <Route path="/logs" element={<Logs />} />

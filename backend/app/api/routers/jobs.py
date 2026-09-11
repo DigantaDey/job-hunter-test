@@ -1,4 +1,5 @@
-"""Jobs, discovery, application and user-input endpoints."""
+"""Jobs, discovery, application and user-input endpoints — now with monetization."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -12,6 +13,7 @@ from app.api.deps import CurrentUser, DbSession, search_context
 from app.core import audit
 from app.core.auth import require_consent
 from app.core.config import settings
+from app.core.entitlements import can, enforce, get_user_plan, increment_usage
 from app.core.logging import get_logger
 from app.models.models import Job, JobEvent, PipelineJob, Profile, UserInputRequest
 from app.schemas.schemas import JobDetail, JobOut
@@ -63,22 +65,60 @@ def list_jobs(
     return query.order_by(Job.score.desc(), Job.discovered_at.desc()).offset(offset).limit(limit).all()
 
 
-# NOTE: static paths must be declared *before* ``/jobs/{job_id}`` — Starlette
-# matches routes in registration order, so a later ``/jobs/sources`` would be
-# swallowed by the integer path parameter and fail validation.
 @router.get("/jobs/sources")
 def job_sources(user: CurrentUser, db: DbSession):
     """Available/blocked job sources + the user's current selection."""
     from app.services.sources import list_sources
 
     config = discovery_sources_config(db, user.id)
-    return {"sources": list_sources(), "selected": config["sources"], "live_enabled": config["live_enabled"],
-            "board_tokens": config["board_tokens"]}
+    plan = get_user_plan(db, user.id)
+    return {
+        "sources": list_sources(),
+        "selected": config["sources"],
+        "live_enabled": config["live_enabled"],
+        "board_tokens": config["board_tokens"],
+        "plan": plan,
+    }
 
 
 @router.get("/jobs/{job_id}", response_model=JobDetail)
 def get_job(job_id: int, user: CurrentUser, db: DbSession):
     return _job_or_404(db, user.id, job_id)
+
+
+@router.get("/jobs/{job_id}/intelligence")
+async def job_intelligence(job_id: int, user: CurrentUser, db: DbSession):
+    """Transparent job intelligence breakdown — Pro feature with fallback."""
+    job = _job_or_404(db, user.id, job_id)
+    profile = db.query(Profile).filter(Profile.user_id == user.id).order_by(Profile.created_at.desc()).first()
+    profile_data = (profile.data if profile else {}) or {}
+
+    stored = (job.extra or {}).get("intelligence")
+    if stored:
+        return stored
+
+    from app.services.scoring import ai_score_detailed, heuristic_score_detailed
+
+    use_advanced = can(db, user.id, "can_use_advanced_matching")
+
+    if use_advanced:
+        try:
+            detail = await ai_score_detailed(profile_data, job.description or "", ai_config=None)
+        except Exception:
+            detail = heuristic_score_detailed(profile_data, job.description or "")
+    else:
+        detail = heuristic_score_detailed(profile_data, job.description or "")
+        detail["upgrade_hint"] = "Upgrade to Pro for AI-powered advanced matching breakdown"
+
+    try:
+        extra = dict(job.extra or {})
+        extra["intelligence"] = detail
+        job.extra = extra
+        db.commit()
+    except Exception:
+        pass
+
+    return detail
 
 
 @router.get("/jobs/{job_id}/events")
@@ -91,8 +131,7 @@ def job_events(job_id: int, user: CurrentUser, db: DbSession):
         .all()
     )
     return [
-        {"id": r.id, "stage": r.stage, "status": r.status, "message": r.message,
-         "meta": r.meta, "created_at": r.created_at}
+        {"id": r.id, "stage": r.stage, "status": r.status, "message": r.message, "meta": r.meta, "created_at": r.created_at}
         for r in rows
     ]
 
@@ -110,10 +149,13 @@ class DiscoveryRequest(BaseModel):
 
 @router.post("/jobs/discover")
 async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: CurrentUser, db: DbSession):
-    """
-    Queue a discovery run. The worker does the fetching so the request returns
-    immediately and long source fan-outs cannot time out the HTTP client.
-    """
+    """Queue a discovery run — monetized via entitlements."""
+    enforce(db, user.id, "jobs_discovered_per_month")
+    enforce(db, user.id, "jobs_discovered_per_day")
+
+    # Daily counter incremented at trigger time (to enforce rate); monthly by actual discovered count in discovery.py
+    increment_usage(db, user.id, "jobs_discovered_per_day", 1)
+
     context = await search_context(db, user.id)
     config = discovery_sources_config(db, user.id)
 
@@ -122,7 +164,7 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
         settings_keywords = ", ".join(str(k) for k in settings_keywords)
 
     keywords = list(payload.keywords or [])
-    for source in (settings_keywords, ):
+    for source in (settings_keywords,):
         for token in str(source or "").split(","):
             token = token.strip()
             if token and token not in keywords:
@@ -140,9 +182,14 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
         db,
         user_id=user.id,
         pipeline="discovery",
-        payload={"keywords": keywords[:20], "freshness_hours": freshness, "limit": payload.limit,
-                 "live_enabled": live_enabled, "sources": payload.sources or config["sources"],
-                 "board_tokens": config["board_tokens"]},
+        payload={
+            "keywords": keywords[:20],
+            "freshness_hours": freshness,
+            "limit": payload.limit,
+            "live_enabled": live_enabled,
+            "sources": payload.sources or config["sources"],
+            "board_tokens": config["board_tokens"],
+        },
         priority=3,
         dedupe_key=f"discovery:{','.join(keywords[:5])}:{freshness}",
     )
@@ -158,7 +205,7 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
 
 
 # --------------------------------------------------------------------------- #
-# Application flow
+# Application flow — Prepare → Review → Confirm → Execute
 # --------------------------------------------------------------------------- #
 class ApplyRequest(BaseModel):
     resume_choice: str = Field(default="auto", pattern="^(auto|master|generated|selected)$")
@@ -175,12 +222,11 @@ async def apply_job(
     user: CurrentUser,
     db: DbSession,
 ):
-    """
-    Prepare (and, when automation + consent allow, execute) an application.
+    """Prepare (and, when allowed, queue) an application — with entitlement checks."""
+    enforce(db, user.id, "can_run_automation")
+    enforce(db, user.id, "applications_per_month")
+    enforce(db, user.id, "automation_runs_per_month")
 
-    The heavy work runs in the worker; this endpoint prepares synchronously so
-    the UI can immediately show the field map / user-input request.
-    """
     job = _job_or_404(db, user.id, job_id)
     if job.status in ("applied",):
         return {"status": "applied", "message": "Already applied", "job_id": job.id}
@@ -190,23 +236,25 @@ async def apply_job(
         raise HTTPException(400, {"code": "profile_missing", "message": "Upload a master resume first"})
 
     if payload.queue_only:
-        item = enqueue(db, user_id=user.id, pipeline="application", job_id=job.id,
-                       payload={"resume_choice": payload.resume_choice, "resume_id": payload.resume_id,
-                                "answers": payload.answers},
-                       priority=1, dedupe_key=f"apply:{job.id}")
+        increment_usage(db, user.id, "automation_runs_per_month", 1)
+        item = enqueue(
+            db,
+            user_id=user.id,
+            pipeline="application",
+            job_id=job.id,
+            payload={"resume_choice": payload.resume_choice, "resume_id": payload.resume_id, "answers": payload.answers},
+            priority=1,
+            dedupe_key=f"apply:{job.id}",
+        )
         job.status = "queued"
         db.commit()
-        record_job_event(db, user_id=user.id, job_id=job.id, stage="queued", status="info",
-                         message="Application queued for processing")
+        record_job_event(db, user_id=user.id, job_id=job.id, stage="queued", status="info", message="Application queued for processing")
         return {"status": "queued", "pipeline_job_id": item.id if item else None, "duplicate": item is None}
 
     try:
-        result = await prepare_application(db, user, job, resume_choice=payload.resume_choice,
-                                           resume_id=payload.resume_id, answers=payload.answers)
+        result = await prepare_application(db, user, job, resume_choice=payload.resume_choice, resume_id=payload.resume_id, answers=payload.answers)
     except ValueError as exc:
-        raise HTTPException(
-            400, {"code": str(exc), "message": "Cannot prepare this application yet"}
-        ) from exc
+        raise HTTPException(400, {"code": str(exc), "message": "Cannot prepare this application yet"}) from exc
 
     if result["status"] == "needs_input":
         return {
@@ -216,54 +264,43 @@ async def apply_job(
             "message": "Some required fields need your input before the application can be submitted",
         }
 
-    # Automation is opt-in three times over: platform config + user setting +
-    # the automation disclosure. Reaching this branch means the click really
-    # submits, so the consent is enforced here (preparing a dry run above must
-    # stay possible without it) — a 403 names the disclosure to accept.
-    if settings.autofill_enabled and not settings.autofill_dry_run \
-            and bool(get_setting(db, user.id, "application", "allow_auto_submit", False)):
+    if settings.autofill_enabled and not settings.autofill_dry_run and bool(get_setting(db, user.id, "application", "allow_auto_submit", False)):
         require_consent("automation")(user)
-        item = enqueue(db, user_id=user.id, pipeline="application", job_id=job.id,
-                       payload={"resume_choice": payload.resume_choice, "resume_id": payload.resume_id,
-                                "answers": payload.answers},
-                       priority=1, dedupe_key=f"apply:{job.id}")
+        enforce(db, user.id, "can_use_autofill")
+        increment_usage(db, user.id, "automation_runs_per_month", 1)
+        item = enqueue(
+            db,
+            user_id=user.id,
+            pipeline="application",
+            job_id=job.id,
+            payload={"resume_choice": payload.resume_choice, "resume_id": payload.resume_id, "answers": payload.answers},
+            priority=1,
+            dedupe_key=f"apply:{job.id}",
+        )
         result.update({"status": "queued", "pipeline_job_id": item.id if item else None})
 
-    audit.audit(db, "job.applied", user=user, target=f"{job.company}:{job.title}",
-                detail={"job_id": job.id, "status": result["status"], "resume_decision": result["resume_decision"]},
-                request=request)
+    audit.audit(
+        db,
+        "job.applied",
+        user=user,
+        target=f"{job.company}:{job.title}",
+        detail={"job_id": job.id, "status": result["status"], "resume_decision": result["resume_decision"]},
+        request=request,
+    )
     return result
 
 
 def _requeue_application(db: Session, user_id: int, job: Job, answers: Dict[str, Any]) -> Optional[PipelineJob]:
-    """
-    Ensure a runnable application item exists for ``job`` carrying the merged
-    ``answers`` — re-activating the active duplicate instead of no-op'ing on
-    its dedupe key.
-
-    A previous run can leave the item parked in ``needs_input`` (the worker's
-    waiting-for-user state). ``enqueue`` treats that as a duplicate and would
-    return ``None``: the job would then sit ``queued`` forever with the
-    answers stored but nothing left to process them. The new answers *are* the
-    unblock signal, so the parked item is re-queued with the fresh payload.
-    The attempt counter resets with it — user-driven re-runs start a new
-    retry cycle, so iterating on answers cannot dead-letter the item.
-    """
     dedupe_key = f"apply:{job.id}"
     existing = (
         db.query(PipelineJob)
-        .filter(PipelineJob.user_id == user_id, PipelineJob.dedupe_key == dedupe_key,
-                PipelineJob.status.in_(("queued", "processing", "needs_input")))
+        .filter(PipelineJob.user_id == user_id, PipelineJob.dedupe_key == dedupe_key, PipelineJob.status.in_(("queued", "processing", "needs_input")))
         .order_by(PipelineJob.id.asc())
         .first()
     )
     if existing is None:
-        return enqueue(db, user_id=user_id, pipeline="application", job_id=job.id,
-                       payload={"resume_choice": "auto", "answers": answers}, priority=1,
-                       dedupe_key=dedupe_key)
+        return enqueue(db, user_id=user_id, pipeline="application", job_id=job.id, payload={"resume_choice": "auto", "answers": answers}, priority=1, dedupe_key=dedupe_key)
     if existing.status == "needs_input":
-        # Reassign the payload wholesale: it is a plain JSON column, so an
-        # in-place mutation would not be flagged as a change.
         existing.payload = {**(existing.payload or {}), "resume_choice": "auto", "answers": answers}
         existing.status = "queued"
         existing.attempts = 0
@@ -274,14 +311,9 @@ def _requeue_application(db: Session, user_id: int, job: Job, answers: Dict[str,
         db.refresh(existing)
         return existing
     if existing.status == "queued":
-        # Not claimed yet — fold the newest answers in so a quick re-submit is
-        # not clobbered by the stale payload.
         existing.payload = {**(existing.payload or {}), "resume_choice": "auto", "answers": answers}
         db.commit()
         db.refresh(existing)
-    # "processing": a worker is running it right now; it re-prepares from its
-    # own payload and will re-open the input request if anything is still
-    # missing, which the user can then answer again.
     return existing
 
 
@@ -295,19 +327,13 @@ async def submit_input(job_id: int, payload: InputPayload, user: CurrentUser, db
     job = _job_or_404(db, user.id, job_id)
     request_row = (
         db.query(UserInputRequest)
-        .filter(UserInputRequest.job_id == job_id, UserInputRequest.user_id == user.id,
-                UserInputRequest.status == "pending")
+        .filter(UserInputRequest.job_id == job_id, UserInputRequest.user_id == user.id, UserInputRequest.status == "pending")
         .order_by(UserInputRequest.created_at.desc())
         .first()
     )
     if not request_row:
         raise HTTPException(404, "No pending input request for this job")
 
-    # Rebuild the list instead of mutating it in place: `fields` is a plain JSON
-    # column, so SQLAlchemy only detects a *reassignment* as a change. Mutating
-    # the nested dicts left the answers unsaved — the request was marked
-    # completed and the job re-queued with the very fields still blank, which
-    # looked like the application silently ignoring the user.
     updated_fields = []
     for field in request_row.fields or []:
         field = dict(field)
@@ -319,7 +345,6 @@ async def submit_input(job_id: int, payload: InputPayload, user: CurrentUser, db
     request_row.completed_at = datetime.utcnow()
     db.commit()
 
-    # Merge the answers into the stored plan so the next prepare() reuses them.
     extra = dict(job.extra or {})
     answers = dict(extra.get("answers") or {})
     answers.update({k: v for k, v in payload.answers.items() if v not in (None, "")})
@@ -328,16 +353,10 @@ async def submit_input(job_id: int, payload: InputPayload, user: CurrentUser, db
     job.status = "queued"
     db.commit()
 
-    record_job_event(db, user_id=user.id, job_id=job.id, stage="user_input", status="success",
-                     message=f"User provided {len(payload.answers)} field(s); application re-queued")
+    record_job_event(db, user_id=user.id, job_id=job.id, stage="user_input", status="success", message=f"User provided {len(payload.answers)} field(s); application re-queued")
     item = _requeue_application(db, user.id, job, answers)
-    audit.audit(db, "job.input_submitted", user=user, target=f"job:{job.id}",
-                detail={"fields": list(payload.answers)}, request=None)
-    return {
-        "ok": True,
-        "requeued": item is not None and item.status in ("queued", "processing"),
-        "pipeline_job_id": item.id if item else None,
-    }
+    audit.audit(db, "job.input_submitted", user=user, target=f"job:{job.id}", detail={"fields": list(payload.answers)}, request=None)
+    return {"ok": True, "requeued": item is not None and item.status in ("queued", "processing"), "pipeline_job_id": item.id if item else None}
 
 
 @router.post("/jobs/{job_id}/mark-applied")
@@ -345,21 +364,25 @@ def confirm_applied(job_id: int, user: CurrentUser, db: DbSession, note: str = "
     """Confirm a manual submission (used when automation is disabled)."""
     job = _job_or_404(db, user.id, job_id)
     result = mark_applied(db, user, job, note=note)
-    audit.audit(db, "job.applied", user=user, target=f"{job.company}:{job.title}",
-                detail={"job_id": job.id, "confirmed_by": "user"})
+    # Track manual application as usage too
+    try:
+        increment_usage(db, user.id, "applications_per_month", 1)
+    except Exception:
+        pass
+    audit.audit(db, "job.applied", user=user, target=f"{job.company}:{job.title}", detail={"job_id": job.id, "confirmed_by": "user"})
     return result
 
 
 @router.post("/jobs/{job_id}/retry")
 def retry_application(job_id: int, user: CurrentUser, db: DbSession):
+    enforce(db, user.id, "automation_runs_per_month")
     job = _job_or_404(db, user.id, job_id)
     job.status = "queued"
     job.error = ""
     db.commit()
-    item = enqueue(db, user_id=user.id, pipeline="application", job_id=job.id,
-                   payload={"resume_choice": "auto"}, priority=1, dedupe_key=f"apply:{job.id}")
-    record_job_event(db, user_id=user.id, job_id=job.id, stage="retry", status="info",
-                     message="Application re-queued after failure")
+    increment_usage(db, user.id, "automation_runs_per_month", 1)
+    item = enqueue(db, user_id=user.id, pipeline="application", job_id=job.id, payload={"resume_choice": "auto"}, priority=1, dedupe_key=f"apply:{job.id}")
+    record_job_event(db, user_id=user.id, job_id=job.id, stage="retry", status="info", message="Application re-queued after failure")
     return {"ok": True, "pipeline_job_id": item.id if item else None, "duplicate": item is None}
 
 
@@ -368,29 +391,19 @@ def skip_job(job_id: int, user: CurrentUser, db: DbSession):
     job = _job_or_404(db, user.id, job_id)
     job.status = "skipped"
     db.commit()
-    record_job_event(db, user_id=user.id, job_id=job.id, stage="skipped", status="info",
-                     message="Skipped by the user")
+    record_job_event(db, user_id=user.id, job_id=job.id, stage="skipped", status="info", message="Skipped by the user")
     return {"ok": True, "status": job.status}
 
 
 @router.get("/user-input-queue")
 def user_input_queue(user: CurrentUser, db: DbSession):
-    rows = (
-        db.query(UserInputRequest)
-        .filter(UserInputRequest.user_id == user.id, UserInputRequest.status == "pending")
-        .order_by(UserInputRequest.created_at.desc())
-        .all()
-    )
+    rows = db.query(UserInputRequest).filter(UserInputRequest.user_id == user.id, UserInputRequest.status == "pending").order_by(UserInputRequest.created_at.desc()).all()
     jobs = {j.id: j for j in db.query(Job).filter(Job.user_id == user.id).all()}
     return [
         {
             "id": row.id,
             "job_id": row.job_id,
-            "job": {
-                "title": jobs[row.job_id].title if row.job_id in jobs else "",
-                "company": jobs[row.job_id].company if row.job_id in jobs else "",
-                "url": jobs[row.job_id].url if row.job_id in jobs else "",
-            },
+            "job": {"title": jobs[row.job_id].title if row.job_id in jobs else "", "company": jobs[row.job_id].company if row.job_id in jobs else "", "url": jobs[row.job_id].url if row.job_id in jobs else ""},
             "fields": row.fields,
             "created_at": row.created_at,
         }
@@ -401,7 +414,7 @@ def user_input_queue(user: CurrentUser, db: DbSession):
 @router.post("/classify/company")
 async def classify_company(user: CurrentUser, db: DbSession, company: str = Query(...), jd: str = ""):
     size, confidence = await ai_company_size(company, jd)
-    if confidence is None:  # pragma: no cover - defensive
+    if confidence is None:
         size, confidence = heuristic_company_size({}, {"company": company, "description": jd}), 0.5
     return {"company": company, "size": size, "confidence": confidence}
 
@@ -416,15 +429,40 @@ def pipelines(user: CurrentUser, db: DbSession):
 
 
 @router.get("/pipelines/jobs")
-def pipeline_items(user: CurrentUser, db: DbSession, pipeline: Optional[str] = None,
-                   status_filter: Optional[str] = Query(None, alias="status"), limit: int = 50):
+def pipeline_items(user: CurrentUser, db: DbSession, pipeline: Optional[str] = None, status_filter: Optional[str] = Query(None, alias="status"), limit: int = 50):
     from app.services.job_queue import recent_items
 
     rows = recent_items(db, user_id=user.id, pipeline=pipeline, status=status_filter, limit=min(200, limit))
     return [
-        {"id": r.id, "pipeline": r.pipeline, "job_id": r.job_id, "status": r.status,
-         "priority": r.priority, "attempts": r.attempts, "max_attempts": r.max_attempts,
-         "error": r.error, "created_at": r.created_at, "updated_at": r.updated_at,
-         "scheduled_at": r.scheduled_at, "payload": {k: v for k, v in (r.payload or {}).items() if k != "result"}}
+        {
+            "id": r.id,
+            "pipeline": r.pipeline,
+            "job_id": r.job_id,
+            "status": r.status,
+            "priority": r.priority,
+            "attempts": r.attempts,
+            "max_attempts": r.max_attempts,
+            "error": r.error,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+            "scheduled_at": r.scheduled_at,
+            "payload": {k: v for k, v in (r.payload or {}).items() if k != "result"},
+        }
         for r in rows
     ]
+
+
+@router.get("/company/{company_name}/intel")
+async def company_intelligence(company_name: str, user: CurrentUser, db: DbSession, refresh: bool = False):
+    """Company intelligence — deeper research."""
+    enforce(db, user.id, "can_use_company_intel")
+    enforce(db, user.id, "company_intel_per_month")
+    from app.services.company_intel import fetch_company_intel
+
+    data = await fetch_company_intel(company_name, db=db, user_id=user.id, force_refresh=refresh)
+    if not refresh:
+        try:
+            increment_usage(db, user.id, "company_intel_per_month", 1)
+        except Exception:
+            pass
+    return data

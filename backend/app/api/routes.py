@@ -12,10 +12,14 @@ from fastapi import APIRouter
 from app.api.deps import search_context  # noqa: F401  (re-exported for callers/tests)
 from app.api.routers import (
     account,
+    analytics,
     auth,
+    billing,
     emails,
     funding,
+    interview,
     jobs,
+    notifications,
     ops,
     resumes,
     settings_api,
@@ -34,5 +38,9 @@ router.include_router(funding.router)
 router.include_router(settings_api.router)
 router.include_router(ops.router)
 router.include_router(tracking.router)
+router.include_router(billing.router)
+router.include_router(analytics.router)
+router.include_router(notifications.router)
+router.include_router(interview.router)
 
 __all__ = ["router", "search_context"]

@@ -357,7 +357,7 @@ def demo_jobs(keywords: List[str], freshness_hours: int, limit: int = 14) -> Lis
         # A stable digest, not the builtin ``hash()``: PYTHONHASHSEED is
         # randomised per process, which would give every demo job a new id (and
         # so a new dedupe key) on each restart and pile up duplicates.
-        digest = hashlib.sha1(f"{job['company']}|{job['title']}".encode("utf-8")).hexdigest()[:10]
+        digest = hashlib.sha1(f"{job['company']}|{job['title']}".encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
         entry["external_id"] = f"demo-{index}-{digest}"
         entry["posted_at"] = now - timedelta(hours=hours)
         entry["url"] = f"https://demo.jobhunter.local/{job['company'].lower().replace(' ', '-')}/{index}"

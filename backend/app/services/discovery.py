@@ -182,6 +182,14 @@ async def discover_for_user(
         log.warning("discovery insert conflict: %s", exc)
         created = []
 
+    # Increment usage by actual inserted count (more accurate than trigger-time 1)
+    try:
+        from app.core.entitlements import increment_usage
+        if created:
+            increment_usage(db, user.id, "jobs_discovered_per_month", len(created))
+    except Exception as e:
+        log.debug("usage increment failed: %s", e)
+
     for job in created:
         db.refresh(job)
         record_job_event(

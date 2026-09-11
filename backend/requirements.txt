@@ -39,3 +39,4 @@ dnspython==2.8.0
 
 # Transitive but security-relevant: pinned so the dependency audit is meaningful.
 starlette==1.6.0
+defusedxml==0.7.1

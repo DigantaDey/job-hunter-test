@@ -1,6 +1,6 @@
-import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
+import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { LayoutDashboard, Briefcase, FileText, Mail, Vault, Settings, ScrollText, Layers, TrendingUp, Moon, Sun, Monitor, Circle, LogOut, UserCog } from 'lucide-react'
+import { LayoutDashboard, Briefcase, FileText, Mail, Vault, Settings, ScrollText, Layers, TrendingUp, Moon, Sun, Monitor, Circle, LogOut, UserCog, CreditCard, BarChart3, Brain, Bell, DollarSign } from 'lucide-react'
 import { useTheme } from '../hooks/useTheme'
 import client from '../api/client'
 import { useAuth } from '../context/AuthContext'
@@ -14,6 +14,11 @@ const nav = [
   {to:'/emails', label:'Email Bucket', icon: Mail},
   {to:'/funding', label:'Funding Radar', icon: TrendingUp},
   {to:'/vault', label:'Vault', icon: Vault},
+  {to:'/interview', label:'Interview Prep', icon: Brain},
+  {to:'/analytics', label:'Analytics', icon: BarChart3},
+  {to:'/notifications', label:'Notifications', icon: Bell},
+  {to:'/billing', label:'Billing', icon: CreditCard},
+  {to:'/pricing', label:'Pricing', icon: DollarSign},
   {to:'/settings', label:'Settings', icon: Settings},
   {to:'/account', label:'Account', icon: UserCog},
   {to:'/logs', label:'Error Logs', icon: ScrollText},
@@ -23,6 +28,7 @@ export default function Layout() {
   const {theme, setTheme} = useTheme()
   const {user, logout} = useAuth()
   const [ai, setAi] = useState<{online:boolean, rpm:number, remaining:number, latency_ms?:number} | null>(null)
+  const [ent, setEnt] = useState<any>(null)
   const loc = useLocation()
   useEffect(()=>{
     let cancelled = false
@@ -34,10 +40,10 @@ export default function Layout() {
         if (!cancelled) setAi({online:false, rpm:60, remaining:0, latency_ms: undefined})
       }
     }, 15000)
-    // immediate
     client.get('/api/settings/ai/status')
       .then(r=>{ if (!cancelled) setAi(r.data) })
       .catch(()=>{ if (!cancelled) setAi({online:false, rpm:60, remaining:0, latency_ms: undefined}) })
+    client.get('/api/billing/subscription').then(r=>{ if(!cancelled) setEnt(r.data) }).catch(()=>{})
     return ()=> { cancelled = true; clearInterval(id) }
   }, [])
   return (
@@ -49,7 +55,7 @@ export default function Layout() {
             <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-600 to-violet-600 flex items-center justify-center text-white font-bold text-sm">JH</div>
             <div>
               <div className="font-semibold tracking-tight leading-none">JobHunter</div>
-              <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mono">AI • Autonomous</div>
+              <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mono">AI • Command Center</div>
             </div>
             <div className="ml-auto flex items-center gap-1">
               <Circle className={`w-3 h-3 ${ai?.online ? 'fill-emerald-500 text-emerald-500' : 'fill-red-500 text-red-500'} animate-pulse`} />
@@ -59,6 +65,7 @@ export default function Layout() {
           {ai && <div className="mt-3 text-[11px] mono text-zinc-500 dark:text-zinc-400 bg-zinc-50 dark:bg-zinc-800 rounded-lg px-2 py-1 flex justify-between">
             <span>RPM {ai.remaining}/{ai.rpm}</span><span>{ai.latency_ms ? `${ai.latency_ms}ms` : ''}</span>
           </div>}
+          {ent && <div className="mt-2 text-[11px] mono bg-gradient-to-r from-blue-600 to-violet-600 text-white rounded-full px-3 py-1 text-center">{ent.plan_label} • {ent.usage?.ai_credits_per_month?.used||0}/{ent.limits?.ai_credits_per_month||0} credits</div>}
         </div>
         <nav className="p-3 space-y-1 flex-1 overflow-auto scrollbar-thin">
           {nav.map(n=> (
@@ -81,7 +88,7 @@ export default function Layout() {
               </button>
             </div>
           )}
-          <div className="mt-2 text-[11px] text-zinc-500 dark:text-zinc-400 mono text-center">v2.0 • multi-tenant • durable queues • audit trail</div>
+          <div className="mt-2 text-[11px] text-zinc-500 dark:text-zinc-400 mono text-center">v2.1 • SaaS • monetized • command center</div>
         </div>
       </aside>
 
@@ -101,14 +108,12 @@ export default function Layout() {
           {nav.map(n=> <NavLink key={n.to} to={n.to} className={({isActive})=> `px-3 py-1.5 rounded-full text-xs whitespace-nowrap border ${isActive?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`}>{n.label}</NavLink>)}
         </div>
         <main className="flex-1 p-4 lg:p-6 max-w-[1600px] w-full mx-auto">
-          {/* Keyed by pathname: a page that throws is contained here — the
-              sidebar, session and other routes keep working. */}
           <ErrorBoundary scope="route" resetKey={loc.pathname}>
             <Outlet />
           </ErrorBoundary>
         </main>
         <footer className="px-6 py-4 text-[11px] mono text-zinc-500 dark:text-zinc-500 text-center border-t dark:border-zinc-800 bg-white/50 dark:bg-zinc-900/50">
-          JobHunter AI v2.0 — accurate by design • per-user encrypted vault • resume fact guard • consent-gated automation • audit trail
+          JobHunter AI v2.1 — Your complete AI-powered job hunting command center • Discover → Analyze → Prepare → Apply → Automate → Reach Out → Track → Improve • per-user encrypted vault • fact guard • monetized
         </footer>
       </div>
     </div>

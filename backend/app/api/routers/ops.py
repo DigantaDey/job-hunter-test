@@ -1,4 +1,5 @@
-"""Operations endpoints: health, readiness, metrics, logs, dashboard, queue admin."""
+"""Operations endpoints: health, readiness, metrics, logs, dashboard, queue admin — with SaaS."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -10,11 +11,22 @@ from app.api.deps import CurrentUser, DbSession
 from app.core import metrics
 from app.core.auth import require_owner
 from app.core.config import settings
+from app.core.entitlements import entitlements_snapshot
 from app.core.rate_limiter import rate_limiter
 from app.core.security import constant_time_equals
 from app.db import check_db_health, migration_state
 from app.metrics_server import TEXT_CONTENT_TYPE
-from app.models.models import Email, ErrorLog, Job, PipelineJob, Resume, UserInputRequest, VaultEntry
+from app.models.models import (
+    AICreditLedger,
+    Email,
+    ErrorLog,
+    Job,
+    Notification,
+    PipelineJob,
+    Resume,
+    UserInputRequest,
+    VaultEntry,
+)
 from app.schemas.schemas import ErrorLogOut
 from app.services.ai_client import breaker_snapshot, is_configured, ping
 from app.services.job_queue import queue_stats, recover_stalled
@@ -52,8 +64,7 @@ async def ready(response: Response):
     healthy = db_ok
     if not healthy:
         response.status_code = 503
-    return {"status": "ready" if healthy else "degraded", "checks": checks,
-            "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "ready" if healthy else "degraded", "checks": checks, "timestamp": datetime.utcnow().isoformat()}
 
 
 @router.get("/metrics")
@@ -63,16 +74,10 @@ def prometheus(
 ):
     """Prometheus exposition. Protected when METRICS_TOKEN is set."""
     if settings.metrics_port:
-        # Metrics live on their own (internal) port — see METRICS_PORT.
-        raise HTTPException(404, {"code": "metrics_moved",
-                                  "message": f"Metrics are served on port {settings.metrics_port} "
-                                             f"({settings.metrics_host}) at /metrics"})
+        raise HTTPException(404, {"code": "metrics_moved", "message": f"Metrics are served on port {settings.metrics_port} ({settings.metrics_host}) at /metrics"})
     if not settings.metrics_enabled:
         raise HTTPException(404, "Metrics are disabled")
     if settings.metrics_token:
-        # Two accepted shapes: `Authorization: Bearer <token>` (preferred — a
-        # query string ends up in access logs, proxy logs and browser history)
-        # and `?metrics_token=` for scrapers that cannot set headers.
         bearer = (authorization or "").removeprefix("Bearer ").strip()
         supplied = metrics_token or bearer
         if not constant_time_equals(supplied, settings.metrics_token):
@@ -82,8 +87,7 @@ def prometheus(
 
 
 @router.get("/logs", response_model=List[ErrorLogOut])
-def logs(user: CurrentUser, db: DbSession, pipeline: Optional[str] = None, level: Optional[str] = None,
-         job_id: Optional[int] = None, limit: int = Query(100, le=1000)):
+def logs(user: CurrentUser, db: DbSession, pipeline: Optional[str] = None, level: Optional[str] = None, job_id: Optional[int] = None, limit: int = Query(100, le=1000)):
     query = db.query(ErrorLog).filter(ErrorLog.user_id == user.id)
     if pipeline:
         query = query.filter(ErrorLog.pipeline == pipeline)
@@ -107,35 +111,104 @@ def clear_logs(user: CurrentUser, db: DbSession, level: Optional[str] = None):
 @router.get("/dashboard/summary")
 def dashboard(user: CurrentUser, db: DbSession):
     today = datetime.utcnow() - timedelta(hours=24)
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
     job_counts = {
         status: db.query(Job).filter(Job.user_id == user.id, Job.status == status).count()
         for status in ("discovered", "queued", "needs_input", "preparing", "ready_to_apply", "applied", "failed", "skipped")
     }
+
+    # Automation stats
+    pipeline_stats = queue_stats(db, user_id=user.id)
+    automation_running = pipeline_stats.get("application", {}).get("processing", 0) + pipeline_stats.get("application", {}).get("queued", 0)
+    automation_completed = pipeline_stats.get("application", {}).get("done", 0)
+    automation_failed = pipeline_stats.get("application", {}).get("failed", 0) + pipeline_stats.get("application", {}).get("dead", 0)
+
+    # Outreach
+    outreach_sent = db.query(Email).filter(Email.user_id == user.id, Email.status == "sent").count()
+    outreach_pending = db.query(Email).filter(Email.user_id == user.id, Email.status == "pending_approval").count()
+    outreach_replies = db.query(Email).filter(Email.user_id == user.id, Email.opens > 0).count()
+
+    # AI usage
+    ai_month = db.query(AICreditLedger).filter(AICreditLedger.user_id == user.id, AICreditLedger.created_at >= month_start).all()
+    ai_tokens_used = sum(r.total_tokens for r in ai_month)
+    ai_cost = sum(r.estimated_cost_usd for r in ai_month)
+
+    # Performance
+    total_jobs = db.query(Job).filter(Job.user_id == user.id).count()
+    applied = job_counts.get("applied", 0)
+    high_match = db.query(Job).filter(Job.user_id == user.id, Job.score >= 75, Job.status == "discovered").count()
+    interview_estimate = db.query(Job).filter(Job.user_id == user.id, Job.score >= 80, Job.status == "applied").count()
+    response_rate = round(interview_estimate / max(1, applied) * 100, 1) if applied else 0
+
+    # Notifications
+    unread_notifications = db.query(Notification).filter(Notification.user_id == user.id, Notification.read.is_(False)).count()
+
+    # Entitlements
+    entitlements = entitlements_snapshot(db, user.id)
+
     return {
         "jobs": {
-            "total": db.query(Job).filter(Job.user_id == user.id).count(),
+            "total": total_jobs,
             "last_24h": db.query(Job).filter(Job.user_id == user.id, Job.discovered_at >= today).count(),
-            "applied": job_counts.get("applied", 0),
-            "high_match": db.query(Job).filter(Job.user_id == user.id, Job.score >= 75,
-                                               Job.status == "discovered").count(),
+            "last_7d": db.query(Job).filter(Job.user_id == user.id, Job.discovered_at >= week_ago).count(),
+            "applied": applied,
+            "high_match": high_match,
+            "new_matches": db.query(Job).filter(Job.user_id == user.id, Job.status == "discovered", Job.discovered_at >= week_ago).count(),
+            "saved": db.query(Job).filter(Job.user_id == user.id, Job.status == "discovered").count(),
             **job_counts,
         },
+        "applications": {
+            "prepared": job_counts.get("queued", 0) + job_counts.get("ready_to_apply", 0),
+            "submitted": applied,
+            "interviews": interview_estimate,
+            "rejected": db.query(Job).filter(Job.user_id == user.id, Job.status == "rejected").count(),
+            "offers": 0,  # future
+            "response_rate": response_rate,
+        },
+        "automation": {
+            "running": automation_running,
+            "completed": automation_completed,
+            "failed": automation_failed,
+            "needs_input": job_counts.get("needs_input", 0),
+            "queues": pipeline_stats,
+        },
+        "outreach": {
+            "sent": outreach_sent,
+            "pending_approval": outreach_pending,
+            "replies": outreach_replies,
+            "follow_ups": 0,
+            "total": db.query(Email).filter(Email.user_id == user.id).count(),
+        },
+        "ai_usage": {
+            "credits_used": ai_tokens_used,
+            "cost_usd": round(ai_cost, 4),
+            "remaining": entitlements["usage"].get("ai_credits_per_month", {}).get("remaining", 0) if entitlements else 0,
+            "limit": entitlements["usage"].get("ai_credits_per_month", {}).get("limit", 0) if entitlements else 0,
+            "operations_month": len(ai_month),
+        },
+        "performance": {
+            "applications": applied,
+            "interviews": interview_estimate,
+            "response_rate": response_rate,
+            "high_priority_jobs": high_match,
+        },
         "emails": {
-            "pending_approval": db.query(Email).filter(Email.user_id == user.id,
-                                                       Email.status == "pending_approval").count(),
-            "sent": db.query(Email).filter(Email.user_id == user.id, Email.status == "sent").count(),
+            "pending_approval": outreach_pending,
+            "sent": outreach_sent,
             "total": db.query(Email).filter(Email.user_id == user.id).count(),
         },
         "resumes": {
             "total": db.query(Resume).filter(Resume.user_id == user.id).count(),
-            "pending_approval": db.query(Resume).filter(Resume.user_id == user.id,
-                                                        Resume.status == "pending").count(),
+            "pending_approval": db.query(Resume).filter(Resume.user_id == user.id, Resume.status == "pending").count(),
         },
         "vault": db.query(VaultEntry).filter(VaultEntry.user_id == user.id).count(),
-        "user_input": db.query(UserInputRequest).filter(UserInputRequest.user_id == user.id,
-                                                        UserInputRequest.status == "pending").count(),
-        "pipelines": queue_stats(db, user_id=user.id),
+        "user_input": db.query(UserInputRequest).filter(UserInputRequest.user_id == user.id, UserInputRequest.status == "pending").count(),
+        "notifications": {"unread": unread_notifications},
+        "pipelines": pipeline_stats,
         "rate_limiter": rate_limiter.stats(),
+        "entitlements": entitlements,
     }
 
 
@@ -151,8 +224,7 @@ async def ops_status(user: CurrentUser, db: DbSession):
         "database": {**db_health, "migrations": migration_state()},
         "ai": {**ai, "breakers": breaker_snapshot(), "rate_limiter": rate_limiter.stats()},
         "queues": depths,
-        "workers": {"in_api": settings.run_worker_in_api, "concurrency": settings.worker_concurrency,
-                    "lease_seconds": settings.worker_lease_seconds},
+        "workers": {"in_api": settings.run_worker_in_api, "concurrency": settings.worker_concurrency, "lease_seconds": settings.worker_lease_seconds},
         "metrics": metrics.snapshot(),
     }
 
