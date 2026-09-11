@@ -115,7 +115,7 @@ jobs:
         working-directory: frontend
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -156,7 +156,7 @@ jobs:
         run: pip-audit -r backend/requirements.txt
       - name: Bandit SAST (fail on high)
         run: bandit -r backend/app -ll -ii --skip B101 -f json -o bandit-report.json || (cat bandit-report.json; exit 1)
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
       - name: npm audit frontend (fail on critical)
