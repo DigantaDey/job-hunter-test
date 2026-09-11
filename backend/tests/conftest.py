@@ -39,6 +39,10 @@ os.environ.update(
         "API_RATE_LIMIT_PER_MINUTE": "10000",
         "PUBLIC_BASE_URL": "http://testserver",
         "INCLUDE_DEMO_POOL": "false",
+        # Hermetic tests: an operator's checkout-level .env (created by run.sh
+        # from .env.example, which ships METRICS_PORT=9464) must not move the
+        # metrics endpoint off /api/metrics for the suite.
+        "METRICS_PORT": "0",
     }
 )
 

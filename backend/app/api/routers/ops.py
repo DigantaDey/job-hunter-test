@@ -34,6 +34,31 @@ from app.services.job_queue import queue_stats, recover_stalled
 router = APIRouter(tags=["ops"])
 
 
+def _users_with_key() -> List[int]:
+    """User ids that have a (decryptable) AI key stored in the DB.
+
+    Readiness is unauthenticated and therefore cannot resolve a specific
+    user's config — but reporting ``ai_configured: false`` while the owner
+    saved a key through the UI is exactly the kind of lie that sends people
+    debugging the wrong problem.
+    """
+    try:
+        from app.db import SessionLocal
+        from app.models.models import SettingsModel
+        from app.services.user_settings import get_secret_setting
+
+        db = SessionLocal()
+        try:
+            rows = db.query(SettingsModel).filter(
+                SettingsModel.category == "ai", SettingsModel.key == "api_key"
+            ).all()
+            return [row.user_id for row in rows if get_secret_setting(db, row.user_id, "ai", "api_key")[0]]
+        finally:
+            db.close()
+    except Exception:
+        return []
+
+
 @router.get("/health")
 def health():
     return {"status": "ok", "version": settings.version, "environment": settings.environment}
@@ -51,16 +76,28 @@ async def ready(response: Response):
     db_health = check_db_health()
     db_ok = db_health.get("database") == "ok"
     migrations = migration_state()
+    configured_users = _users_with_key()
     checks = {
         "database": db_health,
         "migrations": migrations,
-        "ai_configured": is_configured(),
+        "ai_configured": is_configured() or bool(configured_users),
         "workers_in_api": settings.run_worker_in_api,
         "version": settings.version,
         "environment": settings.environment,
     }
-    if is_configured():
-        checks["ai"] = await ping(timeout=3)
+    if checks["ai_configured"]:
+        # Probe with a configured user's key when no env key exists, so the
+        # readiness signal matches what the app actually uses.
+        from app.db import SessionLocal
+
+        if not settings.ai_api_key and configured_users:
+            db = SessionLocal()
+            try:
+                checks["ai"] = await ping(timeout=3, db=db, user_id=configured_users[0])
+            finally:
+                db.close()
+        else:
+            checks["ai"] = await ping(timeout=3)
     healthy = db_ok
     if not healthy:
         response.status_code = 503
@@ -216,7 +253,7 @@ def dashboard(user: CurrentUser, db: DbSession):
 async def ops_status(user: CurrentUser, db: DbSession):
     """Single pane of glass for the Ops page."""
     db_health = check_db_health()
-    ai = await ping(timeout=3) if is_configured() else {"online": False, "reason": "no_api_key"}
+    ai = await ping(timeout=3, db=db, user_id=user.id) if is_configured(db=db, user_id=user.id) else {"online": False, "reason": "no_api_key"}
     depths = queue_stats(db, user_id=None)
     return {
         "version": settings.version,

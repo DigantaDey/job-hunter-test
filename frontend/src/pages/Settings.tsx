@@ -104,10 +104,25 @@ export default function Settings(){
           <p className="text-xs mono text-zinc-600 dark:text-zinc-400 mt-1">Owner account can add/modify default API details. OpenAI compatible format: works with OpenAI, Groq, Together, Anyscale, OpenRouter, Ollama, LM Studio, vLLM, etc. Per-workflow overrides below fallback to this default.</p>
           
           {aiStatus && (
-            <div className={`mt-3 p-3 rounded-xl border text-xs mono flex items-center gap-2 ${aiStatus.online ? 'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950 dark:border-emerald-800 dark:text-emerald-300' : 'bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-950 dark:border-amber-800 dark:text-amber-300'}`}>
+            <div className={`mt-3 p-3 rounded-xl border text-xs mono flex flex-wrap items-center gap-2 ${aiStatus.online ? 'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950 dark:border-emerald-800 dark:text-emerald-300' : 'bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-950 dark:border-amber-800 dark:text-amber-300'}`}>
               {aiStatus.online ? <CheckCircle className="w-4 h-4"/> : <AlertTriangle className="w-4 h-4"/>}
-              <span>{aiStatus.online ? `AI online • ${aiStatus.latency_ms}ms • ${aiStatus.model}` : `AI offline • ${aiStatus.reason || aiStatus.hint || 'no_api_key'}`}</span>
-              <span className="ml-auto">Configured: {String(aiStatus.configured)} • RPM {aiStatus.remaining}/{aiStatus.rpm}</span>
+              <span>
+                {aiStatus.online
+                  ? `AI online • ${aiStatus.latency_ms}ms • ${aiStatus.model}`
+                  : `AI offline • ${aiStatus.reason || 'no_api_key'}${aiStatus.detail ? ` — ${aiStatus.detail}` : ''}`}
+              </span>
+              <span className="opacity-70">{aiStatus.online && aiStatus.probe === 'chat_completions' ? '• /models unavailable, chat verified working' : ''}</span>
+              <span className="ml-auto flex items-center gap-2">
+                {aiStatus.key_preview && <span className="px-2 py-0.5 rounded-full bg-white/60 dark:bg-zinc-800/60" title={`API key currently in use (${aiStatus.key_source || 'env'})`}>key {aiStatus.key_preview} · {aiStatus.key_source || 'env'}</span>}
+                <span>Configured: {String(aiStatus.configured)} • RPM {aiStatus.remaining}/{aiStatus.rpm}</span>
+              </span>
+            </div>
+          )}
+
+          {aiStatus?.stored_key_error && (
+            <div className="mt-2 p-3 rounded-xl border border-red-300 bg-red-50 dark:bg-red-950 dark:border-red-800 text-red-700 dark:text-red-300 text-xs mono">
+              Your saved API key can&apos;t be decrypted on this server (its ENCRYPTION_KEY changed since the key was saved).
+              The app is currently using a fallback key — re-enter your key below and click <strong>Save AI Default</strong> to fix it.
             </div>
           )}
 

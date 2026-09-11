@@ -47,13 +47,39 @@ STARTED_AT = time.time()
 
 
 def _load_workflow_overrides() -> None:
-    """Restore per-workflow AI config from the DB into the runtime registry."""
+    """
+    Warm the per-workflow AI override cache and migrate legacy rows.
+
+    Rows written before the keys were encrypted at rest hold plaintext
+    ``api_key`` values; they are re-encrypted in place on first boot. Per-user
+    overrides are resolved fresh from the DB on each AI call, so this cache is
+    only a warm start — staleness can never outlive a restart.
+    """
     try:
         db = SessionLocal()
         try:
+            from app.core.security import encrypt_secret
             from app.models.models import SettingsModel
+            from app.services.user_settings import _secret_scope, read_workflow_override
+
             rows = db.query(SettingsModel).filter(SettingsModel.category == "ai_workflows").all()
-            set_workflow_overrides({row.key: row.value for row in rows if isinstance(row.value, dict)})
+            restored = migrated = 0
+            for row in rows:
+                if not isinstance(row.value, dict):
+                    continue
+                cfg = read_workflow_override(db, row.user_id, row.key)  # decrypts, legacy plaintext passthrough
+                stored_key = str(row.value.get("api_key") or "")
+                if cfg.get("api_key") and stored_key and not stored_key.startswith("gAAAA"):
+                    try:  # legacy plaintext → encrypted at rest
+                        row.value = {**row.value, "api_key": encrypt_secret(cfg["api_key"], _secret_scope(row.user_id))}
+                        db.commit()
+                        migrated += 1
+                    except Exception:
+                        db.rollback()
+                set_workflow_overrides({row.key: cfg}, user_id=row.user_id)
+                restored += 1
+            if restored or migrated:
+                log.info("loaded %d AI workflow override(s)%s", restored, f", migrated {migrated} to encrypted storage" if migrated else "")
         finally:
             db.close()
     except Exception as exc:  # pragma: no cover - startup best effort
