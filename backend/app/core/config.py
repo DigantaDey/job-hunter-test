@@ -316,6 +316,27 @@ class Settings(BaseSettings):
     backup_dir: str = "./backups"
     backup_keep: int = 14
 
+    # ------------------------------------------------------------------ #
+    # Billing / Monetization
+    # ------------------------------------------------------------------ #
+    billing_provider: str = "manual"  # manual | stripe | razorpay
+    stripe_api_key: str = ""
+    stripe_webhook_secret: str = ""
+    stripe_price_pro_monthly: str = ""
+    stripe_price_pro_plus_monthly: str = ""
+    stripe_price_pro_yearly: str = ""
+    stripe_price_pro_plus_yearly: str = ""
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""
+    razorpay_webhook_secret: str = ""
+    razorpay_plan_pro_monthly: str = ""
+    razorpay_plan_pro_plus_monthly: str = ""
+    billing_success_url: str = "http://localhost:5173/billing/success"
+    billing_cancel_url: str = "http://localhost:5173/billing/cancel"
+    trial_days: int = 7
+    enable_free_tier: bool = True
+    free_tier_auto_approve: bool = True
+
     # ==================================================================== #
     # Validators
     # ==================================================================== #

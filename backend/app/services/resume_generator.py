@@ -273,3 +273,40 @@ def resume_plain_text(tailored: Dict[str, Any], profile: Dict[str, Any]) -> str:
     from app.services.resume_service import render_profile_text
 
     return render_profile_text(tailored or profile or {})
+
+
+async def generate_cover_letter(profile: Dict[str, Any], jd: str, job_title: str, company: str, db=None, user_id=None) -> str:
+    """Generate a grounded cover letter — never fabricates."""
+    safe_jd = jd[:4000].replace("```", "").replace("SYSTEM:", "")
+    prompt = f"""
+You are an expert cover letter writer. Write a compelling cover letter grounded ONLY in the candidate's actual profile.
+
+Rules:
+- Never invent jobs, education, certifications, achievements not in profile
+- Use real skills and experiences from profile
+- Tailor to JD: {job_title} at {company}
+- Keep to 3-4 paragraphs, professional tone
+- Return JSON: {{"cover_letter": "...", "highlights": ["skill1", "skill2"]}}
+
+Profile: {json.dumps(profile, indent=2)[:4000]}
+
+JD: \"\"\"{safe_jd}\"\"\"
+"""
+    try:
+        data = await chat_completion("resume_gen", prompt, temperature=0.6, max_tokens=800, db=db, user_id=user_id)
+        return data.get("cover_letter", "") if isinstance(data, dict) else str(data)
+    except Exception:
+        # Fallback
+        skills = ", ".join(profile.get("skills", [])[:5])
+        return f"""Dear Hiring Manager at {company},
+
+I am excited to apply for the {job_title} position. With experience in {skills}, I believe I can contribute effectively to your team.
+
+{profile.get('summary','')[:500]}
+
+I would welcome the opportunity to discuss how my background aligns with your needs.
+
+Sincerely,
+{profile.get('name','Candidate')}
+"""
+

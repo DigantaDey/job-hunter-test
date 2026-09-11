@@ -335,3 +335,158 @@ class AuditLog(Base):
     ip = Column(String(64), default="")
     request_id = Column(String(64), default="")
     created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+
+
+# --------------------------------------------------------------------------- #
+# Monetization & SaaS — Plans, Subscriptions, Credits, Usage
+# --------------------------------------------------------------------------- #
+class Subscription(Base):
+    """
+    Per-user subscription state.
+
+    Provider abstraction: stripe | razorpay | manual.
+    Status: trialing | active | past_due | canceled | expired | incomplete
+    """
+
+    __tablename__ = "subscriptions"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_subscriptions_user"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    plan = Column(String(20), default="free", nullable=False)  # free | pro | pro_plus
+    status = Column(String(20), default="active", nullable=False)
+    provider = Column(String(20), default="manual")  # manual | stripe | razorpay
+    provider_customer_id = Column(String(200), default="")
+    provider_subscription_id = Column(String(200), default="")
+    current_period_start = Column(DateTime, default=utcnow)
+    current_period_end = Column(DateTime, nullable=True)
+    trial_end = Column(DateTime, nullable=True)
+    cancel_at_period_end = Column(Boolean, default=False, nullable=False)
+    grace_until = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class BillingEvent(Base):
+    """Idempotency & audit for webhook events (stripe/razorpay)."""
+
+    __tablename__ = "billing_events"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_billing_provider_event"),
+        Index("ix_billing_user_created", "user_id", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    provider = Column(String(20), nullable=False)  # stripe | razorpay | manual
+    provider_event_id = Column(String(200), nullable=False)
+    kind = Column(String(80), default="")  # e.g., invoice.paid, subscription.updated
+    payload = Column(JSON, default=dict)
+    processed = Column(Boolean, default=False, nullable=False)
+    error = Column(Text, default="")
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
+class AICreditLedger(Base):
+    """
+    Every AI operation that costs tokens/money.
+    Used for per-user limits, cost ceilings, and billing.
+    """
+
+    __tablename__ = "ai_credit_ledger"
+    __table_args__ = (Index("ix_ai_ledger_user_created", "user_id", "created_at"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    workflow = Column(String(40), nullable=False)  # parse, scoring, resume_gen, etc.
+    model = Column(String(120), default="")
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    estimated_cost_usd = Column(Float, default=0.0)
+    success = Column(Boolean, default=True, nullable=False)
+    latency_ms = Column(Integer, default=0)
+    error = Column(Text, default="")
+    meta = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
+class UsageCounter(Base):
+    """
+    Monthly usage counters per user, reset on period start.
+    One row per (user, period, capability) or aggregated JSON.
+    """
+
+    __tablename__ = "usage_counters"
+    __table_args__ = (
+        UniqueConstraint("user_id", "period", "capability", name="uq_usage_user_period_cap"),
+        Index("ix_usage_user_period", "user_id", "period"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    period = Column(String(7), nullable=False)  # YYYY-MM
+    capability = Column(String(40), nullable=False)  # jobs_discovered, ai_ops, resumes, etc.
+    count = Column(Integer, default=0, nullable=False)
+    limit = Column(Integer, default=0, nullable=False)  # snapshot of limit at time
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
+class Notification(Base):
+    """In-app notifications for job alerts, automation failures, etc."""
+
+    __tablename__ = "notifications"
+    __table_args__ = (Index("ix_notifications_user_read", "user_id", "read", "created_at"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    kind = Column(String(40), default="info")  # high_match, automation_failed, email_reply, etc.
+    title = Column(String(200), default="")
+    body = Column(Text, default="")
+    link = Column(String(500), default="")
+    read = Column(Boolean, default=False, nullable=False)
+    meta = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
+class InterviewPrep(Base):
+    """Interview preparation sessions grounded in resume + JD."""
+
+    __tablename__ = "interview_preps"
+    __table_args__ = (Index("ix_interview_user_job", "user_id", "job_id"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
+    job_title = Column(String(300), default="")
+    company = Column(String(200), default="")
+    questions = Column(JSON, default=list)  # [{q, category, difficulty}]
+    answers = Column(JSON, default=dict)  # user answers
+    feedback = Column(JSON, default=dict)  # AI feedback per answer
+    status = Column(String(20), default="draft")  # draft | in_progress | completed
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class CompanyIntel(Base):
+    """Cached company intelligence for deeper research."""
+
+    __tablename__ = "company_intel"
+    __table_args__ = (UniqueConstraint("user_id", "company", name="uq_intel_user_company"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    company = Column(String(200), nullable=False)
+    website = Column(String(500), default="")
+    industry = Column(String(200), default="")
+    size = Column(String(50), default="unknown")
+    funding_stage = Column(String(50), default="")
+    tech_stack = Column(JSON, default=list)
+    culture = Column(Text, default="")
+    recent_news = Column(JSON, default=list)
+    sources = Column(JSON, default=list)
+    summary = Column(Text, default="")
+    verified = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)

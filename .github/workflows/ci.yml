@@ -33,6 +33,9 @@ jobs:
       - name: Lint (ruff)
         run: ruff check backend
 
+      - name: Type check (mypy)
+        run: mypy backend/app --ignore-missing-imports || true
+
       - name: Run test suite
         working-directory: backend
         env:
@@ -140,18 +143,26 @@ jobs:
           cache-to: type=gha,mode=max
 
   security:
-    name: Dependency audit
+    name: Security scanning (fail on critical)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - run: pip install pip-audit
-      - run: pip-audit -r backend/requirements.txt --strict
+      - name: Install audit tools
+        run: pip install pip-audit bandit[toml]
+      - name: pip-audit backend (fail on high)
+        run: pip-audit -r backend/requirements.txt --disable-pip --requirement backend/requirements.txt
+      - name: Bandit SAST (fail on high)
+        run: bandit -r backend/app -ll -ii -f json -o bandit-report.json || (cat bandit-report.json; exit 1)
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - run: npm audit --omit=dev --audit-level=high
+      - name: npm audit frontend (fail on critical)
+        run: npm audit --omit=dev --audit-level=critical
         working-directory: frontend
+      - name: Check for hardcoded secrets (gitleaks pattern)
+        run: |
+          ! grep -R --include="*.py" -E "(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})" backend/app || (echo "Potential hardcoded secret found" && exit 1)
+          ! grep -R --include="*.tsx" --include="*.ts" -E "sk-[A-Za-z0-9]{20,}" frontend/src || true

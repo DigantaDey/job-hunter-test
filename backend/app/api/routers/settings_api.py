@@ -61,16 +61,32 @@ def runtime(user: CurrentUser, db: DbSession):
 
 
 @router.get("/settings/ai/status")
-async def ai_status(user: CurrentUser):
-    health = await ping()
+async def ai_status(user: CurrentUser, db: DbSession):
+    # Per-user ping with owner fallback
+    health = await ping(db=db, user_id=user.id)
     stats = rate_limiter.stats()
+    # Resolve full config for user for UI display
+    from app.services.user_settings import get_user_ai_config
+    try:
+        user_cfg = get_user_ai_config(db, user.id)
+    except Exception:
+        user_cfg = {"base_url": settings.ai_base_url, "model": settings.ai_model, "api_key_set": bool(settings.ai_api_key)}
+
     return {
         "online": health.get("online", False),
-        "configured": is_configured(),
-        "model": health.get("model") or settings.ai_model,
-        "base_url": health.get("base_url") or settings.ai_base_url,
+        "configured": is_configured(db=db, user_id=user.id),
+        "model": health.get("model") or user_cfg.get("model") or settings.ai_model,
+        "base_url": health.get("base_url") or user_cfg.get("base_url") or settings.ai_base_url,
         "latency_ms": health.get("latency_ms"),
         "reason": health.get("reason") or health.get("error"),
+        "hint": health.get("hint"),
+        "user_config": {
+            "base_url": user_cfg.get("base_url"),
+            "model": user_cfg.get("model"),
+            "api_key_set": user_cfg.get("api_key_set"),
+            "rpm": user_cfg.get("rpm"),
+        },
+        "is_owner": user.role == "owner",
         **stats,
         "breakers": breaker_snapshot(),
         "usage": usage_snapshot(),

@@ -22,6 +22,9 @@ for before calling the deployment production-grade.
 | 10 | Backups scheduled and **restore-tested** | `backend/scripts/backup.py` (see §5) |
 | 11 | `AUTOFILL_*` left at defaults unless you accept the portal-ToS risk | dry-run by default |
 | 12 | Log shipper configured | `LOG_JSON=true`, ship stdout |
+| 13 | Billing provider configured | `BILLING_PROVIDER=stripe|razorpay|manual`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`; webhooks idempotent via `billing_events` unique constraint |
+| 14 | AI credit ceilings set | `AI_CREDITS_MONTHLY_LIMIT`, `AI_COST_DAILY_LIMIT_USD`; monitor `ai_credit_ledger` |
+| 15 | Pricing page public | `/pricing` should be reachable without auth for SEO; `/billing` behind auth |
 
 The application fails fast at startup with a readable list of the problems above (see
 `Settings.validate_runtime()`); it never silently degrades into an insecure mode.

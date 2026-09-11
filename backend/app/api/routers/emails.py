@@ -1,4 +1,5 @@
-"""Email approval bucket, compliance, sending and engagement endpoints."""
+"""Email approval bucket, compliance, sending and engagement endpoints — monetized."""
+
 from __future__ import annotations
 
 from typing import Annotated, List, Optional
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import CurrentUser, DbSession
 from app.core import audit
 from app.core.auth import require_consent
+from app.core.entitlements import enforce, increment_usage
 from app.core.logging import get_logger
 from app.models.models import Email, EmailEvent, EmailOptOut, Job, User
 from app.schemas.schemas import EmailOut
@@ -48,6 +50,10 @@ class EmailGenerate(BaseModel):
 @router.post("/generate")
 async def create_email(payload: EmailGenerate, request: Request, user: CurrentUser, db: DbSession):
     """Draft outreach (never sends) and put it in the approval bucket."""
+    enforce(db, user.id, "can_send_outreach")
+    enforce(db, user.id, "outreach_per_month")
+    enforce(db, user.id, "contact_discovery_per_month")
+
     job = None
     if payload.job_id:
         job = db.query(Job).filter(Job.id == payload.job_id, Job.user_id == user.id).first()
@@ -56,16 +62,11 @@ async def create_email(payload: EmailGenerate, request: Request, user: CurrentUs
 
     recipient = None
     if payload.recipient_email:
-        recipient = {"name": payload.recipient_name or "", "email": payload.recipient_email,
-                     "title": "", "confidence": 1.0, "source": "manual", "verified": False}
+        recipient = {"name": payload.recipient_name or "", "email": payload.recipient_email, "title": "", "confidence": 1.0, "source": "manual", "verified": False}
 
     try:
-        result = await draft_email(db, user, company=payload.company, job=job, founder=payload.founder,
-                                   department=payload.department, recipient=recipient,
-                                   extra_context=payload.context)
+        result = await draft_email(db, user, company=payload.company, job=job, founder=payload.founder, department=payload.department, recipient=recipient, extra_context=payload.context)
     except ValueError as exc:
-        # User-fixable service errors must surface as 4xx with a machine code,
-        # never as a 500.
         reason = str(exc)
         messages = {
             "profile_missing": "Upload your resume first so outreach can be personalised",
@@ -75,28 +76,26 @@ async def create_email(payload: EmailGenerate, request: Request, user: CurrentUs
         raise HTTPException(400, {"code": reason, "message": messages.get(reason, reason)}) from exc
     email_row: Email = result["email"]
     if payload.queue:
-        enqueue(db, user_id=user.id, pipeline="email",
-                payload={"send": True, "email_id": email_row.id}, priority=4,
-                dedupe_key=f"email:{email_row.id}")
-    audit.audit(db, "email.generated", user=user, target=email_row.to_email,
-                detail={"company": payload.company, "source": email_row.source,
-                        "confidence": email_row.confidence}, request=request)
+        enqueue(db, user_id=user.id, pipeline="email", payload={"send": True, "email_id": email_row.id}, priority=4, dedupe_key=f"email:{email_row.id}")
+    audit.audit(db, "email.generated", user=user, target=email_row.to_email, detail={"company": payload.company, "source": email_row.source, "confidence": email_row.confidence}, request=request)
+    increment_usage(db, user.id, "outreach_per_month", 1)
+    increment_usage(db, user.id, "contact_discovery_per_month", 1)
     return {
-        "email": {"id": email_row.id, "to": email_row.to_email, "subject": email_row.subject,
-                  "body": email_row.body, "status": email_row.status, "source": email_row.source,
-                  "confidence": email_row.confidence},
+        "email": {"id": email_row.id, "to": email_row.to_email, "subject": email_row.subject, "body": email_row.body, "status": email_row.status, "source": email_row.source, "confidence": email_row.confidence},
         "decision_maker": result["decision"],
         "ai": {"used": result["ai"].get("ai_used"), "fact_guard": result["ai"].get("fact_guard")},
     }
 
 
 @router.get("/contacts")
-async def preview_contacts(user: CurrentUser, db: DbSession, company: str = Query(...),
-                          department: str = "engineering"):
+async def preview_contacts(user: CurrentUser, db: DbSession, company: str = Query(...), department: str = "engineering"):
     """Show who we can find *before* drafting anything (transparency + trust)."""
+    enforce(db, user.id, "contact_discovery_per_month")
     from app.services.contact_discovery import discover_decision_makers
 
-    return await discover_decision_makers(company, department=department, limit=8)
+    result = await discover_decision_makers(company, department=department, limit=8)
+    increment_usage(db, user.id, "contact_discovery_per_month", 1)
+    return result
 
 
 @router.put("/{email_id}")
@@ -128,20 +127,17 @@ def send_now(
     email_id: int,
     payload: SendRequest,
     request: Request,
-    # The consent gate lives at the route so it cannot be forgotten: this is the
-    # only endpoint that puts mail on the wire. `compliance_report()` inside
-    # outreach.send_email() re-checks it, which is what protects the worker path
-    # (queued sends) that never goes through this route.
     user: Annotated[User, Depends(require_consent("outreach"))],
     db: DbSession,
 ):
+    enforce(db, user.id, "outreach_per_day")
     row = _email_or_404(db, user.id, email_id)
     result = send_email(db, user, row, otp=payload.otp, allow_real=payload.allow_real)
     if result.get("sent"):
+        increment_usage(db, user.id, "outreach_per_day", 1)
         audit.audit(db, "email.sent", user=user, target=row.to_email, detail={"email_id": row.id}, request=request)
     elif result.get("blocked"):
-        audit.audit(db, "email.blocked", user=user, target=row.to_email,
-                    detail={"email_id": row.id, "blockers": result["compliance"]["blockers"]}, request=request)
+        audit.audit(db, "email.blocked", user=user, target=row.to_email, detail={"email_id": row.id, "blockers": result["compliance"]["blockers"]}, request=request)
     return result
 
 
@@ -155,14 +151,8 @@ def check_compliance(email_id: int, user: CurrentUser, db: DbSession):
 @router.get("/{email_id}/events")
 def email_events(email_id: int, user: CurrentUser, db: DbSession):
     _email_or_404(db, user.id, email_id)
-    rows = (
-        db.query(EmailEvent)
-        .filter(EmailEvent.email_id == email_id, EmailEvent.user_id == user.id)
-        .order_by(EmailEvent.created_at.desc())
-        .all()
-    )
-    return [{"id": r.id, "kind": r.kind, "detail": r.detail, "meta": r.meta, "created_at": r.created_at}
-            for r in rows]
+    rows = db.query(EmailEvent).filter(EmailEvent.email_id == email_id, EmailEvent.user_id == user.id).order_by(EmailEvent.created_at.desc()).all()
+    return [{"id": r.id, "kind": r.kind, "detail": r.detail, "meta": r.meta, "created_at": r.created_at} for r in rows]
 
 
 @router.delete("/{email_id}")
@@ -194,11 +184,7 @@ def add_suppression(payload: dict, user: CurrentUser, db: DbSession):
 
 @router.delete("/suppressions/{suppression_id}")
 def remove_suppression(suppression_id: int, user: CurrentUser, db: DbSession):
-    row = (
-        db.query(EmailOptOut)
-        .filter(EmailOptOut.id == suppression_id, EmailOptOut.user_id == user.id)
-        .first()
-    )
+    row = db.query(EmailOptOut).filter(EmailOptOut.id == suppression_id, EmailOptOut.user_id == user.id).first()
     if not row:
         raise HTTPException(404, "Entry not found")
     db.delete(row)
