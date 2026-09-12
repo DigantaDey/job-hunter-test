@@ -4,6 +4,112 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.1.0] — 2026-09-13
+
+AI becomes a **hard dependency with an honest pause/resume contract**, and the
+token budgets that govern every prompt and answer are **per-user settings**.
+From now on the product either shows a real AI result or explains precisely
+why the model could not answer — it never substitutes a guessed value and
+never presents one as AI output.
+
+### Added
+
+- **One central AI-availability signal.** `ai_client.ai_availability()`
+  (backed by `ping()` + the breaker + the daily budget) reports exactly three
+  states for a user: `online`, `transient_outage` (timeout / unreachable / 429
+  / 5xx / breaker open / budget exhausted — retrying later is meaningful) and
+  `blocked_needs_action` (no key / invalid key / undecryptable key / provider
+  quota / unknown model / plan limit — retrying is pointless until the user
+  acts). **Decision: `quota_exceeded` is blocked, not transient** — a 429
+  rate window resets on its own, but an account with no credits stays broken
+  until topped up. The probe's generic `status_NNN` verdicts are normalised
+  into this stable vocabulary (`ai_client.normalise_ping_reason`).
+- **Pausable failures.** Synchronous AI calls that hit a transient outage
+  return a dedicated 503 (never a generic 500) carrying
+  `code=ai_unavailable`, `state=transient_outage`,
+  `status="ai_paused"`, `pausable=true`, a `retry_after_hint` and a non-blank
+  actionable `detail`, on top of the v2.0.5 `attempts` /
+  `possibly_billed` accounting. Blocked failures return
+  `state=blocked_needs_action`, `status="ai_blocked"` and a fix pointing at
+  Settings → AI API — with exactly one wire attempt (no retry storm on a
+  rejected key).
+- **Queue pause/resume.** Queued work that hits a transient AI outage is
+  **paused** (`job_queue.pause`): re-queued with backoff, never marked failed
+  or completed, and the pause does *not* consume an attempt (an outage is not
+  the work's fault; after 12 consecutive pauses it is dead-lettered with its
+  error, so a pathological case cannot loop forever). A new **AI watchdog**
+  (`ai_watchdog.py`, runs with the worker) re-probes on a schedule
+  (`AI_WATCHDOG_INTERVAL_SECONDS`, 0 disables) and drains paused work the
+  moment the signal is green. `POST /api/settings/ai/resume` is the one-click
+  equivalent (force drain). All re-executed work is idempotent: AI calls run
+  before any side effects, discovery dedupes by `dedupe_key`, and usage is
+  increment-only on actually-inserted rows.
+- **Per-user token budgets** (Settings → AI API, same pattern as `ai.timeout`):
+  `ai.max_input_tokens` (256–200000) and `ai.max_output_tokens` (64–16000),
+  editable by the owner and paid tiers, read-only on free — enforced
+  **server-side** (a free-tier PUT is rejected with 403
+  `upgrade_required`, not merely hidden). The gateway obeys them as the single
+  source of truth: every outgoing `max_tokens` is clamped to the user's
+  output ceiling (the PR #29 automatic escalation can never exceed it), and
+  every prompt/document spliced into a prompt is clamped to the input budget
+  (`ai_client.input_budget_chars` / `fit_prompt_part`). **Over-context
+  decision: clamp-with-warning** — an oversized document still produces a
+  (shorter) honest request and the ledger flags `input_truncated`; it is
+  never rejected.
+- **`/api/settings/ai/status`** now reports the three-state `state`,
+  `retry_after_hint` and `paused_count` alongside the existing health data.
+- **Scripted-provider test harness** (local OpenAI-compatible server in
+  `tests/conftest.py`, hermetic `real_ai` convention): mid-run outages,
+  recoveries, rejected keys and abnormal model answers — 14 new tests cover
+  the pausable 503 (nothing persisted before the AI call succeeds), blocked
+  no-retry-storm, pause→recover→complete-without-duplicates, watchdog
+  drain-only-when-online, the status/resume endpoints, budget round-trips,
+  tier gating, wire-level `max_tokens` clamping, the escalation ceiling and
+  over-context clamping.
+
+### Changed
+
+- **Deleted: every heuristic / offline / silent fallback on the AI path.**
+  Upload parsing, search-context extraction, resume tailoring/tagging/cover
+  letters, cold emails + subject lines, scoring, company-size classification
+  (interactive), company intel, interview questions/feedback, form
+  detection, funding scans, persona portrait/tracks — none of them catches an
+  AI failure and substitutes a regex/keyword/canned answer anymore. Each now
+  raises the typed outage (pausable or blocked) or fails the queued item
+  honestly. The deterministic helpers that remain are *labelled by
+  provenance*, never presented as AI: `deterministic_company_size`
+  (bulk-labelling jobs outside the AI top-N of a discovery run — a documented
+  cost control, recorded in `company_size_confidence`), `mined_context`
+  (the deterministic merge base unioned into *successful* AI extractions, and
+  the degenerate answer for an account with no data to read), and
+  `diagnostic_preview_extract` (diagnostics/tests only, `degraded=true`).
+  Names were changed accordingly (`heuristic_*` → the names above) so no
+  function can be mistaken for an AI fallback.
+- **`max_tokens` is a named budget per task** — `PARSE_OUTPUT_TOKENS` (4000),
+  `SCORING_OUTPUT_TOKENS` (1200), `EMAIL_OUTPUT_TOKENS` (900),
+  `QUESTIONS_OUTPUT_TOKENS` (2000) / `FEEDBACK_OUTPUT_TOKENS` (1000),
+  `TAILOR_OUTPUT_TOKENS` (3000) / `COVER_LETTER_OUTPUT_TOKENS` (1200) /
+  `TAG_OUTPUT_TOKENS` (300), `INTEL_OUTPUT_TOKENS` (800) — each clamped to
+  the user's output ceiling by the gateway; no hardcoded `max_tokens=` or
+  prompt `[:N]` slice remains on any AI path (the anti-hallucination fact
+  ledger's local memory bound `MAX_LEDGER_CHARS` is not a prompt cap).
+- **Env defaults:** `AI_MAX_OUTPUT_TOKENS` is now 16000 (the ceiling; per-task
+  starting budgets are the named constants above), new `AI_MAX_INPUT_TOKENS`
+  (12000) and `AI_WATCHDOG_INTERVAL_SECONDS` (15).
+- `AI_API_KEY=` empty no longer means "heuristic mode" — it means the app
+  boots in `blocked_needs_action` and says so.
+
+### Fixed
+
+- Services that imported the gateway at module level
+  (`classifier`, `keyword_extractor`, `interview_prep`, `company_intel`,
+  `resume_generator`) now resolve `chat_completion` at call time, matching
+  the rest of the codebase — test doubles (and hot-swapped providers) work
+  uniformly.
+- `test_company_classification_heuristics` (which asserted the deleted
+  classify fallback) is replaced by `test_company_classification_is_the_ai_verdict`
+  plus scripted-provider outage coverage.
+
 ## [2.0.5] — 2026-09-12
 
 Fixes the "`AI unavailable — nothing was generated` / `unreachable` with a blank

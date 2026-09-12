@@ -134,7 +134,7 @@ export default function Funding() {
           <Sparkles className="w-4 h-4 text-blue-600" /> Search context auto-extracted by AI
           {context?.source && (
             <span className="text-[11px] px-2 py-0.5 rounded-full bg-white dark:bg-zinc-900 border mono text-zinc-600 dark:text-zinc-300">
-              {context.source === 'ai' ? 'AI (profile + resume + context)' : 'heuristic fallback (no AI key)'}
+              {context.source === 'ai' ? 'AI (profile + resume + context)' : context.source === 'mined' ? 'mined from your data (deterministic)' : context.source}
             </span>
           )}
           {refreshedAt && <span className="text-[11px] mono text-zinc-500 ml-auto">updated {new Date(refreshedAt).toLocaleTimeString()}</span>}

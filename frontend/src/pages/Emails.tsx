@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import client, { apiError, AI_REQUEST_TIMEOUT_MS } from '../api/client'
 import { Mail, Send, Check, Pencil, Search, Building2, User, Clock, AlertTriangle, Loader2, Briefcase, ExternalLink, ShieldCheck, ShieldAlert, XCircle } from 'lucide-react'
 import { aiOutage, type AIOutage } from '../api/client'
+import { AIOutageBanner } from '../components/AIBanner'
 
 /** A per-email message: a blocked send or a missing disclosure, with an action. */
 type Notice = { id: number; kind: 'err' | 'warn'; text: string; consent?: string }
@@ -116,18 +117,7 @@ export default function Emails(){
         </div>
       </div>
 
-      {outage && (
-        <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-sm">
-          <div className="flex items-start gap-2">
-            <XCircle className="w-4 h-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5"/>
-            <div className="min-w-0">
-              <div className="font-medium text-red-800 dark:text-red-200">AI unavailable — no draft was created</div>
-              <div className="text-xs mono mt-1 text-red-700 dark:text-red-300">{outage.message}{outage.reason ? ` (${outage.reason})` : ''}</div>
-              {outage.fix && <div className="text-xs mono mt-1 text-red-700 dark:text-red-300"><strong>Fix:</strong> {outage.fix}</div>}
-            </div>
-          </div>
-        </div>
-      )}
+      {outage && <AIOutageBanner outage={outage} what='no draft was created' onDismiss={()=>setOutage(null)} />}
 
       {/* Errors from the drafting form itself (id -1) belong at page level —
           the per-row notices below are keyed to an existing email. */}

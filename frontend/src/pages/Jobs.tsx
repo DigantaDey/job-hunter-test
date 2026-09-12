@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import client, { apiError, AI_REQUEST_TIMEOUT_MS } from '../api/client'
+import client, { apiError, aiOutage, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
+import { AIOutageBanner } from '../components/AIBanner'
 import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader2, Wand2, CheckCircle, AlertCircle, Eye, Brain, Target, MapPin, DollarSign, GraduationCap, Zap, TrendingUp, FileText } from 'lucide-react'
 
 /**
@@ -26,6 +27,7 @@ export default function Jobs(){
   const [companyIntel, setCompanyIntel] = useState<any>(null)
   const [busy, setBusy] = useState(false)
   const [discoverBusy, setDiscoverBusy] = useState(false)
+  const [outage, setOutage] = useState<AIOutage | null>(null)
   const [resumeChoice, setResumeChoice] = useState('auto')
   const [applyMsg, setApplyMsg] = useState('')
   const [discoverMsg, setDiscoverMsg] = useState('')
@@ -74,7 +76,11 @@ export default function Jobs(){
       const {data} = await client.post('/api/resumes/generate', null, {params:{job_id: selected.id}, timeout: AI_REQUEST_TIMEOUT_MS})
       setGenerateMsg('Tailored resume ready')
       setGeneratedLinks(data.files)
-    }catch(e:any){ setGenerateMsg(apiError(e, 'Generation failed')) }
+    }catch(e:any){
+      const o = aiOutage(e)
+      if (o) setOutage(o)
+      else setGenerateMsg(apiError(e, 'Generation failed'))
+    }
     finally{ setGenerating(false) }
   }
   const apply = async()=>{
@@ -105,6 +111,7 @@ export default function Jobs(){
         </div>
       </div>
       {discoverMsg && <div className="text-xs mono p-2 rounded-lg bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300">Keywords: {discoverMsg}</div>}
+      {outage && <AIOutageBanner outage={outage} what="no tailored resume was created" onDismiss={()=>setOutage(null)} />}
 
       <div className="card p-3 flex flex-wrap gap-2 items-center">
         <div className="flex items-center gap-2 text-xs mono text-zinc-500"><Filter className="w-3.5 h-3.5"/> Filter:</div>
@@ -222,7 +229,7 @@ export default function Jobs(){
               ) : (
                 <div className="bg-zinc-50 dark:bg-zinc-800 rounded-xl p-3">
                   <div className="text-xs mono font-medium flex items-center gap-1"><Brain className="w-3.5 h-3.5"/> Scoring reason</div>
-                  <div className="text-xs text-zinc-600 dark:text-zinc-400 mt-1 leading-relaxed">{selected.score_reason || 'Heuristic + AI hybrid'}</div>
+                  <div className="text-xs text-zinc-600 dark:text-zinc-400 mt-1 leading-relaxed">{selected.score_reason || 'Preliminary keyword-overlap score'}</div>
                 </div>
               )}
 

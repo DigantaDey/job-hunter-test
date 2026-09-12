@@ -177,7 +177,8 @@ def create_app() -> FastAPI:
     app.include_router(router, prefix="/api")
 
     # --- error handling: one JSON shape, always with a request id ---
-    from app.services.ai_guardrails import AIUnavailableError, GuardrailError
+    from app.services.ai_client import AIClientError
+    from app.services.ai_guardrails import AIUnavailableError, GuardrailError, describe_ai_error
 
     @app.exception_handler(AIUnavailableError)
     async def ai_unavailable_handler(request: Request, exc: AIUnavailableError):
@@ -188,6 +189,24 @@ def create_app() -> FastAPI:
             status_code=503,
             content={"detail": exc.message, "request_id": getattr(request.state, "request_id", ""),
                      **exc.payload()},
+        )
+
+    @app.exception_handler(AIClientError)
+    async def ai_client_error_handler(request: Request, exc: AIClientError):
+        """A raw gateway failure that a service did not wrap itself.
+
+        Same contract as the AIUnavailableError handler: a typed, pausable 503
+        (transient) or a needs-action 503 (blocked) — never a generic 500,
+        never a guessed result.
+        """
+        outage = describe_ai_error(exc)
+        inc("jobhunter_http_errors_total", kind="ai_unavailable", reason=outage.reason)
+        log.warning("AI failure on %s %s (%s): %s", request.method, request.url.path,
+                    outage.reason, outage.detail)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": outage.message, "request_id": getattr(request.state, "request_id", ""),
+                     **outage.payload()},
         )
 
     @app.exception_handler(GuardrailError)

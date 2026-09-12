@@ -117,12 +117,25 @@ DIAGNOSIS: Dict[str, Tuple[str, str]] = {
 
 
 class AIUnavailableError(Exception):
-    """AI cannot produce a trustworthy result. Always carries a full diagnosis."""
+    """AI cannot produce a trustworthy result. Always carries a full diagnosis.
+
+    v2.1: every failure also carries the three-state availability signal
+    (:attr:`state` — ``online`` never occurs on an error, only
+    ``transient_outage`` or ``blocked_needs_action``), the dedicated pausable
+    status string (``status``: ``ai_paused`` / ``ai_blocked``), a
+    ``retry_after_hint`` and the v2.0.5 attempts/billing accounting. The UI
+    renders "AI paused — will resume automatically" for pausable failures and
+    "AI blocked — action needed" (pointing at Settings → AI API) otherwise.
+    """
 
     http_status = 503
 
     def __init__(self, reason: str, *, workflow: str = "", detail: str = "",
-                 context: Optional[Dict[str, Any]] = None):
+                 context: Optional[Dict[str, Any]] = None,
+                 state: Optional[str] = None,
+                 retry_after_hint: Optional[float] = None,
+                 attempts: Optional[int] = None,
+                 possibly_billed: Optional[bool] = None):
         message, fix = DIAGNOSIS.get(reason, DIAGNOSIS["unknown"])
         super().__init__(message)
         self.reason = reason
@@ -131,17 +144,40 @@ class AIUnavailableError(Exception):
         self.fix = fix
         self.detail = (detail or "")[:500]
         self.context = context or {}
+        self.state = state  # set by describe_ai_error when left None
+        self.retry_after_hint = retry_after_hint
+        self.attempts = attempts
+        self.possibly_billed = possibly_billed
+
+    @property
+    def pausable(self) -> bool:
+        """Safe to retry later — the queue pauses (not fails) pausable work."""
+        return self.state == "transient_outage"
 
     def payload(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "code": "ai_unavailable",
             "reason": self.reason,
             "message": self.message,
             "fix": self.fix,
             "workflow": self.workflow,
             "detail": self.detail,
-            **self.context,
         }
+        if self.state:
+            payload["state"] = self.state
+            # Dedicated pausable/blocked status (lowercase snake_case).
+            payload["status"] = "ai_paused" if self.pausable else "ai_blocked"
+            payload["pausable"] = self.pausable
+            if self.pausable:
+                payload["retry_after_hint"] = self.retry_after_hint
+            # v2.0.5 accounting: attempts spent and the billing caveat survive
+            # into the response, not just the ledger.
+            if self.attempts is not None:
+                payload["attempts"] = self.attempts
+            if self.possibly_billed is not None:
+                payload["possibly_billed"] = self.possibly_billed
+        payload.update(self.context)
+        return payload
 
 
 class GuardrailError(Exception):
@@ -224,6 +260,17 @@ def describe_ai_error(exc: BaseException, *, workflow: str = "",
         # renders an empty explanation.
         message, _fix = DIAGNOSIS.get(reason, DIAGNOSIS["unknown"])
         detail = f"{reason}: {message}"
+
+    # Three-state availability signal + pausable accounting (v2.1).
+    from app.services.ai_client import classify_reason, retry_hint_for_reason
+
+    state = classify_reason(reason)
+    meta = getattr(exc, "meta", None) if isinstance(exc, BaseException) else None
+    if not isinstance(meta, dict):
+        meta = {}
+    retry_after_hint = meta.get("retry_after_hint")
+    if retry_after_hint is None and state == "transient_outage":
+        retry_after_hint = retry_hint_for_reason(reason, workflow=workflow)
     return AIUnavailableError(
         reason,
         workflow=workflow,
@@ -236,6 +283,10 @@ def describe_ai_error(exc: BaseException, *, workflow: str = "",
             "latency_ms": (probe or {}).get("latency_ms"),
             "hint": (probe or {}).get("hint"),
         },
+        state=state,
+        retry_after_hint=retry_after_hint,
+        attempts=meta.get("attempts"),
+        possibly_billed=meta.get("possibly_billed"),
     )
 
 
@@ -353,6 +404,10 @@ def _norm(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+#: Hard memory bound for the ledger's raw text (grounding index only).
+MAX_LEDGER_CHARS = 20000
+
+
 @dataclass
 class FactLedger:
     """Every entity the user's own data supports, normalised for comparison."""
@@ -424,10 +479,12 @@ def build_fact_ledger(profile: Dict[str, Any], extra_text: str = "") -> FactLedg
     for phone in PHONE_RE.findall(str(profile.get("phone") or "")):
         ledger.phones.add(re.sub(r"\D", "", phone))
 
+    # Memory bound for the grounding index (not a prompt slice — the ledger is
+    # compared locally, never sent to the model).
     ledger.raw = " ".join([
-        json.dumps(profile, default=str)[:20000],
-        str(profile.get("raw_text") or "")[:20000],
-        str(extra_text or "")[:20000],
+        json.dumps(profile, default=str)[:MAX_LEDGER_CHARS],
+        str(profile.get("raw_text") or "")[:MAX_LEDGER_CHARS],
+        str(extra_text or "")[:MAX_LEDGER_CHARS],
     ])
     for match in _YEAR_RE.finditer(ledger.raw):
         ledger.years.add(match.group(0))

@@ -10,14 +10,24 @@ Guarantees (in order of importance):
    backoff + jitter, honouring ``Retry-After``. 4xx auth/validation errors are
    not retried (they will not fix themselves).
 3. **Circuit breaker.** After N consecutive failures the gateway fails fast for a
-   cooldown window instead of queueing doomed requests; callers fall back to
-   heuristics immediately.
+   cooldown window instead of queueing doomed requests. Callers never substitute
+   a guessed value: a transient failure surfaces as a *pausable* outcome (the
+   product pauses and re-queues the work), a blocked failure (bad/missing key,
+   quota) surfaces as an explicit needs-action outcome.
 4. **Observability.** Latency, status, token usage and breaker state are exported
-   as metrics and surfaced through ``/api/settings/ai/status``.
+   as metrics and surfaced through ``/api/settings/ai/status`` — including the
+   central three-state availability signal (:func:`ai_availability`):
+   ``online``, ``transient_outage`` (safe to retry later), ``blocked_needs_action``
+   (retrying is pointless until the user acts).
 5. **Per-workflow config.** Different base_url/model/key per workflow, resolved
    from the DB overrides with env defaults.
 6. **Per-user credit tracking.** Every successful call can be attributed to a
    user for billing, limits and cost control.
+7. **User-controlled token budgets.** The per-user ``ai.max_input_tokens`` /
+   ``ai.max_output_tokens`` settings (owner + paid tiers; fixed safe defaults on
+   free) are the single source of truth for prompt truncation and the output
+   ceiling: the gateway clamps every outgoing ``max_tokens`` to the resolved
+   ceiling and the automatic escalation on truncation can never exceed it.
 """
 
 from __future__ import annotations
@@ -114,19 +124,127 @@ def reason_from_message(message: str, status: Optional[int] = None) -> str:
     return REASON_UNKNOWN
 
 
+# --------------------------------------------------------------------------- #
+# Central AI-availability signal — three states, one classifier
+# --------------------------------------------------------------------------- #
+#: The product pauses (and re-queues) work on ``transient_outage`` and demands
+#: user action on ``blocked_needs_action``. Every stable reason maps to exactly
+#: one state; the mapping is the single source of truth for the UI banner, the
+#: queue pause/resume decision and the watchdog's drain condition.
+STATE_ONLINE = "online"
+STATE_TRANSIENT = "transient_outage"
+STATE_BLOCKED = "blocked_needs_action"
+
+#: Safe to retry later — nothing the user can fix in this moment; waiting works.
+#: * timeout / unreachable / 5xx: provider-side, recovers on its own;
+#: * rate_limited (429): a rate *window* that resets automatically;
+#: * circuit_open: opened BY transient failures — it resets after the cooldown;
+#: * budget_exhausted: the daily token budget resets at the next UTC day.
+TRANSIENT_REASONS = frozenset({
+    REASON_TIMEOUT, REASON_UNREACHABLE, REASON_PROVIDER_STATUS, REASON_RATE_LIMITED,
+    REASON_CIRCUIT_OPEN, REASON_BUDGET,
+})
+
+#: Retrying is pointless until the user acts (fix the key, add credit, upgrade).
+#:
+#: **Where ``quota_exceeded`` belongs — and why:** it is BLOCKED, not transient.
+#: A 429 rate limit is a *time window*: the provider resets it on its own, so
+#: retrying later is meaningful. A quota/billing rejection (HTTP 402,
+#: ``insufficient_quota``) is *account-level*: the provider account has no
+#: credits left, and no amount of waiting changes that — only topping up the
+#: account does. Retrying a hard-quota account burns nothing but retries, so
+#: the product treats it as "needs action" and points the user at their
+#: provider billing instead of pausing work forever.
+BLOCKED_REASONS = frozenset({
+    REASON_NO_API_KEY, REASON_INVALID_API_KEY, REASON_STORED_KEY_UNREADABLE,
+    REASON_QUOTA, REASON_MODEL_UNAVAILABLE, REASON_ENTITLEMENT,
+})
+
+
+def normalise_ping_reason(reason: Optional[str]) -> str:
+    """Map the probe's generic ``status_NNN`` verdicts to the stable reasons.
+
+    ``ping`` reports non-auth probe verdicts as ``status_NNN`` (the probe does
+    not know the product's vocabulary) — the availability signal, the UI and
+    the watchdog must all speak the stable reason language instead.
+    """
+    if not reason or not str(reason).startswith("status_"):
+        return reason or REASON_UNKNOWN
+    try:
+        code = int(str(reason).split("_", 1)[1])
+    except (ValueError, IndexError):
+        return str(reason)
+    if code == 429:
+        return REASON_RATE_LIMITED
+    if code in (401, 403):
+        return REASON_INVALID_API_KEY
+    if code == 404:
+        return REASON_MODEL_UNAVAILABLE
+    return REASON_PROVIDER_STATUS  # 5xx and other 4xx probe verdicts
+
+
+def classify_reason(reason: Optional[str]) -> str:
+    """Map a stable reason to the three-state availability signal.
+
+    Per-call answer-quality problems (``invalid_json``, ``empty_response``,
+    ``truncated_response``, ``malformed_response``, ``content_filter``,
+    ``unknown``) are classified ``transient_outage``: they are retryable later
+    (which is exactly what the queue/worker does) and none of them indicates
+    that the *provider connection or account* needs user action — so they must
+    never flip the global signal to ``blocked_needs_action``.
+    """
+    if reason in TRANSIENT_REASONS:
+        return STATE_TRANSIENT
+    if reason in BLOCKED_REASONS:
+        return STATE_BLOCKED
+    return STATE_TRANSIENT
+
+
+def retry_hint_for_reason(reason: Optional[str], *, workflow: str = "") -> Optional[float]:
+    """Best-effort ``retry_after_hint`` (seconds) for a failure reason.
+
+    ``None`` means "do not retry on a schedule" (blocked states). Values are
+    advisory: the watchdog re-probes on its own interval regardless.
+    """
+    if reason in BLOCKED_REASONS:
+        return None
+    if reason == REASON_CIRCUIT_OPEN:
+        breaker = _breaker(workflow) if workflow else None
+        remaining = breaker.state().get("cooldown_remaining") if breaker else None
+        return float(remaining) if remaining else float(settings.ai_breaker_cooldown_seconds)
+    if reason == REASON_BUDGET:
+        # Daily budget resets at the next UTC midnight.
+        import datetime as _dt
+
+        now = _dt.datetime.utcnow()
+        tomorrow = (now + _dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return float((tomorrow - now).total_seconds())
+    if reason == REASON_RATE_LIMITED:
+        return 30.0  # a typical rate window; Retry-After is not always present
+    return float(settings.ai_backoff_base) ** max(1, settings.ai_max_retries) * 5  # ~34s at defaults
+
+
 class AIClientError(Exception):
     """Raised when the AI layer cannot produce a result (unconfigured, timeout, HTTP error…)."""
 
     def __init__(self, message: str, *, status: Optional[int] = None, retryable: bool = False,
-                 reason: Optional[str] = None):
+                 reason: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
         self.reason = reason or reason_from_message(message, status)
+        #: v2.0.5 accounting carried through to the response/ledger: attempts
+        #: spent, whether a billed-but-unseen generation may exist, …
+        self.meta: Dict[str, Any] = dict(meta or {})
 
     def diagnostics(self) -> Dict[str, Any]:
         return {"reason": self.reason, "status": self.status, "retryable": self.retryable,
                 "detail": str(self)[:500]}
+
+    @property
+    def state(self) -> str:
+        """Three-state availability classification of this failure."""
+        return classify_reason(self.reason)
 
 
 WORKFLOWS = {
@@ -261,6 +379,8 @@ def resolve_config(workflow: Optional[str] = None) -> Dict[str, Any]:
         "key_source": "workflow_override" if override.get("api_key") else ("env" if api_key else None),
         "timeout": settings.ai_timeout,
         "max_retries": settings.ai_max_retries,
+        "max_input_tokens": settings.ai_max_input_tokens,
+        "max_output_tokens": settings.ai_max_output_tokens,
     }
 
 
@@ -281,6 +401,8 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
     key_error: Optional[str] = None
     user_timeout: Any = settings.ai_timeout
     user_max_retries: Any = settings.ai_max_retries
+    user_max_input_tokens: Any = settings.ai_max_input_tokens
+    user_max_output_tokens: Any = settings.ai_max_output_tokens
     try:
         from app.services.user_settings import get_user_ai_config
         user_cfg = get_user_ai_config(db, user_id)
@@ -291,6 +413,8 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
         key_error = user_cfg.get("api_key_error")
         user_timeout = user_cfg.get("timeout", settings.ai_timeout)
         user_max_retries = user_cfg.get("max_retries", settings.ai_max_retries)
+        user_max_input_tokens = user_cfg.get("max_input_tokens", settings.ai_max_input_tokens)
+        user_max_output_tokens = user_cfg.get("max_output_tokens", settings.ai_max_output_tokens)
     except Exception as exc:
         log.warning("per-user AI config resolution failed for user %s, using env defaults: %s", user_id, exc)
         base_url = settings.ai_base_url
@@ -321,6 +445,8 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
         "key_error": key_error,
         "timeout": user_timeout,
         "max_retries": user_max_retries,
+        "max_input_tokens": user_max_input_tokens,
+        "max_output_tokens": user_max_output_tokens,
     }
 
 
@@ -394,6 +520,129 @@ def breaker_snapshot() -> Dict[str, Dict[str, Any]]:
     return {k: v.state() for k, v in _breakers.items()}
 
 
+def input_budget_chars(db=None, user_id: Optional[int] = None,
+                       ai_config: Optional[Dict[str, Any]] = None) -> int:
+    """Character budget for ONE dynamic prompt part, from the user's input budget.
+
+    Services cap every document they splice into a prompt (JD, profile JSON,
+    resume text…) with this instead of hardcoded slices; the gateway then caps
+    the *total* prompt the same way, so the user's ``ai.max_input_tokens`` is
+    the single source of truth end to end.
+    """
+    raw: Any = None
+    if isinstance(ai_config, dict):
+        raw = ai_config.get("max_input_tokens")
+    if raw is None and db is not None and user_id is not None:
+        try:
+            raw = resolve_config_for_user(db, user_id).get("max_input_tokens")
+        except Exception:
+            raw = None
+    if raw is None:
+        raw = settings.ai_max_input_tokens
+    try:
+        return max(1000, int(raw) * CHARS_PER_TOKEN)
+    except (TypeError, ValueError):
+        return max(1000, settings.ai_max_input_tokens * CHARS_PER_TOKEN)
+
+
+def fit_prompt_part(text: str, budget_chars: int, *, label: str = "") -> Tuple[str, bool]:
+    """Cap one dynamic prompt part at the input budget. Returns ``(text, truncated)``.
+
+    Truncation is *clamping with a warning* — not rejection: a budget smaller
+    than a document must still produce a (shorter) honest request, and the
+    caller is told truncation happened (see ``input_truncated`` in the ledger
+    meta). The provider-side ``max_tokens`` 400 fix-up remains the last line of
+    defence for output budgets a specific model does not support.
+    """
+    text = (text or "").strip()
+    if budget_chars <= 0 or len(text) <= budget_chars:
+        return text, False
+    if label:
+        log.warning("AI prompt part '%s' truncated %d -> %d chars (user input budget)",
+                    label, len(text), budget_chars)
+    return text[:budget_chars], True
+
+
+async def ai_availability(db=None, user_id: Optional[int] = None,
+                          *, probe_timeout: int = 6) -> Dict[str, Any]:
+    """The central three-state AI-availability signal.
+
+    Combines the live probe (:func:`ping`, cached — polling is cheap) with the
+    in-process breaker and daily budget, so the state reflects what the NEXT
+    call would actually experience, not just whether the endpoint answers:
+
+    * ``online``                — the probe succeeded AND nothing in-process
+                                  blocks the next call;
+    * ``transient_outage``      — timeout / unreachable / 429 / 5xx / breaker
+                                  open / daily budget used up: safe to retry
+                                  later, so paused work is re-queued (drained
+                                  by the watchdog);
+    * ``blocked_needs_action``  — no key / invalid key / undecryptable key /
+                                  provider quota / unknown model / plan limit:
+                                  retrying is pointless until the user acts.
+
+    ``retry_after_hint`` (seconds, ``None`` when blocked) tells the UI and the
+    watchdog when it is worth looking again.
+    """
+    try:
+        health = await ping(db=db, user_id=user_id, timeout=probe_timeout)
+    except Exception as exc:  # the signal itself must never raise
+        health = {"online": False, "reason": "unreachable", "error": str(exc)}
+
+    if health.get("online"):
+        # Probe is green — but an open breaker or an exhausted daily budget
+        # still blocks the next call in this process.
+        any_breaker_open = any(b.is_open() for b in _breakers.values())
+        if any_breaker_open:
+            reason = REASON_CIRCUIT_OPEN
+        elif budget_exhausted():
+            reason = REASON_BUDGET
+        else:
+            return {"state": STATE_ONLINE, "online": True, "reason": None, "hint": None,
+                    "detail": "", "retry_after_hint": None,
+                    "latency_ms": health.get("latency_ms"), "base_url": health.get("base_url"),
+                    "model": health.get("model"), "key_source": health.get("key_source")}
+    else:
+        reason = normalise_ping_reason(str(health.get("reason") or "unknown"))
+
+    state = classify_reason(reason)
+    try:
+        from app.services.ai_guardrails import DIAGNOSIS  # local import: ai_guardrails imports this module
+        _fix = DIAGNOSIS.get(reason, (None, None))[1]
+    except Exception:
+        _fix = ""
+    return {
+        "state": state,
+        "online": False,
+        "reason": reason,
+        "hint": health.get("hint") or _fix,
+        "detail": str(health.get("detail") or health.get("error") or "")[:500],
+        "retry_after_hint": retry_hint_for_reason(reason) if state != STATE_ONLINE else None,
+        "latency_ms": health.get("latency_ms"),
+        "base_url": health.get("base_url"),
+        "model": health.get("model"),
+        "key_source": health.get("key_source"),
+    }
+
+
+def is_transient_ai_error(exc: BaseException) -> bool:
+    """True when an AI-layer failure is a *transient outage* (pause + re-queue),
+    as opposed to a needs-action failure (do not retry) or non-AI error."""
+    from app.services.ai_guardrails import AIUnavailableError
+
+    if isinstance(exc, AIUnavailableError):
+        return getattr(exc, "state", None) == STATE_TRANSIENT
+    if isinstance(exc, AIClientError):
+        return exc.state == STATE_TRANSIENT
+    return False
+
+
+def is_ai_error(exc: BaseException) -> bool:
+    from app.services.ai_guardrails import AIUnavailableError
+
+    return isinstance(exc, (AIUnavailableError, AIClientError))
+
+
 # --------------------------------------------------------------------------- #
 # Per-user AI credit tracking (SaaS)
 # --------------------------------------------------------------------------- #
@@ -435,9 +684,19 @@ _INVISIBLES_TABLE = str.maketrans("", "", "\ufeff\u200b\u200c\u200d\u2060")
 #: How many opening-bracket positions to probe when salvaging the model's last
 #: JSON draft out of a reasoning trace.
 _MAX_JSON_SALVAGE_TRIES = 32
-#: Upper bound for automatic max_tokens escalation (reasoning models can need
-#: thousands of tokens of thinking before the JSON is even started).
+#: Hard upper bound for automatic max_tokens escalation (reasoning models can
+#: need thousands of tokens of thinking before the JSON is even started). The
+#: user's configured output ceiling is always clamped to this value as well.
 _MAX_OUTPUT_TOKENS_CEILING = 16000
+#: Starting output budget when a task does not state its own (per-call
+#: ``max_tokens`` argument is the task's own starting budget; this is the
+#: fallback — matching the legacy AI_MAX_OUTPUT_TOKENS default so out-of-the-box
+#: behaviour is unchanged).
+_DEFAULT_OUTPUT_START = 4000
+#: Rough chars-per-token factor used to turn the user's input-token budget
+#: into a character budget for prompt parts (4 chars/token is the industry
+#: planning figure for English prose/JSON mixes).
+CHARS_PER_TOKEN = 4
 #: ```json { ... } ``` or ``` { ... } ``` blocks (findall → every block, so the
 #: last one — the model's final answer — can be tried first).
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
@@ -752,6 +1011,8 @@ async def chat_completion(
                 "key_error": cfg.get("key_error"),
                 "timeout": cfg.get("timeout"),
                 "max_retries": cfg.get("max_retries"),
+                "max_input_tokens": ai_config.get("max_input_tokens") or cfg.get("max_input_tokens") or settings.ai_max_input_tokens,
+                "max_output_tokens": ai_config.get("max_output_tokens") or cfg.get("max_output_tokens") or settings.ai_max_output_tokens,
             }
         if not cfg["api_key"]:
             if cfg.get("key_error"):
@@ -772,8 +1033,8 @@ async def chat_completion(
                 enforce(db, user_id, "ai_operations_per_month")
                 enforce(db, user_id, "ai_credits_per_month")
             except Exception as e:
-                # If enforcement fails (limit exceeded), raise as client error
-                # to be caught and fallback to heuristic
+                # Plan limit reached: a BLOCKED outcome (limit_exceeded) — the
+                # call is refused honestly, never substituted with an estimate.
                 raise AIClientError(f"limit_exceeded: {e}", retryable=False) from e
 
         if budget_exhausted():
@@ -786,22 +1047,49 @@ async def chat_completion(
         breaker = _breaker(workflow)
         if breaker.is_open():
             inc("jobhunter_ai_requests_total", workflow=workflow, status="breaker_open")
-            raise AIClientError(f"circuit_open: {breaker.last_error}", retryable=True)
+            raise AIClientError(f"circuit_open: {breaker.last_error}", retryable=True,
+                                meta={"retry_after_hint": retry_hint_for_reason(REASON_CIRCUIT_OPEN, workflow=workflow)})
+
+        # ------------------------------------------------------------------ #
+        # User token budgets — the single source of truth (Settings → AI API)
+        # ------------------------------------------------------------------ #
+        try:
+            output_ceiling = min(max(64, int(cfg.get("max_output_tokens") or settings.ai_max_output_tokens)),
+                                 _MAX_OUTPUT_TOKENS_CEILING)
+        except (TypeError, ValueError):
+            output_ceiling = _MAX_OUTPUT_TOKENS_CEILING
+        try:
+            input_budget_chars = max(1000, int(cfg.get("max_input_tokens") or settings.ai_max_input_tokens) * CHARS_PER_TOKEN)
+        except (TypeError, ValueError):
+            input_budget_chars = max(1000, settings.ai_max_input_tokens * CHARS_PER_TOKEN)
+        input_truncated = False
 
         messages: List[Dict[str, str]] = []
         if system:
-            # Sanitize system prompt — treat external data as untrusted
-            safe_system = system.replace("```", "")[:2000]
+            # Sanitize system prompt — treat external data as untrusted, then
+            # cap it at the user's input budget (no hardcoded slices).
+            safe_system, _system_truncated = fit_prompt_part(system.replace("```", ""), input_budget_chars,
+                                                             label=f"{workflow}.system")
+            input_truncated = input_truncated or _system_truncated
             messages.append({"role": "system", "content": safe_system})
-        # Sanitize user prompt: remove potential injection
-        safe_prompt = prompt.replace("SYSTEM:", "").replace("Ignore previous", "")[:12000]
+        # Sanitize user prompt: remove potential injection, cap at the budget.
+        safe_prompt, _prompt_truncated = fit_prompt_part(
+            prompt.replace("SYSTEM:", "").replace("Ignore previous", ""), input_budget_chars,
+            label=f"{workflow}.prompt")
+        input_truncated = input_truncated or _prompt_truncated
         messages.append({"role": "user", "content": safe_prompt})
 
         payload: Dict[str, Any] = {"model": cfg["model"], "messages": messages, "temperature": temperature}
         json_mode_active = json_mode
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        current_max_tokens = max_tokens or settings.ai_max_output_tokens
+        # Output budget: the task's starting budget (per call) clamped to the
+        # user's configured ceiling. The ceiling is the single source of truth
+        # — the automatic escalation below can never exceed it either.
+        current_max_tokens = min(max(1, int(max_tokens or _DEFAULT_OUTPUT_START)), output_ceiling)
+        if max_tokens and int(max_tokens) > output_ceiling:
+            log.warning("AI %s: max_tokens=%d clamped to the user's output ceiling %d",
+                        workflow, int(max_tokens), output_ceiling)
         max_tokens_key = "max_tokens"
         payload[max_tokens_key] = current_max_tokens
 
@@ -886,7 +1174,10 @@ async def chat_completion(
                                                        "connect_timeout_seconds": connect_timeout,
                                                        "possibly_billed": False,
                                                        "usage_unknown": False})
-                    raise AIClientError(last_error, reason=REASON_UNREACHABLE, retryable=True) from exc
+                    raise AIClientError(last_error, reason=REASON_UNREACHABLE, retryable=True,
+                                        meta={"attempts": attempt, "possibly_billed": False,
+                                              "usage_unknown": False,
+                                              "retry_after_hint": retry_hint_for_reason(REASON_UNREACHABLE)}) from exc
                 last_error = (
                     f"timeout: model '{cfg['model']}' was still generating after "
                     f"{effective_timeout:g}s (attempt {attempt}/{attempts}, waited {waited:.1f}s) — "
@@ -900,7 +1191,10 @@ async def chat_completion(
                                                    "timeout_seconds": effective_timeout,
                                                    "possibly_billed": True,
                                                    "usage_unknown": True})
-                raise AIClientError(last_error, reason=REASON_TIMEOUT, retryable=True) from exc
+                raise AIClientError(last_error, reason=REASON_TIMEOUT, retryable=True,
+                                    meta={"attempts": attempt, "possibly_billed": True,
+                                          "usage_unknown": True,
+                                          "retry_after_hint": retry_hint_for_reason(REASON_TIMEOUT)}) from exc
             except httpx.HTTPError as exc:
                 raw = str(exc).strip() or type(exc).__name__
                 last_error = f"http_error: {raw} (attempt {attempt}/{attempts})"
@@ -913,7 +1207,10 @@ async def chat_completion(
                                                    "timeout_seconds": effective_timeout,
                                                    "possibly_billed": False,
                                                    "usage_unknown": False})
-                raise AIClientError(last_error, reason=REASON_UNREACHABLE, retryable=True) from exc
+                raise AIClientError(last_error, reason=REASON_UNREACHABLE, retryable=True,
+                                    meta={"attempts": attempt, "possibly_billed": False,
+                                          "usage_unknown": False,
+                                          "retry_after_hint": retry_hint_for_reason(REASON_UNREACHABLE)}) from exc
             finally:
                 observe("jobhunter_ai_latency_seconds", time.perf_counter() - started, workflow=workflow)
 
@@ -964,6 +1261,7 @@ async def chat_completion(
                         continue
 
                 retryable = response.status_code == 429 or 500 <= response.status_code < 600
+                http_reason = reason_from_message(last_error, response.status_code)
                 inc("jobhunter_ai_requests_total", workflow=workflow, status=str(response.status_code))
                 if retryable and attempt < attempts:
                     delay = _retry_delay(response, attempt)
@@ -974,11 +1272,14 @@ async def chat_completion(
                     if response.status_code in (401, 403):
                         breaker.record_failure(last_error)
                     _ledger_failure(last_error, meta={"attempts": attempt})
-                    raise AIClientError(last_error, status=response.status_code, retryable=False)
+                    raise AIClientError(last_error, status=response.status_code, retryable=False,
+                                        meta={"attempts": attempt})
 
                 breaker.record_failure(last_error)
                 _ledger_failure(last_error, meta={"attempts": attempt})
-                raise AIClientError(last_error, status=response.status_code, retryable=True)
+                raise AIClientError(last_error, status=response.status_code, retryable=True,
+                                    meta={"attempts": attempt,
+                                          "retry_after_hint": retry_hint_for_reason(http_reason, workflow=workflow)})
 
             # ---------------------------------------------------------------- #
             # 200 — validate the answer instead of trusting it.
@@ -1050,7 +1351,9 @@ async def chat_completion(
 
             if action == "raise_max_tokens_big" or action == "raise_max_tokens":
                 factor, floor = (4, 4000) if action == "raise_max_tokens_big" else (2, 2400)
-                new_max = min(max(current_max_tokens * factor, floor), _MAX_OUTPUT_TOKENS_CEILING)
+                # PR #29 escalation is preserved — but the user's configured
+                # output ceiling is the hard stop: it can never be exceeded.
+                new_max = min(max(current_max_tokens * factor, floor), output_ceiling)
                 if new_max > current_max_tokens:
                     what = "the thinking phase used the whole budget" if not content.strip() \
                         else "the JSON was cut off"
@@ -1059,7 +1362,7 @@ async def chat_completion(
                     current_max_tokens = new_max
                     payload[max_tokens_key] = new_max
                     continue
-                action = None  # already at the ceiling — retrying cannot help
+                action = None  # already at the user's ceiling — retrying cannot help
             elif action == "drop_response_format":
                 log.warning("AI %s: model returned an empty answer with response_format=json_object "
                             "— retrying without it", workflow)
@@ -1082,7 +1385,9 @@ async def chat_completion(
         if parsed_result is None and text_result is None:
             breaker.record_failure(last_error or "unknown error")
             _ledger_failure(last_error or "unknown error", meta={"attempts": attempt})
-            raise AIClientError(last_error or "unknown error", retryable=True)
+            raise AIClientError(last_error or "unknown error", retryable=True,
+                                meta={"attempts": attempt,
+                                      "retry_after_hint": retry_hint_for_reason(None, workflow=workflow)})
 
         prompt_tokens = usage_totals["prompt_tokens"]
         completion_tokens = usage_totals["completion_tokens"]
@@ -1109,7 +1414,9 @@ async def chat_completion(
                 total_tokens=total_tokens,
                 success=True,
                 latency_ms=latency_ms,
-                meta={"attempts": attempt, "timeout_seconds": effective_timeout},
+                meta={"attempts": attempt, "timeout_seconds": effective_timeout,
+                      "input_truncated": input_truncated, "max_tokens": current_max_tokens,
+                      "output_ceiling": output_ceiling},
             )
 
         if not json_mode:

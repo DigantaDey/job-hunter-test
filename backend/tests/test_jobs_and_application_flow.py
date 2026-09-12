@@ -268,13 +268,24 @@ def test_apply_requires_profile(client, auth, db):
     assert response.json()["detail"]["code"] == "profile_missing"
 
 
-def test_company_classification_heuristics(client, auth, db):
-    small = client.post("/api/classify/company?company=Stealth+AI+Startup&jd=seed+stage+3+people",
-                        headers=auth).json()
-    assert small["size"] in ("startup", "small")
-    big = client.post("/api/classify/company?company=BigCorp&jd=Fortune+500+enterprise+public+company+10000%2B+employees",
-                      headers=auth).json()
-    assert big["size"] == "big"
+def test_company_classification_is_the_ai_verdict(client, auth, db, request):
+    """classify/company is the model's verdict, never a deterministic guess.
+
+    The deterministic estimator is only used for bulk-labelling jobs outside
+    the AI top-N of a discovery run (provenance-labelled) — the interactive
+    endpoint must reflect the AI answer.
+    """
+    result = client.post("/api/classify/company?company=Stealth+AI+Startup&jd=seed+stage+3+people",
+                         headers=auth)
+    assert result.status_code == 200, result.text
+    body = result.json()
+    # The deterministic AI stand-in answers "small" for the classify workflow.
+    assert body["size"] == "small", body
+    assert body["confidence"] == 0.7, body  # stand-in omits confidence → documented default
+
+    # And the outage path is covered by the scripted-provider suite
+    # (test_ai_pause_resume.py): a failed AI call returns the typed pausable /
+    # blocked 503 — never a guessed size.
 
 
 def test_pipeline_stats_and_jobs_endpoints(client, auth, db, uploaded_resume):

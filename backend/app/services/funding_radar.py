@@ -30,8 +30,15 @@ async def scan_funded_companies(
     window_days: int = 45,
     limit: int = 18,
     provider: Optional[str] = None,
+    db=None,
+    user_id: Optional[int] = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Fetch + filter + (optionally) AI-rank real funding events."""
+    """Fetch + filter + AI-rank real funding events.
+
+    The AI ranking is a hard dependency when AI is configured: on a transient
+    outage this raises and the caller pauses (queue) or reports (sync) — the
+    events are real either way, but an unranked list is not the product.
+    """
     events, report = await funding_sources.fetch_funding_events(
         context, window_days=window_days, limit=limit, provider=provider
     )
@@ -48,7 +55,7 @@ async def scan_funded_companies(
             events = relevant
 
     if await _ai_enabled():
-        events = await funding_sources.ai_rank_events(context, events, limit=limit)
+        events = await funding_sources.ai_rank_events(context, events, limit=limit, db=db, user_id=user_id)
 
     report["provider_status"] = funding_sources.provider_status()
     companies = []

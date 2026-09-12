@@ -72,7 +72,11 @@ async def ai_status(user: CurrentUser, db: DbSession):
     except Exception:
         user_cfg = {"base_url": settings.ai_base_url, "model": settings.ai_model, "api_key_set": bool(settings.ai_api_key)}
 
-    reason = health.get("reason") or health.get("error")
+    from app.services.ai_client import normalise_ping_reason
+
+    # The probe speaks ``status_NNN``; the rest of the product speaks stable
+    # reasons — normalise so the UI sees one vocabulary everywhere.
+    reason = normalise_ping_reason(health.get("reason") or health.get("error"))
     hint = health.get("hint")
     stored_key_error = bool(user_cfg.get("api_key_error"))
     if stored_key_error and not health.get("online"):
@@ -82,8 +86,20 @@ async def ai_status(user: CurrentUser, db: DbSession):
         hint = ("Your saved API key can't be decrypted on this server (its ENCRYPTION_KEY changed). "
                 "Re-enter the key below and save to fix it.")
 
+    # The central three-state availability signal (v2.1) — the single value the
+    # UI polls to decide between "AI paused — will resume automatically"
+    # (transient_outage), "AI blocked — action needed" (blocked_needs_action)
+    # and the green dot (online). It reflects what the NEXT call would
+    # experience: the probe plus in-process breaker and daily budget.
+    from app.services.ai_client import ai_availability
+    from app.services.job_queue import paused_count
+
+    availability = await ai_availability(db, int(user.id))
     return {
         "online": health.get("online", False),
+        "state": availability.get("state"),
+        "retry_after_hint": availability.get("retry_after_hint"),
+        "paused_count": paused_count(db, user_id=int(user.id)),
         "configured": is_configured(db=db, user_id=user.id),
         "model": health.get("model") or user_cfg.get("model") or settings.ai_model,
         "base_url": health.get("base_url") or user_cfg.get("base_url") or settings.ai_base_url,
@@ -108,6 +124,33 @@ async def ai_status(user: CurrentUser, db: DbSession):
         "usage": usage_snapshot(),
         "overrides": sorted(get_workflow_overrides(user.id).keys()),
     }
+
+
+@router.post("/settings/ai/resume")
+async def resume_ai(user: CurrentUser, db: DbSession, request: Request):
+    """One-click resume: re-queue this user's paused AI work right now.
+
+    The watchdog already drains paused work automatically the moment the
+    availability probe is green — this endpoint is for the impatient: it
+    forces the drain immediately (the user explicitly asked). Idempotent and
+    cheap when nothing is paused. The response includes the current
+    availability state so the UI can explain why the work may pause again.
+    """
+    from app.services.ai_client import ai_availability
+    from app.services.job_queue import drain_paused, paused_count
+
+    paused_before = paused_count(db, user_id=int(user.id))
+    resumed = drain_paused(db, user_id=int(user.id), force=True)
+    # Probe after the drain so the "why did it pause again?" answer is current
+    # (the probe result is cached ~60s — this is cheap).
+    availability = await ai_availability(db, int(user.id))
+    audit.audit(db, "ai.resume_requested", user=user, target="ai",
+                detail={"resumed": resumed, "paused_before": paused_before,
+                        "state": availability.get("state")},
+                request=request)
+    return {"ok": True, "resumed": resumed, "paused_count": paused_count(db, user_id=int(user.id)),
+            "state": availability.get("state"),
+            "retry_after_hint": availability.get("retry_after_hint")}
 
 
 @router.get("/ai/config")

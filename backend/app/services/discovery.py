@@ -2,9 +2,11 @@
 Discovery pipeline: source fan-out → filtering → scoring → classification →
 form detection → deduplicated persistence.
 
-Cost control is explicit: heuristics score everything, and only the top
-candidates get (rate-limited) AI calls, so a discovery run cannot blow the
-configured RPM budget or the AI bill.
+Cost control is explicit: a deterministic pre-rank scores everything, and only
+the top candidates get (rate-limited) AI calls, so a discovery run cannot blow
+the configured RPM budget or the AI bill. The AI verdicts are a hard
+dependency for the top slice — an outage pauses the queued run (v2.1), which
+re-executes when the provider is back.
 """
 from __future__ import annotations
 
@@ -19,12 +21,11 @@ from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.models.models import Job, User
 from app.services import sources as source_registry
-from app.services.ai_guardrails import AIUnavailableError
-from app.services.classifier import ai_company_size, heuristic_company_size
+from app.services.classifier import ai_company_size, deterministic_company_size
 from app.services.demo_pool import demo_jobs
 from app.services.events import record_job_event
 from app.services.form_detector import detect_form_structure
-from app.services.scoring import heuristic_score, score_job
+from app.services.scoring import preliminary_score, score_job
 from app.services.user_settings import get_setting
 
 log = get_logger("app.discovery")
@@ -50,16 +51,23 @@ async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[
                             *, db=None, user_id: Optional[int] = None,
                             persona: Optional[Dict[str, Any]] = None) -> None:
     """
-    Preliminary score for all; guardrailed AI verdict for the strongest.
+    Preliminary pre-rank for all (deterministic, provenance-labelled
+    ``score_source='preliminary'``); guardrailed AI verdict for the strongest.
 
-    Provenance is recorded on every candidate: scoring 200 postings with the
-    model is not viable, so the bulk of a discovery run carries a deterministic
-    *preliminary* score, and only the top slice gets the real AI verdict. The
-    UI reads ``score_source`` so a keyword estimate is never presented as an
-    AI match score.
+    Cost control is explicit: scoring 200 postings with the model is not
+    viable, so the bulk of a discovery run carries the *preliminary* score and
+    only the top slice gets the real AI verdict. The UI reads ``score_source``
+    so a preliminary estimate is never presented as an AI match score.
+
+    AI is a hard dependency for the top-slice verdicts: when the model is
+    unavailable this RAISES (transient outage → the queued discovery run is
+    paused and re-executed when the provider is back; needs-action → the run
+    dead-letters with the diagnosis). Nothing is persisted before this point,
+    so a paused-and-resumed run creates exactly the same rows as an
+    uninterrupted one.
     """
     for candidate in candidates:
-        score, reason = heuristic_score(profile_data, candidate["description"])
+        score, reason = preliminary_score(profile_data, candidate["description"])
         candidate["score"] = score
         candidate["score_reason"] = f"Preliminary keyword estimate: {reason}"
         candidate["score_source"] = "preliminary"
@@ -67,26 +75,13 @@ async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[
     if not use_ai or not profile_data:
         return
     ranked = sorted(candidates, key=lambda c: c["score"], reverse=True)[:AI_RESCORE_TOP]
-    ai_outage: Optional[Dict[str, Any]] = None
     for candidate in ranked:
-        try:
-            result = await score_job(profile_data, candidate["description"], db=db, user_id=user_id,
-                                     persona=persona, allow_preliminary=False)
-            candidate["score"] = result["score"]
-            candidate["score_reason"] = result["reason"]
-            candidate["score_source"] = result["score_source"]
-            candidate["score_detail"] = result.get("detail") or {}
-        except AIUnavailableError as exc:
-            # Do not keep hammering a provider that is down — report it once
-            # and leave the remaining candidates on their preliminary score.
-            ai_outage = exc.payload()
-            log.warning("AI scoring unavailable during discovery (%s): %s", exc.reason, exc.detail)
-            break
-        except Exception as exc:  # a single bad JD must not fail discovery
-            log.debug("ai scoring skipped: %s", exc)
-    if ai_outage:
-        for candidate in candidates:
-            candidate.setdefault("ai_error", ai_outage)
+        result = await score_job(profile_data, candidate["description"], db=db, user_id=user_id,
+                                 persona=persona, allow_preliminary=False)
+        candidate["score"] = result["score"]
+        candidate["score_reason"] = result["reason"]
+        candidate["score_source"] = result["score_source"]
+        candidate["score_detail"] = result.get("detail") or {}
 
 
 async def discover_for_user(
@@ -169,9 +164,14 @@ async def discover_for_user(
     ranked = sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)[:limit * 2]
     for index, candidate in enumerate(ranked):
         if index < AI_CLASSIFY_TOP and profile_data:
-            size, confidence = await ai_company_size(candidate["company"], candidate["description"])
+            # AI verdict — a hard dependency: on outage this raises and the
+            # queued run pauses (re-executed when the provider is back).
+            size, confidence = await ai_company_size(candidate["company"], candidate["description"],
+                                                     db=db, user_id=user.id)
         else:
-            size = heuristic_company_size({"size": candidate.get("company_size")}, candidate)
+            # Bulk slice (beyond the AI top-N): deterministic, source-data-first
+            # labelling — provenance-labelled, never an AI substitute.
+            size = deterministic_company_size({"size": candidate.get("company_size")}, candidate)
             confidence = 0.55
         candidate["company_size"] = size
         candidate["company_size_confidence"] = confidence

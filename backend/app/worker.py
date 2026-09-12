@@ -21,7 +21,9 @@ from app.core.logging import LogContext, configure_logging, get_logger
 from app.core.metrics import inc, set_gauge
 from app.db import SessionLocal, init_db
 from app.metrics_server import start_metrics_server
+from app.services.ai_client import is_ai_error, is_transient_ai_error
 from app.services.ai_pipeline import ai_pipeline
+from app.services.ai_watchdog import AIWatchdog
 from app.services.handlers import HANDLERS
 from app.services.job_queue import (
     PIPELINES,
@@ -30,6 +32,7 @@ from app.services.job_queue import (
     complete,
     fail,
     needs_input,
+    pause,
     recover_stalled,
     worker_id,
 )
@@ -78,6 +81,21 @@ class Worker:
                 try:
                     result = await handler(db, item)
                 except Exception as exc:  # noqa: BLE001 - pipeline failures must not kill the worker
+                    if is_ai_error(exc):
+                        # AI is a hard dependency — but the *kind* of failure
+                        # decides the outcome. A transient outage (timeout /
+                        # unreachable / 429 / 5xx / breaker / budget) pauses
+                        # the item with backoff: it is re-queued (not failed,
+                        # not completed) and the watchdog resumes it when the
+                        # availability signal is green. A needs-action failure
+                        # (no/invalid key, quota, …) is dead-lettered at once
+                        # — retrying a blocked account is pointless.
+                        if is_transient_ai_error(exc):
+                            outcome = pause(db, item, str(exc))
+                        else:
+                            outcome = fail(db, item, str(exc), retryable=False)
+                        log.warning("item %s -> %s (ai)", item.id, outcome)
+                        return
                     outcome = fail(db, item, f"{type(exc).__name__}: {exc}")
                     log.warning("item %s -> %s", item.id, outcome)
                     return
@@ -116,11 +134,17 @@ class Worker:
         self._tasks = [asyncio.create_task(self._loop()) for _ in range(self.concurrency)]
         ai_task = asyncio.create_task(ai_pipeline.worker_loop())
         self._tasks.append(ai_task)
+        # Re-probes the AI-availability signal and drains paused work when the
+        # provider is back — the resume half of the pause/resume contract.
+        self.watchdog = AIWatchdog()
+        self._tasks.append(asyncio.create_task(self.watchdog.run()))
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
     async def stop(self) -> None:
         self.running = False
         ai_pipeline.running = False
+        if hasattr(self, "watchdog"):
+            self.watchdog.stop()
         for task in self._tasks:
             task.cancel()
         inc("jobhunter_worker_stops_total", worker=self.worker_id)

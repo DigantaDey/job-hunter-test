@@ -130,6 +130,7 @@ async def handle_funding(db: Session, item: PipelineJob) -> Dict[str, Any]:
     companies, report = await funding_radar.scan_funded_companies(
         context, stages=payload.get("stages"), window_days=window,
         limit=int(payload.get("limit") or settings.funding_limit), provider=provider,
+        db=db, user_id=int(user.id),
     )
     sync = funding_radar.sync_funding_db(db, user.id, companies, window)
     return {"scanned": len(companies), "provider_report": report, **sync}

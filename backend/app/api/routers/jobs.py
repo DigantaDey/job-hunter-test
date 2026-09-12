@@ -19,7 +19,7 @@ from app.models.models import Job, JobEvent, PipelineJob, Profile, UserInputRequ
 from app.schemas.schemas import JobDetail, JobOut
 from app.services import persona as persona_service
 from app.services.apply_flow import mark_applied, prepare_application
-from app.services.classifier import ai_company_size, heuristic_company_size
+from app.services.classifier import ai_company_size
 from app.services.discovery import discovery_sources_config
 from app.services.events import record_job_event
 from app.services.job_queue import enqueue, queue_stats
@@ -89,7 +89,7 @@ def get_job(job_id: int, user: CurrentUser, db: DbSession):
 
 @router.get("/jobs/{job_id}/intelligence")
 async def job_intelligence(job_id: int, request: Request, user: CurrentUser, db: DbSession):
-    """Transparent job intelligence breakdown — Pro feature with fallback."""
+    """Transparent job intelligence breakdown.\n\n    Pro: the AI rubric verdict (an AI outage is reported as ``ai_error``,\n    never papered over). Free tier: the deterministic keyword-overlap\n    breakdown, explicitly labelled (``score_source="preliminary"`` +\n    ``upgrade_hint``) — a plan difference with provenance, not a silent\n    substitute for the AI verdict.\n    """
     job = _job_or_404(db, user.id, job_id)
     profile = db.query(Profile).filter(Profile.user_id == user.id).order_by(Profile.created_at.desc()).first()
     profile_data = (profile.data if profile else {}) or {}
@@ -99,7 +99,7 @@ async def job_intelligence(job_id: int, request: Request, user: CurrentUser, db:
     if stored and not force:
         return stored
 
-    from app.services.scoring import RUBRIC_WEIGHTS, heuristic_score_detailed, score_job
+    from app.services.scoring import RUBRIC_WEIGHTS, preliminary_score_detailed, score_job
 
     use_advanced = can(db, user.id, "can_use_advanced_matching")
     persona = persona_service.get_persona(db, user.id, job.persona_id)
@@ -119,7 +119,7 @@ async def job_intelligence(job_id: int, request: Request, user: CurrentUser, db:
             detail["ai_error"] = result["error"]
             detail["preliminary_score"] = result.get("preliminary_score")
     else:
-        detail = heuristic_score_detailed(profile_data, job.description or "")
+        detail = preliminary_score_detailed(profile_data, job.description or "")
         detail["upgrade_hint"] = "Upgrade to Pro for AI-powered advanced matching breakdown"
 
     # Provenance is part of the contract, not a detail: the UI must be able to
@@ -456,9 +456,9 @@ def user_input_queue(user: CurrentUser, db: DbSession):
 
 @router.post("/classify/company")
 async def classify_company(user: CurrentUser, db: DbSession, company: str = Query(...), jd: str = ""):
-    size, confidence = await ai_company_size(company, jd)
-    if confidence is None:
-        size, confidence = heuristic_company_size({}, {"company": company, "description": jd}), 0.5
+    # AI is a hard dependency: an outage surfaces as the typed pausable 503
+    # (handled centrally) — never a guessed size.
+    size, confidence = await ai_company_size(company, jd, db=db, user_id=user.id)
     return {"company": company, "size": size, "confidence": confidence}
 
 

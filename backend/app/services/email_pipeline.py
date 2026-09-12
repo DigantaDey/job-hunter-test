@@ -21,6 +21,7 @@ from email.utils import formataddr, make_msgid
 from typing import Any, Dict, List, Optional
 
 from app.core.logging import get_logger
+from app.services.ai_client import fit_prompt_part, input_budget_chars
 from app.services.ai_guardrails import (
     AIUnavailableError,
     FieldSpec,
@@ -36,6 +37,10 @@ EMAIL_SCHEMA = SchemaSpec([
     FieldSpec("subject", "str", min_length=8, max_length=90),
     FieldSpec("body", "str", min_length=120, max_length=2200),
 ])
+
+#: Starting output budget for a cold email (the user's configured output
+#: ceiling still caps it and any escalation — it is never exceeded).
+EMAIL_OUTPUT_TOKENS = 900
 
 #: Words that must never survive into an outreach message — they are the
 #: fingerprints of a degraded extraction, and a recruiter reads them as spam.
@@ -91,26 +96,7 @@ def clean_message_body(body: str, profile: Dict[str, Any]) -> str:
     return (text + "\n\n" + "\n".join(part for part in signature if part)).strip()
 
 
-def build_fallback_subject(job_title: str, company: str, profile: Dict[str, Any]) -> str:
-    """
-    A specific, short subject — never the candidate's name as a suffix and never
-    a placeholder like "Unknown".
-    """
-    years = ""
-    summary = str(profile.get("summary") or "") + " " + " ".join(str(e.get("duration") or "")
-                                                                for e in (profile.get("experience") or [])
-                                                                if isinstance(e, dict))
-    match = re.search(r"(\d{1,2})\+?\s*years", summary, re.IGNORECASE)
-    if match:
-        years = f"{match.group(1)} yrs "
-    skills = [str(s) for s in (profile.get("skills") or [])][:2]
-    hook = ", ".join(skills)
-    title = (job_title or "the open role").strip()
-    company = (company or "your team").strip()
-    subject = f"{title} at {company}"
-    if hook:
-        subject = f"{title} at {company} — {years}{hook}"
-    return subject[:88]
+
 
 
 def _email_checks(profile: Dict[str, Any], company: str, job_title: str, jd: str):
@@ -166,9 +152,10 @@ NO_JD_NOTE = ("No job description supplied — write to the company about the ca
               "for their engineering team.")
 
 
-def _jd_block(jd: str) -> str:
-    """JD text for the prompt (never an empty quoted block)."""
-    cleaned = strip_ai_artifacts(jd or "")[:3000]
+def _jd_block(jd: str, budget_chars: int) -> str:
+    """JD text for the prompt (never an empty quoted block), capped at the
+    user's input budget."""
+    cleaned, _truncated = fit_prompt_part(strip_ai_artifacts(jd or ""), budget_chars, label="email_gen.jd")
     return cleaned or NO_JD_NOTE
 
 
@@ -210,6 +197,9 @@ async def generate_cold_email(
     outreach_context = " ".join([jd or "", company or "", job_title or "",
                                  recipient_name or "", extra_context or ""])
     ledger = build_fact_ledger(profile, outreach_context)
+    budget = input_budget_chars(db=db, user_id=user_id, ai_config=ai_config)
+    profile_json, _t1 = fit_prompt_part(json.dumps(profile, default=str), budget, label="email_gen.profile")
+    extra_context_block, _t2 = fit_prompt_part(extra_context or "", budget, label="email_gen.context")
     prompt = f"""Write a short cold email from this candidate to the {audience} of {company}.
 
 Role: {job_title or "their open engineering role"}
@@ -217,12 +207,12 @@ Role: {job_title or "their open engineering role"}
 {f"Job posting: {job_url}" if job_url else ""}
 
 Job description (the reason for the email — reference it specifically):
-\"\"\"{_jd_block(jd)}\"\"\"
+\"\"\"{_jd_block(jd, budget)}\"\"\"
 
 Candidate profile (ground truth — never add anything not present):
-{json.dumps(profile, default=str)[:3500]}
+{profile_json}
 
-{extra_context[:600]}
+{extra_context_block}
 
 Rules — an automated checker rejects violations:
 - Plain text only. No markdown, no [links](url), no HTML, no emojis.
@@ -245,11 +235,19 @@ Return JSON {{"subject": "...", "body": "..."}}"""
         db=db,
         user_id=user_id,
         temperature=0.5,
-        max_tokens=900,
+        max_tokens=EMAIL_OUTPUT_TOKENS,
     )
 
-    subject = strip_ai_artifacts(str(data.get("subject") or ""))[:120] or \
-        build_fallback_subject(job_title, company, profile)
+    # The schema already guarantees a non-empty subject; if sanitisation still
+    # leaves nothing, that is an unusable answer — say so, never template one.
+    subject = strip_ai_artifacts(str(data.get("subject") or ""))
+    if not subject.strip():
+        raise AIUnavailableError(
+            "empty_response", workflow="email_gen",
+            detail="the model's subject became empty after sanitisation",
+            context={"message": "The drafted subject was empty — retry the draft.",
+                     "fix": "Retry, or switch to a model that reliably returns JSON in Settings → AI API."},
+        )
     body = clean_message_body(str(data.get("body") or ""), profile)
     return {
         "subject": subject,
@@ -369,10 +367,4 @@ def send_via_smtp(
         return {"success": False, "configured": True, "error": f"{type(exc).__name__}: {exc}"}
 
 
-async def find_funded_companies(stage_filter: List[str] = None) -> List[Dict[str, Any]]:
-    """Deprecated shim → use ``app.services.funding_radar``."""
-    from app.services.funding_radar import scan_funded_companies
-    from app.services.keyword_extractor import heuristic_context
 
-    companies, _ = await scan_funded_companies(heuristic_context({}), stages=stage_filter)
-    return companies

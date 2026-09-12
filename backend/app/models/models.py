@@ -364,7 +364,7 @@ class PipelineJob(Base):
     pipeline = Column(String, nullable=False)  # discovery|application|email|funding|ai
     job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
     payload = Column(JSON, default=dict)
-    status = Column(String, default="queued")  # queued|processing|done|failed|needs_input|dead
+    status = Column(String, default="queued")  # queued|processing|paused|done|failed|needs_input|dead
     priority = Column(Integer, default=5)  # 1 highest
     attempts = Column(Integer, default=0)
     max_attempts = Column(Integer, default=3)

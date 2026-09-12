@@ -3,6 +3,7 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
+from app.services.ai_client import fit_prompt_part, input_budget_chars
 from app.services.ai_guardrails import (
     AIUnavailableError,
     FieldSpec,
@@ -205,15 +206,15 @@ def _detailed_breakdown(profile: Dict[str, Any], jd: str) -> Dict[str, Any]:
         "similarity": round(cosine_sim(tf(profile_text), tf(jd)), 3),
     }
 
-def heuristic_score(profile: Dict[str,Any], jd: str) -> Tuple[float, str]:
+def preliminary_score(profile: Dict[str,Any], jd: str) -> Tuple[float, str]:
     if not _extract_profile_text(profile).strip() or not jd.strip():
         return 50.0, "Insufficient data, default 50"
     detail = _detailed_breakdown(profile, jd)
     score = float(detail["overall"])
-    reason = f"skill overlap {detail['coverage']}% of JD terms, similarity {detail['similarity']:.2f} (calibrated heuristic) | {detail['recommendation']}: {detail['recommendation_reason']}"
+    reason = f"preliminary: skill overlap {detail['coverage']}% of JD terms, similarity {detail['similarity']:.2f} | {detail['recommendation']}: {detail['recommendation_reason']}"
     return score, reason
 
-def heuristic_score_detailed(profile: Dict[str, Any], jd: str) -> Dict[str, Any]:
+def preliminary_score_detailed(profile: Dict[str, Any], jd: str) -> Dict[str, Any]:
     """Returns full detailed breakdown plus score/reason."""
     if not _extract_profile_text(profile).strip() or not jd.strip():
         return {
@@ -247,6 +248,10 @@ RUBRIC_WEIGHTS = {
     "location": 0.08,
     "education": 0.08,
 }
+
+#: Starting output budget for a scoring verdict (the user's configured output
+#: ceiling still caps it and any escalation).
+SCORING_OUTPUT_TOKENS = 1200
 
 SCORE_SCHEMA = SchemaSpec([
     FieldSpec("score", "float", minimum=0, maximum=100),
@@ -372,19 +377,22 @@ async def ai_score_detailed(
     (bulk discovery) catch it and mark the job ``score_source="pending"``.
     """
     if not (jd or "").strip() or not _extract_profile_text(profile or {}).strip():
-        detail = heuristic_score_detailed(profile or {}, jd or "")
+        detail = preliminary_score_detailed(profile or {}, jd or "")
         detail["source"] = "insufficient_data"
         detail["reason"] = "Not enough profile or job text to score"
         return detail
 
     anchor = _anchor_breakdown(profile, jd)
-    safe_jd = strip_ai_artifacts(jd)[:5000]
+    budget = input_budget_chars(db=db, user_id=user_id)
+    safe_jd, _t1 = fit_prompt_part(strip_ai_artifacts(jd or ""), budget, label="scoring.jd")
     persona_block = ""
     if persona:
+        persona_json, _t2 = fit_prompt_part(json.dumps(persona, default=str), budget, label="scoring.persona")
         persona_block = (
             "\nCandidate track (persona) — weight the match towards this target:\n"
-            f"{json.dumps(persona, default=str)[:1200]}\n"
+            f"{persona_json}\n"
         )
+    profile_json, _t3 = fit_prompt_part(json.dumps(profile, indent=2, default=str), budget, label="scoring.profile")
 
     prompt = f"""Score how well this candidate matches this job description, 0-100.
 
@@ -405,7 +413,7 @@ Hard rules — an automated checker rejects violations:
 - Do not invent requirements, employers or metrics.
 {persona_block}
 Candidate profile:
-{json.dumps(profile, indent=2, default=str)[:5000]}
+{profile_json}
 
 Job description:
 \"\"\"{safe_jd}\"\"\"
@@ -423,7 +431,7 @@ Return JSON:
         db=db,
         user_id=user_id,
         temperature=0.1,
-        max_tokens=1200,
+        max_tokens=SCORING_OUTPUT_TOKENS,
     )
 
     score = max(0.0, min(100.0, float(data.get("score", 0))))
@@ -497,7 +505,7 @@ async def score_job(
     except AIUnavailableError as exc:
         if not allow_preliminary:
             raise
-        preliminary = heuristic_score_detailed(profile or {}, jd or "")
+        preliminary = preliminary_score_detailed(profile or {}, jd or "")
         return {"score": 0.0, "reason": "Not scored — AI is unavailable",
                 "score_source": "pending", "detail": preliminary,
                 "error": exc.payload(),

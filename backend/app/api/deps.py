@@ -32,8 +32,10 @@ async def search_context(
     AI-extracted search context (keywords/roles/industries/funding focus) built
     from the user's profile, master resume text and free-form context.
 
-    Cached per user; the heuristic extractor guarantees a non-empty result even
-    with no AI configured.
+    Cached per user. AI is a hard dependency: when the model is unavailable
+    this raises (sync callers → pausable 503, queued callers → the item is
+    paused and re-run when the provider is back) — a stale or mined-only
+    context is never served as the extraction.
     """
     from app.services.keyword_extractor import ai_extract_context
 
@@ -50,7 +52,8 @@ async def search_context(
 
     profile_data = (profile.data if profile else {}) or {}
     resume_text = profile_data.get("raw_text", "") or ""
-    context = await ai_extract_context(profile_data, resume_text=resume_text, extra_context=extra_context)
+    context = await ai_extract_context(profile_data, resume_text=resume_text, extra_context=extra_context,
+                                       db=db, user_id=user_id)
     context["profile_id"] = profile_id
     context["generated_at"] = datetime.utcnow().isoformat()
     _context_cache[user_id] = context

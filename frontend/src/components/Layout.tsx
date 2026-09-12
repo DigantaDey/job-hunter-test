@@ -5,6 +5,7 @@ import { useTheme } from '../hooks/useTheme'
 import client from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import { ErrorBoundary } from './ErrorBoundary'
+import { AIStatusBanner } from './AIBanner'
 
 const nav = [
   {to:'/', label:'Dashboard', icon: LayoutDashboard},
@@ -28,25 +29,36 @@ const nav = [
 export default function Layout() {
   const {theme, setTheme} = useTheme()
   const {user, logout} = useAuth()
-  const [ai, setAi] = useState<{online:boolean, rpm:number, remaining:number, latency_ms?:number} | null>(null)
+  const [ai, setAi] = useState<{online:boolean, rpm:number, remaining:number, latency_ms?:number, state?:string, reason?:string|null, hint?:string|null, paused_count?:number, retry_after_hint?:number|null} | null>(null)
   const [ent, setEnt] = useState<any>(null)
+  const [resuming, setResuming] = useState(false)
   const loc = useLocation()
+  const refreshAi = () => client.get('/api/settings/ai/status').then(r=>setAi(r.data)).catch(()=>{})
   useEffect(()=>{
     let cancelled = false
-    let id = setInterval(async ()=>{
+    const poll = async ()=>{
       try {
         const {data} = await client.get('/api/settings/ai/status')
         if (!cancelled) setAi(data)
       } catch {
-        if (!cancelled) setAi({online:false, rpm:60, remaining:0, latency_ms: undefined})
+        // Network down — do not flip the banner: the last known signal stands.
+        if (!cancelled) setAi(prev => prev ? {...prev, online:false} : {online:false, rpm:60, remaining:0})
       }
-    }, 15000)
-    client.get('/api/settings/ai/status')
-      .then(r=>{ if (!cancelled) setAi(r.data) })
-      .catch(()=>{ if (!cancelled) setAi({online:false, rpm:60, remaining:0, latency_ms: undefined}) })
+    }
+    let id = setInterval(poll, 15000)
+    poll()
     client.get('/api/billing/subscription').then(r=>{ if(!cancelled) setEnt(r.data) }).catch(()=>{})
     return ()=> { cancelled = true; clearInterval(id) }
   }, [])
+  /** One-click resume: force-drain the user's paused AI work (watchdog does it
+      automatically on a green probe; this is the impatient path). */
+  const resumeNow = async ()=>{
+    setResuming(true)
+    try {
+      await client.post('/api/settings/ai/resume')
+      await refreshAi()
+    } finally { setResuming(false) }
+  }
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex">
       {/* sidebar */}
@@ -109,6 +121,7 @@ export default function Layout() {
           {nav.map(n=> <NavLink key={n.to} to={n.to} className={({isActive})=> `px-3 py-1.5 rounded-full text-xs whitespace-nowrap border ${isActive?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`}>{n.label}</NavLink>)}
         </div>
         <main className="flex-1 p-4 lg:p-6 max-w-[1600px] w-full mx-auto">
+          <AIStatusBanner status={ai} resuming={resuming} onResume={()=>void resumeNow()} />
           <ErrorBoundary scope="route" resetKey={loc.pathname}>
             <Outlet />
           </ErrorBoundary>

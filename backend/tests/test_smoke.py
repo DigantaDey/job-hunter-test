@@ -52,21 +52,21 @@ def test_resume_generation_requires_a_resume(client, auth, seeded_job):
 
 
 def test_ocr_free_pdf_parsing(tmp_path):
-    from app.services.resume_parser import extract_text, heuristic_profile_extract
+    from app.services.resume_parser import diagnostic_preview_extract, extract_text
 
     path = tmp_path / "resume.pdf"
     path.write_bytes(pdf_bytes())
     text = extract_text(str(path))
     assert "python" in text.lower()
 
-    profile = heuristic_profile_extract(text)
+    profile = diagnostic_preview_extract(text)
     assert profile["email"] == "test.candidate@example.com"
     assert profile["name"]
     assert "python" in [skill.lower() for skill in profile["skills"]]
 
 
-def test_keyword_extractor_heuristic():
-    from app.services.keyword_extractor import heuristic_context, merge_user_keywords
+def test_keyword_extractor_miner():
+    from app.services.keyword_extractor import merge_user_keywords, mined_context
 
     profile = {
         "name": "Test Candidate",
@@ -76,7 +76,7 @@ def test_keyword_extractor_heuristic():
         "location": "Bangalore, India",
         "raw_text": "python fastapi react aws kubernetes payments fintech microservices postgresql redis",
     }
-    context = heuristic_context(profile, "interested in AI infrastructure startups")
+    context = mined_context(profile, "interested in AI infrastructure startups")
     assert context["keywords"]
     assert "python" in [keyword.lower() for keyword in context["keywords"]]
     assert context["seniority"] in {"junior", "mid", "senior", "senior+", "staff+"}

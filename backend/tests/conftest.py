@@ -8,9 +8,13 @@ tests. Environment variables are set *before* `app.core.config` is imported.
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Iterator
 
 _TMP = tempfile.mkdtemp(prefix="jobhunter-test-")
@@ -263,6 +267,158 @@ def stub_ai_response(workflow: str, prompt: str) -> Dict[str, Any]:
     if workflow == "funding_scan":
         return {"ranked": []}
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Scripted OpenAI-compatible provider (v2.1 pause/resume + token-budget suites)
+#
+# A local HTTP server that emulates provider wire behaviour: normal JSON
+# answers per workflow, latency, and — crucially — a mid-run outage. After
+# ``behavior["fail_after"]`` good responses it starts returning
+# ``behavior["status"]``, so a test can watch a pipeline get partway through,
+# hit an outage, recover, and finish without duplicates. No outbound network.
+# --------------------------------------------------------------------------- #
+class ScriptedAIHandler(BaseHTTPRequestHandler):
+    behavior: Dict[str, Any] = {}
+
+    def log_message(self, *a):  # silence
+        pass
+
+    def _send(self, status: int, obj: Any) -> None:
+        body = json.dumps(obj).encode()
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client already gave up (timeout) — like a real provider
+
+    @classmethod
+    def _outage_active(cls) -> bool:
+        """Is the scripted provider currently down?
+
+        A real outage takes the *whole* provider down — both the chat
+        endpoint and the /models probe — so the availability signal (which
+        probes /models) must flip too. ``fail_after=N`` means "serve N good
+        responses, then go down"; the counter is shared by GET and POST.
+        """
+        behavior = cls.behavior
+        fail_after = behavior.get("fail_after")
+        return fail_after is not None and behavior.get("good", 0) >= fail_after
+
+    def _outage_response(self) -> None:
+        self._send(int(self.behavior.get("status") or 503),
+                   {"error": {"message": "scripted provider outage"}})
+
+    def do_GET(self):
+        # The /models probe — green only while the provider is up.
+        if self._outage_active():
+            self._outage_response()
+            return
+        self._send(200, {"data": [{"id": "scripted-model"}]})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        request_body = json.loads(self.rfile.read(length) or b"{}")
+        behavior = self.behavior
+        behavior["requests"].append(request_body)
+        delay = behavior.get("delay") or 0.0
+        if delay:
+            time.sleep(delay)
+        if self._outage_active():
+            # Mid-run outage: the first N responses were fine, the provider
+            # is down from here on (until the test flips the behaviour back).
+            self._outage_response()
+            return
+        behavior["good"] = behavior.get("good", 0) + 1
+        # One-off raw responses (tests of truncated/abnormal model answers).
+        override = behavior.get("override")
+        if isinstance(override, list) and override:
+            self._send(200, override.pop(0))
+            return
+        messages = request_body.get("messages") or []
+        text = " ".join(str(m.get("content") or "") for m in messages)
+        self._send(200, {
+            "choices": [{"message": {"content": json.dumps(_scripted_answer(text))},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 500, "completion_tokens": 200,
+                      "total_tokens": 700},
+        })
+
+
+def _scripted_answer(prompt_text: str) -> Any:
+    """Schema-valid answer per workflow, detected from the prompt itself.
+
+    Reuses the deterministic stand-in's payloads so a recovery completes the
+    pipeline exactly like the stub would — only the wire path is real.
+    """
+    lowered = (prompt_text or "").lower()
+    if "extract a complete, structured profile" in lowered:
+        return stub_ai_response("parse", prompt_text)
+    if "score how well this candidate" in lowered:
+        return stub_ai_response("scoring", prompt_text)
+    if "classify company size" in lowered:
+        return {"size": "small", "confidence": 0.9, "reason": "scripted"}
+    if "write a short cold email" in lowered:
+        return stub_ai_response("email_gen", prompt_text)
+    if "create 3-5 short, lowercase, hyphenated tags" in lowered:
+        return stub_ai_response("tagging", prompt_text)
+    if "cover letter" in lowered:
+        return stub_ai_response("resume_gen", prompt_text)
+    if "evidence pack" in lowered or "tracks" in lowered:
+        return stub_ai_response("persona", prompt_text)
+    if "keywords" in lowered and "respond only with json" in lowered:
+        return stub_ai_response("keyword_extract", prompt_text)
+    if "interview questions" in lowered:
+        return stub_ai_response("interview", prompt_text)
+    if "form" in lowered and "json" in lowered:
+        return stub_ai_response("form_detect", prompt_text)
+    if "rank" in lowered and "funding" in lowered:
+        return stub_ai_response("funding_scan", prompt_text)
+    return {"ok": True}
+
+
+@pytest.fixture()
+def ai_provider():
+    """Start a local scripted provider; yield its base URL.
+
+    Point a user at it with ``PUT /api/settings`` (``ai.base_url`` +
+    ``api_key`` + ``model``). Then the ``ai_stub`` stand-in detects the key
+    and hands the call to the REAL gateway → real wire → this server.
+
+    ``ScriptedAIHandler.behavior`` (reset per test):
+      * ``status`` (int)    — HTTP status served during the outage
+      * ``fail_after`` (int)— after this many good responses, go down
+      * ``delay`` (float)   — seconds of latency per request
+      * ``requests``        — every wire request body (ground truth)
+      * ``good``            — how many good responses were served
+    """
+    ScriptedAIHandler.behavior = {"requests": [], "good": 0, "status": 503,
+                                  "fail_after": None, "delay": 0.0,
+                                  "override": []}
+    server = HTTPServer(("127.0.0.1", 0), ScriptedAIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}/v1"
+    server.shutdown()
+    thread.join(timeout=5)
+
+
+@pytest.fixture()
+def provider_owner(client: TestClient, auth: Dict[str, str], ai_provider: str) -> str:
+    """The owner's AI settings point at the scripted provider.
+
+    Every AI call for the owner now goes through the real gateway to the
+    local scripted server — the hermetic ``real_ai`` convention.
+    """
+    saved = client.put("/api/settings", json={
+        "ai": {"base_url": ai_provider, "model": "scripted-model",
+               "api_key": "sk-scripted-test-key", "rpm": 600},
+    }, headers=auth)
+    assert saved.status_code == 200, saved.text
+    return ai_provider
 
 
 @pytest.fixture(autouse=True)

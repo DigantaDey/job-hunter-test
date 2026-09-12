@@ -69,8 +69,8 @@ def enqueue(
             .first()
         )
         if existing:
-            if existing.status in ("queued", "processing", "needs_input"):
-                return None  # identical work is already in flight
+            if existing.status in ("queued", "processing", "needs_input", "paused"):
+                return None  # identical work is already in flight (paused = waiting on AI)
             existing.pipeline = pipeline
             existing.job_id = job_id
             existing.payload = payload or {}
@@ -201,6 +201,89 @@ def complete(db: Session, item: PipelineJob, *, result: Optional[Dict[str, Any]]
     inc("jobhunter_queue_completed_total", pipeline=item.pipeline)
 
 
+#: Safety valve: a paused item is re-run by the watchdog whenever the probe is
+#: green. If the *same* work keeps failing on retry (a 400 the probe cannot
+#: see, a provider that only fails on real prompts, …) it must not loop
+#: forever — after this many pauses it is dead-lettered with its last error.
+AI_PAUSE_MAX = 12
+
+
+def pause(db: Session, item: PipelineJob, error: str) -> str:
+    """Pause work because the AI layer is in a *transient outage*.
+
+    The item is re-queued with backoff (``status='paused'``, ``scheduled_at``
+    in the future) but — unlike :func:`fail` — the pause does NOT consume an
+    attempt: an outage is not the work's fault, so retries caused by the
+    outage cannot dead-letter innocent items. The watchdog (or a one-click
+    resume) flips paused items back to ``queued`` when the availability
+    signal is green. Work must be idempotent to be safe to pause this way
+    (see the audit in the v2.1 CHANGELOG: every queued AI path creates its
+    side effects only after the AI call succeeds, or upserts by unique key).
+    """
+    # (mypy sees ORM attribute assignments as Column-typed — same known noise
+    # class as fail()/complete(); ignored here to keep the mypy delta at zero.)
+    item.error = (error or "ai_transient_outage")[:2000]  # type: ignore[assignment]
+    item.locked_by = ""  # type: ignore[assignment]
+    item.lease_expires_at = None  # type: ignore[assignment]
+    payload = dict(item.payload or {})
+    pauses = int(payload.get("paused_count") or 0) + 1
+    if pauses > AI_PAUSE_MAX:
+        item.status = "dead"  # type: ignore[assignment]
+        item.finished_at = datetime.utcnow()  # type: ignore[assignment]
+        item.error = f"paused {AI_PAUSE_MAX} times during AI outages, giving up: {item.error}"  # type: ignore[assignment]
+        db.commit()
+        inc("jobhunter_queue_dead_total", pipeline=item.pipeline)
+        log.error("queue item %s dead-lettered after repeated AI outages", item.id)
+        return "dead"
+    payload["paused_count"] = pauses
+    delay = min(600, int(settings.ai_backoff_base ** min(pauses, 8) * 5))
+    item.payload = payload  # type: ignore[assignment]
+    item.status = "paused"  # type: ignore[assignment]
+    item.scheduled_at = datetime.utcnow() + timedelta(seconds=delay)  # type: ignore[assignment]
+    item.updated_at = datetime.utcnow()  # type: ignore[assignment]
+    db.commit()
+    inc("jobhunter_queue_paused_total", pipeline=item.pipeline)
+    log.warning("queue item %s paused (AI transient outage), re-queue in %ss: %s",
+                item.id, delay, item.error)
+    return "paused"
+
+
+def drain_paused(db: Session, *, user_id: Optional[int] = None,
+                 pipelines: Optional[Sequence[str]] = None, limit: int = 100,
+                 force: bool = False) -> int:
+    """Flip paused items back to ``queued`` now that AI is available.
+
+    Called by the watchdog on every green probe (honouring the pause backoff)
+    and by the one-click resume endpoint (``force=True`` — the user asked, so
+    no waiting). Idempotent: only items currently in ``paused`` are touched.
+    """
+    query = db.query(PipelineJob).filter(PipelineJob.status == "paused")
+    if not force:
+        query = query.filter(PipelineJob.scheduled_at <= datetime.utcnow())
+    if user_id is not None:
+        query = query.filter(PipelineJob.user_id == user_id)
+    if pipelines:
+        query = query.filter(PipelineJob.pipeline.in_(list(pipelines)))
+    items = query.order_by(PipelineJob.priority.asc(), PipelineJob.id.asc()).limit(limit).all()
+    now = datetime.utcnow()
+    for item in items:
+        item.status = "queued"  # type: ignore[assignment]
+        item.scheduled_at = now  # type: ignore[assignment]
+        item.updated_at = now  # type: ignore[assignment]
+    if items:
+        db.commit()
+        inc("jobhunter_queue_resumed_total", value=len(items))
+        log.info("resumed %s paused queue item(s) — AI is back", len(items))
+    return len(items)
+
+
+def paused_count(db: Session, *, user_id: Optional[int] = None) -> int:
+    query = db.query(func.count(PipelineJob.id)).filter(PipelineJob.status == "paused")
+    if user_id is not None:
+        query = query.filter(PipelineJob.user_id == user_id)
+    return int(query.scalar() or 0)
+
+
 def fail(db: Session, item: PipelineJob, error: str, *, retryable: bool = True) -> str:
     """Record a failure; retry with backoff or move to the dead-letter state."""
     item.error = (error or "unknown error")[:2000]
@@ -264,11 +347,11 @@ def queue_stats(db: Session, *, user_id: Optional[int] = None) -> Dict[str, Dict
         query = query.filter(PipelineJob.user_id == user_id)
     rows = query.group_by(PipelineJob.pipeline, PipelineJob.status).all()
     stats: Dict[str, Dict[str, int]] = {
-        pipeline: {"queued": 0, "processing": 0, "done": 0, "failed": 0, "needs_input": 0, "dead": 0}
+        pipeline: {"queued": 0, "processing": 0, "done": 0, "failed": 0, "needs_input": 0, "dead": 0, "paused": 0}
         for pipeline in PIPELINES
     }
     for pipeline, status, count in rows:
-        bucket = stats.setdefault(pipeline, {"queued": 0, "processing": 0, "done": 0, "failed": 0, "needs_input": 0, "dead": 0})
+        bucket = stats.setdefault(pipeline, {"queued": 0, "processing": 0, "done": 0, "failed": 0, "needs_input": 0, "dead": 0, "paused": 0})
         bucket[status] = int(count)
     set_gauge("jobhunter_queue_depth", sum(b.get("queued", 0) for b in stats.values()), scope="global")
     return stats
