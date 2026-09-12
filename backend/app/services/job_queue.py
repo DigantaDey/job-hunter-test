@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -56,18 +57,36 @@ def enqueue(
     """
     if pipeline not in PIPELINES:
         raise ValueError(f"unknown pipeline '{pipeline}'")
+
+    # ``uq_pipeline_user_dedupe`` is a HARD unique constraint over (user_id,
+    # dedupe_key) — it covers finished rows too. Re-running a scan therefore has
+    # to *reuse* the completed row instead of inserting a second one, otherwise
+    # the second click raises IntegrityError and the API answers 500.
     if dedupe_key:
         existing = (
             db.query(PipelineJob)
-            .filter(
-                PipelineJob.user_id == user_id,
-                PipelineJob.dedupe_key == dedupe_key,
-                PipelineJob.status.in_(("queued", "processing", "needs_input")),
-            )
+            .filter(PipelineJob.user_id == user_id, PipelineJob.dedupe_key == dedupe_key)
             .first()
         )
         if existing:
-            return None
+            if existing.status in ("queued", "processing", "needs_input"):
+                return None  # identical work is already in flight
+            existing.pipeline = pipeline
+            existing.job_id = job_id
+            existing.payload = payload or {}
+            existing.status = "queued"
+            existing.priority = max(1, min(9, priority))
+            existing.attempts = 0
+            existing.max_attempts = max_attempts or settings.worker_max_attempts
+            existing.scheduled_at = datetime.utcnow() + timedelta(seconds=max(0, delay_seconds))
+            existing.lease_expires_at = None
+            existing.locked_by = ""
+            existing.finished_at = None
+            existing.error = ""
+            db.commit()
+            db.refresh(existing)
+            inc("jobhunter_queue_enqueued_total", pipeline=pipeline, reused="true")
+            return existing
 
     item = PipelineJob(
         user_id=user_id,
@@ -81,7 +100,17 @@ def enqueue(
         max_attempts=max_attempts or settings.worker_max_attempts,
     )
     db.add(item)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost a race against another worker on the same dedupe key — the other
+        # enqueue already created the row, so behave like the dedupe path.
+        db.rollback()
+        return (
+            db.query(PipelineJob)
+            .filter(PipelineJob.user_id == user_id, PipelineJob.dedupe_key == dedupe_key)
+            .first()
+        )
     db.refresh(item)
     inc("jobhunter_queue_enqueued_total", pipeline=pipeline)
     return item

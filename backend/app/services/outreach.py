@@ -34,6 +34,17 @@ log = get_logger("app.outreach")
 
 DEFAULT_SENDER_NAME = "Hiring Team"
 
+#: Mailbox local-parts that mean "a department", not a person. Outreach to these
+#: converts badly, so the UI must say so instead of presenting them as a find.
+ROLE_MAILBOXES = {"hiring", "jobs", "careers", "recruiting", "talent", "people", "hr",
+                  "info", "hello", "contact", "office", "team", "engineering", "admin"}
+
+
+def is_role_mailbox(address: str) -> bool:
+    local = (address or "").split("@", 1)[0].strip().lower()
+    return bool(local) and (local in ROLE_MAILBOXES or local.split(".")[0] in ROLE_MAILBOXES
+                            or local.split("+")[0] in ROLE_MAILBOXES)
+
 
 # --------------------------------------------------------------------------- #
 # Suppression list
@@ -103,13 +114,17 @@ async def draft_email(
     department: str = "engineering",
     recipient: Optional[Dict[str, Any]] = None,
     extra_context: str = "",
+    persona_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a draft in the approval bucket (never sends).
 
     ``recipient`` may be supplied explicitly (manual address or a contact picked
     in the UI); otherwise discovery runs and the result — including its honest
-    ``confidence``/``verified`` flags — is stored on the row.
+    ``confidence``/``verified`` flags — is stored on the row. The job's own
+    description is passed to the writer so the message is about *that* posting,
+    and the posting's context is stored on the row so the approval bucket can
+    always show which job a draft was written for.
     """
     company_name = company if isinstance(company, str) else getattr(company, "name", "") or ""
     profile = get_setting(db, user.id, "application", "profile_snapshot", {}) or {}
@@ -120,6 +135,10 @@ async def draft_email(
         profile = (profile_row.data if profile_row else {}) or {}
     if not profile:
         raise ValueError("profile_missing")
+    if not str(profile.get("name") or "").strip():
+        # A message signed "Unknown" is unreadable to the recipient, so refuse
+        # rather than drafting something the user would have to rewrite anyway.
+        raise ValueError("profile_name_missing")
 
     contact = dict(recipient or {})
     if not contact.get("email"):
@@ -139,6 +158,10 @@ async def draft_email(
         founder=founder,
         recipient_name=str(contact.get("name") or ""),
         extra_context=extra_context,
+        jd=(job.description if job else "") or "",
+        job_url=(job.url if job else "") or "",
+        db=db,
+        user_id=user.id,
     )
 
     row = Email(
@@ -149,10 +172,17 @@ async def draft_email(
         body=str(drafted.get("body") or ""),
         status="pending_approval",
         job_id=job.id if job else None,
+        job_title=(job.title if job else "")[:300],
+        job_url=(job.url if job else "")[:500],
+        jd_excerpt=(job.description if job else "")[:2000],
+        persona_id=persona_id or (job.persona_id if job else None),
         company=(company_name or (job.company if job else "") or "")[:200],
         recipient_type="founder" if founder else "hiring_manager",
         source=str(contact.get("source") or "manual")[:40],
         confidence=float(contact.get("confidence") or 0.0),
+        verified=bool(contact.get("verified")) or bool((contact.get("verification") or {}).get("mx_ok")),
+        ai_used=bool(drafted.get("ai_used")),
+        guardrail_report=drafted.get("fact_guard", {}) or {},
         tracking_token=new_tracking_token(),
         unsubscribe_token=new_tracking_token(),
         dry_run=not settings.email_real_sending,
@@ -164,8 +194,13 @@ async def draft_email(
                        detail="draft created",
                        meta={"contact": {k: v for k, v in contact.items() if k != "email"},
                              "ai_used": bool(drafted.get("ai_used")),
-                             "fact_guard": drafted.get("fact_guard", {})})
+                             "fact_guard": drafted.get("fact_guard", {}),
+                             "job_id": row.job_id, "job_title": row.job_title})
     inc("jobhunter_emails_drafted_total", audience=row.recipient_type)
+    from app.services import persona as persona_service
+
+    persona_service.record_signal(db, user.id, row.persona_id, "email_drafted",
+                                  {"title": row.job_title, "company": row.company})
     return {"email": row, "decision": contact, "contact": contact,
             "ai": {"ai_used": bool(drafted.get("ai_used")),
                    "fact_guard": drafted.get("fact_guard", {})}}
@@ -259,6 +294,18 @@ def compliance_report(db: Session, user: User, email_row: Email) -> Dict[str, An
         )
     if (email_row.source or "") == "manual":
         warnings.append("Address was entered manually — double-check the domain.")
+    if not email_row.verified:
+        warnings.append(
+            f"This address is unverified ({email_row.source or 'unknown source'}) — "
+            "confirm it is a real mailbox before sending."
+        )
+    if is_role_mailbox(email_row.to_email):
+        warnings.append(
+            "This is a generic role mailbox (e.g. hiring@/info@), not a named person — "
+            "reply rates are much lower. Use Contacts to find a real decision maker."
+        )
+    if not email_row.job_title:
+        warnings.append("This draft is not attached to a job posting — the recipient will not know which role you mean.")
 
     return {
         "ok": not blockers,
@@ -450,6 +497,7 @@ def followups_due(db: Session, user_id: int, hours: int = 72) -> int:
 
 __all__ = [
     "is_suppressed",
+    "is_role_mailbox",
     "suppress",
     "sent_today",
     "tracking_urls",

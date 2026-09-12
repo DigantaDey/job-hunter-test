@@ -24,6 +24,15 @@ type Context = {
   funding_focus?: string[]
   source?: string
   profile_id?: number | null
+  persona?: { id: number; name: string; target_role: string } | null
+}
+
+type ResumeInfo = {
+  id?: number | null
+  profile_id?: number | null
+  name?: string
+  current_title?: string
+  extraction_source?: string
 }
 
 const STAGES = ['Seed', 'Series A', 'Series B', 'Series C', 'Series D']
@@ -31,6 +40,7 @@ const STAGES = ['Seed', 'Series A', 'Series B', 'Series C', 'Series D']
 export default function Funding() {
   const [companies, setCompanies] = useState<Company[]>([])
   const [context, setContext] = useState<Context | null>(null)
+  const [resume, setResume] = useState<ResumeInfo | null>(null)
   const [refreshedAt, setRefreshedAt] = useState<string>('')
   const [stageFilter, setStageFilter] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
@@ -49,6 +59,7 @@ export default function Funding() {
       const { data } = await client.get('/api/funding/companies', { params: { refresh } })
       setCompanies(data.companies || [])
       setContext(data.context || null)
+      setResume(data.resume || null)
       setRefreshedAt(data.refreshed_at || '')
     } catch (e: any) {
       setError(apiError(e, 'Failed to load funding radar'))
@@ -73,8 +84,10 @@ export default function Funding() {
       setNotice(
         data.duplicate
           ? 'A scan is already running — results will appear here shortly.'
-          : 'Scan queued — results appear as the worker finishes.'
+          : `Scan queued${data.focus_applied ? ` with focus "${data.focus_applied}" (saved to your settings)` : ''} — results appear as the worker finishes.`
       )
+      setContext(data.context || null)
+      setShowContextInput(false)
       await load(false)
       setRefreshedAt(new Date().toISOString())
     } catch (e: any) {
@@ -126,8 +139,20 @@ export default function Funding() {
           )}
           {refreshedAt && <span className="text-[11px] mono text-zinc-500 ml-auto">updated {new Date(refreshedAt).toLocaleTimeString()}</span>}
         </div>
-        {!context?.profile_id && (
-          <div className="mt-2 text-xs text-amber-700 dark:text-amber-300 mono">No resume uploaded yet — upload one in Resume Studio for personalized matches.</div>
+        {resume?.profile_id ? (
+          <div className="mt-2 text-xs text-emerald-700 dark:text-emerald-300 mono">
+            Matched to {resume.name || 'your resume'}{resume.current_title ? ` • ${resume.current_title}` : ''}
+            {resume.extraction_source && resume.extraction_source !== 'ai' ? ` • profile source: ${resume.extraction_source}` : ''}
+          </div>
+        ) : (
+          <div className="mt-2 text-xs text-amber-700 dark:text-amber-300 mono">
+            No resume uploaded yet — <Link to="/resumes" className="underline">upload one in Resume Studio</Link> for personalized matches.
+          </div>
+        )}
+        {context?.persona && (
+          <div className="mt-1 text-[11px] mono text-blue-700 dark:text-blue-300">
+            Track: {context.persona.name}{context.persona.target_role ? ` — ${context.persona.target_role}` : ''}
+          </div>
         )}
         <div className="mt-2 flex flex-wrap gap-1.5">
           {(context?.funding_focus || []).map((f: string) => (

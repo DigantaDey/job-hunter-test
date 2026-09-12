@@ -40,13 +40,74 @@ from app.core.rate_limiter import rate_limiter
 log = get_logger("app.ai")
 
 
+#: Stable machine-readable reasons. Every AI failure the product can hit maps to
+#: one of these so the UI can explain *why* the model is offline instead of
+#: silently substituting a degraded result.
+REASON_NO_API_KEY = "no_api_key"
+REASON_INVALID_API_KEY = "invalid_api_key"
+REASON_STORED_KEY_UNREADABLE = "stored_key_unreadable"
+REASON_UNREACHABLE = "unreachable"
+REASON_TIMEOUT = "timeout"
+REASON_PROVIDER_STATUS = "provider_error"
+REASON_RATE_LIMITED = "rate_limited"
+REASON_QUOTA = "quota_exceeded"
+REASON_CIRCUIT_OPEN = "circuit_open"
+REASON_BUDGET = "budget_exhausted"
+REASON_ENTITLEMENT = "limit_exceeded"
+REASON_MALFORMED = "malformed_response"
+REASON_INVALID_JSON = "invalid_json"
+REASON_MODEL_UNAVAILABLE = "model_unavailable"
+REASON_UNKNOWN = "unknown"
+
+_REASON_PREFIXES = {
+    "no_api_key": REASON_NO_API_KEY,
+    "circuit_open": REASON_CIRCUIT_OPEN,
+    "budget_exhausted": REASON_BUDGET,
+    "limit_exceeded": REASON_ENTITLEMENT,
+    "invalid_json": REASON_INVALID_JSON,
+    "malformed_response": REASON_MALFORMED,
+    "http_error": REASON_UNREACHABLE,
+    "stored_key_unreadable": REASON_STORED_KEY_UNREADABLE,
+}
+
+
+def reason_from_message(message: str, status: Optional[int] = None) -> str:
+    """Best-effort stable reason code for an error string."""
+    text = (message or "").strip()
+    head = text.split(":", 1)[0].strip().lower()
+    if head in _REASON_PREFIXES:
+        return _REASON_PREFIXES[head]
+    lowered = text.lower()
+    if "timed out" in lowered or "timeout" in lowered or "readtimeout" in lowered:
+        return REASON_TIMEOUT
+    if status in (401, 403) or "incorrect api key" in lowered or "invalid api key" in lowered:
+        return REASON_INVALID_API_KEY
+    if status == 429:
+        return REASON_RATE_LIMITED
+    if status in (402, 429) or "quota" in lowered or "insufficient_quota" in lowered or "billing" in lowered:
+        return REASON_QUOTA
+    if status == 404 or "model_not_found" in lowered or "does not exist" in lowered:
+        return REASON_MODEL_UNAVAILABLE
+    if status and status >= 500:
+        return REASON_PROVIDER_STATUS
+    if "connect" in lowered or "name or service not known" in lowered or "ssl" in lowered:
+        return REASON_UNREACHABLE
+    return REASON_UNKNOWN
+
+
 class AIClientError(Exception):
     """Raised when the AI layer cannot produce a result (unconfigured, timeout, HTTP error…)."""
 
-    def __init__(self, message: str, *, status: Optional[int] = None, retryable: bool = False):
+    def __init__(self, message: str, *, status: Optional[int] = None, retryable: bool = False,
+                 reason: Optional[str] = None):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+        self.reason = reason or reason_from_message(message, status)
+
+    def diagnostics(self) -> Dict[str, Any]:
+        return {"reason": self.reason, "status": self.status, "retryable": self.retryable,
+                "detail": str(self)[:500]}
 
 
 WORKFLOWS = {
@@ -61,6 +122,7 @@ WORKFLOWS = {
     "tagging": "resume auto-tagging",
     "interview": "interview preparation",
     "company_intel": "company intelligence",
+    "persona": "user-persona reflection / track suggestions",
 }
 
 _workflow_overrides: Dict[Tuple[int, str], Dict[str, str]] = {}
@@ -415,7 +477,16 @@ async def chat_completion(
                 "key_error": cfg.get("key_error"),
             }
         if not cfg["api_key"]:
-            raise AIClientError("no_api_key: AI is not configured (set AI_API_KEY in Settings or per-workflow override — OpenAI compatible format: base_url like https://api.openai.com/v1, model like gpt-4o-mini)")
+            if cfg.get("key_error"):
+                raise AIClientError(
+                    "stored_key_unreadable: the saved AI API key could not be decrypted on this server "
+                    "(its ENCRYPTION_KEY changed since the key was saved) — re-enter it in Settings → AI API",
+                    reason=REASON_STORED_KEY_UNREADABLE,
+                )
+            raise AIClientError(
+                "no_api_key: AI is not configured (set AI_API_KEY in Settings or per-workflow override — OpenAI compatible format: base_url like https://api.openai.com/v1, model like gpt-4o-mini)",
+                reason=REASON_NO_API_KEY,
+            )
 
         # Per-user entitlement pre-check if db/user_id provided
         if db is not None and user_id is not None:

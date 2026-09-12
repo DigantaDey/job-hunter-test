@@ -96,8 +96,58 @@ class Profile(Base):
     data = Column(JSON, default=dict)  # extracted profile details
     layout = Column(JSON, default=dict)  # layout json
     master_resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
+    # Where the extraction came from. "ai" is the only supported source for the
+    # master profile — anything else means the AI layer was unavailable and the
+    # row must not be trusted as ground truth.
+    extraction_source = Column(String(20), default="ai")
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class Persona(Base):
+    """
+    A candidate *track* — e.g. "Data Analyst" and "Data Scientist" for the same
+    person. Each persona owns its own search context, preferences, learned memory
+    and funnel (discovery → scoring → resume → outreach), so one account can run
+    several job searches in parallel without them blurring into each other.
+
+    ``memory`` grows as the user works: every scored job, application, reply and
+    edit records a signal, and ``portrait`` is the AI-written reflection of the
+    user *under this persona* — rebuilt from observed evidence only.
+    """
+
+    __tablename__ = "personas"
+    __table_args__ = (
+        Index("ix_personas_user_active", "user_id", "is_active"),
+        UniqueConstraint("user_id", "name", name="uq_personas_user_name"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(120), nullable=False)
+    target_role = Column(String(200), default="")
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_default = Column(Boolean, default=False, nullable=False)
+
+    #: Derived search context for this track (keywords/roles/industries/…)
+    search_context = Column(JSON, default=dict)
+    #: Hard preferences the user states (salary, remote, company stage, exclusions)
+    preferences = Column(JSON, default=dict)
+    #: Learned state: signals, observed strengths/gaps, funnel counters
+    memory = Column(JSON, default=dict)
+
+    #: AI reflection of the user under this persona, plus the evidence it rests on
+    portrait = Column(Text, default="")
+    portrait_evidence = Column(JSON, default=dict)
+    portrait_at = Column(DateTime, nullable=True)
+
+    stats = Column(JSON, default=dict)
+    source_resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
+
+    last_used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
 
 
 class Resume(Base):
@@ -118,6 +168,13 @@ class Resume(Base):
     # Text snapshot of the *rendered* document, used for diff/preview without
     # re-parsing files on every request.
     text_snapshot = Column(Text, default="")
+    #: Professional download name ("Diganta-Dey-Wirelane-Embedded-Engineer.pdf").
+    #: ``filepath`` stays an opaque unique path on disk; this is what the user sees.
+    display_name = Column(String(300), default="")
+    #: Which persona/track this resume was tailored for.
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
+    #: Guardrail verdict (accuracy + ATS quality checks) — see ai_guardrails.py
+    guardrail_report = Column(JSON, default=dict)
     approved_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow)
 
@@ -142,6 +199,13 @@ class Job(Base):
     status = Column(String, default="discovered")  # discovered|queued|needs_input|applying|applied|failed|emailed|rejected
     score = Column(Float, default=0.0)
     score_reason = Column(Text, default="")
+    #: Provenance of ``score``: "ai" (guardrail-verified), "pending" (AI offline,
+    #: not yet scored) or "unscored" (no profile/JD to score against).
+    score_source = Column(String(20), default="pending")
+    #: Rubric breakdown + evidence + guardrail report for the score above.
+    score_detail = Column(JSON, default=dict)
+    #: Persona/track this job was discovered and scored for.
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
     company_size = Column(String, default="unknown")  # big, medium, small, startup
     company_info = Column(JSON, default=dict)
     discovered_at = Column(DateTime, default=utcnow)
@@ -194,9 +258,23 @@ class Email(Base):
     status = Column(String, default="draft")  # draft|pending_approval|queued|sending|sent|failed|needs_otp|suppressed
     job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
     company = Column(String, default="")
+    #: Denormalised job context so the approval bucket can show *which* posting
+    #: this draft was written for without a join (and survives job deletion).
+    job_title = Column(String(300), default="")
+    job_url = Column(String(500), default="")
+    jd_excerpt = Column(Text, default="")
+    #: Persona/track the outreach was written for.
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
     recipient_type = Column(String, default="hiring_manager")  # hiring_manager | founder
     source = Column(String, default="heuristic")  # ai | hunter | clearbit | apollo | heuristic | manual
     confidence = Column(Float, default=0.0)
+    #: True only when the address came from a verifying provider (hunter/apollo
+    #: or an MX-confirmed personal address). Role mailboxes are always False.
+    verified = Column(Boolean, default=False, nullable=False)
+    #: True when the message text was written by the model (vs. a template).
+    ai_used = Column(Boolean, default=False, nullable=False)
+    #: Guardrail verdict for the drafted subject/body.
+    guardrail_report = Column(JSON, default=dict)
     tracking_token = Column(String(64), default="", index=True)
     unsubscribe_token = Column(String(64), default="", index=True)
     opens = Column(Integer, default=0)

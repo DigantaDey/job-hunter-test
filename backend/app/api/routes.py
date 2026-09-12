@@ -21,6 +21,7 @@ from app.api.routers import (
     jobs,
     notifications,
     ops,
+    personas,
     resumes,
     settings_api,
     tracking,
@@ -42,5 +43,6 @@ router.include_router(billing.router)
 router.include_router(analytics.router)
 router.include_router(notifications.router)
 router.include_router(interview.router)
+router.include_router(personas.router)
 
 __all__ = ["router", "search_context"]

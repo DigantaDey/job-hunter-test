@@ -110,4 +110,57 @@ export function apiError(error: unknown, fallback = 'Something went wrong'): str
   return fallback
 }
 
+
+/** Structured explanation the backend sends when the model cannot be used. */
+export type AIOutage = {
+  reason?: string
+  message?: string
+  fix?: string
+  workflow?: string
+  detail?: string
+  base_url?: string | null
+  model?: string | null
+  hint?: string | null
+}
+
+/**
+ * Pull the AI diagnosis out of a 503, or null when the failure is unrelated.
+ *
+ * Every AI-backed action (upload, generate, score, draft, reflect) now fails
+ * loudly with this shape instead of quietly producing a degraded result, so the
+ * UI can tell the user *why* the model is offline and how to fix it.
+ */
+export function aiOutage(error: unknown): AIOutage | null {
+  const err = error as AxiosError<{ code?: string; reason?: string; message?: string; fix?: string }>
+  const data = err?.response?.data
+  if (err?.response?.status === 503 || data?.code === 'ai_unavailable') {
+    return (data || {}) as AIOutage
+  }
+  return null
+}
+
+/** Guardrail verdict for a 422 from a guardrailed endpoint. */
+export function guardrailFailure(error: unknown): { issues: { code: string; field?: string; message?: string }[]; message?: string } | null {
+  const err = error as AxiosError<{ code?: string; issues?: any[]; message?: string }>
+  const data = err?.response?.data
+  if (err?.response?.status === 422 && data?.code === 'guardrail_failed') {
+    return { issues: data.issues || [], message: data.message }
+  }
+  return null
+}
+
+/**
+ * Download a resume through the authenticated signed-URL endpoint.
+ *
+ * A bare `<a href="/api/resumes/2/download">` sends no Authorization header,
+ * which is why downloads used to open a JSON `{"detail":"Not authenticated"}`
+ * page. We fetch a short-lived signed URL first, then let the browser navigate
+ * to it so the native download/preview UI is used.
+ */
+export async function downloadResume(resumeId: number, format: 'pdf' | 'docx'): Promise<string> {
+  const { data } = await client.get(`/api/resumes/${resumeId}/download-url`, { params: { format } })
+  window.location.assign(data.url)
+  return data.filename as string
+}
+
 export default client

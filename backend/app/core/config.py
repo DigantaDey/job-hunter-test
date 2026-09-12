@@ -174,12 +174,11 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Defaults used when a user has not saved their own settings
     # ------------------------------------------------------------------ #
-    default_keywords: List[str] = Field(
-        default_factory=lambda: [
-            "python", "backend engineer", "data engineer", "machine learning",
-            "devops", "full stack", "platform engineer", "site reliability",
-        ]
-    )
+    #: Intentionally empty. Search keywords are *extracted from the user's own
+    #: resume* (Settings shows them read-only, plus an editable "extra keywords"
+    #: field). Prefilling "python, backend engineer, …" silently pointed every
+    #: new account at one generic search.
+    default_keywords: List[str] = Field(default_factory=list)
     default_freshness_hours: int = 72
     discovery_cache_seconds: int = 900
     ai_max_concurrency: int = 4

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import re
 import shutil
+import time
 import uuid
 from datetime import datetime
 from typing import List, Optional
@@ -17,8 +20,10 @@ from app.core import audit
 from app.core.config import settings
 from app.core.entitlements import enforce, increment_usage
 from app.core.logging import get_logger
+from app.core.security import constant_time_equals
 from app.models.models import Job, Profile, Resume
 from app.schemas.schemas import ProfileOut, ResumeOut
+from app.services import persona as persona_service
 from app.services.job_queue import enqueue
 from app.services.resume_generator import generate_tailored_profile
 from app.services.resume_parser import ai_extract_profile, extract_layout, extract_text
@@ -26,6 +31,7 @@ from app.services.resume_service import (
     build_and_save_resume,
     create_polished_resume,
     diff_text,
+    download_filename,
     fact_guard_check,
     render_profile_text,
     resume_preview,
@@ -42,6 +48,10 @@ MAGIC_BYTES = {
     b"PK\x03\x04": ".docx",
     b"\xd0\xcf\x11\xe0": ".doc",
 }
+
+#: Lifetime of a signed download URL. Long enough to survive a browser
+#: "save as" dialog, short enough that a leaked link is useless soon after.
+DOWNLOAD_TOKEN_TTL_SECONDS = 900
 
 
 def _validate_upload(file: UploadFile, head: bytes) -> str:
@@ -84,9 +94,76 @@ def _store_upload(file: UploadFile, extension: str = ".pdf") -> tuple[str, str]:
     return path, safe_name
 
 
+# --------------------------------------------------------------------------- #
+# Signed download URLs
+#
+# The SPA downloads with a plain <a href>, which carries no Authorization
+# header — that is exactly why /download used to answer {"detail":"Not
+# authenticated"}. The UI now asks for a short-lived, per-resume signed URL and
+# the browser can follow it directly.
+# --------------------------------------------------------------------------- #
+def _sign_download(resume_id: int, user_id: int, fmt: str, expires: int) -> str:
+    message = f"{resume_id}:{user_id}:{fmt}:{expires}".encode()
+    return hmac.new(settings.secret_key.encode(), message, hashlib.sha256).hexdigest()
+
+
+def create_download_token(resume_id: int, user_id: int, fmt: str = "pdf",
+                          ttl: int = DOWNLOAD_TOKEN_TTL_SECONDS) -> str:
+    expires = int(time.time()) + max(30, ttl)
+    return f"{expires}.{_sign_download(resume_id, user_id, fmt, expires)}"
+
+
+def verify_download_token(token: str, resume_id: int, user_id: int, fmt: str) -> bool:
+    try:
+        raw_expires, signature = str(token).split(".", 1)
+        expires = int(raw_expires)
+    except (ValueError, AttributeError):
+        return False
+    if expires < int(time.time()):
+        return False
+    expected = _sign_download(resume_id, user_id, fmt, expires)
+    return constant_time_equals(expected, signature)
+
+
+@router.get("/resumes/{resume_id}/download-url")
+def download_url(resume_id: int, user: CurrentUser, db: DbSession, format: str = "pdf"):
+    """Issue a short-lived signed URL the browser can download directly."""
+    fmt = format.lower()
+    if fmt not in ("pdf", "docx"):
+        raise HTTPException(400, "format must be 'pdf' or 'docx'")
+    resume = db.query(Resume).filter(Resume.id == resume_id, Resume.user_id == user.id).first()
+    if not resume:
+        raise HTTPException(404, "Resume not found")
+    token = create_download_token(resume.id, user.id, fmt)
+    return {
+        "url": f"/api/resumes/{resume.id}/download?format={fmt}&token={token}",
+        "filename": download_filename(resume, fmt),
+        "expires_in": DOWNLOAD_TOKEN_TTL_SECONDS,
+        "available_formats": _available_formats(resume),
+    }
+
+
+def _available_formats(resume: Resume) -> List[str]:
+    available = []
+    docx = resume.filepath
+    pdf = os.path.splitext(resume.filepath)[0] + ".pdf"
+    if docx and os.path.exists(docx):
+        available.append("docx")
+    if os.path.exists(pdf):
+        available.append("pdf")
+    return available
+
+
 @router.post("/resume/upload")
 async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file: UploadFile = File(...)):
-    """Upload the master resume: text + layout extraction, AI profile, keywords."""
+    """
+    Upload the master resume: deterministic text + layout extraction, then an
+    AI-extracted profile under guardrails.
+
+    AI is required for the profile: if the model is unreachable this returns 503
+    with the exact reason instead of storing a regex-guessed profile that later
+    produces resumes and emails addressed to "Unknown".
+    """
     enforce(db, user.id, "resume_parses_per_month")
     enforce(db, user.id, "resumes_max")
 
@@ -105,8 +182,12 @@ async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file
         os.remove(path)
         raise HTTPException(422, "No readable text found in the document (is it a scanned image?)")
 
-    layout = extract_layout(path) if safe_name.lower().endswith(".pdf") else {"bullet_style": "•", "colors": [], "fonts": ["Calibri"]}
-    profile_data, meta = await ai_extract_profile(text, ai_config=None)
+    layout = extract_layout(path) if safe_name.lower().endswith(".pdf") else {
+        "bullet_style": "•", "colors": [], "fonts": ["Calibri"], "estimated": True}
+
+    # AI-required. ``AIUnavailableError`` bubbles to the 503 handler with the
+    # provider's own diagnosis (no key / bad key / unreachable / breaker open…).
+    profile_data, meta = await ai_extract_profile(text, ai_config=None, db=db, user_id=user.id)
     profile_data["raw_text"] = text[:20000]
 
     resume = Resume(
@@ -118,6 +199,7 @@ async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file
         profile_snapshot=profile_data,
         layout=layout,
         tags=["master"],
+        display_name=safe_name,
         text_snapshot=render_profile_text(profile_data),
         approved_at=datetime.utcnow(),
     )
@@ -126,29 +208,41 @@ async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file
     db.refresh(resume)
 
     db.query(Profile).filter(Profile.user_id == user.id).delete(synchronize_session=False)
-    profile = Profile(user_id=user.id, data=profile_data, layout=layout, master_resume_id=resume.id)
+    profile = Profile(user_id=user.id, data=profile_data, layout=layout, master_resume_id=resume.id,
+                      extraction_source="ai")
     db.add(profile)
     db.commit()
     db.refresh(profile)
 
     invalidate_context(user.id)
     context = await search_context(db, user.id, force_refresh=True)
+    persona = persona_service.ensure_default_persona(db, user.id, profile_data)
     audit.audit(
         db,
         "resume.uploaded",
         user=user,
         target=safe_name,
-        detail={"resume_id": resume.id, "size_kb": round(os.path.getsize(path) / 1024, 1), "extraction": meta.get("source") if isinstance(meta, dict) else None},
+        detail={"resume_id": resume.id, "size_kb": round(os.path.getsize(path) / 1024, 1),
+                "extraction": meta.get("source") if isinstance(meta, dict) else None,
+                "guardrail": (meta or {}).get("guardrail", {}).get("passed")},
         request=request,
     )
 
-    enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id}, priority=4, dedupe_key=f"tag_resume:{resume.id}")
+    enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id},
+            priority=4, dedupe_key=f"tag_resume:{resume.id}")
+
+    # Re-rank previously unscored jobs against the fresh profile. These are
+    # explicitly labelled "preliminary" — the real verdict comes from the AI
+    # scorer (see /api/jobs/{id}/intelligence).
+    from app.services.scoring import heuristic_score_detailed, score_job
 
     rescored = 0
     for job in db.query(Job).filter(Job.user_id == user.id, Job.score == 0).limit(50).all():
-        from app.services.scoring import heuristic_score
-
-        job.score, job.score_reason = heuristic_score(profile_data, job.description)
+        detail = heuristic_score_detailed(profile_data, job.description or "")
+        job.score = float(detail["overall"])
+        job.score_reason = detail["reason"]
+        job.score_source = "preliminary"
+        job.score_detail = detail
         rescored += 1
     if rescored:
         db.commit()
@@ -161,6 +255,7 @@ async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file
         "layout": layout,
         "ai_meta": meta,
         "search_context": context,
+        "persona": persona_service.to_dict(persona) if persona else None,
         "rescored_jobs": rescored,
     }
 
@@ -175,7 +270,9 @@ def current_profile(user: CurrentUser, db: DbSession):
     profile = get_owned_profile(db, user.id)
     if not profile:
         raise HTTPException(404, "Upload a resume to create your profile")
-    return {"id": profile.id, "data": profile.data, "layout": profile.layout, "created_at": profile.created_at}
+    return {"id": profile.id, "data": profile.data, "layout": profile.layout,
+            "extraction_source": profile.extraction_source or "ai",
+            "created_at": profile.created_at}
 
 
 @router.put("/profile/{profile_id}")
@@ -184,15 +281,34 @@ def update_profile(profile_id: int, data: dict, user: CurrentUser, db: DbSession
     if not profile:
         raise HTTPException(404, "Profile not found")
     profile.data = data
+    profile.extraction_source = "user_edited"
     db.commit()
     invalidate_context(user.id)
     return {"ok": True}
 
 
 @router.get("/context/keywords")
-async def keywords_context(user: CurrentUser, db: DbSession, force: bool = False):
-    """AI-extracted keywords/roles/industries from profile + resume + context."""
-    return await search_context(db, user.id, force_refresh=force)
+async def keywords_context(user: CurrentUser, db: DbSession, force: bool = False,
+                           persona_id: Optional[int] = None):
+    """
+    Search keywords: AI-extracted from the resume, plus whatever the user added.
+
+    The extracted set is the base and is never replaced by the editable field —
+    the user's extra terms are appended, and nothing generic is prefilled.
+    """
+    context = await search_context(db, user.id, force_refresh=force)
+    if persona_id:
+        persona = persona_service.get_persona(db, user.id, persona_id)
+        context = persona_service.context_for_persona(context, persona)
+
+    user_keywords = get_setting(db, user.id, "scraping", "keywords", settings.default_keywords) or []
+    extracted = [str(k) for k in (context.get("keywords") or []) if str(k).strip()]
+    merged = list(dict.fromkeys(extracted + [str(k).strip() for k in user_keywords if str(k).strip()]))
+    context["extracted_keywords"] = extracted
+    context["user_keywords"] = [str(k) for k in user_keywords]
+    context["keywords"] = merged
+    context["profile_id"] = context.get("profile_id")
+    return context
 
 
 # --------------------------------------------------------------------------- #
@@ -218,8 +334,15 @@ async def generate_resume(
     db: DbSession,
     job_id: int = Query(...),
     strict_skeleton: bool = False,
+    persona_id: Optional[int] = None,
 ):
-    """Generate a tailored resume for a job (starts ``pending`` until approved)."""
+    """
+    Generate a tailored resume for a job (starts ``pending`` until approved).
+
+    AI is required. If the model is offline the caller gets a 503 explaining
+    exactly why; if the model's draft cannot be made accurate the caller gets a
+    422 listing the guardrail violations. Nothing half-made is ever saved.
+    """
     enforce(db, user.id, "can_generate_resume")
     enforce(db, user.id, "tailored_resumes_per_month")
 
@@ -229,14 +352,40 @@ async def generate_resume(
     profile = get_owned_profile(db, user.id)
     if not profile:
         raise HTTPException(400, "Upload a master resume first")
+    if not (job.description or "").strip():
+        raise HTTPException(422, "This job has no description — paste the JD into the job first")
 
+    persona = persona_service.get_persona(db, user.id, persona_id) or persona_service.ensure_default_persona(db, user.id)
+    persona_context = persona_service.memory_summary(persona) if persona else {}
     strict = bool(strict_skeleton or get_setting(db, user.id, "general", "strict_skeleton", False))
-    tailored = await generate_tailored_profile(profile.data or {}, job.description or "", profile.layout or {}, strict)
-    guard = fact_guard_check(profile.data or {}, tailored.get("tailored_profile") or {})
-    resume = build_and_save_resume(db, user_id=user.id, profile=profile, job=job, tailored=tailored, strict_skeleton=strict, status="pending")
 
-    audit.audit(db, "resume.generated", user=user, target=resume.filename, detail={"job_id": job.id, "resume_id": resume.id, "fact_guard": guard}, request=request)
-    enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id}, priority=4, dedupe_key=f"tag_resume:{resume.id}")
+    tailored = await generate_tailored_profile(
+        profile.data or {}, job.description or "", profile.layout or {}, strict,
+        db=db, user_id=user.id,
+        persona={"name": persona.name if persona else "", "target_role": persona.target_role if persona else "",
+                 "observed_skills": list((persona_context.get("observed_skills") or {}).keys())[:12],
+                 "observed_titles": list((persona_context.get("observed_titles") or {}).keys())[:8]}
+        if persona else None,
+    )
+    guard = fact_guard_check(profile.data or {}, tailored.get("tailored_profile") or {})
+    if not guard["passed"]:
+        raise HTTPException(422, {"code": "fact_guard_failed",
+                                  "message": "The tailored resume contained facts not present in your profile.",
+                                  "violations": guard["violations"]})
+
+    resume = build_and_save_resume(db, user_id=user.id, profile=profile, job=job, tailored=tailored,
+                                   strict_skeleton=strict, status="pending",
+                                   persona_id=persona.id if persona else None)
+
+    audit.audit(db, "resume.generated", user=user, target=resume.filename,
+                detail={"job_id": job.id, "resume_id": resume.id, "fact_guard": guard,
+                        "guardrail": (tailored.get("guardrail") or {}).get("passed"),
+                        "persona_id": resume.persona_id}, request=request)
+    enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id},
+            priority=4, dedupe_key=f"tag_resume:{resume.id}")
+    persona_service.record_signal(db, user.id, resume.persona_id, "resume_generated",
+                                  {"title": job.title, "company": job.company,
+                                   "keywords": tailored.get("tags") or []})
 
     increment_usage(db, user.id, "tailored_resumes_per_month", 1)
 
@@ -244,9 +393,13 @@ async def generate_resume(
         "resume_id": resume.id,
         "status": resume.status,
         "tags": resume.tags,
+        "display_name": resume.display_name,
         "fact_guard": guard,
+        "guardrail": tailored.get("guardrail", {}),
+        "reasoning": tailored.get("reasoning", ""),
         "tailored": resume.profile_snapshot,
-        "files": {"docx": f"/api/resumes/{resume.id}/download?format=docx", "pdf": f"/api/resumes/{resume.id}/download?format=pdf"},
+        "files": {"docx": f"/api/resumes/{resume.id}/download?format=docx",
+                  "pdf": f"/api/resumes/{resume.id}/download?format=pdf"},
     }
 
 
@@ -284,16 +437,76 @@ def update_tags(resume_id: int, tags: List[str], user: CurrentUser, db: DbSessio
 
 
 @router.get("/resumes/{resume_id}/download")
-def download_resume(resume_id: int, user: CurrentUser, db: DbSession, format: str = "docx"):
-    resume = db.query(Resume).filter(Resume.id == resume_id, Resume.user_id == user.id).first()
+def download_resume(
+    resume_id: int,
+    request: Request,
+    db: DbSession,
+    format: str = "docx",
+    token: Optional[str] = None,
+):
+    """
+    Serve a resume file.
+
+    Authorised either by the normal bearer token (API clients) or by a
+    short-lived signed token from ``/resumes/{id}/download-url`` (browser
+    ``<a href>`` downloads, which cannot send an Authorization header). The
+    served filename is the professional display name, never the opaque path.
+    """
+    fmt = (format or "docx").lower()
+    if fmt not in ("pdf", "docx"):
+        raise HTTPException(400, "format must be 'pdf' or 'docx'")
+
+    user_id = _resolve_downloader(request, db, resume_id, fmt, token)
+    resume = db.query(Resume).filter(Resume.id == resume_id, Resume.user_id == user_id).first()
     if not resume:
         raise HTTPException(404, "Resume not found")
+
     path = resume.filepath
-    if format == "pdf":
+    if fmt == "pdf":
         path = os.path.splitext(resume.filepath)[0] + ".pdf"
-    if not os.path.exists(path):
-        raise HTTPException(404, f"{format.upper()} file is not available for this resume")
-    return FileResponse(path, filename=os.path.basename(path))
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, f"The {fmt.upper()} file is not available for this resume — regenerate it")
+
+    audit.audit(db, "resume.downloaded", user_id=user_id, target=download_filename(resume, fmt),
+                detail={"resume_id": resume.id, "format": fmt}, request=request)
+    return FileResponse(
+        path,
+        filename=download_filename(resume, fmt),
+        media_type="application/pdf" if fmt == "pdf" else
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+def _resolve_downloader(request: Request, db, resume_id: int, fmt: str, token: Optional[str]) -> int:
+    """Bearer token first; otherwise a valid signed download token."""
+    from app.core.auth import get_current_user
+    from app.db import get_db  # noqa: F401  (db already injected)
+
+    try:
+        user = get_current_user(request=request, credentials=_bearer_credentials(request), db=db)
+        if user:
+            return user.id
+    except HTTPException:
+        pass
+
+    if token:
+        # The signed token is bound to (resume_id, user_id, format) — but the
+        # user id is inside the signature, so verify against every candidate by
+        # checking the resume's owner.
+        resume = db.query(Resume).filter(Resume.id == resume_id).first()
+        if resume and verify_download_token(token, resume_id, resume.user_id, fmt):
+            return resume.user_id
+    raise HTTPException(401, {"code": "not_authenticated",
+                              "message": "Sign in again, or fetch a fresh download link from Resume Studio."})
+
+
+def _bearer_credentials(request: Request):
+    from fastapi.security import HTTPAuthorizationCredentials
+
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        return HTTPAuthorizationCredentials(scheme="Bearer", credentials=header[7:].strip())
+    return None
 
 
 @router.get("/resumes/{resume_id}/preview")
@@ -355,11 +568,17 @@ async def upload_polished(
         os.remove(path)
         raise HTTPException(413, "File too large")
     text = extract_text(path)
-    resume = create_polished_resume(db, user_id=user.id, parent=parent, filepath=path, filename=safe_name, text=text or resume_text(parent))
+    resume = create_polished_resume(db, user_id=user.id, parent=parent, filepath=path, filename=safe_name,
+                                    text=text or resume_text(parent))
+    resume.display_name = safe_name
+    db.commit()
     audit.audit(db, "resume.polished", user=user, target=safe_name, detail={"parent_id": parent.id, "resume_id": resume.id}, request=request)
+    persona_service.record_signal(db, user.id, parent.persona_id, "resume_edited",
+                                  {"note": f"candidate rewrote the tailored resume for {safe_name}"})
     increment_usage(db, user.id, "resume_polish_per_month", 1)
     return {
-        "resume": {"id": resume.id, "filename": resume.filename, "status": resume.status, "parent_resume_id": parent.id},
+        "resume": {"id": resume.id, "filename": resume.filename, "status": resume.status,
+                   "parent_resume_id": parent.id, "display_name": resume.display_name},
         "diff": diff_text(resume_text(parent), text or resume_text(parent)),
     }
 
@@ -388,7 +607,7 @@ async def generate_cover_letter(
     db: DbSession,
     job_id: int = Query(...),
 ):
-    """Generate cover letter — monetized."""
+    """Generate cover letter — monetized, AI-required and guardrailed."""
     enforce(db, user.id, "can_generate_cover_letter")
     enforce(db, user.id, "cover_letters_per_month")
 
@@ -401,7 +620,9 @@ async def generate_cover_letter(
 
     from app.services.resume_generator import generate_cover_letter as gen_cl
 
-    letter = await gen_cl(profile.data or {}, job.description or "", job.title, job.company, db=db, user_id=user.id)
+    letter = await gen_cl(profile.data or {}, job.description or "", job.title, job.company,
+                          db=db, user_id=user.id)
     increment_usage(db, user.id, "cover_letters_per_month", 1)
-    audit.audit(db, "cover_letter.generated", user=user, target=f"{job.company}:{job.title}", detail={"job_id": job.id}, request=request)
+    audit.audit(db, "cover_letter.generated", user=user, target=f"{job.company}:{job.title}",
+                detail={"job_id": job.id}, request=request)
     return {"cover_letter": letter, "job_id": job.id}

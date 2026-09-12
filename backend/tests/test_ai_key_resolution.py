@@ -58,8 +58,15 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
         else:
             body = json.dumps({
                 "choices": [{"message": {"content": json.dumps({
-                    "score": 88, "reason": "AI: great match", "missing_skills": [], "strengths": ["x"],
-                    "breakdown": {}, "recommendation": "GOOD FIT", "recommendation_reason": "y"})}}],
+                    # Schema-valid for the scoring contract: the guardrail now
+                    # requires a substantive reason, grounded strengths, evidence
+                    # and a recommendation that matches the score band.
+                    "score": 88,
+                    "reason": "Strong python overlap with the core requirements of this role.",
+                    "missing_skills": [], "strengths": ["python"],
+                    "breakdown": {}, "recommendation": "HIGH PRIORITY",
+                    "recommendation_reason": "core stack matches",
+                    "evidence": ["python"]})}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
             }).encode()
             self.send_response(200)

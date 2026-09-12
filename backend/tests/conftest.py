@@ -84,6 +84,213 @@ def clean_database() -> Iterator[None]:
     yield
 
 
+
+# --------------------------------------------------------------------------- #
+# Deterministic AI stand-in
+#
+# The product now *requires* the model for profile extraction, resume tailoring,
+# scoring and outreach. The suite has no provider, so every test gets a
+# deterministic stand-in that answers each workflow with schema-valid JSON.
+# Tests marked ``real_ai`` (or running with a resolvable API key) bypass it and
+# exercise the real gateway.
+# --------------------------------------------------------------------------- #
+def _stub_profile() -> Dict[str, Any]:
+    return {
+        "name": "Test Candidate",
+        "email": "test.candidate@example.com",
+        "phone": "+91 90000 00001",
+        "location": "Bangalore, India",
+        "current_title": "Senior Software Engineer",
+        "summary": ("Backend engineer with 6 years building Python, FastAPI and PostgreSQL services "
+                    "for fintech payments platforms serving 2M users."),
+        "skills": ["Python", "FastAPI", "PostgreSQL", "Docker", "Kubernetes", "AWS", "React"],
+        "experience": [
+            {"title": "Senior Software Engineer", "company": "FinCo", "duration": "2021 - present",
+             "location": "Bangalore", "bullets": ["Led the payments platform serving 2M users on AWS.",
+                                                 "Cut p95 latency by 40% migrating to FastAPI."]},
+            {"title": "Software Engineer", "company": "ShopStack", "duration": "2018 - 2021",
+             "location": "Bangalore", "bullets": ["Built the order pipeline on AWS handling 500k orders/day."]},
+        ],
+        "education": [{"degree": "B.Tech Computer Science", "school": "VTU", "year": "2018", "field": "CS"}],
+        "projects": [{"name": "Payments SDK", "description": "Open-source SDK with 1.2k stars.", "tech": ["Python"]}],
+        "links": ["https://github.com/testcandidate"],
+        "languages": ["English", "Hindi"],
+        "certifications": ["AWS Solutions Architect"],
+    }
+
+
+def _stub_tailored() -> Dict[str, Any]:
+    profile = _stub_profile()
+    return {
+        "tailored_profile": {
+            **{k: profile[k] for k in ("name", "email", "phone", "location", "links",
+                                       "languages", "certifications")},
+            "current_title": profile["current_title"],
+            "summary": ("Senior backend engineer with 6 years on Python, FastAPI and PostgreSQL, "
+                        "specialising in payments platforms at scale."),
+            "skills": ["Python", "FastAPI", "PostgreSQL", "Kubernetes", "AWS"],
+            "experience": profile["experience"],
+            "education": profile["education"],
+            "projects": profile["projects"],
+        },
+        "tags": ["backend-python", "fintech", "aws"],
+        "reasoning": "Reordered bullets to lead with payments-platform scale.",
+    }
+
+
+def _stub_score() -> Dict[str, Any]:
+    return {
+        "score": 88,
+        "reason": "Strong Python/FastAPI/PostgreSQL overlap with 6 years of relevant payments work.",
+        "breakdown": {"skills": 90, "experience": 88, "seniority": 85, "domain": 90,
+                      "location": 85, "education": 80},
+        "strengths": ["python", "fastapi"],
+        "missing_skills": [],
+        "evidence": ["6 years building Python, FastAPI, PostgreSQL", "Payments platform at scale"],
+        "recommendation": "HIGH PRIORITY",
+        "recommendation_reason": "Matches the core stack and domain.",
+    }
+
+
+def _stub_portrait(prompt: str = "") -> Dict[str, Any]:
+    """
+    A portrait written from the evidence pack in the prompt.
+
+    A real model can only claim what it was shown, and the persona guardrail
+    enforces exactly that — so the stand-in has to do the same or it would fail
+    the product's own checker (which is the point of the checker).
+    """
+    import json as _json
+    import re as _re
+
+    evidence: Dict[str, Any] = {}
+    match = _re.search(r"Evidence pack:\s*(\{.*\})", prompt or "", _re.DOTALL)
+    if match:
+        try:
+            evidence = _json.loads(match.group(1))
+        except ValueError:
+            evidence = {}
+
+    facts = evidence.get("resume_facts") or {}
+    name = str(facts.get("name") or "The candidate")
+    skills = [str(v) for v in (facts.get("skills") or [])][:4]
+    companies = [str(v) for v in (facts.get("companies") or [])][:2]
+    titles = [str(v) for v in (facts.get("titles") or [])][:2]
+    target_role = str(evidence.get("target_role") or evidence.get("persona_name") or "this track")
+    context = evidence.get("search_context") or {}
+    keywords = [str(v) for v in (context.get("keywords") or [])][:3]
+
+    strength_words = " and ".join(skills[:2]) if skills else target_role
+    identity = (
+        f"{name} is tracked on the {target_role} track. The evidence on file covers "
+        f"{', '.join(titles) if titles else 'the recorded roles'}"
+        f"{(' at ' + ' and '.join(companies)) if companies else ''}"
+        f"{(', working with ' + ', '.join(skills)) if skills else ''}."
+    )
+    directives = [f"prioritise {target_role} roles"]
+    if keywords:
+        directives.append(f"prefer roles emphasising {keywords[0]}")
+    return {
+        "headline": f"{target_role} track: {strength_words}",
+        "identity": identity,
+        "strengths": ([f"{strength_words} delivery",
+                       f"Recorded work as {titles[0]}" if titles else f"{target_role} experience"]
+                      if skills else [f"{target_role} experience", "Recorded activity on this track"]),
+        "gaps": ["No recorded ownership of frontend delivery"],
+        "positioning": f"Position against {target_role} requirements using the recorded evidence only.",
+        "search_directives": directives,
+        "outreach_angle": (f"{strength_words} work"
+                           + (f" at {companies[0]}" if companies else "") + "."),
+        "evidence": (skills + companies)[:6],
+    }
+
+
+def _stub_tracks() -> Dict[str, Any]:
+    return {"tracks": [
+        {"name": "Backend Engineer", "target_role": "Senior Backend Engineer",
+         "keywords": ["python backend", "fastapi", "payments"], "industries": ["fintech"],
+         "seniority": "senior", "why": "6 years of Python/FastAPI payments work at FinCo."},
+        {"name": "Platform Engineer", "target_role": "Platform Engineer",
+         "keywords": ["kubernetes", "aws", "docker"], "industries": ["developer tools"],
+         "seniority": "senior", "why": "AWS and Kubernetes ownership across both roles."},
+    ]}
+
+
+def stub_ai_response(workflow: str, prompt: str) -> Dict[str, Any]:
+    """Schema-valid answer per workflow — keeps every pipeline on the AI path."""
+    lowered = (prompt or "").lower()
+    if workflow == "parse":
+        return _stub_profile()
+    if workflow == "resume_gen":
+        if "cover letter" in lowered:
+            return {"cover_letter": ("Dear Hiring Manager,\n\n"
+                                     "Six years of Python, FastAPI and PostgreSQL work on payments "
+                                     "platforms at FinCo aligns directly with this role. At FinCo the "
+                                     "payments platform serves 2M users, and a FastAPI migration cut "
+                                     "p95 latency by 40%.\n\nI would welcome a short call about how "
+                                     "that experience maps to your team.\n\nRegards,\nTest Candidate"),
+                    "highlights": ["python", "fastapi"]}
+        return _stub_tailored()
+    if workflow == "scoring":
+        return _stub_score()
+    if workflow == "email_gen":
+        # Company-agnostic on purpose: the guardrail flags any employer the
+        # candidate did not work at, so the stand-in must not name one.
+        return {"subject": "Senior Backend Engineer role — Python payments",
+                "body": ("Hi team,\n\nI saw the Senior Backend Engineer opening and wanted to reach "
+                         "out directly. I have spent 6 years building Python, FastAPI and PostgreSQL "
+                         "services, most recently the payments platform at FinCo that serves 2M users.\n\n"
+                         "A FastAPI migration there cut p95 latency by 40%, which is the kind of work "
+                         "this role describes. Would you be open to a 15-minute call this week or next?")}
+    if workflow == "persona":
+        return _stub_tracks() if '"tracks"' in prompt else _stub_portrait(prompt)
+    if workflow == "tagging":
+        return {"tags": ["backend-python", "fintech", "aws"]}
+    if workflow == "keyword_extract":
+        return {"keywords": ["python backend engineer", "fastapi", "payments"],
+                "roles": ["Senior Backend Engineer"], "industries": ["fintech"],
+                "tech_stack": ["python", "fastapi", "postgresql"], "locations": ["Bangalore"],
+                "seniority": "senior", "funding_focus": ["fintech"]}
+    if workflow == "classify":
+        return {"size": "small", "reason": "stub"}
+    if workflow == "form_detect":
+        return {"portal_type": "unknown", "fields": [], "ai_confidence": 0.5}
+    if workflow == "interview":
+        return {"questions": [{"q": "Describe a payments system you scaled.", "category": "system design",
+                               "difficulty": "medium"}]}
+    if workflow == "company_intel":
+        return {"summary": "stub", "industry": "fintech", "size": "small", "tech_stack": ["python"]}
+    if workflow == "funding_scan":
+        return {"ranked": []}
+    return {"ok": True}
+
+
+@pytest.fixture(autouse=True)
+def ai_stub(monkeypatch, request):
+    """Deterministic AI answers unless the test drives a real provider."""
+    if request.node.get_closest_marker("real_ai"):
+        yield False
+        return
+
+    import app.services.ai_client as ai_client
+
+    original = ai_client.chat_completion
+    calls: list = []
+
+    async def fake_chat_completion(workflow, prompt, *, json_mode=True, **kwargs):
+        calls.append({"workflow": workflow, "prompt": prompt})
+        if ai_client.is_configured(workflow, db=kwargs.get("db"), user_id=kwargs.get("user_id")):
+            return await original(workflow, prompt, json_mode=json_mode, **kwargs)
+        payload = stub_ai_response(workflow, prompt)
+        if not json_mode:
+            return {"content": str(payload), "raw": {}, "usage": {}}
+        return payload
+
+    monkeypatch.setattr(ai_client, "chat_completion", fake_chat_completion)
+    request.node.stub_ai_calls = calls
+    yield True
+
+
 @pytest.fixture
 def db():
     session = SessionLocal()
