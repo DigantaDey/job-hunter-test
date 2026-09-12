@@ -2,6 +2,22 @@ import { useEffect, useState } from 'react'
 import client, { apiError } from '../api/client'
 import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader2, Wand2, CheckCircle, AlertCircle, Eye, Brain, Target, MapPin, DollarSign, GraduationCap, Zap, TrendingUp, FileText } from 'lucide-react'
 
+/**
+ * Where a score came from. The AI verdict and a keyword-overlap estimate are
+ * not the same claim, so the label travels with the number.
+ */
+function SourceBadge({ source }: { source?: string }) {
+  const map: Record<string, { label: string; cls: string; title: string }> = {
+    ai: { label: 'AI verified', cls: 'bg-emerald-600 text-white', title: 'Guardrail-checked model score' },
+    preliminary: { label: 'estimate', cls: 'bg-zinc-200 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-200', title: 'Keyword-overlap pre-rank — not an AI verdict' },
+    pending: { label: 'AI pending', cls: 'bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300', title: 'The model could not be reached' },
+    rejected: { label: 'rejected', cls: 'bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300', title: 'The model answered but failed the accuracy guardrail' },
+    insufficient_data: { label: 'no data', cls: 'bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300', title: 'Not enough text to score' },
+  }
+  const info = map[source || ''] || { label: source || 'unknown', cls: 'bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300', title: '' }
+  return <span title={info.title} className={`text-[10px] px-2 py-0.5 rounded-full font-normal mono ${info.cls}`}>{info.label}</span>
+}
+
 export default function Jobs(){
   const [jobs, setJobs] = useState<any[]>([])
   const [filter, setFilter] = useState({status:'', source:'', q:''})
@@ -38,7 +54,7 @@ export default function Jobs(){
     // Fetch intelligence breakdown
     client.get(`/api/jobs/${id}/intelligence`).then(r=>setIntelligence(r.data)).catch(()=>{})
     // Fetch company intel
-    client.get(`/api/jobs/company/${encodeURIComponent(data.company)}/intel`).then(r=>setCompanyIntel(r.data)).catch(()=>{})
+    client.get(`/api/company/${encodeURIComponent(data.company)}/intel`).then(r=>setCompanyIntel(r.data)).catch(()=>{})
   }
 
   const discover = async()=>{
@@ -165,7 +181,9 @@ export default function Jobs(){
               {intelligence ? (
                 <div className="bg-gradient-to-br from-zinc-50 to-blue-50/30 dark:from-zinc-800 dark:to-blue-950/20 rounded-xl p-4 border dark:border-zinc-700 space-y-3">
                   <div className="flex items-center justify-between">
-                    <div className="text-sm font-semibold flex items-center gap-2"><Target className="w-4 h-4"/> Overall Match <span className="text-lg mono">{intelligence.overall || intelligence.score}/100</span></div>
+                    <div className="text-sm font-semibold flex items-center gap-2"><Target className="w-4 h-4"/> Overall Match <span className="text-lg mono">{intelligence.overall || intelligence.score}/100</span>
+                      <SourceBadge source={intelligence.score_source} />
+                    </div>
                     <span className={`text-[11px] px-2 py-1 rounded-full font-bold ${intelligence.recommendation?.includes('HIGH')?'bg-emerald-600 text-white': intelligence.recommendation?.includes('GOOD')?'bg-blue-600 text-white':'bg-amber-500 text-white'}`}>{intelligence.recommendation}</span>
                   </div>
                   <div className="text-xs text-zinc-600 dark:text-zinc-400">{intelligence.recommendation_reason}</div>
@@ -176,7 +194,7 @@ export default function Jobs(){
                       <div className="bg-white dark:bg-zinc-900 rounded-lg p-2 text-center"><div className="text-[10px] mono uppercase text-zinc-500 flex items-center justify-center gap-1"><Clock className="w-3 h-3"/>Exp</div><div className="font-bold mono text-sm">{intelligence.breakdown.experience}</div></div>
                       <div className="bg-white dark:bg-zinc-900 rounded-lg p-2 text-center"><div className="text-[10px] mono uppercase text-zinc-500">Seniority</div><div className="font-bold mono text-sm">{intelligence.breakdown.seniority}</div></div>
                       <div className="bg-white dark:bg-zinc-900 rounded-lg p-2 text-center"><div className="text-[10px] mono uppercase text-zinc-500 flex items-center justify-center gap-1"><MapPin className="w-3 h-3"/>Location</div><div className="font-bold mono text-sm">{intelligence.breakdown.location}</div></div>
-                      <div className="bg-white dark:bg-zinc-900 rounded-lg p-2 text-center"><div className="text-[10px] mono uppercase text-zinc-500 flex items-center justify-center gap-1"><DollarSign className="w-3 h-3"/>Salary</div><div className="font-bold mono text-sm">{intelligence.breakdown.salary}</div></div>
+                      <div className="bg-white dark:bg-zinc-900 rounded-lg p-2 text-center"><div className="text-[10px] mono uppercase text-zinc-500 flex items-center justify-center gap-1"><DollarSign className="w-3 h-3"/>Domain</div><div className="font-bold mono text-sm">{intelligence.breakdown.domain}</div></div>
                       <div className="bg-white dark:bg-zinc-900 rounded-lg p-2 text-center"><div className="text-[10px] mono uppercase text-zinc-500 flex items-center justify-center gap-1"><GraduationCap className="w-3 h-3"/>Edu</div><div className="font-bold mono text-sm">{intelligence.breakdown.education}</div></div>
                     </div>
                   )}
@@ -186,6 +204,18 @@ export default function Jobs(){
                   )}
                   {intelligence.missing_weak?.length>0 && (
                     <div><div className="text-[11px] mono font-medium uppercase text-amber-700 dark:text-amber-300">Missing / weak areas</div><div className="flex flex-wrap gap-1 mt-1">{intelligence.missing_weak.map((s:string)=><span key={s} className="text-[11px] px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300">{s}</span>)}</div></div>
+                  )}
+                  {intelligence.ai_error && (
+                    <div className="text-[11px] p-2 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 mono">
+                      <div className="font-medium text-red-800 dark:text-red-200">AI scoring unavailable — this is not an AI verdict</div>
+                      <div className="text-red-700 dark:text-red-300 mt-0.5">{intelligence.ai_error.message} ({intelligence.ai_error.reason})</div>
+                      {intelligence.ai_error.fix && <div className="text-red-700 dark:text-red-300 mt-0.5"><strong>Fix:</strong> {intelligence.ai_error.fix}</div>}
+                      {intelligence.preliminary_score != null && <div className="text-red-600 dark:text-red-400 mt-0.5">Keyword-overlap estimate for reference: {intelligence.preliminary_score}/100</div>}
+                    </div>
+                  )}
+                  {intelligence.evidence?.length > 0 && (
+                    <div><div className="text-[11px] mono font-medium uppercase text-zinc-500">Evidence the score rests on</div>
+                      <ul className="mt-1 space-y-0.5">{intelligence.evidence.slice(0,4).map((e:string,i:number)=><li key={i} className="text-[11px] text-zinc-600 dark:text-zinc-400">“{e}”</li>)}</ul></div>
                   )}
                   {intelligence.upgrade_hint && <div className="text-[11px] p-2 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800">{intelligence.upgrade_hint}</div>}
                 </div>

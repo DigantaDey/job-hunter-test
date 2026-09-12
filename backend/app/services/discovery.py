@@ -19,11 +19,12 @@ from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.models.models import Job, User
 from app.services import sources as source_registry
+from app.services.ai_guardrails import AIUnavailableError
 from app.services.classifier import ai_company_size, heuristic_company_size
 from app.services.demo_pool import demo_jobs
 from app.services.events import record_job_event
 from app.services.form_detector import detect_form_structure
-from app.services.scoring import ai_score, heuristic_score
+from app.services.scoring import heuristic_score, score_job
 from app.services.user_settings import get_setting
 
 log = get_logger("app.discovery")
@@ -45,23 +46,47 @@ def _demo_pool_enabled() -> bool:
     return bool(settings.include_demo_pool)
 
 
-async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[str, Any]], use_ai: bool) -> None:
-    """Heuristic score for all; AI re-score for the strongest candidates."""
+async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[str, Any]], use_ai: bool,
+                            *, db=None, user_id: Optional[int] = None,
+                            persona: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Preliminary score for all; guardrailed AI verdict for the strongest.
+
+    Provenance is recorded on every candidate: scoring 200 postings with the
+    model is not viable, so the bulk of a discovery run carries a deterministic
+    *preliminary* score, and only the top slice gets the real AI verdict. The
+    UI reads ``score_source`` so a keyword estimate is never presented as an
+    AI match score.
+    """
     for candidate in candidates:
         score, reason = heuristic_score(profile_data, candidate["description"])
         candidate["score"] = score
-        candidate["score_reason"] = f"heuristic: {reason}"
+        candidate["score_reason"] = f"Preliminary keyword estimate: {reason}"
+        candidate["score_source"] = "preliminary"
 
     if not use_ai or not profile_data:
         return
     ranked = sorted(candidates, key=lambda c: c["score"], reverse=True)[:AI_RESCORE_TOP]
+    ai_outage: Optional[Dict[str, Any]] = None
     for candidate in ranked:
         try:
-            score, reason = await ai_score(profile_data, candidate["description"])
-            candidate["score"] = score
-            candidate["score_reason"] = reason
-        except Exception as exc:  # AI failure must not fail discovery
+            result = await score_job(profile_data, candidate["description"], db=db, user_id=user_id,
+                                     persona=persona, allow_preliminary=False)
+            candidate["score"] = result["score"]
+            candidate["score_reason"] = result["reason"]
+            candidate["score_source"] = result["score_source"]
+            candidate["score_detail"] = result.get("detail") or {}
+        except AIUnavailableError as exc:
+            # Do not keep hammering a provider that is down — report it once
+            # and leave the remaining candidates on their preliminary score.
+            ai_outage = exc.payload()
+            log.warning("AI scoring unavailable during discovery (%s): %s", exc.reason, exc.detail)
+            break
+        except Exception as exc:  # a single bad JD must not fail discovery
             log.debug("ai scoring skipped: %s", exc)
+    if ai_outage:
+        for candidate in candidates:
+            candidate.setdefault("ai_error", ai_outage)
 
 
 async def discover_for_user(
@@ -75,8 +100,10 @@ async def discover_for_user(
     source_ids: Optional[List[str]] = None,
     board_tokens: Optional[List[str]] = None,
     profile: Optional[Dict[str, Any]] = None,
+    persona_id: Optional[int] = None,
+    persona_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run one discovery pass for a user and persist new jobs."""
+    """Run one discovery pass for a user (optionally scoped to one persona)."""
 
     profile_data = profile or {}
     started = datetime.utcnow()
@@ -136,7 +163,8 @@ async def discover_for_user(
     candidates = [c for c in candidates if c["dedupe_key"] not in existing_keys]
 
     # ---------------- score / classify ----------------
-    await _score_candidates(profile_data, candidates, use_ai=bool(profile_data))
+    await _score_candidates(profile_data, candidates, use_ai=bool(profile_data),
+                            db=db, user_id=user.id, persona=persona_context)
 
     ranked = sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)[:limit * 2]
     for index, candidate in enumerate(ranked):
@@ -164,6 +192,10 @@ async def discover_for_user(
             status="discovered",
             score=float(candidate.get("score", 0.0)),
             score_reason=candidate.get("score_reason", ""),
+            score_source=str(candidate.get("score_source") or "preliminary"),
+            score_detail=candidate.get("score_detail") or ({"ai_error": candidate["ai_error"]}
+                                                           if candidate.get("ai_error") else {}),
+            persona_id=persona_id,
             company_size=candidate.get("company_size", "unknown"),
             company_info={"confidence": candidate.get("company_size_confidence", 0.0),
                           "industry": candidate.get("industry", "")},

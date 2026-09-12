@@ -17,6 +17,7 @@ import Billing from './pages/Billing'
 import Analytics from './pages/Analytics'
 import Interview from './pages/Interview'
 import Notifications from './pages/Notifications'
+import Personas from './pages/Personas'
 import { AuthProvider, useAuth } from './context/AuthContext'
 
 function RequireAuth({ children }: { children: ReactNode }) {
@@ -45,6 +46,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/jobs" element={<Jobs />} />
             <Route path="/queues" element={<Queues />} />
+            <Route path="/personas" element={<Personas />} />
             <Route path="/resumes" element={<Resumes />} />
             <Route path="/emails" element={<Emails />} />
             <Route path="/funding" element={<Funding />} />

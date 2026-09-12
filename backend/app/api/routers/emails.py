@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, List, Optional
+from typing import Annotated, Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -13,9 +13,16 @@ from app.core.auth import require_consent
 from app.core.entitlements import enforce, increment_usage
 from app.core.logging import get_logger
 from app.models.models import Email, EmailEvent, EmailOptOut, Job, User
-from app.schemas.schemas import EmailOut
+from app.services import persona as persona_service
 from app.services.job_queue import enqueue
-from app.services.outreach import compliance_report, draft_email, send_email, suppress, tracking_urls
+from app.services.outreach import (
+    compliance_report,
+    draft_email,
+    is_role_mailbox,
+    send_email,
+    suppress,
+    tracking_urls,
+)
 
 router = APIRouter(prefix="/emails", tags=["emails"])
 log = get_logger("app.emails")
@@ -28,12 +35,72 @@ def _email_or_404(db, user_id: int, email_id: int) -> Email:
     return row
 
 
-@router.get("", response_model=List[EmailOut])
+def _bucket_row(row: Email, *, jobs: Dict[int, Job]) -> Dict[str, Any]:
+    """
+    One approval-bucket card.
+
+    The bucket is where the user decides what actually gets sent, so it has to
+    answer "which job was this written for, and is this address real?" without
+    the user leaving the page.
+    """
+    job = jobs.get(row.job_id) if row.job_id else None
+    excerpt = row.jd_excerpt or (job.description if job else "") or ""
+    return {
+        "id": row.id,
+        "to_email": row.to_email,
+        "to": row.to_email,  # alias kept for existing API clients
+        "to_name": row.to_name,
+        "subject": row.subject,
+        "body": row.body,
+        "status": row.status,
+        "company": row.company,
+        "recipient_type": row.recipient_type,
+        "source": row.source,
+        "confidence": row.confidence,
+        "verified": bool(row.verified),
+        "role_mailbox": is_role_mailbox(row.to_email),
+        "ai_used": bool(row.ai_used),
+        "guardrail": row.guardrail_report or {},
+        "opens": row.opens,
+        "dry_run": row.dry_run,
+        "created_at": row.created_at,
+        "sent_at": row.sent_at,
+        "job": ({
+            "id": row.job_id,
+            "title": row.job_title or (job.title if job else ""),
+            "company": row.company,
+            "url": row.job_url or (job.url if job else ""),
+            "jd_excerpt": excerpt[:600],
+            "jd_length": len(excerpt),
+        } if row.job_id else None),
+    }
+
+
+@router.get("")
 def list_emails(user: CurrentUser, db: DbSession, status: Optional[str] = None, limit: int = Query(200, le=500)):
+    """Approval bucket, with the job/JD context each draft was written for."""
     query = db.query(Email).filter(Email.user_id == user.id)
     if status:
         query = query.filter(Email.status == status)
-    return query.order_by(Email.created_at.desc()).limit(limit).all()
+    rows = query.order_by(Email.created_at.desc()).limit(limit).all()
+    job_ids = {row.job_id for row in rows if row.job_id}
+    jobs: Dict[int, Job] = {}
+    if job_ids:
+        jobs = {job.id: job for job in db.query(Job).filter(Job.id.in_(job_ids)).all()}
+    return [_bucket_row(row, jobs=jobs) for row in rows]
+
+
+@router.get("/contacts")
+async def preview_contacts(user: CurrentUser, db: DbSession, company: str = Query(...), department: str = "engineering"):
+    """Show who we can find *before* drafting anything (transparency + trust)."""
+    enforce(db, user.id, "contact_discovery_per_month")
+    from app.services.contact_discovery import discover_decision_makers
+
+    result = await discover_decision_makers(company, department=department, limit=8)
+    for contact in result.get("contacts") or []:
+        contact["role_mailbox"] = is_role_mailbox(str(contact.get("email") or ""))
+    increment_usage(db, user.id, "contact_discovery_per_month", 1)
+    return result
 
 
 class EmailGenerate(BaseModel):
@@ -45,6 +112,7 @@ class EmailGenerate(BaseModel):
     recipient_name: Optional[str] = None
     context: str = ""
     queue: bool = False
+    persona_id: Optional[int] = None
 
 
 @router.post("/generate")
@@ -64,12 +132,18 @@ async def create_email(payload: EmailGenerate, request: Request, user: CurrentUs
     if payload.recipient_email:
         recipient = {"name": payload.recipient_name or "", "email": payload.recipient_email, "title": "", "confidence": 1.0, "source": "manual", "verified": False}
 
+    persona = persona_service.get_persona(db, user.id, payload.persona_id or (job.persona_id if job else None))
     try:
-        result = await draft_email(db, user, company=payload.company, job=job, founder=payload.founder, department=payload.department, recipient=recipient, extra_context=payload.context)
+        result = await draft_email(db, user, company=payload.company, job=job, founder=payload.founder,
+                                   department=payload.department, recipient=recipient,
+                                   extra_context=payload.context,
+                                   persona_id=persona.id if persona else None)
     except ValueError as exc:
         reason = str(exc)
         messages = {
             "profile_missing": "Upload your resume first so outreach can be personalised",
+            "profile_name_missing": ("Your profile has no name, so the email cannot be signed. "
+                                     "Re-upload your master resume with AI online, or add your name to the profile."),
             "no_recipient": "No contact could be found — provide recipient_email explicitly",
             "suppressed": "That recipient is on your suppression list",
         }
@@ -81,21 +155,13 @@ async def create_email(payload: EmailGenerate, request: Request, user: CurrentUs
     increment_usage(db, user.id, "outreach_per_month", 1)
     increment_usage(db, user.id, "contact_discovery_per_month", 1)
     return {
-        "email": {"id": email_row.id, "to": email_row.to_email, "subject": email_row.subject, "body": email_row.body, "status": email_row.status, "source": email_row.source, "confidence": email_row.confidence},
+        "email": _bucket_row(email_row, jobs={job.id: job} if job else {}),
         "decision_maker": result["decision"],
+        "contact": {**result["contact"], "role_mailbox": is_role_mailbox(email_row.to_email),
+                    "verified": bool(email_row.verified)},
         "ai": {"used": result["ai"].get("ai_used"), "fact_guard": result["ai"].get("fact_guard")},
+        "persona": persona_service.to_dict(persona, include_memory=False) if persona else None,
     }
-
-
-@router.get("/contacts")
-async def preview_contacts(user: CurrentUser, db: DbSession, company: str = Query(...), department: str = "engineering"):
-    """Show who we can find *before* drafting anything (transparency + trust)."""
-    enforce(db, user.id, "contact_discovery_per_month")
-    from app.services.contact_discovery import discover_decision_makers
-
-    result = await discover_decision_makers(company, department=department, limit=8)
-    increment_usage(db, user.id, "contact_discovery_per_month", 1)
-    return result
 
 
 @router.put("/{email_id}")

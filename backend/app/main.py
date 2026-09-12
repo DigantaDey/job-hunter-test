@@ -177,6 +177,30 @@ def create_app() -> FastAPI:
     app.include_router(router, prefix="/api")
 
     # --- error handling: one JSON shape, always with a request id ---
+    from app.services.ai_guardrails import AIUnavailableError, GuardrailError
+
+    @app.exception_handler(AIUnavailableError)
+    async def ai_unavailable_handler(request: Request, exc: AIUnavailableError):
+        """AI offline is never a silent degradation — the UI gets the reason."""
+        inc("jobhunter_http_errors_total", kind="ai_unavailable", reason=exc.reason)
+        log.warning("AI unavailable for %s (%s): %s", exc.workflow, exc.reason, exc.detail)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": exc.message, "request_id": getattr(request.state, "request_id", ""),
+                     **exc.payload()},
+        )
+
+    @app.exception_handler(GuardrailError)
+    async def guardrail_handler(request: Request, exc: GuardrailError):
+        """The model answered but the answer is not safe to ship."""
+        inc("jobhunter_http_errors_total", kind="guardrail_failed", workflow=exc.workflow)
+        log.warning("guardrail rejected %s output: %s", exc.workflow, exc.issues[:4])
+        return JSONResponse(
+            status_code=422,
+            content={"detail": exc.payload()["message"], "request_id": getattr(request.state, "request_id", ""),
+                     **exc.payload()},
+        )
+
     @app.exception_handler(RequestValidationError)
     async def validation_handler(request: Request, exc: RequestValidationError):
         inc("jobhunter_http_errors_total", kind="validation")

@@ -105,7 +105,15 @@ async def choose_resume(
 
     if score >= generate_min_score and (profile.data or {}):
         strict = bool(get_setting(db, user_id, "general", "strict_skeleton", False))
-        tailored = await generate_tailored_profile(profile.data, job.description, profile.layout or {}, strict)
+        from app.services import persona as persona_service
+
+        persona = persona_service.get_persona(db, user_id, job.persona_id)
+        persona_payload = ({"name": persona.name, "target_role": persona.target_role,
+                            "observed_skills": list((persona_service.memory_summary(persona)
+                                                     .get("observed_skills") or {}).keys())[:12]}
+                           if persona else None)
+        tailored = await generate_tailored_profile(profile.data, job.description, profile.layout or {}, strict,
+                                                   db=db, user_id=user_id, persona=persona_payload)
         guard = fact_guard_check(profile.data or {}, tailored.get("tailored_profile") or {})
         if not guard["passed"]:
             log.warning("fact guard violations: %s", guard["violations"])
@@ -113,7 +121,11 @@ async def choose_resume(
                              message=f"Tailored resume flagged {len(guard['violations'])} potential fabrication(s)",
                              meta=guard)
         resume = build_and_save_resume(db, user_id=user_id, profile=profile, job=job, tailored=tailored,
-                                       strict_skeleton=strict, status="pending")
+                                       strict_skeleton=strict, status="pending",
+                                       persona_id=persona.id if persona else None)
+        persona_service.record_signal(db, user_id, resume.persona_id, "resume_generated",
+                                      {"title": job.title, "company": job.company,
+                                       "keywords": tailored.get("tags") or []})
         record_job_event(db, user_id=user_id, job_id=job.id, stage="resume_generated", status="info",
                          message=f"Generated tailored resume #{resume.id} (score {score:.0f}) — awaiting approval",
                          meta={"fact_guard": guard})

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.models import Job, Profile, Resume
-from app.services.resume_generator import build_docx, build_pdf, hash_jd
+from app.services.resume_generator import build_docx, build_pdf, hash_jd, professional_filename
 
 
 def render_profile_text(profile: Dict[str, Any]) -> str:
@@ -74,10 +74,13 @@ def build_and_save_resume(
     strict_skeleton: bool = False,
     status: str = "pending",
     resume_type: str = "generated",
+    persona_id: Optional[int] = None,
 ) -> Resume:
     """Render DOCX+PDF and persist the resume row (pending approval by default)."""
     tailored_profile = tailored.get("tailored_profile", tailored if isinstance(tailored, dict) else {})
     jd_hash = hash_jd(job.description if job and job.description else tailored_profile.get("summary", ""))
+    # The path on disk stays opaque and collision-free; ``filename``/
+    # ``display_name`` are what the user sees and downloads.
     stem = f"resume_{job.id if job else 'general'}_{jd_hash}"
     os.makedirs(settings.generated_dir, exist_ok=True)
     docx_path = os.path.join(settings.generated_dir, f"{stem}.docx")
@@ -86,9 +89,10 @@ def build_and_save_resume(
     build_docx(tailored_profile, profile.data or {}, profile.layout or {}, docx_path)
     build_pdf(tailored_profile, profile.data or {}, pdf_path)
 
+    display_name = professional_filename(tailored_profile or profile.data or {}, job, "pdf")
     resume = Resume(
         user_id=user_id,
-        filename=f"{stem}.docx",
+        filename=professional_filename(tailored_profile or profile.data or {}, job, "docx"),
         filepath=docx_path,
         type=resume_type,
         status=status,
@@ -97,12 +101,31 @@ def build_and_save_resume(
         tags=tailored.get("tags", []) or [],
         jd_hash=jd_hash,
         job_id=job.id if job else None,
+        persona_id=persona_id,
+        display_name=display_name,
+        guardrail_report=tailored.get("guardrail", {}) or {},
         text_snapshot=render_profile_text(tailored_profile),
     )
     db.add(resume)
     db.commit()
     db.refresh(resume)
     return resume
+
+
+def download_filename(resume: Resume, fmt: str = "pdf") -> str:
+    """
+    The name the browser saves the file under.
+
+    Prefers the professional display name; falls back to the stored filename and
+    finally to a readable placeholder, so a user never downloads
+    ``resume_26_a6786c6``.
+    """
+    base = resume.display_name or resume.filename or f"resume-{resume.id}"
+    stem, extension = os.path.splitext(base)
+    extension = (extension or f".{fmt}").lower()
+    if extension not in (".pdf", ".docx", ".doc"):
+        extension = f".{fmt}"
+    return f"{stem}{extension}"
 
 
 def create_polished_resume(
@@ -168,6 +191,8 @@ def resume_preview(resume: Resume) -> Dict[str, Any]:
         "job_id": resume.job_id,
         "parent_resume_id": resume.parent_resume_id,
         "created_at": resume.created_at.isoformat() if resume.created_at else None,
+        "display_name": resume.display_name or resume.filename,
+        "guardrail_report": resume.guardrail_report or {},
         "text": resume_text(resume),
         "profile": profile,
         "facts": {

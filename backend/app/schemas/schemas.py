@@ -29,6 +29,11 @@ class ResumeOut(ORMModel):
     job_id: Optional[int] = None
     parent_resume_id: Optional[int] = None
     approved_at: Optional[datetime] = None
+    # The name a recruiter sees in their downloads folder, and the verdict of
+    # the accuracy checker that produced the document.
+    display_name: Optional[str] = None
+    persona_id: Optional[int] = None
+    guardrail_report: Optional[dict] = None
 
 
 class JobOut(ORMModel):
@@ -53,6 +58,11 @@ class JobDetail(JobOut):
     company_info: Dict[str, Any]
     extra: Dict[str, Any]
     applied_with_resume_id: Optional[int] = None
+    # ai | preliminary | pending | rejected | insufficient_data — the list must
+    # never present a keyword-overlap estimate as a model verdict.
+    score_source: Optional[str] = None
+    score_detail: Optional[dict] = None
+    persona_id: Optional[int] = None
 
 
 class VaultOut(ORMModel):
@@ -79,6 +89,16 @@ class EmailOut(ORMModel):
     dry_run: bool = True
     created_at: datetime
     sent_at: Optional[datetime] = None
+    # Which posting the draft was written for, and whether the address is a
+    # verified person or a guessed department mailbox.
+    job_id: Optional[int] = None
+    job_title: Optional[str] = None
+    job_url: Optional[str] = None
+    jd_excerpt: Optional[str] = None
+    persona_id: Optional[int] = None
+    verified: bool = False
+    ai_used: bool = False
+    guardrail_report: Optional[dict] = None
 
 
 class ErrorLogOut(ORMModel):

@@ -33,10 +33,17 @@ async def handle_discovery(db: Session, item: PipelineJob) -> Dict[str, Any]:
     if not user:
         raise RuntimeError("user_missing")
     payload = item.payload or {}
+    from app.services import persona as persona_service
     from app.services.discovery import discovery_sources_config
 
     config = discovery_sources_config(db, user.id)
-    return await discover_for_user(
+    persona = persona_service.get_persona(db, user.id, payload.get("persona_id"))
+    persona_context = None
+    if persona:
+        memory = persona_service.memory_summary(persona)
+        persona_context = {"name": persona.name, "target_role": persona.target_role,
+                           "observed_skills": list((memory.get("observed_skills") or {}).keys())[:12]}
+    result = await discover_for_user(
         db,
         user,
         keywords=payload.get("keywords") or [],
@@ -45,7 +52,13 @@ async def handle_discovery(db: Session, item: PipelineJob) -> Dict[str, Any]:
         live_enabled=bool(payload.get("live_enabled", config["live_enabled"])),
         source_ids=payload.get("sources") or config["sources"],
         board_tokens=payload.get("board_tokens") or config["board_tokens"],
+        persona_id=payload.get("persona_id") or (persona.id if persona else None),
+        persona_context=persona_context,
     )
+    # One signal per run is enough to mark the track as active in memory.
+    if persona and (result.get("job_ids") or []):
+        persona_service.record_signal(db, user.id, persona.id, "job_scored", {"note": "discovery run"})
+    return result
 
 
 async def handle_application(db: Session, item: PipelineJob) -> Dict[str, Any]:

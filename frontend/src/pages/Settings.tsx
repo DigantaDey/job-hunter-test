@@ -13,11 +13,13 @@ export default function Settings(){
   const [aiForm, setAiForm]=useState({base_url:'', model:'', api_key:'', rpm:60})
   const [aiStatus, setAiStatus]=useState<any>(null)
   const [aiSaving, setAiSaving]=useState(false)
+  const [extracted, setExtracted]=useState<any>(null)
 
   const load=async()=>{
     const {data}=await client.get('/api/settings'); setData(data)
     const {data:wfc}=await client.get('/api/ai/config'); setWfConfig(wfc.overrides||wfc||{})
     const {data:status}=await client.get('/api/settings/ai/status'); setAiStatus(status)
+    try{ const {data:ctx}=await client.get('/api/context/keywords'); setExtracted(ctx) }catch{ setExtracted(null) }
     // Prefill AI form from settings
     if(data?.ai){
       setAiForm({
@@ -191,7 +193,23 @@ export default function Settings(){
         <div className="card p-5">
           <h3 className="font-medium flex items-center gap-2"><Search className="w-4 h-4"/> Scraping</h3>
           <div className="mt-3 space-y-3">
-            <div><label className="text-xs mono">Keywords (comma-separated, extracted from resume + editable)</label><input value={Array.isArray(data.scraping.keywords) ? data.scraping.keywords.join(', ') : (data.scraping.keywords || '')} onChange={e=>update('scraping','keywords', e.target.value.split(',').map(s=>s.trim()).filter(Boolean))} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
+            <div>
+              <label className="text-xs mono font-medium">Extracted from your resume (AI, read-only)</label>
+              <div className="mt-1 min-h-[38px] border rounded-xl px-3 py-2 bg-zinc-50 dark:bg-zinc-800 dark:border-zinc-700 flex flex-wrap gap-1">
+                {(extracted?.keywords || []).length === 0
+                  ? <span className="text-xs text-zinc-500 mono">Nothing yet — upload a master resume and the AI extracts these automatically.</span>
+                  : (extracted.keywords || []).map((k:string)=> <span key={k} className="text-[11px] px-2 py-0.5 rounded-full bg-white dark:bg-zinc-900 border dark:border-zinc-700 mono">{k}</span>)}
+              </div>
+              <div className="text-[11px] mono text-zinc-500 mt-1">
+                Source: {extracted?.source ? (extracted.source === 'ai' || String(extracted.source).startsWith('ai') ? 'AI extraction' : `${extracted.source} (AI offline)`) : 'unknown'}
+                {extracted?.profile_id ? '' : ' • no resume uploaded yet'}
+              </div>
+            </div>
+            <div>
+              <label className="text-xs mono">Extra search keywords (comma-separated, optional)</label>
+              <input value={Array.isArray(data.scraping.keywords) ? data.scraping.keywords.join(', ') : (data.scraping.keywords || '')} onChange={e=>update('scraping','keywords', e.target.value.split(',').map(s=>s.trim()).filter(Boolean))} placeholder="empty by default — add terms your resume does not cover" className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/>
+              <div className="text-[11px] mono text-zinc-500 mt-1">Added <em>on top of</em> the extracted keywords. This starts empty on purpose — nothing generic is prefilled.</div>
+            </div>
             <div><label className="text-xs mono">Job freshness (hours)</label><input type="number" value={data.scraping.freshness_hours} onChange={e=>update('scraping','freshness_hours', Number(e.target.value))} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
             <div><label className="text-xs mono">Sources (clubbed)</label><div className="flex flex-wrap gap-1 mt-1">{(data.scraping.sources||[]).map((s:string)=> <span key={s} className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 mono">{s}</span>)}</div></div>
             <label className="flex items-center gap-2 text-sm pt-1"><input type="checkbox" checked={!!data.scraping.live_enabled} onChange={e=>update('scraping','live_enabled', e.target.checked)}/> Live job sources (Arbeitnow + Remotive, keyless APIs)</label>

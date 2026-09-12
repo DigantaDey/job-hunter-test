@@ -160,3 +160,47 @@ def test_every_spa_write_call_matches_the_api_schema():
             )
 
     assert not problems, "SPA/API contract mismatches:\n  - " + "\n  - ".join(problems)
+
+
+# --------------------------------------------------------------------------- #
+# GET calls: path existence
+#
+# The write-call check above cannot catch a mistyped read path — a GET to a
+# route that does not exist answers 404 and the page silently renders its empty
+# state. `/api/resumes/context/keywords` (the real route is
+# `/api/context/keywords`) shipped exactly like that: the Settings page showed
+# "Nothing yet — upload a master resume" forever.
+# --------------------------------------------------------------------------- #
+_GET = re.compile(
+    r"""client\.get\(\s*(?P<quote>['"`])(?P<url>/api/[^'"`]*)(?P=quote)"""
+)
+
+
+def _collect_reads() -> List[Tuple[str, str]]:
+    """Return (file, url) for every SPA read call with a literal path."""
+    calls: List[Tuple[str, str]] = []
+    for path in _iter_source_files():
+        source = open(path, encoding="utf-8").read()
+        for match in _GET.finditer(source):
+            calls.append((os.path.relpath(path, FRONTEND_SRC), match.group("url")))
+    return calls
+
+
+@pytest.mark.skipif(not os.path.isdir(FRONTEND_SRC), reason="frontend sources not present")
+def test_every_spa_read_call_matches_the_api_schema():
+    paths = _schema_paths()
+    calls = _collect_reads()
+    assert calls, "no client.get calls found — did the SPA layout change?"
+
+    problems: List[str] = []
+    for file, url in calls:
+        schema_path = _match_schema_path(url, paths)
+        if schema_path is None:
+            problems.append(f"{file}: GET {url} — no such route in the OpenAPI schema")
+            continue
+        if "get" not in paths[schema_path]:
+            allowed = sorted(k for k in paths[schema_path]
+                             if k in {"get", "post", "put", "patch", "delete"})
+            problems.append(f"{file}: GET {url} — route exists but only allows {allowed}")
+
+    assert not problems, "SPA/API read mismatches:\n  - " + "\n  - ".join(problems)

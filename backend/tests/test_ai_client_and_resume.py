@@ -20,6 +20,7 @@ from app.services.ai_client import (
 from app.services.scoring import jd_similarity, should_generate_new_resume
 
 
+@pytest.mark.real_ai
 def test_ai_client_without_key_raises_before_the_wire():
     import app.services.ai_client as ai
 

@@ -17,6 +17,7 @@ from app.core.entitlements import can, enforce, get_user_plan, increment_usage
 from app.core.logging import get_logger
 from app.models.models import Job, JobEvent, PipelineJob, Profile, UserInputRequest
 from app.schemas.schemas import JobDetail, JobOut
+from app.services import persona as persona_service
 from app.services.apply_flow import mark_applied, prepare_application
 from app.services.classifier import ai_company_size, heuristic_company_size
 from app.services.discovery import discovery_sources_config
@@ -87,37 +88,72 @@ def get_job(job_id: int, user: CurrentUser, db: DbSession):
 
 
 @router.get("/jobs/{job_id}/intelligence")
-async def job_intelligence(job_id: int, user: CurrentUser, db: DbSession):
+async def job_intelligence(job_id: int, request: Request, user: CurrentUser, db: DbSession):
     """Transparent job intelligence breakdown — Pro feature with fallback."""
     job = _job_or_404(db, user.id, job_id)
     profile = db.query(Profile).filter(Profile.user_id == user.id).order_by(Profile.created_at.desc()).first()
     profile_data = (profile.data if profile else {}) or {}
 
+    force = bool(request.query_params.get("refresh")) if hasattr(request, "query_params") else False
     stored = (job.extra or {}).get("intelligence")
-    if stored:
+    if stored and not force:
         return stored
 
-    from app.services.scoring import ai_score_detailed, heuristic_score_detailed
+    from app.services.scoring import RUBRIC_WEIGHTS, heuristic_score_detailed, score_job
 
     use_advanced = can(db, user.id, "can_use_advanced_matching")
+    persona = persona_service.get_persona(db, user.id, job.persona_id)
+    persona_context = (
+        {"name": persona.name, "target_role": persona.target_role,
+         "observed_skills": list((persona_service.memory_summary(persona).get("observed_skills") or {}).keys())[:12]}
+        if persona else None
+    )
 
     if use_advanced:
-        try:
-            detail = await ai_score_detailed(profile_data, job.description or "", ai_config=None)
-        except Exception:
-            detail = heuristic_score_detailed(profile_data, job.description or "")
+        result = await score_job(profile_data, job.description or "", db=db, user_id=user.id,
+                                 persona=persona_context)
+        detail = result.get("detail") or {}
+        detail["source"] = result["score_source"]
+        if result.get("error"):
+            # AI offline is reported, never papered over with a keyword estimate.
+            detail["ai_error"] = result["error"]
+            detail["preliminary_score"] = result.get("preliminary_score")
     else:
         detail = heuristic_score_detailed(profile_data, job.description or "")
         detail["upgrade_hint"] = "Upgrade to Pro for AI-powered advanced matching breakdown"
 
+    # Provenance is part of the contract, not a detail: the UI must be able to
+    # tell an AI verdict apart from a keyword-overlap estimate at a glance, and
+    # the persisted breakdown must say the same as the response.
+    # ``weights`` is what the scorer calls it; ``rubric`` is the API/UI name.
+    detail["rubric"] = detail.get("weights") or RUBRIC_WEIGHTS
+    detail["score"] = float(detail.get("overall") or detail.get("score") or job.score or 0)
+    detail["score_source"] = str(detail.get("source") or "preliminary")
+
+    # Persist the verdict + its provenance on the job row so lists can be honest.
+    job.score = detail["score"]
+    job.score_reason = str(detail.get("reason") or job.score_reason or "")
+    job.score_source = str(detail.get("source") or "preliminary")
+    job.score_detail = detail
     try:
         extra = dict(job.extra or {})
         extra["intelligence"] = detail
         job.extra = extra
         db.commit()
     except Exception:
-        pass
+        db.rollback()
 
+    if persona and detail.get("source") == "ai":
+        persona_service.record_signal(db, user.id, persona.id, "job_scored",
+                                      {"title": job.title, "company": job.company,
+                                       "score": detail.get("overall"),
+                                       "score_band": detail.get("recommendation"),
+                                       "skills": detail.get("missing_weak") or []})
+
+    # Provenance is part of the contract, not a detail: the UI must be able to
+    # tell an AI verdict apart from a keyword-overlap estimate at a glance.
+    detail["score"] = job.score
+    detail["score_source"] = job.score_source
     return detail
 
 
@@ -145,6 +181,7 @@ class DiscoveryRequest(BaseModel):
     limit: int = Field(default=40, ge=1, le=200)
     live_enabled: Optional[bool] = None
     sources: Optional[List[str]] = None
+    persona_id: Optional[int] = None
 
 
 @router.post("/jobs/discover")
@@ -156,9 +193,14 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
     # Daily counter incremented at trigger time (to enforce rate); monthly by actual discovered count in discovery.py
     increment_usage(db, user.id, "jobs_discovered_per_day", 1)
 
+    persona = persona_service.get_persona(db, user.id, payload.persona_id) or \
+        persona_service.ensure_default_persona(db, user.id)
     context = await search_context(db, user.id)
+    context = persona_service.context_for_persona(context, persona)
     config = discovery_sources_config(db, user.id)
 
+    # Only what the user explicitly typed/edited — the resume-derived keywords
+    # arrive via `context` below, so nothing is prefilled with generic terms.
     settings_keywords = get_setting(db, user.id, "scraping", "keywords", settings.default_keywords)
     if isinstance(settings_keywords, list):
         settings_keywords = ", ".join(str(k) for k in settings_keywords)
@@ -189,9 +231,10 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
             "live_enabled": live_enabled,
             "sources": payload.sources or config["sources"],
             "board_tokens": config["board_tokens"],
+            "persona_id": persona.id if persona else None,
         },
         priority=3,
-        dedupe_key=f"discovery:{','.join(keywords[:5])}:{freshness}",
+        dedupe_key=f"discovery:{persona.id if persona else 0}:{','.join(keywords[:5])}:{freshness}",
     )
     return {
         "queued": item is not None,
