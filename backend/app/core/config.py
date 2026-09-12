@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.0.3"
+    version: str = "2.0.4"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -210,7 +210,9 @@ class Settings(BaseSettings):
     ai_max_retries: int = 3
     ai_backoff_base: float = 1.5
     ai_daily_token_budget: int = 0
-    ai_max_output_tokens: int = 1200
+    # Resume parsing emits a large JSON document (every role, bullet, skill…).
+    # 1200 truncated it mid-JSON, surfacing as invalid_json / empty answers.
+    ai_max_output_tokens: int = 4000
 
     # ------------------------------------------------------------------ #
     # Job sources

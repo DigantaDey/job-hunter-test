@@ -51,7 +51,10 @@ def test_workflow_override_resolution():
 def test_usage_and_breaker_snapshots_have_stable_shape():
     assert isinstance(usage_snapshot(), dict)
     for workflow, row in usage_snapshot().items():
-        assert {"calls", "tokens"} <= set(row), workflow
+        # The bucket shape the settings/AI status endpoints render. (This used
+        # to assert a non-existent "tokens" key and passed only vacuously,
+        # because nothing had populated the snapshot yet.)
+        assert {"calls", "prompt_tokens", "completion_tokens", "total_tokens"} <= set(row), workflow
     assert all({"failures", "open"} <= set(row) for row in breaker_snapshot().values())
 
 

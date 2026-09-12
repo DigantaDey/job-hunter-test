@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import json
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -56,6 +57,9 @@ REASON_BUDGET = "budget_exhausted"
 REASON_ENTITLEMENT = "limit_exceeded"
 REASON_MALFORMED = "malformed_response"
 REASON_INVALID_JSON = "invalid_json"
+REASON_EMPTY_RESPONSE = "empty_response"
+REASON_TRUNCATED = "truncated_response"
+REASON_CONTENT_FILTER = "content_filter"
 REASON_MODEL_UNAVAILABLE = "model_unavailable"
 REASON_UNKNOWN = "unknown"
 
@@ -65,6 +69,9 @@ _REASON_PREFIXES = {
     "budget_exhausted": REASON_BUDGET,
     "limit_exceeded": REASON_ENTITLEMENT,
     "invalid_json": REASON_INVALID_JSON,
+    "empty_response": REASON_EMPTY_RESPONSE,
+    "truncated_response": REASON_TRUNCATED,
+    "content_filter": REASON_CONTENT_FILTER,
     "malformed_response": REASON_MALFORMED,
     "http_error": REASON_UNREACHABLE,
     "stored_key_unreadable": REASON_STORED_KEY_UNREADABLE,
@@ -400,34 +407,220 @@ def _estimate_tokens_from_text(prompt: str, content: str) -> int:
         return 0
 
 
+#: Invisible characters some providers wrap answers in (BOM, zero-width joiners).
+#: They break ``json.loads`` while being undetectable in logs.
+_INVISIBLES_TABLE = str.maketrans("", "", "\ufeff\u200b\u200c\u200d\u2060")
+#: How many opening-bracket positions to probe when salvaging the model's last
+#: JSON draft out of a reasoning trace.
+_MAX_JSON_SALVAGE_TRIES = 32
+#: Upper bound for automatic max_tokens escalation (reasoning models can need
+#: thousands of tokens of thinking before the JSON is even started).
+_MAX_OUTPUT_TOKENS_CEILING = 16000
+#: ```json { ... } ``` or ``` { ... } ``` blocks (findall → every block, so the
+#: last one — the model's final answer — can be tried first).
+_FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
+
+
 def _extract_json_lenient(text: str):
-    """Best-effort JSON extraction for providers that wrap JSON in markdown fences or prose."""
+    """Best-effort JSON extraction for providers that wrap JSON in markdown
+    fences, prose or reasoning traces.
+
+    Tries, in order: the whole text → fenced blocks (last first — the final
+    block is the model's answer) → the span from the first opening bracket to
+    the last closing bracket → balanced objects scanned from the end (the last
+    complete draft a reasoning model produced before its budget ran out).
+    """
     if not isinstance(text, str):
         return None
-    import re as _re
-    candidate = text.strip()
-    # fenced block ```json { ... } ``` or ``` { ... } ```
-    m = _re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", candidate, _re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            pass
+    candidate = text.translate(_INVISIBLES_TABLE).strip()
+    if not candidate:
+        return None
     try:
         return json.loads(candidate)
-    except Exception:
+    except (ValueError, TypeError):
         pass
-    start_candidates = [i for i in (candidate.find("{"), candidate.find("[")) if i >= 0]
-    if not start_candidates:
+    # fenced block ```json { ... } ``` or ``` { ... } ``` — several blocks may be
+    # present (repair loops, drafts); the LAST one is the model's final answer.
+    for block in reversed(_FENCED_JSON.findall(candidate)):
+        try:
+            return json.loads(block)
+        except (ValueError, TypeError):
+            continue
+    # span from the first opening bracket to the last closing bracket
+    starts = [i for i in (candidate.find("{"), candidate.find("[")) if i >= 0]
+    if not starts:
         return None
-    start = min(start_candidates)
+    start = min(starts)
     end = max(candidate.rfind("}"), candidate.rfind("]"))
     if end > start:
         try:
-            return json.loads(candidate[start:end+1])
-        except Exception:
-            return None
+            return json.loads(candidate[start:end + 1])
+        except (ValueError, TypeError):
+            pass
+    # Last resort: the model drafted the JSON inside its reasoning trace —
+    # try every object that *ends* at the last closing brackets, opening
+    # brackets from the end backwards. Only a complete, valid object parses.
+    ends = sorted((i for i in (candidate.rfind("}"), candidate.rfind("]")) if i > 0), reverse=True)
+    for end in ends:
+        opens = [i for i, ch in enumerate(candidate[:end]) if ch in "{["]
+        for start in reversed(opens[-_MAX_JSON_SALVAGE_TRIES:]):
+            try:
+                return json.loads(candidate[start:end + 1])
+            except (ValueError, TypeError):
+                continue
     return None
+
+
+def _parse_model_json(content: str):
+    """Strict parse first, lenient extraction (fences/prose) as a fallback."""
+    if not isinstance(content, str) or not content.strip():
+        return None
+    try:
+        return json.loads(content)
+    except (ValueError, TypeError):
+        return _extract_json_lenient(content)
+
+
+def _extract_content(data: Any) -> Dict[str, Any]:
+    """
+    Pull the answer out of an OpenAI-compatible chat completion body without
+    ever raising.
+
+    The wild is messy: ``content`` arrives as ``None``, as a list of parts
+    (``[{"type": "text", "text": ...}]``), or empty with the real answer in
+    ``reasoning_content`` (reasoning models whose thinking phase consumed the
+    whole ``max_tokens`` budget). Legacy completions proxies put the text in
+    ``choices[0].text``. All of those are normalised here.
+    """
+    empty: Dict[str, Any] = {"content": "", "reasoning": "", "finish_reason": None,
+                             "message": {}, "well_formed": False}
+    choices = data.get("choices") if isinstance(data, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    if not isinstance(choice, dict):
+        return empty
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        message = {}
+    finish_reason = choice.get("finish_reason")
+    if not isinstance(finish_reason, str):
+        finish_reason = None
+
+    content = message.get("content")
+    if isinstance(content, list):
+        # Multimodal / parts-style content: [{"type": "text", "text": "..."}]
+        parts = [p.get("text") if isinstance(p, dict) else str(p) for p in content]
+        content = "\n".join(str(p) for p in parts if p)
+    if content is None:
+        content = ""
+    elif not isinstance(content, str):
+        content = json.dumps(content) if isinstance(content, (dict, list)) else str(content)
+
+    reasoning = ""
+    for alt_key in ("reasoning_content", "reasoning"):
+        alt = message.get(alt_key)
+        if isinstance(alt, str) and alt.strip():
+            reasoning = alt
+            break
+    if not content.strip() and not reasoning:
+        # Legacy completions-style proxy: the answer sits on the choice itself.
+        legacy = choice.get("text")
+        if isinstance(legacy, str) and legacy.strip():
+            content = legacy
+    return {"content": content, "reasoning": reasoning, "finish_reason": finish_reason,
+            "message": message, "well_formed": True}
+
+
+def _read_usage(data: Dict[str, Any], prompt: str, content: str) -> Tuple[int, int, int]:
+    """Extract token usage, handling the many provider field variants."""
+    raw_usage = data.get("usage") or data.get("usage_metadata") or {}
+    if not isinstance(raw_usage, dict):
+        raw_usage = {}
+
+    def _int_field(*keys: str) -> int:
+        for k in keys:
+            v = raw_usage.get(k)
+            if isinstance(v, int) and v > 0:
+                return v
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+        return 0
+
+    prompt_tokens = _int_field("prompt_tokens", "input_tokens", "promptTokens", "inputTokens", "prompt_tokens_count")
+    completion_tokens = _int_field("completion_tokens", "output_tokens", "completionTokens", "outputTokens", "candidatesTokenCount")
+    total_tokens = _int_field("total_tokens", "totalTokens")
+    if total_tokens == 0:
+        total_tokens = (prompt_tokens + completion_tokens) if (prompt_tokens or completion_tokens) else 0
+    # Fallback estimate when the provider omits usage entirely (common on free tiers)
+    if total_tokens == 0 and content:
+        estimated = _estimate_tokens_from_text(prompt, str(content))
+        # don't pretend it's precise — mark as estimate in meta but still bill something
+        if estimated > 10:
+            total_tokens = estimated
+            if prompt_tokens == 0:
+                prompt_tokens = len(prompt) // 4
+            if completion_tokens == 0:
+                completion_tokens = max(1, total_tokens - prompt_tokens)
+    # Some providers nest usage differently
+    if total_tokens == 0 and raw_usage:
+        # try any numeric field
+        for v in raw_usage.values():
+            if isinstance(v, int) and v > 5:
+                total_tokens = v
+                break
+    return prompt_tokens, completion_tokens, total_tokens
+
+
+def _json_retry_action(content: str, finish_reason: Optional[str], *, json_mode_active: bool,
+                       plain_retries: int) -> Optional[str]:
+    """Decide how to recover from an empty/invalid JSON answer.
+
+    Returns one of ``raise_max_tokens_big`` (the thinking phase consumed the
+    budget), ``raise_max_tokens`` (the JSON was cut mid-way),
+    ``drop_response_format`` (provider accepted json_object but emitted
+    nothing), ``plain_retry`` (transient flake) or ``None`` (do not retry).
+    """
+    if finish_reason == "content_filter":
+        return None  # the same prompt will be blocked again
+    empty = not (content or "").strip()
+    if finish_reason == "length":
+        return "raise_max_tokens_big" if empty else "raise_max_tokens"
+    if empty:
+        if json_mode_active:
+            # The provider accepted response_format=json_object but emitted an
+            # empty answer — retrying without it is the targeted fix.
+            return "drop_response_format"
+        return "plain_retry" if plain_retries < 1 else None
+    # Non-empty text that is not JSON — one same-payload retry (a temperature
+    # flake or a fenced answer the lenient parser still missed).
+    return "plain_retry" if plain_retries < 1 else None
+
+
+def _invalid_json_error(content: str, finish_reason: Optional[str], current_max_tokens: int) -> "AIClientError":
+    """A precise, actionable error instead of a blanket "invalid_json"."""
+    if finish_reason == "content_filter":
+        return AIClientError(
+            "content_filter: the provider blocked the answer (finish_reason=content_filter)",
+            reason=REASON_CONTENT_FILTER, retryable=False)
+    empty = not (content or "").strip()
+    if empty:
+        if finish_reason == "length":
+            return AIClientError(
+                f"truncated_response: the model spent all {current_max_tokens} output tokens before writing "
+                "an answer (finish_reason=length — a reasoning model's thinking phase consumed the budget). "
+                "Raise AI_MAX_OUTPUT_TOKENS or use a model that does not burn the budget on reasoning",
+                reason=REASON_TRUNCATED, retryable=True)
+        return AIClientError(
+            f"empty_response: the model returned an empty answer (finish_reason={finish_reason or 'unknown'}) "
+            "— free-tier and reasoning models do this intermittently; retry or switch model",
+            reason=REASON_EMPTY_RESPONSE, retryable=True)
+    if finish_reason == "length":
+        return AIClientError(
+            f"truncated_response: the JSON was cut off at max_tokens={current_max_tokens} "
+            "(finish_reason=length) — raise AI_MAX_OUTPUT_TOKENS or use a model with a larger output limit",
+            reason=REASON_TRUNCATED, retryable=True)
+    return AIClientError(
+        f"invalid_json: model did not return valid JSON (preview: {content[:300]!r})",
+        reason=REASON_INVALID_JSON, retryable=True)
 
 def track_ai_usage(
     db=None,
@@ -502,7 +695,16 @@ async def chat_completion(
     db=None,
     user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Send a chat completion. Raises ``AIClientError`` on failure."""
+    """Send a chat completion. Raises ``AIClientError`` on failure.
+
+    A 200 response is not trusted blindly: reasoning models can return an
+    empty ``content`` (the whole ``max_tokens`` budget spent on thinking), the
+    JSON can be truncated mid-way (``finish_reason=length``), and some
+    providers accept ``response_format=json_object`` but then emit nothing.
+    All of those are retried *automatically with a targeted fix* — more output
+    tokens, or without ``response_format`` — before the caller ever sees an
+    ``invalid_json`` / ``empty_response`` / ``truncated_response`` error.
+    """
     # Resolution order: explicit ai_config > per-user DB config (explicit or
     # ambient request/worker user, with owner fallback) > env defaults.
     resolved = _resolve_ai_config(workflow, db, user_id)
@@ -562,17 +764,41 @@ async def chat_completion(
         messages.append({"role": "user", "content": safe_prompt})
 
         payload: Dict[str, Any] = {"model": cfg["model"], "messages": messages, "temperature": temperature}
+        json_mode_active = json_mode
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        payload["max_tokens"] = max_tokens or settings.ai_max_output_tokens
+        current_max_tokens = max_tokens or settings.ai_max_output_tokens
+        max_tokens_key = "max_tokens"
+        payload[max_tokens_key] = current_max_tokens
 
         headers = {"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}
         url = f"{cfg['base_url']}/chat/completions"
         attempts = max(1, settings.ai_max_retries)
         last_error: Optional[str] = None
-        json_mode_active = json_mode
 
-        for attempt in range(1, attempts + 1):
+        # State accumulated across the wire attempts of this logical call.
+        usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        parsed_result: Optional[Dict[str, Any]] = None   # JSON mode success
+        text_result: Optional[str] = None                # text mode success
+        final_error: Optional[AIClientError] = None      # 200-but-unusable answer
+        data: Dict[str, Any] = {}
+        plain_retries = 0     # same-payload retries allowed for empty/flaky answers
+        fixups = 0            # provider-parameter fix-ups (don't consume attempts)
+        call_started = time.perf_counter()
+
+        def _ledger_failure(error: str) -> None:
+            """Record the final failure with the tokens actually spent."""
+            if db and user_id:
+                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"],
+                               prompt_tokens=usage_totals["prompt_tokens"],
+                               completion_tokens=usage_totals["completion_tokens"],
+                               total_tokens=usage_totals["total_tokens"], success=False,
+                               error=error[:2000],
+                               latency_ms=int((time.perf_counter() - call_started) * 1000))
+
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
             await rate_limiter.wait_and_acquire(1)
             started = time.perf_counter()
             try:
@@ -586,97 +812,182 @@ async def chat_completion(
                     await _sleep_backoff(attempt)
                     continue
                 breaker.record_failure(last_error)
-                if db and user_id:
-                    track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error)
+                _ledger_failure(last_error)
                 raise AIClientError(last_error, retryable=True) from exc
             finally:
                 observe("jobhunter_ai_latency_seconds", time.perf_counter() - started, workflow=workflow)
 
-            if response.status_code == 200:
-                breaker.record_success()
-                break
+            if response.status_code != 200:
+                body = response.text[:400]
+                last_error = f"status {response.status_code}: {body}"
+                lowered = body.lower()
 
-            body = response.text[:400]
-            last_error = f"status {response.status_code}: {body}"
-            # Some providers (e.g. z-ai via aggregators) don't support json_object response_format
-            # and return 400 mentioning response_format. Retry once without it.
-            if response.status_code == 400 and json_mode_active and "response_format" in body.lower():
-                log.warning("AI %s: provider rejected json_object response_format, retrying without it", workflow)
+                # -------------------------------------------------------------- #
+                # Provider-parameter fix-ups (a 400 that says exactly which
+                # parameter is unsupported). They don't consume a retry.
+                # -------------------------------------------------------------- #
+                if response.status_code == 400 and fixups < 3:
+                    fixup_applied = False
+                    # Some providers (e.g. z-ai via aggregators) don't support
+                    # json_object response_format and 400 mentioning it.
+                    if json_mode_active and "response_format" in lowered:
+                        log.warning("AI %s: provider rejected json_object response_format, retrying without it", workflow)
+                        payload.pop("response_format", None)
+                        json_mode_active = False
+                        fixup_applied = True
+                    # Newer OpenAI models want max_completion_tokens instead of max_tokens.
+                    if (not fixup_applied and max_tokens_key in payload
+                            and "max_completion_tokens" in lowered and "unsupported" in lowered):
+                        log.warning("AI %s: provider wants max_completion_tokens, renaming the parameter", workflow)
+                        payload["max_completion_tokens"] = payload.pop(max_tokens_key)
+                        max_tokens_key = "max_completion_tokens"
+                        fixup_applied = True
+                    # Reasoning models also reject temperature != 1.
+                    if (not fixup_applied and "temperature" in payload and "temperature" in lowered
+                            and ("unsupported" in lowered or "not supported" in lowered)):
+                        log.warning("AI %s: provider rejected temperature, retrying without it", workflow)
+                        payload.pop("temperature", None)
+                        fixup_applied = True
+                    # We escalated max_tokens past what the model supports.
+                    if (not fixup_applied and max_tokens_key in payload and "max_tokens" in lowered
+                            and any(w in lowered for w in ("too large", "too high", "at most", "maximum", "exceeds"))):
+                        clamped = max(256, current_max_tokens // 2)
+                        if clamped < current_max_tokens:
+                            log.warning("AI %s: max_tokens=%d exceeds the model limit, retrying with %d",
+                                        workflow, current_max_tokens, clamped)
+                            current_max_tokens = clamped
+                            payload[max_tokens_key] = clamped
+                            fixup_applied = True
+                    if fixup_applied:
+                        fixups += 1
+                        attempt -= 1  # a parameter fix-up is not a retry
+                        continue
+
+                retryable = response.status_code == 429 or 500 <= response.status_code < 600
+                inc("jobhunter_ai_requests_total", workflow=workflow, status=str(response.status_code))
+                if retryable and attempt < attempts:
+                    delay = _retry_delay(response, attempt)
+                    log.warning("AI %s -> %s, retrying in %.1fs", workflow, response.status_code, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                if not retryable:
+                    if response.status_code in (401, 403):
+                        breaker.record_failure(last_error)
+                    _ledger_failure(last_error)
+                    raise AIClientError(last_error, status=response.status_code, retryable=False)
+
+                breaker.record_failure(last_error)
+                _ledger_failure(last_error)
+                raise AIClientError(last_error, status=response.status_code, retryable=True)
+
+            # ---------------------------------------------------------------- #
+            # 200 — validate the answer instead of trusting it.
+            # ---------------------------------------------------------------- #
+            breaker.record_success()
+            inc("jobhunter_ai_requests_total", workflow=workflow, status="200")
+            try:
+                data = response.json()
+            except ValueError as exc:
+                last_error = f"malformed_response: provider returned a non-JSON body ({exc})"
+                if plain_retries < 1:
+                    plain_retries += 1
+                    continue
+                breaker.record_failure(last_error)
+                _ledger_failure(last_error)
+                raise AIClientError(last_error, retryable=True) from exc
+
+            extracted = _extract_content(data)
+            content = extracted["content"]
+            finish_reason = extracted["finish_reason"]
+            reasoning = extracted["reasoning"]
+
+            p_tok, c_tok, t_tok = _read_usage(data, prompt, content)
+            usage_totals["prompt_tokens"] += p_tok
+            usage_totals["completion_tokens"] += c_tok
+            usage_totals["total_tokens"] += t_tok
+
+            if not extracted["well_formed"]:
+                last_error = ("malformed_response: provider returned 200 without a usable "
+                              "choices[0].message")
+                if plain_retries < 1:
+                    plain_retries += 1
+                    continue
+                breaker.record_failure(last_error)
+                _ledger_failure(last_error)
+                raise AIClientError(last_error, retryable=True)
+
+            if not json_mode:
+                if content.strip() and finish_reason != "length":
+                    text_result = content
+                    break
+                # Empty or truncated text — same recovery decisions as JSON mode.
+                action = _json_retry_action(content, finish_reason,
+                                            json_mode_active=False, plain_retries=plain_retries)
+            else:
+                parsed: Any = None
+                if content.strip():
+                    parsed = _parse_model_json(content)
+                if parsed is None and reasoning.strip():
+                    # Reasoning model: the answer (or its final draft) lives in
+                    # the reasoning channel while `content` came back empty.
+                    parsed = _parse_model_json(reasoning)
+                if isinstance(parsed, dict):
+                    parsed_result = parsed
+                    break
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                    # Some models return a list with one object
+                    parsed_result = parsed[0]
+                    break
+                action = _json_retry_action(content, finish_reason,
+                                            json_mode_active=json_mode_active,
+                                            plain_retries=plain_retries)
+
+            # -------------------------------------------------------------- #
+            # Targeted recovery for an empty/invalid answer.
+            # -------------------------------------------------------------- #
+            if action is not None and attempt >= attempts:
+                action = None  # no attempts left to retry with — report precisely
+
+            if action == "raise_max_tokens_big" or action == "raise_max_tokens":
+                factor, floor = (4, 4000) if action == "raise_max_tokens_big" else (2, 2400)
+                new_max = min(max(current_max_tokens * factor, floor), _MAX_OUTPUT_TOKENS_CEILING)
+                if new_max > current_max_tokens:
+                    what = "the thinking phase used the whole budget" if not content.strip() \
+                        else "the JSON was cut off"
+                    log.warning("AI %s: %s at %d tokens (finish_reason=%s) — retrying with %d tokens",
+                                workflow, what, current_max_tokens, finish_reason, new_max)
+                    current_max_tokens = new_max
+                    payload[max_tokens_key] = new_max
+                    continue
+                action = None  # already at the ceiling — retrying cannot help
+            elif action == "drop_response_format":
+                log.warning("AI %s: model returned an empty answer with response_format=json_object "
+                            "— retrying without it", workflow)
                 payload.pop("response_format", None)
                 json_mode_active = False
-                if attempt < attempts:
-                    continue
-                # fall through to retry logic below
-
-            retryable = response.status_code == 429 or 500 <= response.status_code < 600
-            inc("jobhunter_ai_requests_total", workflow=workflow, status=str(response.status_code))
-            if retryable and attempt < attempts:
-                delay = _retry_delay(response, attempt)
-                log.warning("AI %s -> %s, retrying in %.1fs", workflow, response.status_code, delay)
-                await asyncio.sleep(delay)
                 continue
-            if not retryable:
-                breaker.record_failure(last_error) if response.status_code in (401, 403) else None
-                if db and user_id:
-                    track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error, latency_ms=int((time.perf_counter() - started)*1000))
-                raise AIClientError(last_error, status=response.status_code, retryable=False)
+            elif action == "plain_retry":
+                log.warning("AI %s: model returned an %s answer (finish_reason=%s) — retrying",
+                            workflow, "empty" if not content.strip() else "unparseable",
+                            finish_reason)
+                plain_retries += 1
+                continue
 
-            breaker.record_failure(last_error)
-            if db and user_id:
-                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=last_error)
-            raise AIClientError(last_error, status=response.status_code, retryable=True)
-        else:  # pragma: no cover - loop always breaks or raises
+            final_error = _invalid_json_error(content, finish_reason, current_max_tokens)
+            break
+
+        if final_error is not None:
+            _ledger_failure(str(final_error))
+            raise final_error
+        if parsed_result is None and text_result is None:
+            breaker.record_failure(last_error or "unknown error")
+            _ledger_failure(last_error or "unknown error")
             raise AIClientError(last_error or "unknown error", retryable=True)
 
-        try:
-            data = response.json()
-            choice = data["choices"][0]
-            content = choice["message"]["content"]
-            if content is None:
-                content = ""
-            elif not isinstance(content, str):
-                # Some providers return structured content
-                content = json.dumps(content)
-        except (KeyError, IndexError, ValueError, TypeError) as exc:
-            breaker.record_failure(f"malformed_response: {exc}")
-            if db and user_id:
-                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=str(exc))
-            raise AIClientError(f"malformed_response: {exc}") from exc
-
-        # Extract usage — handle many provider variants (prompt_tokens / input_tokens / etc.)
-        raw_usage = data.get("usage") or data.get("usage_metadata") or {}
-        def _int_field(*keys: str) -> int:
-            for k in keys:
-                v = raw_usage.get(k)
-                if isinstance(v, int) and v > 0:
-                    return v
-                if isinstance(v, str) and v.isdigit():
-                    return int(v)
-            return 0
-        prompt_tokens = _int_field("prompt_tokens", "input_tokens", "promptTokens", "inputTokens", "prompt_tokens_count")
-        completion_tokens = _int_field("completion_tokens", "output_tokens", "completionTokens", "outputTokens", "candidatesTokenCount")
-        total_tokens = _int_field("total_tokens", "totalTokens")
-        if total_tokens == 0:
-            total_tokens = (prompt_tokens + completion_tokens) if (prompt_tokens or completion_tokens) else 0
-        # Fallback estimate when provider omits usage entirely (common on free tiers)
-        if total_tokens == 0 and content:
-            estimated = _estimate_tokens_from_text(prompt, str(content))
-            # don't pretend it's precise — mark as estimate in meta but still bill something
-            if estimated > 10:
-                total_tokens = estimated
-                if prompt_tokens == 0:
-                    prompt_tokens = len(prompt) // 4
-                if completion_tokens == 0:
-                    completion_tokens = max(1, total_tokens - prompt_tokens)
-        # Some providers nest usage differently
-        if total_tokens == 0 and isinstance(raw_usage, dict) and raw_usage:
-            # try any numeric field
-            for v in raw_usage.values():
-                if isinstance(v, int) and v > 5:
-                    total_tokens = v
-                    break
-
-        latency_ms = int((time.perf_counter() - started) * 1000) if 'started' in locals() else 0
+        prompt_tokens = usage_totals["prompt_tokens"]
+        completion_tokens = usage_totals["completion_tokens"]
+        total_tokens = usage_totals["total_tokens"]
+        latency_ms = int((time.perf_counter() - call_started) * 1000)
 
         _spend_tokens(total_tokens)
         bucket = _usage.setdefault(workflow, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0})
@@ -685,7 +996,6 @@ async def chat_completion(
         bucket["completion_tokens"] += completion_tokens
         bucket["total_tokens"] += total_tokens
         set_gauge("jobhunter_ai_tokens_total", bucket["total_tokens"], workflow=workflow)
-        inc("jobhunter_ai_requests_total", workflow=workflow, status="200")
 
         # Track per-user — success path
         if db and user_id:
@@ -702,30 +1012,12 @@ async def chat_completion(
             )
 
         if not json_mode:
-            return {"content": content, "raw": data, "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}}
-
-        # Lenient JSON parsing — many models wrap JSON in markdown fences or add preamble
-        text_content = str(content or "")
-        parsed = None
-        try:
-            parsed = json.loads(text_content)
-        except (json.JSONDecodeError, TypeError):
-            parsed = _extract_json_lenient(text_content)
-
-        if isinstance(parsed, dict):
-            return parsed
-        if isinstance(parsed, list) and parsed:
-            # Some models return a list with one object
-            if isinstance(parsed[0], dict):
-                return parsed[0]
-
-        # Still not JSON — record ledger with real token counts before failing
-        if db and user_id:
-            track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"],
-                           prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                           total_tokens=total_tokens, success=False,
-                           error=f"invalid_json: {str(text_content)[:200]}", latency_ms=latency_ms)
-        raise AIClientError(f"invalid_json: model did not return valid JSON (preview: {text_content[:300]!r})")
+            return {"content": text_result or "", "raw": data,
+                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                              "total_tokens": total_tokens}}
+        if parsed_result is None:  # pragma: no cover - defensive: failures raise above
+            raise AIClientError(last_error or "unknown error", retryable=True)
+        return parsed_result
     finally:
         if resolved.owned_session and resolved.db is not None:
             try:
