@@ -181,6 +181,17 @@ def test_hallucinated_resume_is_rejected_and_never_saved(client: TestClient, aut
     assert db.query(Resume).filter(Resume.type == "generated").count() == 0
 
 
+def test_phone_keeps_its_plus_sign_in_rendered_resumes(db):
+    """A leading '+' in a phone number was eaten by the markdown bullet pass."""
+    from app.services.ai_guardrails import strip_ai_artifacts
+
+    assert strip_ai_artifacts("+49 151 2345 6789") == "+49 151 2345 6789"
+    assert strip_ai_artifacts("+91 90000 00001") == "+91 90000 00001"
+    # genuine bullets are still normalised to the resume bullet glyph
+    assert strip_ai_artifacts("- led a team of five").startswith("•")
+    assert strip_ai_artifacts("+ shipped a feature").startswith("•")
+
+
 # --------------------------------------------------------------------------- #
 # 3. Stronger AI scoring, with honest provenance
 # --------------------------------------------------------------------------- #

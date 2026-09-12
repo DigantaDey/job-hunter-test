@@ -242,7 +242,9 @@ def markdown_to_text(value: str) -> str:
     text = re.sub(r"(?<![\w_])_([^_\n]{1,200})_(?![\w_])", r"\1", text)
     text = re.sub(r"`([^`\n]{1,200})`", r"\1", text)                          # inline code
     text = re.sub(r"^\s*>\s?", "", text, flags=re.MULTILINE)                   # quotes
-    text = re.sub(r"^\s*[-+•]\s*", "• ", text, flags=re.MULTILINE)             # normalise bullets
+    # Normalise bullets, but never swallow a phone number's "+" or a hyphen in
+    # "e-mail"-style prose: only treat - / + as a bullet when a space follows.
+    text = re.sub(r"^\s*(?:•\s*|[-+]\s+)", "• ", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*\|\s*-+.*$", "", text, flags=re.MULTILINE)             # table rules
     text = text.replace("|", " ").replace("---", "—")
     return text.strip()
