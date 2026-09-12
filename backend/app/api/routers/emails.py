@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -13,9 +13,8 @@ from app.core.auth import require_consent
 from app.core.entitlements import enforce, increment_usage
 from app.core.logging import get_logger
 from app.models.models import Email, EmailEvent, EmailOptOut, Job, User
-from app.schemas.schemas import EmailOut
-from app.services.job_queue import enqueue
 from app.services import persona as persona_service
+from app.services.job_queue import enqueue
 from app.services.outreach import (
     compliance_report,
     draft_email,

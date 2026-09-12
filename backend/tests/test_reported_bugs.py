@@ -463,9 +463,8 @@ def test_terminal_queue_items_are_reused_instead_of_colliding(db, owner):
 
 
 def test_funding_focus_is_persisted_to_settings(client: TestClient, auth: Dict[str, str], db):
-    from app.services.user_settings import get_setting
-
     from app.models.models import User
+    from app.services.user_settings import get_setting
 
     response = client.post("/api/funding/refresh",
                            json={"context": "embedded IoT hardware", "industries": "hardware, mobility"},

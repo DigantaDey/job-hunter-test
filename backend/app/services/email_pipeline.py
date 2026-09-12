@@ -21,11 +21,9 @@ from email.utils import formataddr, make_msgid
 from typing import Any, Dict, List, Optional
 
 from app.core.logging import get_logger
-from app.services.ai_client import AIClientError, chat_completion
 from app.services.ai_guardrails import (
     AIUnavailableError,
     FieldSpec,
-    GuardrailError,
     SchemaSpec,
     build_fact_ledger,
     run_guarded_task,
@@ -77,7 +75,7 @@ def clean_message_body(body: str, profile: Dict[str, Any]) -> str:
             continue
         if phone and re.sub(r"\D", "", phone) and re.sub(r"\D", "", phone) in re.sub(r"\D", "", stripped):
             continue
-        if name and stripped.lower() in {name.lower(), f"best,", f"regards,", f"- {name.lower()}"}:
+        if name and stripped.lower() in {name.lower(), "best,", "regards,", f"- {name.lower()}"}:
             continue
         if stripped.lower().rstrip(",") in {"best", "regards", "sincerely", "thanks", "thank you", "cheers"}:
             continue
@@ -85,7 +83,7 @@ def clean_message_body(body: str, profile: Dict[str, Any]) -> str:
 
     text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
-    signature = [f"Best regards,", name] if name else ["Best regards,"]
+    signature = ["Best regards,", name] if name else ["Best regards,"]
     if email:
         signature.append(email)
     if phone:

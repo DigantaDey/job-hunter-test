@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -66,7 +66,7 @@ EMPTY_MEMORY: Dict[str, Any] = {
     "observed_titles": {},
     "observed_skills": {},
     "observed_companies": {},
-    "engagement": {key: 0 for key in COUNTER_KEYS},
+    "engagement": dict.fromkeys(COUNTER_KEYS, 0),
     "preferences": {},
     "notes": [],
 }
@@ -417,7 +417,7 @@ def _stats(memory: Dict[str, Any]) -> Dict[str, Any]:
 def memory_summary(persona: Optional[Persona]) -> Dict[str, Any]:
     """Compact, UI-ready view of what the system currently believes."""
     if persona is None:
-        return {"signals": 0, "engagement": {key: 0 for key in COUNTER_KEYS}, "observed_titles": {},
+        return {"signals": 0, "engagement": dict.fromkeys(COUNTER_KEYS, 0), "observed_titles": {},
                 "observed_skills": {}, "observed_companies": {}, "notes": [], "maturity": "new"}
     memory = {**_blank_memory(), **(persona.memory or {})}
     signals = len(memory.get("signals") or [])

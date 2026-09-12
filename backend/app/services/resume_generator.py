@@ -29,10 +29,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.shared import Inches, Pt, RGBColor
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT, TA_RIGHT
-from reportlab.lib.pagesizes import A4, LETTER
+from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.platypus import HRFlowable, KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import HRFlowable, KeepTogether, Paragraph, SimpleDocTemplate, Table, TableStyle
 
 from app.services.ai_client import AIClientError, chat_completion
 from app.services.ai_guardrails import (
@@ -42,7 +42,6 @@ from app.services.ai_guardrails import (
     GuardrailError,
     SchemaSpec,
     build_fact_ledger,
-    check_grounded,
     run_guarded_task,
     strip_ai_artifacts,
 )
@@ -403,7 +402,6 @@ def build_docx(tailored: Dict[str, Any], profile: Dict[str, Any], layout: Dict[s
     """
     fonts = [str(f) for f in (layout or {}).get("fonts") or [] if f and not str(f).startswith("/")]
     base_font = fonts[0] if fonts else "Calibri"
-    bullet_char = str((layout or {}).get("bullet_style") or "•")[:1] or "•"
 
     doc = Document()
     section = doc.sections[0]
@@ -720,7 +718,8 @@ def resume_plain_text(tailored: Dict[str, Any], profile: Dict[str, Any]) -> str:
 async def generate_cover_letter(profile: Dict[str, Any], jd: str, job_title: str, company: str,
                                 db=None, user_id=None) -> str:
     """Generate a grounded cover letter — never fabricates."""
-    from app.services.ai_guardrails import FieldSpec as _FS, SchemaSpec as _SS
+    from app.services.ai_guardrails import FieldSpec as _FS
+    from app.services.ai_guardrails import SchemaSpec as _SS
 
     safe_jd = strip_ai_artifacts(jd)[:4000]
     prompt = f"""Write a cover letter grounded ONLY in the candidate's actual profile.

@@ -1,11 +1,8 @@
 import json
 import math
 import re
-from typing import Any, Dict, List, Tuple  # noqa: F401
+from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
-from typing import Optional
-
-from app.services.ai_client import AIClientError, chat_completion
 from app.services.ai_guardrails import (
     AIUnavailableError,
     FieldSpec,

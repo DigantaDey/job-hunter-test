@@ -19,11 +19,11 @@ from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.models.models import Job, User
 from app.services import sources as source_registry
+from app.services.ai_guardrails import AIUnavailableError
 from app.services.classifier import ai_company_size, heuristic_company_size
 from app.services.demo_pool import demo_jobs
 from app.services.events import record_job_event
 from app.services.form_detector import detect_form_structure
-from app.services.ai_guardrails import AIUnavailableError
 from app.services.scoring import heuristic_score, score_job
 from app.services.user_settings import get_setting
 

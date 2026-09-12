@@ -24,7 +24,6 @@ from app.services.ai_guardrails import (
     FieldSpec,
     SchemaSpec,
     build_fact_ledger,
-    check_grounded,
     run_guarded_task,
     strip_ai_artifacts,
 )
@@ -230,7 +229,7 @@ def _normalise_profile(data: Dict[str, Any], text: str) -> Dict[str, Any]:
         "education": [e for e in education if e["degree"] or e["school"]],
         "projects": [p for p in projects if p["name"]],
         "links": links[:10],
-        "languages": [clean(l, 60) for l in (data.get("languages") or []) if clean(l, 60)][:12],
+        "languages": [clean(lang, 60) for lang in (data.get("languages") or []) if clean(lang, 60)][:12],
         "certifications": [clean(c, 160) for c in (data.get("certifications") or []) if clean(c, 160)][:12],
         "extraction_source": "ai",
     }
@@ -355,7 +354,6 @@ def heuristic_profile_extract(text: str) -> Dict[str, Any]:
                        "kubernetes", "sql", "nosql", "fastapi", "django", "spring", "golang", "rust",
                        "ml", "ai", "pytorch", "tensorflow"]
     found_skills = [k for k in skills_keywords if k.lower() in text.lower()]
-    exp_years = re.findall(r"(\d+)\+?\s*years", text, re.IGNORECASE)
     title_match = re.search(
         r"\b((?:senior|junior|lead|staff|principal|associate)?\s*(?:software|backend|frontend|full[- ]?stack|data|ml|machine learning|devops|platform|product|qa)?\s*(?:engineer|developer|architect|scientist|manager|analyst|designer))\b",
         text[:600], re.IGNORECASE)

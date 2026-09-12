@@ -15,9 +15,9 @@ from app.core.entitlements import enforce, increment_usage
 from app.core.logging import get_logger
 from app.models.models import FundingCompany, Job, Profile
 from app.services import funding_radar
+from app.services import persona as persona_service
 from app.services.funding_sources import provider_status
 from app.services.job_queue import enqueue
-from app.services import persona as persona_service
 from app.services.outreach import draft_email
 from app.services.scoring import score_job
 from app.services.user_settings import get_setting, set_setting

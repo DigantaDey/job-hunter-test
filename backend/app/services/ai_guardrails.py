@@ -350,8 +350,6 @@ def build_fact_ledger(profile: Dict[str, Any], extra_text: str = "") -> FactLedg
         add(ledger.companies, entry.get("company"))
         add(ledger.titles, entry.get("title"))
         for key in ("duration", "dates", "period", "start", "end", "location"):
-            for token in _YEAR_RE.findall(str(entry.get(key) or "")):
-                pass
             for match in _YEAR_RE.finditer(str(entry.get(key) or "")):
                 ledger.years.add(match.group(0))
         for bullet in _as_list(entry.get("bullets") or entry.get("description")):
@@ -592,7 +590,6 @@ async def run_guarded_task(
     attempt = 0
     last_issues: List[Dict[str, Any]] = []
     current_prompt = prompt
-    data: Optional[Dict[str, Any]] = None
 
     while attempt <= repairs:
         attempt += 1

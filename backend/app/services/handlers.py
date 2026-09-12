@@ -55,10 +55,9 @@ async def handle_discovery(db: Session, item: PipelineJob) -> Dict[str, Any]:
         persona_id=payload.get("persona_id") or (persona.id if persona else None),
         persona_context=persona_context,
     )
-    if persona:
-        for job_id in result.get("job_ids") or []:
-            persona_service.record_signal(db, user.id, persona.id, "job_scored", {"note": "discovery run"})
-            break  # one signal per run is enough to mark the track as active
+    # One signal per run is enough to mark the track as active in memory.
+    if persona and (result.get("job_ids") or []):
+        persona_service.record_signal(db, user.id, persona.id, "job_scored", {"note": "discovery run"})
     return result
 
 
