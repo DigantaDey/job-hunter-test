@@ -7,6 +7,7 @@ import hmac
 import os
 import re
 import shutil
+import threading as _threading
 import time
 import uuid
 from datetime import datetime
@@ -52,8 +53,6 @@ MAGIC_BYTES = {
 # --------------------------------------------------------------------------- #
 # Real-time upload progress (in-memory per user, polled by the SPA)
 # --------------------------------------------------------------------------- #
-import threading as _threading
-
 _upload_progress: dict = {}
 _upload_lock = _threading.Lock()
 
