@@ -83,11 +83,25 @@ export default function Billing() {
               <div className="flex justify-between"><span>Monthly tokens</span><span>{credits.monthly_tokens}</span></div>
               <div className="flex justify-between"><span>Monthly cost</span><span>${credits.monthly_cost_usd}</span></div>
               <div className="flex justify-between"><span>Avg cost/app</span><span>${usage?.recent_ai_ops ? (credits.monthly_cost_usd/Math.max(1,usage?.usage?.applications_per_month?.used||1)).toFixed(4) : '0'}</span></div>
-              <div className="mt-3 max-h-64 overflow-auto divide-y dark:divide-zinc-800 border rounded-xl">
+              <div className="mt-3 max-h-72 overflow-auto divide-y dark:divide-zinc-800 border rounded-xl">
                 {credits.ledger.map((r:any)=>(
-                  <div key={r.id} className="p-2 flex justify-between gap-2"><span>{r.workflow} • {r.model}</span><span>{r.total_tokens} tokens • ${r.cost_usd}</span><span className={r.success?'text-emerald-600':'text-red-600'}>{r.success?'ok':'fail'}</span></div>
+                  <div key={r.id} className={`p-2 ${!r.success ? 'bg-red-50/50 dark:bg-red-950/20' : ''}`}>
+                    <div className="flex justify-between gap-2">
+                      <span className="truncate">{r.workflow} • {r.model || 'unknown model'}</span>
+                      <span>{r.total_tokens} tokens • ${Number(r.cost_usd||0).toFixed(4)}</span>
+                      <span className={r.success?'text-emerald-600':'text-red-600 font-medium'}>{r.success?'ok':'fail'}</span>
+                    </div>
+                    <div className="flex justify-between text-[11px] opacity-60">
+                      <span>{r.created_at ? new Date(r.created_at).toLocaleString() : ''}{r.latency_ms ? ` • ${r.latency_ms}ms` : ''}</span>
+                      <span>prompt {r.prompt_tokens} • completion {r.completion_tokens}</span>
+                    </div>
+                    {!r.success && r.error && <div className="text-[11px] mt-1 p-1 rounded bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 break-all line-clamp-2">{String(r.error).slice(0,200)}</div>}
+                    {r.success && r.total_tokens===0 && <div className="text-[11px] text-amber-600">⚠ 0 tokens — provider omitted usage, estimated from text length</div>}
+                  </div>
                 ))}
+                {credits.ledger.length===0 && <div className="p-4 text-center text-zinc-500">No AI operations yet — upload a resume to generate the first parse entry.</div>}
               </div>
+              <div className="mt-2 text-[11px] mono text-zinc-500">Tip: “fail” rows are AI calls that reached the provider but returned invalid JSON/guardrail failure — check error. “ok” rows include token counts (estimated when provider omits usage).</div>
             </div>
           ) : <div className="text-xs mono text-zinc-500">No AI usage yet.</div>}
         </div>

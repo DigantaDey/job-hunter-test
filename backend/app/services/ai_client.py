@@ -376,6 +376,9 @@ MODEL_COSTS = {
     "claude-3-opus": {"input": 0.015, "output": 0.075},
     "claude-3-sonnet": {"input": 0.003, "output": 0.015},
     "claude-3-haiku": {"input": 0.00025, "output": 0.00125},
+    # free/open models via aggregators (OpenRouter, z-ai, etc.)
+    "glm": {"input": 0.0001, "output": 0.0003},
+    "z-ai": {"input": 0.0001, "output": 0.0003},
     "default": {"input": 0.001, "output": 0.002},
 }
 
@@ -383,10 +386,48 @@ def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> flo
     m = (model or "").lower()
     cost_entry = MODEL_COSTS["default"]
     for key, val in MODEL_COSTS.items():
-        if key in m:
+        if key in m and key != "default":
             cost_entry = val
             break
     return (prompt_tokens / 1000.0) * cost_entry["input"] + (completion_tokens / 1000.0) * cost_entry["output"]
+
+
+def _estimate_tokens_from_text(prompt: str, content: str) -> int:
+    """Very rough token estimate when provider omits usage — ~4 chars per token."""
+    try:
+        return max(1, (len(prompt or "") + len(content or "")) // 4)
+    except Exception:
+        return 0
+
+
+def _extract_json_lenient(text: str):
+    """Best-effort JSON extraction for providers that wrap JSON in markdown fences or prose."""
+    if not isinstance(text, str):
+        return None
+    import re as _re
+    candidate = text.strip()
+    # fenced block ```json { ... } ``` or ``` { ... } ```
+    m = _re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", candidate, _re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+    start_candidates = [i for i in (candidate.find("{"), candidate.find("[")) if i >= 0]
+    if not start_candidates:
+        return None
+    start = min(start_candidates)
+    end = max(candidate.rfind("}"), candidate.rfind("]"))
+    if end > start:
+        try:
+            return json.loads(candidate[start:end+1])
+        except Exception:
+            return None
+    return None
 
 def track_ai_usage(
     db=None,
@@ -529,6 +570,7 @@ async def chat_completion(
         url = f"{cfg['base_url']}/chat/completions"
         attempts = max(1, settings.ai_max_retries)
         last_error: Optional[str] = None
+        json_mode_active = json_mode
 
         for attempt in range(1, attempts + 1):
             await rate_limiter.wait_and_acquire(1)
@@ -554,8 +596,18 @@ async def chat_completion(
                 breaker.record_success()
                 break
 
-            body = response.text[:300]
+            body = response.text[:400]
             last_error = f"status {response.status_code}: {body}"
+            # Some providers (e.g. z-ai via aggregators) don't support json_object response_format
+            # and return 400 mentioning response_format. Retry once without it.
+            if response.status_code == 400 and json_mode_active and "response_format" in body.lower():
+                log.warning("AI %s: provider rejected json_object response_format, retrying without it", workflow)
+                payload.pop("response_format", None)
+                json_mode_active = False
+                if attempt < attempts:
+                    continue
+                # fall through to retry logic below
+
             retryable = response.status_code == 429 or 500 <= response.status_code < 600
             inc("jobhunter_ai_requests_total", workflow=workflow, status=str(response.status_code))
             if retryable and attempt < attempts:
@@ -580,28 +632,62 @@ async def chat_completion(
             data = response.json()
             choice = data["choices"][0]
             content = choice["message"]["content"]
-        except (KeyError, IndexError, ValueError) as exc:
+            if content is None:
+                content = ""
+            elif not isinstance(content, str):
+                # Some providers return structured content
+                content = json.dumps(content)
+        except (KeyError, IndexError, ValueError, TypeError) as exc:
             breaker.record_failure(f"malformed_response: {exc}")
             if db and user_id:
                 track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=str(exc))
             raise AIClientError(f"malformed_response: {exc}") from exc
 
-        usage = data.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-        completion_tokens = int(usage.get("completion_tokens") or 0)
-        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        # Extract usage — handle many provider variants (prompt_tokens / input_tokens / etc.)
+        raw_usage = data.get("usage") or data.get("usage_metadata") or {}
+        def _int_field(*keys: str) -> int:
+            for k in keys:
+                v = raw_usage.get(k)
+                if isinstance(v, int) and v > 0:
+                    return v
+                if isinstance(v, str) and v.isdigit():
+                    return int(v)
+            return 0
+        prompt_tokens = _int_field("prompt_tokens", "input_tokens", "promptTokens", "inputTokens", "prompt_tokens_count")
+        completion_tokens = _int_field("completion_tokens", "output_tokens", "completionTokens", "outputTokens", "candidatesTokenCount")
+        total_tokens = _int_field("total_tokens", "totalTokens")
+        if total_tokens == 0:
+            total_tokens = (prompt_tokens + completion_tokens) if (prompt_tokens or completion_tokens) else 0
+        # Fallback estimate when provider omits usage entirely (common on free tiers)
+        if total_tokens == 0 and content:
+            estimated = _estimate_tokens_from_text(prompt, str(content))
+            # don't pretend it's precise — mark as estimate in meta but still bill something
+            if estimated > 10:
+                total_tokens = estimated
+                if prompt_tokens == 0:
+                    prompt_tokens = len(prompt) // 4
+                if completion_tokens == 0:
+                    completion_tokens = max(1, total_tokens - prompt_tokens)
+        # Some providers nest usage differently
+        if total_tokens == 0 and isinstance(raw_usage, dict) and raw_usage:
+            # try any numeric field
+            for v in raw_usage.values():
+                if isinstance(v, int) and v > 5:
+                    total_tokens = v
+                    break
+
         latency_ms = int((time.perf_counter() - started) * 1000) if 'started' in locals() else 0
 
         _spend_tokens(total_tokens)
         bucket = _usage.setdefault(workflow, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0})
         bucket["calls"] += 1
-        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            if isinstance(usage.get(key), int):
-                bucket[key] += usage[key]
+        bucket["prompt_tokens"] += prompt_tokens
+        bucket["completion_tokens"] += completion_tokens
+        bucket["total_tokens"] += total_tokens
         set_gauge("jobhunter_ai_tokens_total", bucket["total_tokens"], workflow=workflow)
         inc("jobhunter_ai_requests_total", workflow=workflow, status="200")
 
-        # Track per-user
+        # Track per-user — success path
         if db and user_id:
             track_ai_usage(
                 db=db,
@@ -616,14 +702,30 @@ async def chat_completion(
             )
 
         if not json_mode:
-            return {"content": content, "raw": data, "usage": usage}
+            return {"content": content, "raw": data, "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}}
 
+        # Lenient JSON parsing — many models wrap JSON in markdown fences or add preamble
+        text_content = str(content or "")
+        parsed = None
         try:
-            return json.loads(content)
-        except (json.JSONDecodeError, TypeError) as exc:
-            if db and user_id:
-                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"], success=False, error=f"invalid_json: {exc}")
-            raise AIClientError(f"invalid_json: {exc}") from exc
+            parsed = json.loads(text_content)
+        except (json.JSONDecodeError, TypeError):
+            parsed = _extract_json_lenient(text_content)
+
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list) and parsed:
+            # Some models return a list with one object
+            if isinstance(parsed[0], dict):
+                return parsed[0]
+
+        # Still not JSON — record ledger with real token counts before failing
+        if db and user_id:
+            track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"],
+                           prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                           total_tokens=total_tokens, success=False,
+                           error=f"invalid_json: {str(text_content)[:200]}", latency_ms=latency_ms)
+        raise AIClientError(f"invalid_json: model did not return valid JSON (preview: {text_content[:300]!r})")
     finally:
         if resolved.owned_session and resolved.db is not None:
             try:

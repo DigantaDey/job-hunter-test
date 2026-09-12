@@ -7,6 +7,7 @@ import hmac
 import os
 import re
 import shutil
+import threading as _threading
 import time
 import uuid
 from datetime import datetime
@@ -48,6 +49,30 @@ MAGIC_BYTES = {
     b"PK\x03\x04": ".docx",
     b"\xd0\xcf\x11\xe0": ".doc",
 }
+
+# --------------------------------------------------------------------------- #
+# Real-time upload progress (in-memory per user, polled by the SPA)
+# --------------------------------------------------------------------------- #
+_upload_progress: dict = {}
+_upload_lock = _threading.Lock()
+
+def _set_progress(user_id: int, step: str, detail: str = "", progress: int = 0, extra: dict | None = None):
+    with _upload_lock:
+        _upload_progress[user_id] = {
+            "step": step,
+            "detail": detail,
+            "progress": max(0, min(100, progress)),
+            "updated_at": datetime.utcnow().isoformat(),
+            **(extra or {}),
+        }
+
+def _clear_progress(user_id: int):
+    with _upload_lock:
+        _upload_progress.pop(user_id, None)
+
+def _get_progress(user_id: int):
+    with _upload_lock:
+        return dict(_upload_progress.get(user_id, {"step": "idle", "progress": 0, "detail": ""}))
 
 #: Lifetime of a signed download URL. Long enough to survive a browser
 #: "save as" dialog, short enough that a leaked link is useless soon after.
@@ -154,6 +179,39 @@ def _available_formats(resume: Resume) -> List[str]:
     return available
 
 
+@router.get("/resume/progress")
+def resume_upload_progress(user: CurrentUser):
+    """Polled by the SPA while a resume upload is in flight — gives real-time steps."""
+    return _get_progress(user.id)
+
+
+@router.get("/resume/recent-ledger")
+def resume_recent_ledger(user: CurrentUser, db: DbSession, limit: int = 5):
+    """Last few AI ledger rows for the parse workflow — powers the live status feed."""
+    from app.models.models import AICreditLedger
+    rows = (db.query(AICreditLedger)
+            .filter(AICreditLedger.user_id == user.id, AICreditLedger.workflow == "parse")
+            .order_by(AICreditLedger.created_at.desc())
+            .limit(min(20, max(1, limit)))
+            .all())
+    return [
+        {
+            "id": r.id,
+            "workflow": r.workflow,
+            "model": r.model,
+            "total_tokens": r.total_tokens,
+            "prompt_tokens": r.prompt_tokens,
+            "completion_tokens": r.completion_tokens,
+            "cost_usd": r.estimated_cost_usd,
+            "success": r.success,
+            "latency_ms": r.latency_ms,
+            "error": r.error,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
 @router.post("/resume/upload")
 async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file: UploadFile = File(...)):
     """
@@ -163,101 +221,150 @@ async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file
     AI is required for the profile: if the model is unreachable this returns 503
     with the exact reason instead of storing a regex-guessed profile that later
     produces resumes and emails addressed to "Unknown".
+
+    Real-time: pushes step updates to ``GET /api/resume/progress`` so the UI can
+    show what is happening while the request is in flight.
     """
     enforce(db, user.id, "resume_parses_per_month")
     enforce(db, user.id, "resumes_max")
+
+    _set_progress(user.id, "validating", "Checking file type…", 5)
 
     head = await file.read(8)
     await file.seek(0)
     extension = _validate_upload(file, head)
 
     path, safe_name = _store_upload(file, extension)
-    size_mb = os.path.getsize(path) / (1024 * 1024)
-    if size_mb > settings.max_upload_mb:
-        os.remove(path)
-        raise HTTPException(413, f"File is {size_mb:.1f}MB — the limit is {settings.max_upload_mb}MB")
+    _set_progress(user.id, "uploaded", f"Saved {safe_name}", 15)
 
-    text = extract_text(path)
-    if not text.strip():
-        os.remove(path)
-        raise HTTPException(422, "No readable text found in the document (is it a scanned image?)")
+    # Use a guard so an AI or DB failure never leaves an orphan file with no DB row.
+    # The file is only kept when the resume row has been committed.
+    keep_file = False
+    try:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        if size_mb > settings.max_upload_mb:
+            raise HTTPException(413, f"File is {size_mb:.1f}MB — the limit is {settings.max_upload_mb}MB")
 
-    layout = extract_layout(path) if safe_name.lower().endswith(".pdf") else {
-        "bullet_style": "•", "colors": [], "fonts": ["Calibri"], "estimated": True}
+        _set_progress(user.id, "extracting", "Extracting text & layout…", 30)
+        text = extract_text(path)
+        if not text.strip():
+            raise HTTPException(422, "No readable text found in the document (is it a scanned image?)")
 
-    # AI-required. ``AIUnavailableError`` bubbles to the 503 handler with the
-    # provider's own diagnosis (no key / bad key / unreachable / breaker open…).
-    profile_data, meta = await ai_extract_profile(text, ai_config=None, db=db, user_id=user.id)
-    profile_data["raw_text"] = text[:20000]
+        _set_progress(user.id, "layout", "Detecting layout…", 40)
+        layout = extract_layout(path) if safe_name.lower().endswith(".pdf") else {
+            "bullet_style": "•", "colors": [], "fonts": ["Calibri"], "estimated": True}
 
-    resume = Resume(
-        user_id=user.id,
-        filename=safe_name,
-        filepath=path,
-        type="master",
-        status="approved",
-        profile_snapshot=profile_data,
-        layout=layout,
-        tags=["master"],
-        display_name=safe_name,
-        text_snapshot=render_profile_text(profile_data),
-        approved_at=datetime.utcnow(),
-    )
-    db.add(resume)
-    db.commit()
-    db.refresh(resume)
+        _set_progress(user.id, "ai_parsing", "Contacting AI to extract structured profile…", 55, extra={"model": "parsing"})
+        # AI-required. ``AIUnavailableError`` bubbles to the 503 handler with the
+        # provider's own diagnosis (no key / bad key / unreachable / breaker open…).
+        try:
+            profile_data, meta = await ai_extract_profile(text, ai_config=None, db=db, user_id=user.id)
+        except Exception as exc:
+            # Surface the progress as failed before the exception propagates to the
+            # global handler (which returns the correct status + diagnosis).
+            _set_progress(user.id, "failed", f"AI extraction failed: {str(exc)[:180]}", 0, extra={"error": str(exc)[:500]})
+            raise
+        profile_data["raw_text"] = text[:20000]
+        _set_progress(user.id, "ai_done", "AI extraction succeeded — validating…", 80, extra={"ai_meta": meta})
 
-    db.query(Profile).filter(Profile.user_id == user.id).delete(synchronize_session=False)
-    profile = Profile(user_id=user.id, data=profile_data, layout=layout, master_resume_id=resume.id,
-                      extraction_source="ai")
-    db.add(profile)
-    db.commit()
-    db.refresh(profile)
-
-    invalidate_context(user.id)
-    context = await search_context(db, user.id, force_refresh=True)
-    persona = persona_service.ensure_default_persona(db, user.id, profile_data)
-    audit.audit(
-        db,
-        "resume.uploaded",
-        user=user,
-        target=safe_name,
-        detail={"resume_id": resume.id, "size_kb": round(os.path.getsize(path) / 1024, 1),
-                "extraction": meta.get("source") if isinstance(meta, dict) else None,
-                "guardrail": (meta or {}).get("guardrail", {}).get("passed")},
-        request=request,
-    )
-
-    enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id},
-            priority=4, dedupe_key=f"tag_resume:{resume.id}")
-
-    # Re-rank previously unscored jobs against the fresh profile. These are
-    # explicitly labelled "preliminary" — the real verdict comes from the AI
-    # scorer (see /api/jobs/{id}/intelligence).
-    from app.services.scoring import heuristic_score_detailed
-
-    rescored = 0
-    for job in db.query(Job).filter(Job.user_id == user.id, Job.score == 0).limit(50).all():
-        detail = heuristic_score_detailed(profile_data, job.description or "")
-        job.score = float(detail["overall"])
-        job.score_reason = detail["reason"]
-        job.score_source = "preliminary"
-        job.score_detail = detail
-        rescored += 1
-    if rescored:
+        _set_progress(user.id, "saving", "Saving resume & profile…", 90)
+        resume = Resume(
+            user_id=user.id,
+            filename=safe_name,
+            filepath=path,
+            type="master",
+            status="approved",
+            profile_snapshot=profile_data,
+            layout=layout,
+            tags=["master"],
+            display_name=safe_name,
+            text_snapshot=render_profile_text(profile_data),
+            approved_at=datetime.utcnow(),
+        )
+        db.add(resume)
         db.commit()
+        db.refresh(resume)
+        keep_file = True  # file is now owned by a DB row
 
-    increment_usage(db, user.id, "resume_parses_per_month", 1)
+        db.query(Profile).filter(Profile.user_id == user.id).delete(synchronize_session=False)
+        profile = Profile(user_id=user.id, data=profile_data, layout=layout, master_resume_id=resume.id,
+                          extraction_source="ai")
+        db.add(profile)
+        db.commit()
+        db.refresh(profile)
 
-    return {
-        "resume": {"id": resume.id, "filename": resume.filename, "tags": resume.tags, "status": resume.status},
-        "profile": profile_data,
-        "layout": layout,
-        "ai_meta": meta,
-        "search_context": context,
-        "persona": persona_service.to_dict(persona) if persona else None,
-        "rescored_jobs": rescored,
-    }
+        invalidate_context(user.id)
+        _set_progress(user.id, "context", "Building search context…", 95)
+        context = await search_context(db, user.id, force_refresh=True)
+        persona = persona_service.ensure_default_persona(db, user.id, profile_data)
+        audit.audit(
+            db,
+            "resume.uploaded",
+            user=user,
+            target=safe_name,
+            detail={"resume_id": resume.id, "size_kb": round(os.path.getsize(path) / 1024, 1),
+                    "extraction": meta.get("source") if isinstance(meta, dict) else None,
+                    "guardrail": (meta or {}).get("guardrail", {}).get("passed")},
+            request=request,
+        )
+
+        enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id},
+                priority=4, dedupe_key=f"tag_resume:{resume.id}")
+
+        # Re-rank previously unscored jobs against the fresh profile. These are
+        # explicitly labelled "preliminary" — the real verdict comes from the AI
+        # scorer (see /api/jobs/{id}/intelligence).
+        from app.services.scoring import heuristic_score_detailed
+
+        rescored = 0
+        for job in db.query(Job).filter(Job.user_id == user.id, Job.score == 0).limit(50).all():
+            detail = heuristic_score_detailed(profile_data, job.description or "")
+            job.score = float(detail["overall"])
+            job.score_reason = detail["reason"]
+            job.score_source = "preliminary"
+            job.score_detail = detail
+            rescored += 1
+        if rescored:
+            db.commit()
+
+        increment_usage(db, user.id, "resume_parses_per_month", 1)
+
+        _set_progress(user.id, "done", f"Profile extracted ({len(profile_data.get('skills', []))} skills, {len(profile_data.get('experience', []))} roles)", 100,
+                      extra={"resume_id": resume.id})
+        return {
+            "resume": {"id": resume.id, "filename": resume.filename, "tags": resume.tags, "status": resume.status},
+            "profile": profile_data,
+            "layout": layout,
+            "ai_meta": meta,
+            "search_context": context,
+            "persona": persona_service.to_dict(persona) if persona else None,
+            "rescored_jobs": rescored,
+        }
+    except HTTPException as exc:
+        # Validation errors (415, 413, 422) already removed file above or need removal here
+        if not keep_file and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        # Don't overwrite the detailed AI failure progress set above
+        if _get_progress(user.id).get("step") not in ("failed",):
+            detail = exc.detail if hasattr(exc, "detail") else str(exc)
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("detail") or str(detail)
+            _set_progress(user.id, "failed", str(detail)[:200], 0)
+        raise
+    except Exception as exc:
+        if not keep_file and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        # If the exception is already a handled AI error (AIUnavailableError etc.) it will be
+        # mapped to 503/422 by the global handler — still mark progress as failed.
+        if _get_progress(user.id).get("step") not in ("failed",):
+            _set_progress(user.id, "failed", f"Unexpected error: {str(exc)[:200]}", 0, extra={"error": str(exc)[:500]})
+        raise
 
 
 @router.get("/profile", response_model=List[ProfileOut])
