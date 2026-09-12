@@ -136,6 +136,7 @@ def get_credits(user: CurrentUser, db: DbSession, limit: int = Query(100, le=500
                 "cost_usd": r.estimated_cost_usd,
                 "success": r.success,
                 "latency_ms": r.latency_ms,
+                "error": r.error,
                 "created_at": r.created_at,
             }
             for r in rows
