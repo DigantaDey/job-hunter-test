@@ -4,6 +4,65 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.0.4] — 2026-09-12
+
+Fixes the "`AI unavailable — nothing was generated` / `invalid_json: model did
+not return valid JSON (preview: '')`" outage reported while AI-processing an
+uploaded resume. Six independent root causes were found; each one alone can
+make a resume upload fail even though the provider, key and model are all fine.
+
+### Fixed
+
+- **An empty model answer was raised instantly as `invalid_json`.** The gateway
+  trusted any HTTP 200: when `choices[0].message.content` came back empty —
+  standard behaviour for reasoning models whose "thinking" phase
+  (`reasoning_content`) consumed the whole `max_tokens` budget, and a known
+  intermittent flake of free-tier providers — the call failed with the
+  misleading `invalid_json (preview: '')` and the UI told the user to "retry"
+  while nothing retried anything. The gateway now inspects `finish_reason`,
+  salvages a complete JSON draft from the reasoning channel, and retries
+  automatically with a targeted fix before ever reporting a failure.
+- **`finish_reason` was never inspected — truncated JSON was unrecoverable.**
+  A resume profile is a large JSON document; when the model ran out of output
+  tokens mid-object (`finish_reason=length`) the call failed with
+  `invalid_json`. The gateway now escalates `max_tokens` (×2, ×4 when the
+  thinking phase ate the budget, capped at 16 000) and retries — and if a
+  provider rejects the escalated value as too large, it clamps automatically.
+- **`AI_MAX_OUTPUT_TOKENS` defaulted to 1200** — smaller than the JSON a full
+  resume profile needs, so parses truncated on perfectly healthy models. The
+  default is now 4000 (documented in `.env.example`).
+- **Answers that arrive as a parts list were mis-parsed.** Providers returning
+  `content` as `[{"type": "text", "text": …}]` were `json.dumps`ed into a JSON
+  *array*, whose first element (`{"type": "text", …}`) masqueraded as the
+  model's answer and failed the guardrail. Text parts are now joined properly;
+  `null` content and legacy `choices[0].text` bodies are also handled.
+- **Modern OpenAI-compat models 400 on `max_tokens` / `temperature`.** Only the
+  `response_format` fix-up existed. The gateway now also renames to
+  `max_completion_tokens`, drops `temperature`, and clamps oversized budgets
+  when the provider's 400 names the offending parameter — none of these
+  fix-ups consume a retry.
+- **Failures were reported dishonestly.** Every 200-but-unusable answer was
+  labelled "The model answered with text that is not valid JSON" — wrong and
+  useless for an empty or truncated answer. Three precise reasons were added —
+  `empty_response`, `truncated_response`, `content_filter` — each with an
+  actionable fix rendered by the existing AI-outage banner in the UI.
+- **Lenient JSON extraction hardened.** Invisible characters (BOM, zero-width)
+  are stripped, the *last* fenced block is preferred (repair loops emit
+  several), and the model's final complete draft is salvaged from a reasoning
+  trace by scanning balanced objects from the end.
+- Usage/credit accounting now sums every wire attempt of a logical call
+  (retries included) instead of only the last one.
+
+### Tests
+
+- New `tests/test_ai_invalid_json_fixes.py` (19 tests) drives the real gateway
+  against a scripted OpenAI-compatible provider: the empty-content reasoning
+  model, the truncation escalation, the response_format drop, the parts-list
+  body, the reasoning-channel salvage, all three 400 fix-ups, the honest
+  failure reasons, and the end-to-end resume upload surviving a flaky provider
+  — plus the upload reporting `empty_response` when the provider never
+  produces an answer.
+
 ## [2.0.3] — 2026-09-11
 
 Fixes the "AI offline / `invalid_api_key` even after adding an API key in

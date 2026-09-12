@@ -86,7 +86,19 @@ DIAGNOSIS: Dict[str, Tuple[str, str]] = {
     ),
     "invalid_json": (
         "The model answered with text that is not valid JSON.",
-        "Retry — a stronger model (or one that supports JSON mode) fixes this almost every time.",
+        "Already retried automatically. A stronger model (or one that supports JSON mode) fixes this almost every time — switch model in Settings → AI API.",
+    ),
+    "empty_response": (
+        "The model returned an empty answer.",
+        "Already retried automatically. Free-tier and 'thinking' models do this intermittently — retry the upload, or switch to a model that reliably returns JSON (e.g. gpt-4o-mini).",
+    ),
+    "truncated_response": (
+        "The model's answer was cut off before the JSON completed.",
+        "The output-token limit is too small for this document — raise AI_MAX_OUTPUT_TOKENS (Settings → AI API) or use a model with a larger output limit. Reasoning models also burn tokens on 'thinking' before the JSON starts.",
+    ),
+    "content_filter": (
+        "The provider blocked the answer with its content filter.",
+        "Retry, or switch models in Settings → AI API if the document keeps triggering the filter.",
     ),
     "model_unavailable": (
         "The configured model does not exist on that provider (404).",
