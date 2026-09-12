@@ -1,6 +1,11 @@
 """
 Interview preparation service — AI-generated questions grounded in resume + JD.
 Never fabricates user experience; all questions derived from actual resume and job description.
+
+AI is a hard dependency: on failure the calls raise and the endpoint reports
+the outage (pausable 503) — there is no set of canned questions to pretend
+with, because a guessed question list is exactly the "output the user never
+asked for" this product must not produce.
 """
 
 from __future__ import annotations
@@ -9,9 +14,14 @@ import json
 from typing import Any, Dict, List, Optional
 
 from app.core.logging import get_logger
-from app.services.ai_client import AIClientError, chat_completion
+from app.services.ai_client import fit_prompt_part, input_budget_chars
 
 log = get_logger("app.interview")
+
+#: Starting output budgets (the user's configured output ceiling still caps
+#: these and any escalation).
+QUESTIONS_OUTPUT_TOKENS = 2000
+FEEDBACK_OUTPUT_TOKENS = 1000
 
 
 INTERVIEW_CATEGORIES = [
@@ -36,9 +46,11 @@ async def generate_interview_questions(
     Generate interview questions based on profile + JD.
     Grounded in user-provided info — never invents jobs/education.
     """
-    # Sanitize JD as untrusted
-    safe_jd = (job_description or "")[:4000].replace("```", "").replace("SYSTEM:", "")
-    profile_json = json.dumps(profile, indent=2)[:4000]
+    # Sanitize JD as untrusted, capped at the user's input budget.
+    budget = input_budget_chars(db=db, user_id=user_id)
+    safe_jd, _t1 = fit_prompt_part((job_description or "").replace("```", "").replace("SYSTEM:", ""),
+                                   budget, label="interview.jd")
+    profile_json, _t2 = fit_prompt_part(json.dumps(profile, indent=2), budget, label="interview.profile")
 
     prompt = f"""
 You are an expert interview coach. Generate {count} interview questions for this candidate.
@@ -58,42 +70,41 @@ JD:
 \"\"\"{safe_jd}\"\"\"
 """
 
-    try:
-        data = await chat_completion(
-            "interview",
-            prompt,
-            temperature=0.7,
-            max_tokens=2000,
-            db=db,
-            user_id=user_id,
-        )
-        questions = data.get("questions", [])[:count]
-        # Validate structure
-        cleaned = []
-        for q in questions:
-            if not isinstance(q, dict):
-                continue
-            if "question" not in q:
-                continue
-            cleaned.append({
-                "question": str(q["question"])[:500],
-                "category": q.get("category", "technical") if q.get("category") in INTERVIEW_CATEGORIES else "technical",
-                "difficulty": q.get("difficulty", "medium"),
-                "hint": str(q.get("hint", ""))[:500],
-                "sample_answer_outline": str(q.get("sample_answer_outline", ""))[:1000],
-            })
-        if cleaned:
-            return cleaned
-    except (AIClientError, Exception) as exc:
-        log.warning("interview question generation failed: %s", exc)
+    # AI failure propagates: the endpoint reports the outage instead of
+    # serving canned questions dressed up as preparation.
+    from app.services.ai_client import chat_completion
 
-    # Fallback heuristic questions
-    skills = profile.get("skills", [])[:5]
-    return [
-        {"question": f"Tell me about your experience with {skills[0]} as it relates to {job_title}?" if skills else f"Tell me about yourself and why you're interested in {job_title} at {company}?", "category": "behavioral", "difficulty": "easy", "hint": "STAR method", "sample_answer_outline": "Situation, Task, Action, Result grounded in your experience"},
-        {"question": f"How would you handle a challenging situation in {job_title} role?", "category": "situational", "difficulty": "medium", "hint": "Problem solving", "sample_answer_outline": "Describe approach"},
-        {"question": f"What do you know about {company} and why do you want to work here?", "category": "company", "difficulty": "easy", "hint": "Company research", "sample_answer_outline": f"Mention {company} mission, recent news"},
-    ][:count]
+    data = await chat_completion(
+        "interview",
+        prompt,
+        temperature=0.7,
+        max_tokens=QUESTIONS_OUTPUT_TOKENS,
+        db=db,
+        user_id=user_id,
+    )
+    questions = data.get("questions", [])[:count] if isinstance(data, dict) else []
+    # Validate structure
+    cleaned = []
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        if "question" not in q:
+            continue
+        cleaned.append({
+            "question": str(q["question"])[:500],
+            "category": q.get("category", "technical") if q.get("category") in INTERVIEW_CATEGORIES else "technical",
+            "difficulty": q.get("difficulty", "medium"),
+            "hint": str(q.get("hint", ""))[:500],
+            "sample_answer_outline": str(q.get("sample_answer_outline", ""))[:1000],
+        })
+    if not cleaned:
+        from app.services.ai_client import AIClientError
+
+        raise AIClientError(
+            "invalid_json: interview returned no usable questions",
+            reason="invalid_json", retryable=True,
+        )
+    return cleaned
 
 
 async def generate_feedback(
@@ -108,15 +119,17 @@ async def generate_feedback(
     Generate feedback for user's interview answer.
     Grounded, constructive, no fabrication.
     """
-    safe_answer = (user_answer or "")[:3000].replace("```", "")
-    safe_q = (question or "")[:500].replace("```", "")
+    budget = input_budget_chars(db=db, user_id=user_id)
+    safe_answer, _t1 = fit_prompt_part((user_answer or "").replace("```", ""), budget, label="interview.answer")
+    safe_q, _t2 = fit_prompt_part((question or "").replace("```", ""), budget, label="interview.question")
+    profile_json, _t3 = fit_prompt_part(json.dumps(profile, indent=2), budget, label="interview.profile")
     prompt = f"""
 You are an interview coach giving feedback.
 
 Question: {safe_q}
 Candidate answer: \"\"\"{safe_answer}\"\"\"
 
-Profile (for grounding): {json.dumps(profile, indent=2)[:2000]}
+Profile (for grounding): {profile_json}
 
 Return JSON: {{"score": 1-10, "strengths": ["..."], "improvements": ["..."], "suggested_answer": "improved version grounded in profile", "follow_up_questions": ["..."]}}
 
@@ -126,28 +139,22 @@ Rules:
 - Score honestly
 """
 
-    try:
-        data = await chat_completion(
-            "interview",
-            prompt,
-            temperature=0.5,
-            max_tokens=1000,
-            db=db,
-            user_id=user_id,
-        )
-        return {
-            "score": int(data.get("score", 5)),
-            "strengths": data.get("strengths", [])[:5],
-            "improvements": data.get("improvements", [])[:5],
-            "suggested_answer": str(data.get("suggested_answer", ""))[:2000],
-            "follow_up_questions": data.get("follow_up_questions", [])[:3],
-        }
-    except Exception as exc:
-        log.warning("feedback generation failed: %s", exc)
-        return {
-            "score": 5,
-            "strengths": ["Answer provided"],
-            "improvements": ["Add specific examples using STAR method"],
-            "suggested_answer": "",
-            "follow_up_questions": [],
-        }
+    # AI failure propagates — a fake 5/10 "score" would be a verdict the model
+    # never gave.
+    from app.services.ai_client import chat_completion
+
+    data = await chat_completion(
+        "interview",
+        prompt,
+        temperature=0.5,
+        max_tokens=FEEDBACK_OUTPUT_TOKENS,
+        db=db,
+        user_id=user_id,
+    )
+    return {
+        "score": int(data.get("score", 5)),
+        "strengths": (data.get("strengths") or [])[:5] if isinstance(data, dict) else [],
+        "improvements": (data.get("improvements") or [])[:5] if isinstance(data, dict) else [],
+        "suggested_answer": str(data.get("suggested_answer", ""))[:2000] if isinstance(data, dict) else "",
+        "follow_up_questions": (data.get("follow_up_questions") or [])[:3] if isinstance(data, dict) else [],
+    }

@@ -6,16 +6,20 @@ locations, seniority, funding focus) from the user's profile, master resume
 text and any free-form context the user provides — in addition to (not
 instead of) explicit user input.
 
-Works in two modes:
-- AI mode  : OpenAI-compatible chat completion returning strict JSON.
-- Heuristic: TF-based keyword mining + role/industry inference (offline).
+AI is a hard dependency: ``ai_extract_context`` raises when the model cannot
+answer (the caller pauses/reports — there is no offline mode that pretends).
+The offline miner below (``mined_context``) is NOT a fallback for AI failure:
+it is (a) the deterministic merge base that enriches a *successful* AI answer
+so a union of signals is never lost, and (b) the degenerate answer for an
+account with no profile/resume/context at all — in which case there is simply
+nothing for a model to read.
 """
 import json
 import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-from app.services.ai_client import AIClientError, chat_completion
+from app.services.ai_client import fit_prompt_part, input_budget_chars
 
 STOPWORDS = {
     "the", "and", "for", "with", "a", "an", "in", "on", "of", "to", "is", "are",
@@ -84,8 +88,8 @@ def _significant_tokens(text: str, top_n: int = 18) -> List[str]:
     return [w for w, _ in counts.most_common(top_n)]
 
 
-def heuristic_context(profile: Dict[str, Any], extra_context: str = "") -> Dict[str, Any]:
-    """Offline fallback: mine keywords from profile fields + resume text."""
+def mined_context(profile: Dict[str, Any], extra_context: str = "") -> Dict[str, Any]:
+    """Offline keyword miner (see module docstring — not an AI fallback)."""
     skills = [_normalize_skill(s) for s in (profile.get("skills") or []) if isinstance(s, str)]
     tech_stack: List[str] = []
     for s in skills:
@@ -136,7 +140,7 @@ def heuristic_context(profile: Dict[str, Any], extra_context: str = "") -> Dict[
         "locations": locations,
         "seniority": _infer_seniority(profile),
         "funding_focus": industries[:4] or ["saas"],
-        "source": "heuristic",
+        "source": "mined",
     }
 
 
@@ -158,16 +162,29 @@ async def ai_extract_context(
     resume_text: str = "",
     extra_context: str = "",
     ai_config: Dict[str, Any] = None,
+    *,
+    db=None,
+    user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     AI mode: extract a structured search context from the profile + resume +
-    free-form context. Falls back to heuristic mining on any failure, and
-    always merges heuristic keywords so the result is never empty.
-    """
-    fallback = heuristic_context(profile, extra_context)
-    if not profile and not resume_text.strip() and not extra_context.strip():
-        return fallback
+    free-form context.
 
+    Raises ``AIClientError`` when the model cannot answer — the caller pauses
+    (queue) or reports (sync) instead of serving a mined-only context dressed
+    up as the extraction. On success, the mined keywords are merged in so the
+    deterministic signals are never lost from a real AI answer.
+    """
+    mined = mined_context(profile, extra_context)
+    if not profile and not resume_text.strip() and not extra_context.strip():
+        # Nothing for a model to read — the mined degenerate answer stands,
+        # explicitly labelled. Not an AI-failure path.
+        return mined
+
+    budget = input_budget_chars(db=db, user_id=user_id, ai_config=ai_config)
+    profile_json, _t1 = fit_prompt_part(json.dumps(profile, default=str), budget, label="keyword_extract.profile")
+    resume_block, _t2 = fit_prompt_part((resume_text or ""), budget, label="keyword_extract.resume")
+    extra_block, _t3 = fit_prompt_part((extra_context or "none"), budget, label="keyword_extract.context")
     prompt = f"""
 You are a career-intelligence extractor. From the candidate profile, resume text and
 extra context below, derive the BEST search context an autonomous job-hunting system
@@ -189,25 +206,28 @@ Rules:
 - Keywords must be useful as search queries (e.g. "backend engineer python", "react frontend", "ml engineer llm").
 
 Profile JSON:
-{json.dumps(profile, default=str)[:3500]}
+{profile_json}
 
 Resume text:
-\"\"\"{(resume_text or '')[:3000]}\"\"\"
+\"\"\"{resume_block}\"\"\"
 
 Extra context from user:
-\"\"\"{(extra_context or 'none')[:800]}\"\"\"
+\"\"\"{extra_block}\"\"\"
 
 Respond ONLY with JSON.
 """
-    try:
-        data = await chat_completion("keyword_extract", prompt, temperature=0.2, ai_config=ai_config)
-        if isinstance(data, dict):
-            merged = _merge_context(fallback, data)
-            merged["source"] = "ai"
-            return merged
-    except (AIClientError, TypeError):
-        pass
-    return fallback
+    from app.services.ai_client import chat_completion
+
+    data = await chat_completion("keyword_extract", prompt, temperature=0.2,
+                                 ai_config=ai_config, db=db, user_id=user_id)
+    if not isinstance(data, dict):
+        from app.services.ai_client import AIClientError
+
+        raise AIClientError("invalid_json: keyword_extract did not return an object",
+                            reason="invalid_json", retryable=True)
+    merged = _merge_context(mined, data)
+    merged["source"] = "ai"
+    return merged
 
 
 def _merge_context(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:

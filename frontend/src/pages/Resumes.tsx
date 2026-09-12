@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import client, { apiError, aiOutage, guardrailFailure, downloadResume, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
+import { AIOutageBanner } from '../components/AIBanner'
 import { Upload, FileText, Wand2, Tag, Download, Brain, ShieldCheck, Sparkles, Layers, Check, Loader2, AlertTriangle, BadgeCheck, XCircle, Clock, Activity, Timer } from 'lucide-react'
 
 type Guardrail = {
@@ -35,31 +36,6 @@ const STEP_LABELS: Record<string, {label: string, desc: string}> = {
   done: {label: 'Done', desc: 'Profile ready'},
   failed: {label: 'Failed', desc: 'Something went wrong'},
   uploading: {label: 'Uploading', desc: 'Sending file to server'},
-}
-
-/** Renders the AI-offline diagnosis the backend returns instead of a degraded result. */
-function AIOutageBanner({ outage }: { outage: AIOutage }) {
-  return (
-    <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-sm">
-      <div className="flex items-start gap-2">
-        <XCircle className="w-4 h-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
-        <div className="min-w-0">
-          <div className="font-medium text-red-800 dark:text-red-200">AI unavailable — nothing was generated</div>
-          <div className="text-xs mono mt-1 text-red-700 dark:text-red-300">
-            {outage.message || 'The AI provider could not be reached.'}
-            {outage.reason ? <span className="opacity-70"> ({outage.reason}{outage.workflow ? ` • ${outage.workflow}` : ''})</span> : null}
-          </div>
-          {outage.fix && <div className="text-xs mono mt-1 text-red-700 dark:text-red-300"><strong>Fix:</strong> {outage.fix}</div>}
-          {outage.detail && <div className="text-[11px] mono mt-1 text-red-600 dark:text-red-400 break-all">{outage.detail}</div>}
-          {(outage.base_url || outage.model) && (
-            <div className="text-[11px] mono mt-1 text-red-600 dark:text-red-400">
-              endpoint {outage.base_url || '—'} • model {outage.model || '—'}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  )
 }
 
 function GuardrailPanel({ report }: { report: Guardrail }) {

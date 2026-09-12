@@ -261,25 +261,28 @@ async def detect_form_structure(
     unmapped = [f for f in fields if not f.get("profile_key")]
 
     if use_ai and unmapped:
-        try:
-            from app.services.ai_client import AIClientError, chat_completion
+        # The caller opted INTO AI field mapping — a failure is not "skip the
+        # AI part", it is an AI outage the caller must see (propagates to a
+        # pausable 503 / a paused queue item).
+        from app.services.ai_client import chat_completion, fit_prompt_part, input_budget_chars
 
-            prompt = (
-                "Map these application-form fields to canonical profile keys. Allowed keys: "
-                f"{sorted(KNOWN_FIELDS)}. Return JSON {{\"mapping\": {{\"<field_name>\": \"<key or null>\"}}}}.\n"
-                f"Fields: {json.dumps([{ 'name': f['name'], 'label': f['label']} for f in unmapped])[:1500]}"
-            )
-            # No per-call timeout — inherit the global wait so slow reasoning models
-            # are not cut off (ai.timeout / AI_TIMEOUT is the single knob).
-            data = await chat_completion("form_detect", prompt, temperature=0)
-            mapping = data.get("mapping") if isinstance(data, dict) else {}
-            for field in unmapped:
-                suggested = (mapping or {}).get(field["name"])
-                if suggested in KNOWN_FIELDS:
-                    field["profile_key"] = suggested
-                    field["profile_key_source"] = "ai"
-        except (AIClientError, Exception) as exc:  # AI is optional here
-            log.debug("AI field mapping skipped: %s", exc)
+        fields_json, _truncated = fit_prompt_part(
+            json.dumps([{"name": f["name"], "label": f["label"]} for f in unmapped]),
+            input_budget_chars(), label="form_detect.fields")
+        prompt = (
+            "Map these application-form fields to canonical profile keys. Allowed keys: "
+            f"{sorted(KNOWN_FIELDS)}. Return JSON {{\"mapping\": {{\"<field_name>\": \"<key or null>\"}}}}.\n"
+            f"Fields: {fields_json}"
+        )
+        # No per-call timeout — inherit the global wait so slow reasoning models
+        # are not cut off (ai.timeout / AI_TIMEOUT is the single knob).
+        data = await chat_completion("form_detect", prompt, temperature=0)
+        mapping = data.get("mapping") if isinstance(data, dict) else {}
+        for field in unmapped:
+            suggested = (mapping or {}).get(field["name"])
+            if suggested in KNOWN_FIELDS:
+                field["profile_key"] = suggested
+                field["profile_key_source"] = "ai"
 
     mapped = [f for f in fields if f.get("profile_key")]
     confidence = min(0.97, 0.45 + 0.5 * (len(mapped) / max(1, len(fields))))

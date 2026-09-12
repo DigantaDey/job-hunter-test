@@ -34,7 +34,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import HRFlowable, KeepTogether, Paragraph, SimpleDocTemplate, Table, TableStyle
 
-from app.services.ai_client import AIClientError, chat_completion
+from app.services.ai_client import AIClientError, fit_prompt_part, input_budget_chars
 from app.services.ai_guardrails import (
     AIUnavailableError,
     FactLedger,
@@ -70,10 +70,16 @@ QUANTIFIER = re.compile(r"\b(\d[\d,\.]*\s*%?|\$\s?\d[\d,\.]*[kmb]?|\d+\s*(?:x|ti
 # Prompt
 # --------------------------------------------------------------------------- #
 def jd_fact_guard_prompt(profile: Dict[str, Any], jd: str, layout: Dict[str, Any],
-                         strict_skeleton: bool, persona: Optional[Dict[str, Any]] = None) -> str:
+                         strict_skeleton: bool, persona: Optional[Dict[str, Any]] = None,
+                         budget_chars: Optional[int] = None) -> str:
+    """Build the tailoring prompt. Dynamic parts are capped at ``budget_chars``
+    (the user's input budget) — no hardcoded truncation slices."""
+    if budget_chars is None:
+        budget_chars = input_budget_chars()
     if strict_skeleton:
+        layout_json, _t1 = fit_prompt_part(json.dumps(layout, default=str), budget_chars, label="resume_gen.layout")
         skeleton = (
-            f"STRICTLY maintain this resume skeleton: {json.dumps(layout, default=str)[:1200]}. "
+            f"STRICTLY maintain this resume skeleton: {layout_json}. "
             f"Keep the section order, heading capitalization and bullet style '{layout.get('bullet_style', '•')}'. "
             "Only rewrite bullet content — never restructure."
         )
@@ -84,10 +90,14 @@ def jd_fact_guard_prompt(profile: Dict[str, Any], jd: str, layout: Dict[str, Any
 
     persona_block = ""
     if persona:
+        persona_json, _t2 = fit_prompt_part(json.dumps(persona, default=str), budget_chars, label="resume_gen.persona")
         persona_block = (
             "\nCandidate track (persona) — tailor towards this specifically:\n"
-            f"{json.dumps(persona, default=str)[:1200]}\n"
+            f"{persona_json}\n"
         )
+
+    profile_json, _t3 = fit_prompt_part(json.dumps(profile, default=str), budget_chars, label="resume_gen.profile")
+    safe_jd, _t4 = fit_prompt_part(strip_ai_artifacts(jd or ""), budget_chars, label="resume_gen.jd")
 
     return f"""Tailor this resume to the job description below.
 
@@ -104,10 +114,10 @@ Ground rules — these are enforced by an automated checker and a violation is r
 {skeleton}
 {persona_block}
 Candidate profile (ground truth):
-{json.dumps(profile, default=str)[:9000]}
+{profile_json}
 
 Job description:
-\"\"\"{strip_ai_artifacts(jd)[:4000]}\"\"\"
+\"\"\"{safe_jd}\"\"\"
 
 Return JSON:
 {{
@@ -293,7 +303,9 @@ async def generate_tailored_profile(
                                             "message": "This job has no description to tailor against."}])
 
     ledger = build_fact_ledger(profile)
-    prompt = jd_fact_guard_prompt(profile, jd, layout or {}, strict_skeleton, persona)
+    budget = input_budget_chars(db=db, user_id=user_id, ai_config=ai_config)
+    prompt = jd_fact_guard_prompt(profile, jd, layout or {}, strict_skeleton, persona,
+                                  budget_chars=budget)
     data, report = await run_guarded_task(
         "resume_gen",
         system=("You are an expert technical resume writer. You tailor ruthlessly to the job description "
@@ -305,7 +317,7 @@ async def generate_tailored_profile(
         db=db,
         user_id=user_id,
         temperature=0.3,
-        max_tokens=3000,
+        max_tokens=TAILOR_OUTPUT_TOKENS,
         # No per-call timeout: a tailored resume is a large generation and slow
         # reasoning models need minutes — inherit the global wait (ai.timeout).
         coerce=lambda payload: {"tailored_profile": _normalise_tailored(payload, profile),
@@ -680,34 +692,41 @@ def hash_jd(jd: str) -> str:
 # --------------------------------------------------------------------------- #
 # Tagging & cover letter
 # --------------------------------------------------------------------------- #
+#: Starting output budgets (the user's configured output ceiling still caps
+#: these and any escalation).
+TAG_OUTPUT_TOKENS = 300
+COVER_LETTER_OUTPUT_TOKENS = 1200
+TAILOR_OUTPUT_TOKENS = 3000
+
+
 async def tag_resume(profile: Dict[str, Any], ai_config=None, *, db=None, user_id=None) -> List[str]:
     """
     Auto-tag a resume so it can be found and reused later.
 
-    AI first (3-5 short tags); the deterministic fallback is a *label* derived
-    from the candidate's own skills, which is safe because it invents nothing.
+    AI is a hard dependency: on failure this raises and the queued tagging job
+    is *paused* (re-run when the provider is back) — the resume is left
+    untagged rather than tagged with a deterministic guess.
     """
+    budget = input_budget_chars(db=db, user_id=user_id, ai_config=ai_config)
+    profile_json, _truncated = fit_prompt_part(json.dumps(profile, default=str), budget, label="tagging.profile")
     prompt = (
         "Create 3-5 short, lowercase, hyphenated tags describing this resume "
         "(e.g. backend-python, fintech, aws). Return JSON {\"tags\": []}.\n"
-        f"Profile: {json.dumps(profile, default=str)[:3000]}"
+        f"Profile: {profile_json}"
     )
-    try:
-        # No per-call timeout — inherit the global wait (ai.timeout / AI_TIMEOUT).
-        data = await chat_completion("tagging", prompt, temperature=0.2,
-                                     ai_config=ai_config, db=db, user_id=user_id)
-        tags = data.get("tags") if isinstance(data, dict) else None
-        if isinstance(tags, list) and tags:
-            cleaned = [re.sub(r"[^a-z0-9\-+#]", "-", str(t).lower()).strip("-") for t in tags]
-            cleaned = [t for t in cleaned if t][:5]
-            if cleaned:
-                return cleaned
-    except (AIClientError, Exception):
-        pass
+    # No per-call timeout — inherit the global wait (ai.timeout / AI_TIMEOUT).
+    from app.services.ai_client import chat_completion
 
-    skills = [str(s).lower().replace(" ", "-") for s in (profile.get("skills") or [])[:3]]
-    tags = ["tailored"] + skills
-    return tags[:5]
+    data = await chat_completion("tagging", prompt, temperature=0.2,
+                                 ai_config=ai_config, db=db, user_id=user_id)
+    tags = data.get("tags") if isinstance(data, dict) else None
+    if isinstance(tags, list) and tags:
+        cleaned = [re.sub(r"[^a-z0-9\-+#]", "-", str(t).lower()).strip("-") for t in tags]
+        cleaned = [t for t in cleaned if t][:5]
+        if cleaned:
+            return cleaned
+    raise AIClientError("invalid_json: tagging did not return usable tags",
+                        reason="invalid_json", retryable=True)
 
 
 def resume_plain_text(tailored: Dict[str, Any], profile: Dict[str, Any]) -> str:
@@ -723,7 +742,9 @@ async def generate_cover_letter(profile: Dict[str, Any], jd: str, job_title: str
     from app.services.ai_guardrails import FieldSpec as _FS
     from app.services.ai_guardrails import SchemaSpec as _SS
 
-    safe_jd = strip_ai_artifacts(jd)[:4000]
+    budget = input_budget_chars(db=db, user_id=user_id)
+    safe_jd, _t1 = fit_prompt_part(strip_ai_artifacts(jd or ""), budget, label="resume_gen.cover_jd")
+    profile_json, _t2 = fit_prompt_part(json.dumps(profile, default=str), budget, label="resume_gen.cover_profile")
     prompt = f"""Write a cover letter grounded ONLY in the candidate's actual profile.
 
 Rules:
@@ -732,7 +753,7 @@ Rules:
 - Tailor to the role: {job_title} at {company}.
 - 3-4 short paragraphs, plain text, no markdown, no first-person clichés like "I am excited to".
 
-Profile: {json.dumps(profile, default=str)[:5000]}
+Profile: {profile_json}
 
 Job description:
 \"\"\"{safe_jd}\"\"\"
@@ -749,6 +770,6 @@ Return JSON: {{"cover_letter": "...", "highlights": ["skill1", "skill2"]}}"""
         db=db,
         user_id=user_id,
         temperature=0.5,
-        max_tokens=1200,
+        max_tokens=COVER_LETTER_OUTPUT_TOKENS,
     )
     return strip_ai_artifacts(str(data.get("cover_letter") or ""))

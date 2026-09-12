@@ -356,34 +356,57 @@ async def fetch_funding_events(
     return events[:limit], report
 
 
-async def ai_rank_events(context: Dict[str, Any], events: List[FundingEvent], limit: int = 20) -> List[FundingEvent]:
+async def ai_rank_events(
+    context: Dict[str, Any],
+    events: List[FundingEvent],
+    limit: int = 20,
+    *,
+    db=None,
+    user_id: Optional[int] = None,
+) -> List[FundingEvent]:
     """
     Re-rank *real* events by relevance to the candidate context.
 
     The model only sees the provider's company names and can only reorder them —
     any name it returns that was not in the input is discarded, so it cannot
     fabricate a funding event.
+
+    AI is a hard dependency: on failure this raises ``AIClientError`` and the
+    caller decides (sync endpoint → pausable 503, queued scan → the item is
+    paused and re-run when the provider is back). The events are *real*
+    (provider-verified) either way — ranking is relevance, not provenance —
+    but a silently unranked list was never asked for, so it is not returned.
     """
     if not events:
         return events
-    from app.services.ai_client import AIClientError, chat_completion
+    from app.services.ai_client import chat_completion, fit_prompt_part, input_budget_chars
 
+    budget = input_budget_chars(db=db, user_id=user_id)
+    focus_json, _t1 = fit_prompt_part(
+        json.dumps({k: context.get(k) for k in ("funding_focus", "industries", "roles", "seniority")}, default=str),
+        budget, label="funding_scan.focus")
+    companies_json, _t2 = fit_prompt_part(
+        json.dumps([{"name": e.name, "stage": e.stage, "industry": e.industry} for e in events[:limit]], default=str),
+        budget, label="funding_scan.companies")
     prompt = (
         "Rank these companies by how relevant they are to this candidate's target focus. "
         "Only reorder the given names — never add new ones.\n"
-        f"Candidate focus: {json.dumps({k: context.get(k) for k in ('funding_focus', 'industries', 'roles', 'seniority')})[:1200]}\n"
-        f"Companies: {json.dumps([{'name': e.name, 'stage': e.stage, 'industry': e.industry} for e in events[:limit]])[:2500]}\n"
+        f"Candidate focus: {focus_json}\n"
+        f"Companies: {companies_json}\n"
         'Return JSON {"order": ["name", ...]}'
     )
-    try:
-        # No per-call timeout — inherit the global wait (ai.timeout / AI_TIMEOUT).
-        data = await chat_completion("funding_scan", prompt, temperature=0.1)
-    except AIClientError:
-        return events
+    # No per-call timeout — inherit the global wait (ai.timeout / AI_TIMEOUT).
+    data = await chat_completion("funding_scan", prompt, temperature=0.1, db=db, user_id=user_id)
 
     order = data.get("order") if isinstance(data, dict) else None
     if not isinstance(order, list):
-        return events
+        # The model answered but not with a usable ranking — surface it.
+        from app.services.ai_client import AIClientError
+
+        raise AIClientError(
+            "invalid_json: funding_scan did not return an 'order' list",
+            reason="invalid_json", retryable=True,
+        )
     ranked: List[FundingEvent] = []
     by_name = {e.name.lower(): e for e in events}
     for name in order:

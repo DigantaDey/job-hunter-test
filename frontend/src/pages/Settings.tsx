@@ -10,7 +10,7 @@ export default function Settings(){
   const [saving, setSaving]=useState(false)
   const [msg, setMsg]=useState('')
   const [showKey, setShowKey]=useState(false)
-  const [aiForm, setAiForm]=useState({base_url:'', model:'', api_key:'', rpm:60, timeout:300})
+  const [aiForm, setAiForm]=useState({base_url:'', model:'', api_key:'', rpm:60, timeout:300, max_input_tokens:12000, max_output_tokens:16000})
   const [aiStatus, setAiStatus]=useState<any>(null)
   const [aiSaving, setAiSaving]=useState(false)
   const [extracted, setExtracted]=useState<any>(null)
@@ -27,7 +27,9 @@ export default function Settings(){
         model: data.ai.model || status?.user_config?.model || 'gpt-4o-mini',
         api_key: '',
         rpm: data.ai.rpm || status?.user_config?.rpm || 60,
-        timeout: data.ai.timeout || 300
+        timeout: data.ai.timeout || 300,
+        max_input_tokens: data.ai.max_input_tokens || 12000,
+        max_output_tokens: data.ai.max_output_tokens || 16000
       })
     }
   }
@@ -59,6 +61,8 @@ export default function Settings(){
           model: aiForm.model,
           rpm: Number(aiForm.rpm)||60,
           timeout: timeoutSecs,
+          max_input_tokens: Number(aiForm.max_input_tokens) || 12000,
+          max_output_tokens: Number(aiForm.max_output_tokens) || 16000,
         }
       }
       if(aiForm.api_key && aiForm.api_key.trim()){
@@ -154,7 +158,7 @@ export default function Settings(){
                 <input value={aiForm.api_key} onChange={e=>setAiForm({...aiForm, api_key:e.target.value})} type={showKey ? "text" : "password"} placeholder={data.ai.api_key_set ? "•••••••••••••••• (set) — leave blank to keep, enter new to replace" : "sk-... or gsk_... or custom key"} className="w-full border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700 pr-10"/>
                 <button onClick={()=>setShowKey(!showKey)} className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800">{showKey ? <EyeOff className="w-4 h-4"/> : <Eye className="w-4 h-4"/>}</button>
               </div>
-              <div className="text-[11px] mono text-zinc-500 mt-1 flex items-center gap-2"><Shield className="w-3 h-3"/> Stored encrypted with per-user HKDF • {data.ai.api_key_set ? `Key set: ${data.ai.api_key_masked||'***'}` : 'No key set — AI will use heuristics fallback'} • Owner key is global fallback for members without their own key</div>
+              <div className="text-[11px] mono text-zinc-500 mt-1 flex items-center gap-2"><Shield className="w-3 h-3"/> Stored encrypted with per-user HKDF • {data.ai.api_key_set ? `Key set: ${data.ai.api_key_masked||'***'}` : 'No key set — AI features are blocked until a key is configured'} • Owner key is the global default for members without their own key</div>
             </div>
             <div className="space-y-2">
               <div className="grid grid-cols-2 gap-2">
@@ -162,6 +166,26 @@ export default function Settings(){
                 <div><label className="text-xs mono" title="How long to wait for the model to finish generating, per request. Heavy reasoning models need minutes.">Timeout (s)</label><input type="number" min={5} max={1800} value={aiForm.timeout} onChange={e=>setAiForm({...aiForm, timeout: Number(e.target.value)})} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
               </div>
               <div className="text-[11px] mono text-zinc-500">Timeout: how long to wait for the model per request (5–1800s). Reasoning models on large tasks need minutes — raise this if slow models time out.</div>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-xs mono">Max input tokens</label>
+                  <input type="number" min={256} max={200000} value={aiForm.max_input_tokens} disabled={!data.ai?.token_limits_editable} onChange={e=>setAiForm({...aiForm, max_input_tokens: Number(e.target.value)})} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700 disabled:opacity-50"/>
+                  <div className="text-[11px] mono text-zinc-500 mt-1">
+                    {data.ai?.token_limits_editable
+                      ? 'Cap on prompt length (resume + JD + context) sent to the model, in tokens (256–200000). Larger prompts are clamped and the truncation is flagged in the record.'
+                      : 'Locked on the free tier — upgrade to edit. Default 12000.'}
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs mono">Max output tokens</label>
+                  <input type="number" min={64} max={16000} value={aiForm.max_output_tokens} disabled={!data.ai?.token_limits_editable} onChange={e=>setAiForm({...aiForm, max_output_tokens: Number(e.target.value)})} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700 disabled:opacity-50"/>
+                  <div className="text-[11px] mono text-zinc-500 mt-1">
+                    {data.ai?.token_limits_editable
+                      ? 'Cap on how much the model may generate per request, in tokens (64–16000). A failed attempt that is retried can never exceed this.'
+                      : 'Locked on the free tier — upgrade to edit. Default 16000.'}
+                  </div>
+                </div>
+              </div>
               <button onClick={saveAiDefault} disabled={aiSaving} className="w-full px-4 py-2.5 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50"><Save className="w-4 h-4"/> {aiSaving?'Saving…':'Save AI Default'}</button>
             </div>
           </div>
@@ -211,7 +235,7 @@ export default function Settings(){
                   : (extracted.keywords || []).map((k:string)=> <span key={k} className="text-[11px] px-2 py-0.5 rounded-full bg-white dark:bg-zinc-900 border dark:border-zinc-700 mono">{k}</span>)}
               </div>
               <div className="text-[11px] mono text-zinc-500 mt-1">
-                Source: {extracted?.source ? (extracted.source === 'ai' || String(extracted.source).startsWith('ai') ? 'AI extraction' : `${extracted.source} (AI offline)`) : 'unknown'}
+                Source: {extracted?.source ? (extracted.source === 'ai' || String(extracted.source).startsWith('ai') ? 'AI extraction (merged with profile data)' : `${extracted.source} (deterministic profile miner — no AI merge yet)`) : 'unknown'}
                 {extracted?.profile_id ? '' : ' • no resume uploaded yet'}
               </div>
             </div>

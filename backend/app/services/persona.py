@@ -584,6 +584,13 @@ async def build_portrait(db: Session, user: User, persona: Persona, *, force: bo
     profile = (profile_row.data if profile_row else {}) or {}
     evidence = _evidence_pack(persona, profile)
 
+    import json as _jsonlib
+
+    from app.services.ai_client import fit_prompt_part, input_budget_chars
+
+    budget = input_budget_chars(db=db, user_id=int(user.id))
+    evidence_json, _truncated = fit_prompt_part(_jsonlib.dumps(evidence, default=str), budget,
+                                                label="persona.evidence")
     prompt = (
         "You are the long-term memory of a job-search copilot. Using ONLY the evidence pack below, "
         "write an honest portrait of this candidate for this specific job track.\n\n"
@@ -596,7 +603,7 @@ async def build_portrait(db: Session, user: User, persona: Persona, *, force: bo
         "(e.g. 'prioritise product analytics roles over pure BI reporting').\n"
         "- 'outreach_angle' is the single most credible hook for cold outreach on this track.\n"
         "- 'evidence' lists the exact signals you relied on (quote them).\n"
-        f"\nEvidence pack:\n{_json(evidence, 9000)}\n\n"
+        f"\nEvidence pack:\n{evidence_json}\n\n"
         "Return JSON with keys: headline, identity, strengths[], gaps[], positioning, "
         "search_directives[], outreach_angle, evidence[]."
     )
@@ -670,7 +677,18 @@ TRACK_SCHEMA = SchemaSpec([
 
 async def suggest_tracks(db: Session, user: User, profile: Dict[str, Any]) -> List[Dict[str, Any]]:
     """AI-suggested personas for a candidate whose resume supports several tracks."""
+    import json as _jsonlib
+
+    from app.services.ai_client import fit_prompt_part, input_budget_chars
+
     ledger = build_fact_ledger(profile)
+    budget = input_budget_chars(db=db, user_id=int(user.id))
+    facts_json, _truncated = fit_prompt_part(
+        _jsonlib.dumps({'name': profile.get('name'), 'current_title': profile.get('current_title'),
+                        'skills': (profile.get('skills') or [])[:40], 'experience': profile.get('experience') or [],
+                        'education': profile.get('education') or [], 'summary': profile.get('summary')},
+                       default=str),
+        budget, label="persona.facts")
     prompt = (
         "This candidate's resume supports more than one job-search track. Suggest 2-4 distinct "
         "personas they could run in parallel (for example 'Data Analyst' and 'Data Scientist').\n\n"
@@ -678,7 +696,7 @@ async def suggest_tracks(db: Session, user: User, profile: Dict[str, Any]) -> Li
         "- Every track must be supported by skills or roles that are actually in the resume.\n"
         "- Each track needs a distinct target role, keyword set and positioning — no duplicates.\n"
         "- 'why' explains, in one sentence, which part of the resume justifies the track.\n\n"
-        f"Resume facts:\n{_json({'name': profile.get('name'), 'current_title': profile.get('current_title'), 'skills': (profile.get('skills') or [])[:40], 'experience': profile.get('experience') or [], 'education': profile.get('education') or [], 'summary': profile.get('summary')}, 7000)}\n\n"
+        f"Resume facts:\n{facts_json}\n\n"
         "Return JSON: {\"tracks\": [{\"name\", \"target_role\", \"keywords\"[], \"industries\"[], "
         "\"seniority\", \"why\"}]}"
     )

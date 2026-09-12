@@ -314,11 +314,11 @@ async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file
         # Re-rank previously unscored jobs against the fresh profile. These are
         # explicitly labelled "preliminary" — the real verdict comes from the AI
         # scorer (see /api/jobs/{id}/intelligence).
-        from app.services.scoring import heuristic_score_detailed
+        from app.services.scoring import preliminary_score_detailed
 
         rescored = 0
         for job in db.query(Job).filter(Job.user_id == user.id, Job.score == 0).limit(50).all():
-            detail = heuristic_score_detailed(profile_data, job.description or "")
+            detail = preliminary_score_detailed(profile_data, job.description or "")
             job.score = float(detail["overall"])
             job.score_reason = detail["reason"]
             job.score_source = "preliminary"

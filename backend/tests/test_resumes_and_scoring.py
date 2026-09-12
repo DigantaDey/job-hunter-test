@@ -7,7 +7,7 @@ import pytest
 
 from app.models.models import Job, Resume, User
 from app.services.resume_service import diff_text, fact_guard_check, render_profile_text, resume_text
-from app.services.scoring import heuristic_score, jd_similarity, tokenize
+from app.services.scoring import jd_similarity, preliminary_score, tokenize
 
 
 def _job(db, description: str = "Python, FastAPI, PostgreSQL, Kubernetes. Payments platform.") -> Job:
@@ -29,20 +29,20 @@ def test_tokenizer_matches_skills_with_punctuation():
     assert "c++" in tokenize("Looking for C++ engineers")
 
 
-def test_heuristic_score_rewards_overlap():
+def test_preliminary_score_rewards_overlap():
     profile = {"skills": ["python", "fastapi", "postgresql"],
                "summary": "Python backend engineer building FastAPI services on PostgreSQL",
                "experience": [{"title": "Backend Engineer", "description": "python fastapi postgresql"}],
                "projects": []}
-    strong, reason = heuristic_score(profile, "Python FastAPI PostgreSQL backend engineer")
-    weak, _ = heuristic_score(profile, "Unity game designer with C# and Photoshop experience")
+    strong, reason = preliminary_score(profile, "Python FastAPI PostgreSQL backend engineer")
+    weak, _ = preliminary_score(profile, "Unity game designer with C# and Photoshop experience")
     assert strong > weak
     assert 0 <= weak <= 100 and 0 <= strong <= 100
     assert "skill overlap" in reason
 
 
-def test_heuristic_score_handles_empty_input():
-    score, reason = heuristic_score({}, "")
+def test_preliminary_score_handles_empty_input():
+    score, reason = preliminary_score({}, "")
     assert score == 50.0
     assert "Insufficient" in reason
 

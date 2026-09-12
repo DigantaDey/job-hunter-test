@@ -11,9 +11,11 @@ from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger
 from app.models.models import CompanyIntel
-from app.services.ai_client import AIClientError, chat_completion
 
 log = get_logger("app.company_intel")
+
+#: Starting output budget (the user's configured output ceiling still caps it).
+INTEL_OUTPUT_TOKENS = 800
 
 
 async def fetch_company_intel(company: str, db: Session = None, user_id: Optional[int] = None, force_refresh: bool = False) -> Dict[str, Any]:
@@ -38,7 +40,11 @@ async def fetch_company_intel(company: str, db: Session = None, user_id: Optiona
                     "cached": True,
                 }
 
-    # Generate via AI
+    # Generate via AI. AI is a hard dependency: on failure this raises and the
+    # endpoint reports the outage (pausable 503). A failed research call is
+    # NOT cached — the previous behaviour (persisting an "unavailable" stub as
+    # if it were intel for 30 days) is exactly the silent degradation this
+    # product removed in v2.1.
     prompt = f"""
 Research company: {company}
 
@@ -57,28 +63,16 @@ Return JSON: {{
 Be concise, no hallucination beyond reasonable public knowledge. If unknown, use "unknown".
 """
 
-    try:
-        data = await chat_completion(
-            "company_intel",
-            prompt,
-            temperature=0.3,
-            max_tokens=800,
-            db=db,
-            user_id=user_id,
-        )
-    except (AIClientError, Exception) as exc:
-        log.warning("company intel failed for %s: %s", company, exc)
-        data = {
-            "website": "",
-            "industry": "unknown",
-            "size": "unknown",
-            "funding_stage": "unknown",
-            "tech_stack": [],
-            "culture": "",
-            "recent_news": [],
-            "summary": f"{company} — company intelligence unavailable (AI not configured)",
-            "sources": [],
-        }
+    from app.services.ai_client import chat_completion
+
+    data = await chat_completion(
+        "company_intel",
+        prompt,
+        temperature=0.3,
+        max_tokens=INTEL_OUTPUT_TOKENS,
+        db=db,
+        user_id=user_id,
+    )
 
     if db and user_id:
         try:

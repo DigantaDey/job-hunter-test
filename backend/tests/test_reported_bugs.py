@@ -244,7 +244,7 @@ def test_free_tier_scores_are_labelled_preliminary_not_ai(client: TestClient, au
 def test_preliminary_scores_are_labelled_as_preliminary(client: TestClient, auth: Dict[str, str], db,
                                                         uploaded_resume):
     """Discovery-time keyword estimates must never masquerade as AI verdicts."""
-    from app.services.scoring import heuristic_score_detailed
+    from app.services.scoring import preliminary_score_detailed
 
     profile = db.query(Profile).first()
     job = Job(user_id=profile.user_id, title="Data Engineer", company="AcmeData",
@@ -253,7 +253,7 @@ def test_preliminary_scores_are_labelled_as_preliminary(client: TestClient, auth
     db.add(job)
     db.commit()
 
-    detail = heuristic_score_detailed(profile.data, job.description)
+    detail = preliminary_score_detailed(profile.data, job.description)
     assert detail["source"] == "preliminary"
     assert detail.get("ai") is not True
 

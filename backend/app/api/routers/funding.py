@@ -77,7 +77,8 @@ async def list_companies(
         context = await search_context(db, user.id, extra_context=extra_context)
         context = persona_service.context_for_persona(context, persona, extra_context=extra_context)
         provider = get_setting(db, user.id, "funding", "provider", settings.funding_provider)
-        companies, report = await funding_radar.scan_funded_companies(context, window_days=window, limit=settings.funding_limit, provider=provider)
+        companies, report = await funding_radar.scan_funded_companies(context, window_days=window, limit=settings.funding_limit, provider=provider,
+                                                                      db=db, user_id=int(user.id))
         funding_radar.sync_funding_db(db, user.id, companies, window)
         audit.audit(db, "funding.scan", user_id=user.id, target=provider, detail={"found": len(companies), "provider_report": report})
         increment_usage(db, user.id, "funding_companies_per_month", len(companies))

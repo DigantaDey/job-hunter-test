@@ -56,6 +56,11 @@ def defaults() -> Dict[str, Dict[str, Any]]:
             "api_key_masked": "***" if settings.ai_api_key else "",
             "max_retries": settings.ai_max_retries,
             "timeout": settings.ai_timeout,
+            # Token budgets (single source of truth for the gateway + every
+            # prompt-truncation site). Editable by the owner and all paid
+            # tiers; the free tier keeps the safe defaults read-only.
+            "max_input_tokens": settings.ai_max_input_tokens,
+            "max_output_tokens": settings.ai_max_output_tokens,
             "provider": "openai_compatible",
             "openai_compatible": True,
         },
@@ -118,7 +123,8 @@ def defaults() -> Dict[str, Dict[str, Any]]:
 
 # Keys that may be written per category (everything else → 400).
 WRITABLE_KEYS: Dict[str, set] = {
-    "ai": {"base_url", "model", "rpm", "max_retries", "timeout", "api_key"},
+    "ai": {"base_url", "model", "rpm", "max_retries", "timeout", "api_key",
+           "max_input_tokens", "max_output_tokens"},
     "scraping": {"keywords", "sources", "live_enabled", "live_sources", "freshness_hours"},
     "general": {"strict_skeleton", "auto_approve_email", "default_resume_format",
                 "require_resume_approval", "reuse_similarity_threshold", "generate_min_score"},
@@ -154,6 +160,27 @@ def validate_openai_compatible(base_url: str, model: str, api_key: str = "") -> 
         if len(model.strip()) < 2:
             return "model must be at least 2 characters (e.g. gpt-4o-mini)"
     return None
+
+
+#: Validation ranges for the per-user token budgets (sane, model-aware lower
+#: and upper bounds — see the over-context decision in the CHANGELOG).
+TOKEN_LIMIT_RANGES = {
+    "max_input_tokens": (256, 200000),
+    "max_output_tokens": (64, 16000),
+}
+
+
+def can_edit_token_limits(db: Session, user: "User") -> bool:
+    """Owner (the operator) and all paid tiers may edit the token budgets.
+
+    The free tier keeps fixed safe defaults — enforced server-side here (a
+    free-tier PUT is rejected), not merely hidden in the UI.
+    """
+    if user.role == "owner":
+        return True
+    from app.core.entitlements import get_user_plan
+
+    return get_user_plan(db, int(user.id)) != "free"
 
 
 def get_secret_setting(db: Session, user_id: int, category: str, key: str) -> Tuple[Optional[str], Optional[str]]:
@@ -300,6 +327,11 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
     api_key, api_key_error = get_secret_setting(db, user_id, "ai", "api_key")
     key_source: Optional[str] = "user" if api_key else None
 
+    # Token budgets: the user's own value, else the owner's (the operator's
+    # global default), else the env default. Same resolution order as the key.
+    max_input_tokens = get_setting(db, user_id, "ai", "max_input_tokens", None)
+    max_output_tokens = get_setting(db, user_id, "ai", "max_output_tokens", None)
+
     # If current user doesn't have api_key, try owner fallback
     if not api_key:
         try:
@@ -311,6 +343,10 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
                     base_url = base_url or get_setting(db, owner.id, "ai", "base_url", None)
                     model = model or get_setting(db, owner.id, "ai", "model", None)
                     key_source = "owner"
+                if max_input_tokens is None:
+                    max_input_tokens = get_setting(db, int(owner.id), "ai", "max_input_tokens", None)
+                if max_output_tokens is None:
+                    max_output_tokens = get_setting(db, int(owner.id), "ai", "max_output_tokens", None)
         except Exception:
             pass
 
@@ -328,6 +364,8 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
         "rpm": get_setting(db, user_id, "ai", "rpm", settings.ai_rpm),
         "max_retries": get_setting(db, user_id, "ai", "max_retries", settings.ai_max_retries),
         "timeout": get_setting(db, user_id, "ai", "timeout", settings.ai_timeout),
+        "max_input_tokens": max_input_tokens or settings.ai_max_input_tokens,
+        "max_output_tokens": max_output_tokens or settings.ai_max_output_tokens,
     }
 
 
@@ -371,17 +409,24 @@ def grouped(db: Session, user: User, *, reveal_secrets: bool = False) -> Dict[st
         result["ai"]["is_owner"] = True
         result["ai"]["is_global_default"] = True
     else:
-        # Show if using owner fallback
-        try:
-            owner = db.query(User).filter(User.role == "owner").order_by(User.id.asc()).first()
-            if owner:
-                owner_has_key = bool(get_setting(db, owner.id, "ai", "api_key", None))
-                if owner_has_key and not ai_key and not settings.ai_api_key:
-                    result["ai"]["using_owner_default"] = True
-                    result["ai"]["owner_base_url"] = get_setting(db, owner.id, "ai", "base_url", settings.ai_base_url)
-                    result["ai"]["owner_model"] = get_setting(db, owner.id, "ai", "model", settings.ai_model)
-        except Exception:
-            pass
+        result["ai"]["is_owner"] = False
+    # The UI disables the token-limit fields (with the upgrade reason) exactly
+    # when the server would reject a PUT — one predicate, both sides.
+    result["ai"]["token_limits_editable"] = can_edit_token_limits(db, user)
+    if not result["ai"]["token_limits_editable"]:
+        result["ai"]["token_limits_locked_reason"] = "upgrade to adjust token limits"
+
+    # Show if using owner fallback
+    try:
+        owner = db.query(User).filter(User.role == "owner").order_by(User.id.asc()).first()
+        if owner:
+            owner_has_key = bool(get_setting(db, owner.id, "ai", "api_key", None))
+            if owner_has_key and not ai_key and not settings.ai_api_key:
+                result["ai"]["using_owner_default"] = True
+                result["ai"]["owner_base_url"] = get_setting(db, owner.id, "ai", "base_url", settings.ai_base_url)
+                result["ai"]["owner_model"] = get_setting(db, owner.id, "ai", "model", settings.ai_model)
+    except Exception:
+        pass
 
     return result
 
@@ -396,6 +441,22 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
 
     updated: Dict[str, Any] = {}
     skipped: Dict[str, Any] = {}
+
+    # Server-side tier gate for the token budgets: the free tier keeps fixed
+    # safe defaults — a PUT that touches them is rejected (not just hidden).
+    if "ai" in payload:
+        token_keys = [k for k in (payload["ai"] or {}) if k in TOKEN_LIMIT_RANGES]
+        if token_keys and not can_edit_token_limits(db, user):
+            from fastapi import HTTPException
+
+            raise HTTPException(
+                403,
+                {
+                    "code": "upgrade_required",
+                    "message": "Token limits are editable on paid tiers — upgrade to adjust token limits.",
+                    "fields": sorted(token_keys),
+                },
+            )
 
     # Pre-validate OpenAI compatible format if ai category present
     if "ai" in payload:
@@ -440,6 +501,20 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
                     raise HTTPException(400, "'ai.timeout' must be a number of seconds") from exc
                 if not 5 <= value <= 1800:
                     raise HTTPException(400, "'ai.timeout' must be between 5 and 1800 seconds")
+            if category == "ai" and key in TOKEN_LIMIT_RANGES:
+                # Sane ranges; over-context behaviour is clamping-with-warning
+                # (the gateway truncates/clamps and flags it — it never
+                # rejects a save just because a model's window is smaller).
+                lo, hi = TOKEN_LIMIT_RANGES[key]
+                try:
+                    value = int(value)
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(400, f"'{category}.{key}' must be an integer number of tokens") from exc
+                if not lo <= value <= hi:
+                    raise HTTPException(
+                        400,
+                        f"'{category}.{key}' must be between {lo} and {hi} tokens",
+                    )
             # Hygiene for AI connection fields: paste artifacts (trailing
             # whitespace/newlines) and masked placeholders are the two classic
             # ways a *valid* key ends up rejected by the provider.

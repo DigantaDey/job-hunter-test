@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.0.5"
+    version: str = "2.1.0"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -223,9 +223,20 @@ class Settings(BaseSettings):
     ai_max_retries: int = 3
     ai_backoff_base: float = 1.5
     ai_daily_token_budget: int = 0
-    # Resume parsing emits a large JSON document (every role, bullet, skill…).
-    # 1200 truncated it mid-JSON, surfacing as invalid_json / empty answers.
-    ai_max_output_tokens: int = 4000
+    # Per-user OUTPUT-token ceiling (the per-request default for users who have
+    # not set their own in Settings → AI API). Every outgoing ``max_tokens`` is
+    # clamped to the resolved ceiling, and the gateway's automatic escalation on
+    # truncation (PR #29) can never exceed it. Kept at the hard escalation
+    # ceiling so out-of-the-box behaviour is unchanged for operators.
+    ai_max_output_tokens: int = 16000
+    # Per-user INPUT-token ceiling (per-request default). The gateway derives a
+    # character budget (≈4 chars/token) from it and caps every prompt part —
+    # the old hardcoded slices (jd[:2000], json.dumps(profile)[:5000], …) all
+    # obey it now.
+    ai_max_input_tokens: int = 12000
+    # How often the AI-availability watchdog re-probes the provider and drains
+    # work that was paused during a transient outage (seconds).
+    ai_watchdog_interval_seconds: float = 15.0
 
     # ------------------------------------------------------------------ #
     # Job sources

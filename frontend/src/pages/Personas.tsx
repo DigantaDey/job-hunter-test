@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import client, { apiError, aiOutage, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
+import { AIOutageBanner } from '../components/AIBanner'
 import { Users, Plus, Sparkles, Target, Brain, RefreshCw, Loader2, Check, Trash2, Pencil, XCircle, BadgeCheck } from 'lucide-react'
 
 /**
@@ -140,18 +141,7 @@ export default function Personas() {
         </p>
       </div>
 
-      {outage && (
-        <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-sm">
-          <div className="flex items-start gap-2">
-            <XCircle className="w-4 h-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
-            <div className="min-w-0">
-              <div className="font-medium text-red-800 dark:text-red-200">AI unavailable — nothing was generated</div>
-              <div className="text-xs mono mt-1 text-red-700 dark:text-red-300">{outage.message}{outage.reason ? ` (${outage.reason})` : ''}</div>
-              {outage.fix && <div className="text-xs mono mt-1 text-red-700 dark:text-red-300"><strong>Fix:</strong> {outage.fix}</div>}
-            </div>
-          </div>
-        </div>
-      )}
+      {outage && <AIOutageBanner outage={outage} onDismiss={()=>setOutage(null)} />}
       {notice && <div className="p-3 rounded-xl bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 text-sm mono text-blue-700 dark:text-blue-300">{notice}</div>}
 
       {creating && (

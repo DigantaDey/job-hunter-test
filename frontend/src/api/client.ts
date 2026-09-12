@@ -132,6 +132,15 @@ export type AIOutage = {
   base_url?: string | null
   model?: string | null
   hint?: string | null
+  /** v2.1 three-state signal: transient_outage | blocked_needs_action */
+  state?: string
+  /** v2.1 dedicated status: ai_paused | ai_blocked */
+  status?: string
+  pausable?: boolean
+  retry_after_hint?: number | null
+  /** v2.0.5 accounting carried into the response. */
+  attempts?: number
+  possibly_billed?: boolean
 }
 
 /**

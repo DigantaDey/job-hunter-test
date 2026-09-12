@@ -8,7 +8,7 @@ guardrail that checks every extracted entity against the source text.
 
 When the model is unreachable the caller gets an ``AIUnavailableError`` carrying
 the provider's own diagnosis — the product refuses to persist a regex-guessed
-profile and present it as the candidate's record. ``heuristic_profile_extract``
+profile and present it as the candidate's record. ``diagnostic_preview_extract``
 remains only as an explicitly-labelled *preview* helper for diagnostics/tests.
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pdfminer.high_level import extract_text as pdfminer_extract
 from pypdf import PdfReader
 
+from app.services.ai_client import fit_prompt_part, input_budget_chars
 from app.services.ai_guardrails import (
     AIUnavailableError,
     FieldSpec,
@@ -27,6 +28,14 @@ from app.services.ai_guardrails import (
     run_guarded_task,
     strip_ai_artifacts,
 )
+
+#: Starting output budget for a full resume profile (a large JSON document).
+#: The user's configured output ceiling still caps it and any escalation.
+#: (Explicit — the gateway's env default no longer silently sets per-request
+#: budgets; PR #29's escalation still starts from this value.)
+PARSE_OUTPUT_TOKENS = 4000
+#: Storage cap for the raw resume text kept on the profile (not a prompt slice).
+MAX_RAW_TEXT_CHARS = 20000
 
 PROFILE_SCHEMA = SchemaSpec([
     FieldSpec("name", "str", min_length=2, max_length=120),
@@ -291,6 +300,9 @@ async def ai_extract_profile(
                      "fix": "Upload a text-based PDF or DOCX, or an OCR'd version of the scan."},
         )
 
+    budget = input_budget_chars(db=db, user_id=user_id, ai_config=ai_config)
+    resume_text, _truncated = fit_prompt_part(strip_ai_artifacts(text), budget, label="parse.resume")
+
     prompt = f"""Extract a complete, structured profile from this resume.
 
 Rules:
@@ -309,7 +321,7 @@ projects (array of {{name, description, tech[], link}}),
 links (array), languages (array), certifications (array).
 
 Resume text:
-\"\"\"{strip_ai_artifacts(text)[:12000]}\"\"\"
+\"\"\"{resume_text}\"\"\"
 """
     data, report = await run_guarded_task(
         "parse",
@@ -322,11 +334,12 @@ Resume text:
         db=db,
         user_id=user_id,
         temperature=0.0,
+        max_tokens=PARSE_OUTPUT_TOKENS,
         coerce=lambda payload: _normalise_profile(payload, text),
     )
 
     profile = _normalise_profile(data, text)
-    profile["raw_text"] = text[:20000]
+    profile["raw_text"] = text[:MAX_RAW_TEXT_CHARS]
     meta = {
         "ai_used": True,
         "source": "ai",
@@ -339,7 +352,7 @@ Resume text:
 # --------------------------------------------------------------------------- #
 # Diagnostic-only heuristic preview (never persisted as the master profile)
 # --------------------------------------------------------------------------- #
-def heuristic_profile_extract(text: str) -> Dict[str, Any]:
+def diagnostic_preview_extract(text: str) -> Dict[str, Any]:
     """
     Regex preview used for diagnostics/tests only.
 

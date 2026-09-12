@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import client, { apiError, AI_REQUEST_TIMEOUT_MS } from '../api/client'
+import client, { apiError, aiOutage, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
+import { AIOutageBanner } from '../components/AIBanner'
 import { Brain, Plus, Trash2, CheckCircle } from 'lucide-react'
 
 export default function Interview() {
@@ -7,6 +8,7 @@ export default function Interview() {
   const [selected, setSelected] = useState<any>(null)
   const [form, setForm] = useState({job_title:'', company:'', job_description:'', count:10})
   const [msg, setMsg] = useState('')
+  const [outage, setOutage] = useState<AIOutage | null>(null)
   const [busy, setBusy] = useState(false)
   const [answer, setAnswer] = useState<{[key:number]:string}>({})
 
@@ -22,7 +24,11 @@ export default function Interview() {
       setMsg(`Generated ${data.questions.length} questions for ${data.job_title}`)
       load()
       setSelected(data)
-    }catch(e:any){ setMsg(apiError(e)) }
+    }catch(e:any){
+      const o = aiOutage(e)
+      if (o) setOutage(o)
+      else setMsg(apiError(e))
+    }
     finally{ setBusy(false) }
   }
 
@@ -36,7 +42,11 @@ export default function Interview() {
       // refresh
       const {data: refreshed} = await client.get(`/api/interview/${selected.id}`)
       setSelected(refreshed)
-    }catch(e:any){ setMsg(apiError(e)) }
+    }catch(e:any){
+      const o = aiOutage(e)
+      if (o) setOutage(o)
+      else setMsg(apiError(e))
+    }
     finally{ setBusy(false) }
   }
 
@@ -45,6 +55,7 @@ export default function Interview() {
       <h1 className="text-xl font-semibold flex items-center gap-2"><Brain className="w-5 h-5"/> Interview Preparation</h1>
       <p className="text-xs text-zinc-500">AI-generated questions grounded in your resume + JD. Never fabricates experience. Pro: 20 sessions/mo, Pro+: 100.</p>
       {msg && <div className="p-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 text-xs mono">{msg}</div>}
+      {outage && <AIOutageBanner outage={outage} what="no questions or feedback were generated" onDismiss={()=>setOutage(null)} />}
 
       <div className="grid lg:grid-cols-[0.9fr_1.1fr] gap-4">
         <div className="space-y-4">
