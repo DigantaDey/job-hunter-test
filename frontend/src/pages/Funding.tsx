@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import client, { apiError } from '../api/client'
+import client, { apiError, AI_REQUEST_TIMEOUT_MS } from '../api/client'
 import { TrendingUp, ExternalLink, Mail, Briefcase, Loader2, Sparkles, RefreshCw, Calendar, Target, Building2, CheckCircle2 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 
@@ -56,7 +56,7 @@ export default function Funding() {
     setError('')
     if (refresh) setScanning(true)
     try {
-      const { data } = await client.get('/api/funding/companies', { params: { refresh } })
+      const { data } = await client.get('/api/funding/companies', { params: { refresh }, timeout: AI_REQUEST_TIMEOUT_MS })
       setCompanies(data.companies || [])
       setContext(data.context || null)
       setResume(data.resume || null)
@@ -98,7 +98,7 @@ export default function Funding() {
   const process = async (c: Company) => {
     setBusy(c.name); setResult(null); setError('')
     try {
-      const { data } = await client.post(`/api/funding/${encodeURIComponent(c.name)}/process`)
+      const { data } = await client.post(`/api/funding/${encodeURIComponent(c.name)}/process`, null, { timeout: AI_REQUEST_TIMEOUT_MS })
       setResult(data)
       await load(false)
     } catch (e: any) {

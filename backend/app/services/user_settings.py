@@ -55,6 +55,7 @@ def defaults() -> Dict[str, Dict[str, Any]]:
             "api_key_set": bool(settings.ai_api_key),
             "api_key_masked": "***" if settings.ai_api_key else "",
             "max_retries": settings.ai_max_retries,
+            "timeout": settings.ai_timeout,
             "provider": "openai_compatible",
             "openai_compatible": True,
         },
@@ -117,7 +118,7 @@ def defaults() -> Dict[str, Dict[str, Any]]:
 
 # Keys that may be written per category (everything else → 400).
 WRITABLE_KEYS: Dict[str, set] = {
-    "ai": {"base_url", "model", "rpm", "max_retries", "api_key"},
+    "ai": {"base_url", "model", "rpm", "max_retries", "timeout", "api_key"},
     "scraping": {"keywords", "sources", "live_enabled", "live_sources", "freshness_hours"},
     "general": {"strict_skeleton", "auto_approve_email", "default_resume_format",
                 "require_resume_approval", "reuse_similarity_threshold", "generate_min_score"},
@@ -326,6 +327,7 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
         "api_key_error": api_key_error,
         "rpm": get_setting(db, user_id, "ai", "rpm", settings.ai_rpm),
         "max_retries": get_setting(db, user_id, "ai", "max_retries", settings.ai_max_retries),
+        "timeout": get_setting(db, user_id, "ai", "timeout", settings.ai_timeout),
     }
 
 
@@ -429,6 +431,15 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
                     value = int(value)
                 except (TypeError, ValueError) as exc:
                     raise HTTPException(400, f"'{category}.{key}' must be an integer") from exc
+            if category == "ai" and key == "timeout":
+                # Generous but bounded: heavy reasoning models need minutes,
+                # but an unbounded wait would hang HTTP requests forever.
+                try:
+                    value = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(400, "'ai.timeout' must be a number of seconds") from exc
+                if not 5 <= value <= 1800:
+                    raise HTTPException(400, "'ai.timeout' must be between 5 and 1800 seconds")
             # Hygiene for AI connection fields: paste artifacts (trailing
             # whitespace/newlines) and masked placeholders are the two classic
             # ways a *valid* key ends up rejected by the provider.

@@ -306,7 +306,8 @@ async def generate_tailored_profile(
         user_id=user_id,
         temperature=0.3,
         max_tokens=3000,
-        timeout=90,
+        # No per-call timeout: a tailored resume is a large generation and slow
+        # reasoning models need minutes — inherit the global wait (ai.timeout).
         coerce=lambda payload: {"tailored_profile": _normalise_tailored(payload, profile),
                                 "tags": payload.get("tags") or [],
                                 "reasoning": payload.get("reasoning") or ""},
@@ -692,7 +693,8 @@ async def tag_resume(profile: Dict[str, Any], ai_config=None, *, db=None, user_i
         f"Profile: {json.dumps(profile, default=str)[:3000]}"
     )
     try:
-        data = await chat_completion("tagging", prompt, temperature=0.2, timeout=20,
+        # No per-call timeout — inherit the global wait (ai.timeout / AI_TIMEOUT).
+        data = await chat_completion("tagging", prompt, temperature=0.2,
                                      ai_config=ai_config, db=db, user_id=user_id)
         tags = data.get("tags") if isinstance(data, dict) else None
         if isinstance(tags, list) and tags:

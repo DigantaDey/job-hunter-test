@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.0.4"
+    version: str = "2.0.5"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -206,7 +206,20 @@ class Settings(BaseSettings):
     ai_api_key: str = ""
     ai_model: str = "gpt-4o-mini"
     ai_rpm: int = 60
-    ai_timeout: float = 30.0
+    # How long to wait for the model to finish generating (per wire attempt).
+    # Heavy reasoning models legitimately take minutes on large tasks (resume
+    # parsing = thinking tokens + a multi-thousand-token JSON), so this is
+    # deliberately generous: 5 minutes covers even slow free-tier reasoning
+    # models while still bounding every HTTP request. Configurable per user in
+    # Settings → AI API (ai.timeout) and via AI_TIMEOUT; per-call overrides
+    # win over both. When hit, the failure is reported honestly as `timeout`
+    # (never `unreachable`) with the attempts spent and a billing caveat.
+    ai_timeout: float = 300.0
+    # TCP+TLS connect deadline. Kept short so a genuinely unreachable endpoint
+    # (wrong base_url, DNS/TLS failure) still fails fast even though the
+    # generation wait above is long. The httpx client is built as
+    # Timeout(ai_timeout, connect=min(ai_connect_timeout, ai_timeout)).
+    ai_connect_timeout: float = 10.0
     ai_max_retries: int = 3
     ai_backoff_base: float = 1.5
     ai_daily_token_budget: int = 0

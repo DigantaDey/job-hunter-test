@@ -376,7 +376,8 @@ async def ai_rank_events(context: Dict[str, Any], events: List[FundingEvent], li
         'Return JSON {"order": ["name", ...]}'
     )
     try:
-        data = await chat_completion("funding_scan", prompt, temperature=0.1, timeout=30)
+        # No per-call timeout — inherit the global wait (ai.timeout / AI_TIMEOUT).
+        data = await chat_completion("funding_scan", prompt, temperature=0.1)
     except AIClientError:
         return events
 

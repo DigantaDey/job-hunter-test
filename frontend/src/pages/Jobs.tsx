@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import client, { apiError } from '../api/client'
+import client, { apiError, AI_REQUEST_TIMEOUT_MS } from '../api/client'
 import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader2, Wand2, CheckCircle, AlertCircle, Eye, Brain, Target, MapPin, DollarSign, GraduationCap, Zap, TrendingUp, FileText } from 'lucide-react'
 
 /**
@@ -52,9 +52,9 @@ export default function Jobs(){
     setIntelligence(null)
     setCompanyIntel(null)
     // Fetch intelligence breakdown
-    client.get(`/api/jobs/${id}/intelligence`).then(r=>setIntelligence(r.data)).catch(()=>{})
+    client.get(`/api/jobs/${id}/intelligence`, { timeout: AI_REQUEST_TIMEOUT_MS }).then(r=>setIntelligence(r.data)).catch(()=>{})
     // Fetch company intel
-    client.get(`/api/company/${encodeURIComponent(data.company)}/intel`).then(r=>setCompanyIntel(r.data)).catch(()=>{})
+    client.get(`/api/company/${encodeURIComponent(data.company)}/intel`, { timeout: AI_REQUEST_TIMEOUT_MS }).then(r=>setCompanyIntel(r.data)).catch(()=>{})
   }
 
   const discover = async()=>{
@@ -71,7 +71,7 @@ export default function Jobs(){
     if(!selected) return
     setGenerating(true)
     try{
-      const {data} = await client.post('/api/resumes/generate', null, {params:{job_id: selected.id}})
+      const {data} = await client.post('/api/resumes/generate', null, {params:{job_id: selected.id}, timeout: AI_REQUEST_TIMEOUT_MS})
       setGenerateMsg('Tailored resume ready')
       setGeneratedLinks(data.files)
     }catch(e:any){ setGenerateMsg(apiError(e, 'Generation failed')) }
@@ -273,13 +273,13 @@ export default function Jobs(){
                 <button onClick={async()=>{
                   setApplyMsg('')
                   try{
-                    await client.post('/api/emails/generate', {company: selected.company, job_id: selected.id})
+                    await client.post('/api/emails/generate', {company: selected.company, job_id: selected.id}, { timeout: AI_REQUEST_TIMEOUT_MS })
                     setApplyMsg('Email drafted → check the Email Bucket')
                   }catch(e:any){ setApplyMsg(apiError(e, 'Could not draft the email')) }
                 }} className="w-full py-2 rounded-full border dark:border-zinc-700">Cold email</button>
                 <button onClick={async()=>{
                   try{
-                    const {data} = await client.post('/api/interview/generate', {job_id: selected.id, count: 8})
+                    const {data} = await client.post('/api/interview/generate', {job_id: selected.id, count: 8}, { timeout: AI_REQUEST_TIMEOUT_MS })
                     setApplyMsg(`Interview prep generated: ${data.questions.length} questions → Interview Prep page`)
                   }catch(e:any){ setApplyMsg(apiError(e)) }
                 }} className="w-full py-2 rounded-full border dark:border-zinc-700 flex items-center justify-center gap-1"><FileText className="w-3.5 h-3.5"/> Interview prep</button>

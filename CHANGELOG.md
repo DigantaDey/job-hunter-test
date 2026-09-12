@@ -4,6 +4,77 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.0.5] — 2026-09-12
+
+Fixes the "`AI unavailable — nothing was generated` / `unreachable` with a blank
+`http_error:` detail" outage reported while AI-parsing an uploaded resume on a
+slow free-tier reasoning model (`z-ai/glm-5.3-free`) — even though the provider
+dashboard showed the requests arriving and consuming tokens. Seven independent
+root causes were found; each one alone misdiagnoses or fails a slow-but-healthy
+generation.
+
+### Fixed
+
+- **A slow model was cut off after 30s and misreported as `unreachable`.**
+  The gateway waited a flat 30s per attempt (`AI_TIMEOUT`), then labelled the
+  resulting `httpx.ReadTimeout` — whose string form is literally `""` — as
+  `http_error: ` and mapped that prefix to `unreachable` ("DNS/TLS/connection
+  failure"). The default wait is now 300s (deliberate, documented,
+  configurable per user in Settings → AI API and via `AI_TIMEOUT`), the
+  TCP+TLS connect phase keeps its own short deadline (`AI_CONNECT_TIMEOUT`,
+  10s) so genuine connectivity failures still fail fast, and an expired
+  generation wait is reported honestly as `timeout` with the model, the wait,
+  the attempts spent and a billing caveat — never blank, never `unreachable`.
+- **Timeouts were retried blindly, multiplying the user's bill.** Every expired
+  wait was retried up to `AI_MAX_RETRIES` (3), so one upload spent — and the
+  provider billed — three full generations while the ledger claimed
+  `0 tokens • $0.0000`. Read/write waits are no longer retried automatically
+  (the provider accepted the request and may still be generating); connect
+  failures and 429/5xx still are (the provider never saw those). The ledger
+  row for a timed-out call carries `attempts`, `timeout_seconds`,
+  `possibly_billed` and `usage_unknown` instead of a silent zero.
+- **The reason classifier short-circuited on the `http_error` prefix.**
+  `reason_from_message` mapped any `http_error:` message to `unreachable`
+  before checking timeout keywords, so even an explicit "timed out" became a
+  connectivity failure. Timeout keywords now win (except connect-phase waits,
+  which honestly stay `unreachable`), and the gateway passes explicit reasons
+  for transport failures instead of relying on string sniffing.
+- **The outage probe could overwrite a precise reason with a worse one.**
+  `describe_ai_error` let any probe verdict replace the exception's reason —
+  a slow model makes the short-deadline probe fail too, turning a correct
+  `timeout` into `unreachable`. Only definitive config verdicts
+  (`invalid_api_key`, `quota_exceeded`, `model_unavailable`, …) now override,
+  and a blank detail falls back to the reason's own message so no failure ever
+  renders an empty explanation.
+- **The wait budget was env-only and ignored per-user settings.**
+  `ai.timeout` (5–1800s) is now a first-class per-user setting with validation,
+  resolved per call alongside `max_retries` (which the gateway previously read
+  from env only); explicit per-call overrides still win. The hardcoded
+  15–90s per-call timeouts (`classify`, `form_detect`, `funding_scan`,
+  `tagging`, `resume_gen`) are removed — one generous, configurable knob
+  governs every workflow, so no artificial deadline cuts off a healthy
+  generation.
+- **The browser gave up before the backend did.** Axios waited 30s globally
+  and 120s for uploads — both shorter than a legitimate reasoning-model
+  generation. AI-backed requests (upload, generate, score, draft, reflect,
+  …) now share a documented 10-minute budget (`AI_REQUEST_TIMEOUT_MS`,
+  covering two backend attempts plus a repair pass); fast endpoints keep the
+  30s fail-fast default.
+- **Money honesty.** Timed-out attempts are labelled "may still have been
+  billed" in the error detail, the ledger meta and the `timeout` fix text, and
+  every failure/success row records the attempts spent.
+
+### Tests
+
+- New `tests/test_ai_timeout_fixes.py` drives the real gateway against a local
+  scripted provider: the slow-reasoning upload succeeding end-to-end, the
+  honest `timeout` failure (correct reason, non-empty actionable detail,
+  attempts + billing caveat in the ledger, exactly one wire attempt), a
+  genuine connectivity failure (still `unreachable`, fast, non-blank), the
+  per-user timeout knob, the probe-override guard, and the connect-vs-read
+  timeout distinction. The PR #29 suite (`test_ai_invalid_json_fixes.py`,
+  19 tests) passes unchanged.
+
 ## [2.0.4] — 2026-09-12
 
 Fixes the "`AI unavailable — nothing was generated` / `invalid_json: model did

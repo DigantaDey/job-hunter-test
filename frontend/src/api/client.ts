@@ -27,6 +27,17 @@ export const tokenStore = {
   }
 }
 
+/**
+ * Wait budget for AI-backed requests (upload, generate, score, draft, reflect…).
+ *
+ * The backend gives a healthy generation up to AI_TIMEOUT per attempt (default
+ * 300s) plus one guardrail repair pass, so the browser must allow ~10 minutes —
+ * aborting earlier would cut off a healthy in-progress generation that the
+ * server would otherwise complete. Non-AI requests keep the short default
+ * below and fail fast on hangs.
+ */
+export const AI_REQUEST_TIMEOUT_MS = 600_000
+
 const client = axios.create({ baseURL: '', timeout: 30000 })
 
 client.interceptors.request.use((config: InternalAxiosRequestConfig) => {

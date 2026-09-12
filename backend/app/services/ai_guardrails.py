@@ -53,8 +53,9 @@ DIAGNOSIS: Dict[str, Tuple[str, str]] = {
         "Check the base_url in Settings → AI API and the server's outbound network access.",
     ),
     "timeout": (
-        "The AI endpoint did not answer in time.",
-        "The provider may be overloaded — retry, switch model, or raise AI_TIMEOUT.",
+        "The AI model was still generating after the configured wait (the endpoint was reached).",
+        "The model needs more time — raise Timeout in Settings → AI API (or AI_TIMEOUT) and retry. "
+        "Note: the timed-out attempt may still have been billed by the provider.",
     ),
     "provider_error": (
         "The AI provider returned a server error (5xx).",
@@ -168,9 +169,25 @@ class GuardrailError(Exception):
         }
 
 
+#: Probe reasons definitive enough to replace the exception's own reason.
+#: Auth/quota/model verdicts come from the provider rejecting a minimal probe
+#: request, so they outrank a network-ish failure — but a probe's
+#: ``unreachable``/``timeout`` must never overwrite the original ``timeout`` /
+#: ``unreachable`` (the probe ran seconds later under a different, shorter
+#: deadline; a slow model makes the probe time out even when the key is fine).
+_PROBE_OVERRIDES = frozenset({
+    "invalid_api_key", "quota_exceeded", "model_unavailable", "rate_limited",
+    "stored_key_unreadable", "no_api_key",
+})
+
+
 def describe_ai_error(exc: BaseException, *, workflow: str = "",
                       probe: Optional[Dict[str, Any]] = None) -> AIUnavailableError:
     """Turn any exception from the AI layer into a fully explained outage."""
+    import asyncio
+
+    import httpx
+
     from app.services.ai_client import AIClientError
 
     if isinstance(exc, AIUnavailableError):
@@ -180,15 +197,33 @@ def describe_ai_error(exc: BaseException, *, workflow: str = "",
     if isinstance(exc, AIClientError):
         reason = exc.reason or "unknown"
         detail = str(exc)
-    elif isinstance(exc, (TimeoutError,)):
-        reason = "timeout"
+    elif isinstance(exc, (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException)):
+        # A raw wait failure that never became an AIClientError (defensive —
+        # the gateway classifies these itself). Connect-phase waits mean the
+        # endpoint was never reached; anything else was reached and is slow.
+        text = f"{type(exc).__name__}: {exc}".strip().lower()
+        if isinstance(exc, httpx.ConnectTimeout) or "connect" in text:
+            reason = "unreachable"
+        else:
+            reason = "timeout"
     if probe:
-        # A probe result is more precise than the exception text (it knows the
-        # provider's own error message and whether /models vs chat failed).
+        # A probe result can be more precise than the exception text (it knows
+        # the provider's own error message and whether /models vs chat
+        # failed) — but only for definitive config verdicts. In particular a
+        # slow reasoning model makes the short-deadline probe fail with
+        # unreachable/timeout while the key is perfectly fine, so those two
+        # must never clobber the original reason.
         probed = str(probe.get("reason") or "")
-        if probed in DIAGNOSIS and probed != reason:
+        if probed in _PROBE_OVERRIDES and probed != reason:
             reason = probed
-        detail = detail or str(probe.get("detail") or probe.get("error") or "")
+        if not (detail or "").strip():
+            detail = str(probe.get("detail") or probe.get("error") or "")
+    if not (detail or "").strip() or (detail or "").strip().endswith(":"):
+        # A blank detail (or a bare "http_error:" prefix) is a bug, not a
+        # diagnosis — fall back to the reason's own message so the UI never
+        # renders an empty explanation.
+        message, _fix = DIAGNOSIS.get(reason, DIAGNOSIS["unknown"])
+        detail = f"{reason}: {message}"
     return AIUnavailableError(
         reason,
         workflow=workflow,
@@ -584,7 +619,7 @@ async def run_guarded_task(
     user_id: Optional[int] = None,
     temperature: float = 0.2,
     max_tokens: Optional[int] = None,
-    timeout: Optional[int] = None,
+    timeout: Optional[float] = None,
     repairs: int = 1,
     coerce: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], GuardrailReport]:
