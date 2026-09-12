@@ -32,7 +32,9 @@ Categories: big (>5000 employees/enterprise/public), medium (500-5000/scaleup), 
 Return JSON {{"size": "big|medium|small|startup", "confidence": 0-1, "reason": ""}}
 JD: {jd[:2000]}"""
     try:
-        data = await chat_completion("classify", prompt, temperature=0.1, timeout=15, ai_config=ai_config)
+        # No per-call timeout: heavy reasoning models "think" even for tiny tasks — the
+        # call inherits the generous, configurable global wait (ai.timeout / AI_TIMEOUT).
+        data = await chat_completion("classify", prompt, temperature=0.1, ai_config=ai_config)
         size = str(data.get("size", "small")).strip().lower()
         if size not in ("big", "medium", "small", "startup"):
             size = "small"

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import client, { apiError } from '../api/client'
+import client, { apiError, AI_REQUEST_TIMEOUT_MS } from '../api/client'
 import { Brain, Plus, Trash2, CheckCircle } from 'lucide-react'
 
 export default function Interview() {
@@ -18,7 +18,7 @@ export default function Interview() {
   const generate = async ()=>{
     setBusy(true); setMsg('')
     try{
-      const {data} = await client.post('/api/interview/generate', form)
+      const {data} = await client.post('/api/interview/generate', form, { timeout: AI_REQUEST_TIMEOUT_MS })
       setMsg(`Generated ${data.questions.length} questions for ${data.job_title}`)
       load()
       setSelected(data)
@@ -31,7 +31,7 @@ export default function Interview() {
     if(!ans) return
     setBusy(true)
     try{
-      const {data} = await client.post(`/api/interview/${selected.id}/answer`, {question_index: idx, answer: ans})
+      const {data} = await client.post(`/api/interview/${selected.id}/answer`, {question_index: idx, answer: ans}, { timeout: AI_REQUEST_TIMEOUT_MS })
       setMsg(`Feedback: score ${data.feedback.score}/10`)
       // refresh
       const {data: refreshed} = await client.get(`/api/interview/${selected.id}`)

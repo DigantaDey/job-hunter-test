@@ -269,7 +269,9 @@ async def detect_form_structure(
                 f"{sorted(KNOWN_FIELDS)}. Return JSON {{\"mapping\": {{\"<field_name>\": \"<key or null>\"}}}}.\n"
                 f"Fields: {json.dumps([{ 'name': f['name'], 'label': f['label']} for f in unmapped])[:1500]}"
             )
-            data = await chat_completion("form_detect", prompt, temperature=0, timeout=20)
+            # No per-call timeout — inherit the global wait so slow reasoning models
+            # are not cut off (ai.timeout / AI_TIMEOUT is the single knob).
+            data = await chat_completion("form_detect", prompt, temperature=0)
             mapping = data.get("mapping") if isinstance(data, dict) else {}
             for field in unmapped:
                 suggested = (mapping or {}).get(field["name"])

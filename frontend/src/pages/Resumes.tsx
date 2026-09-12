@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import client, { apiError, aiOutage, guardrailFailure, downloadResume, type AIOutage } from '../api/client'
+import client, { apiError, aiOutage, guardrailFailure, downloadResume, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
 import { Upload, FileText, Wand2, Tag, Download, Brain, ShieldCheck, Sparkles, Layers, Check, Loader2, AlertTriangle, BadgeCheck, XCircle, Clock, Activity, Timer } from 'lucide-react'
 
 type Guardrail = {
@@ -223,7 +223,7 @@ export default function Resumes(){
             setProgress(prev=> ({...(prev||{step:'uploading'}), step:'uploading', detail:`Uploading ${file.name} — ${Math.round(evt.loaded/1024)}KB / ${Math.round(evt.total/1024)}KB`, progress: Math.max(prev?.progress||0, pct)} as Progress))
           }
         },
-        timeout: 120000
+        timeout: AI_REQUEST_TIMEOUT_MS
       })
       // final progress will be polled, but set immediately to done
       setProgress({step:'done', detail:`Extracted ${data.profile?.name || 'profile'} • ${(data.profile?.skills||[]).length} skills • ${(data.profile?.experience||[]).length} roles`, progress:100, resume_id: data.resume?.id})
@@ -277,7 +277,7 @@ export default function Resumes(){
     if(!selectedJob) return setNotice('Pick a job')
     setGenerating(true); setOutage(null); setGuardrailErr(null); setNotice(''); setPreview(null)
     try{
-      const {data}=await client.post('/api/resumes/generate', null, {params:{job_id: selectedJob, strict_skeleton: strict, persona_id: personaId || undefined}})
+      const {data}=await client.post('/api/resumes/generate', null, {params:{job_id: selectedJob, strict_skeleton: strict, persona_id: personaId || undefined}, timeout: AI_REQUEST_TIMEOUT_MS})
       setPreview(data)
       load()
     }catch(e:any){
@@ -330,7 +330,7 @@ export default function Resumes(){
           <label className={`block border-2 border-dashed rounded-xl p-6 text-center cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/50 ${uploading ? 'opacity-50 pointer-events-none dark:border-zinc-700' : 'dark:border-zinc-700 border-zinc-300'}`}>
             {uploading ? <Loader2 className="w-6 h-6 mx-auto text-blue-500 animate-spin"/> : <Upload className="w-6 h-6 mx-auto text-zinc-400"/>}
             <div className="text-sm mono mt-2">{uploading ? 'Processing — see live status above' : 'Upload master resume (PDF/DOCX)'}</div>
-            <div className="text-xs text-zinc-500">{uploading ? 'This can take 10–30s while AI extracts the profile. Don’t close the tab.' : 'AI extracts profile + layout (margins, bullets, colors, hyperlinks…)'}</div>
+            <div className="text-xs text-zinc-500">{uploading ? 'Heavy reasoning models can take several minutes — the live status above tracks progress. Don’t close the tab.' : 'AI extracts profile + layout (margins, bullets, colors, hyperlinks…)'}</div>
             <input type="file" accept=".pdf,.docx,.doc" onChange={upload} disabled={uploading} className="hidden"/>
           </label>
           <div className="text-[11px] mono text-zinc-500 flex items-start gap-1">

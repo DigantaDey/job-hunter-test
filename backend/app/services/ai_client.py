@@ -74,19 +74,31 @@ _REASON_PREFIXES = {
     "content_filter": REASON_CONTENT_FILTER,
     "malformed_response": REASON_MALFORMED,
     "http_error": REASON_UNREACHABLE,
+    "timeout": REASON_TIMEOUT,
     "stored_key_unreadable": REASON_STORED_KEY_UNREADABLE,
 }
 
 
 def reason_from_message(message: str, status: Optional[int] = None) -> str:
-    """Best-effort stable reason code for an error string."""
+    """Best-effort stable reason code for an error string.
+
+    A wait problem must never be reported as a connectivity failure: timeout
+    keywords win over the ``http_error`` prefix (a read timeout means the
+    endpoint *was* reached and is still generating). Genuine connect-phase
+    failures keep the ``unreachable`` reason.
+    """
     text = (message or "").strip()
+    lowered = text.lower()
+    # Timeout first — before the prefix map. "http_error: timed out" is a wait
+    # problem, not a DNS/TLS/connection failure. A connect-phase timeout
+    # ("connection timed out", "connect timeout") means the endpoint was never
+    # reached, so it stays unreachable.
+    if "timed out" in lowered or "timeout" in lowered or "readtimeout" in lowered:
+        if "connect" not in lowered:
+            return REASON_TIMEOUT
     head = text.split(":", 1)[0].strip().lower()
     if head in _REASON_PREFIXES:
         return _REASON_PREFIXES[head]
-    lowered = text.lower()
-    if "timed out" in lowered or "timeout" in lowered or "readtimeout" in lowered:
-        return REASON_TIMEOUT
     if status in (401, 403) or "incorrect api key" in lowered or "invalid api key" in lowered:
         return REASON_INVALID_API_KEY
     if status == 429:
@@ -238,7 +250,7 @@ def get_workflow_overrides(user_id: Optional[int] = None) -> Dict[str, Dict[str,
     return {k[1]: dict(v) for k, v in _workflow_overrides.items() if k[0] == user_id}
 
 
-def resolve_config(workflow: Optional[str] = None) -> Dict[str, str]:
+def resolve_config(workflow: Optional[str] = None) -> Dict[str, Any]:
     """Env-level config (no user context). Includes the legacy system bucket."""
     override = _workflow_overrides.get((0, workflow or ""), {}) if workflow else {}
     api_key = (override.get("api_key") or settings.ai_api_key or "").strip()
@@ -247,10 +259,12 @@ def resolve_config(workflow: Optional[str] = None) -> Dict[str, str]:
         "api_key": api_key,
         "model": (override.get("model") or settings.ai_model).strip(),
         "key_source": "workflow_override" if override.get("api_key") else ("env" if api_key else None),
+        "timeout": settings.ai_timeout,
+        "max_retries": settings.ai_max_retries,
     }
 
 
-def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) -> Dict[str, str]:
+def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) -> Dict[str, Any]:
     """
     Resolve AI config for a specific user, including per-user DB settings and owner fallback.
     Resolution order:
@@ -259,10 +273,14 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
     2. Per-user default AI settings (from SettingsModel category=ai)
     3. Owner's default AI settings as global fallback
     4. Env defaults
-    All are OpenAI compatible: base_url, model, api_key
+    All are OpenAI compatible: base_url, model, api_key. The wait budget
+    (timeout) and retry count also resolve per user so a slow reasoning model
+    can be given more time in Settings → AI API without touching env.
     """
     key_source: Optional[str] = None
     key_error: Optional[str] = None
+    user_timeout: Any = settings.ai_timeout
+    user_max_retries: Any = settings.ai_max_retries
     try:
         from app.services.user_settings import get_user_ai_config
         user_cfg = get_user_ai_config(db, user_id)
@@ -271,6 +289,8 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
         api_key = user_cfg.get("api_key") or settings.ai_api_key
         key_source = user_cfg.get("key_source") or ("env" if api_key else None)
         key_error = user_cfg.get("api_key_error")
+        user_timeout = user_cfg.get("timeout", settings.ai_timeout)
+        user_max_retries = user_cfg.get("max_retries", settings.ai_max_retries)
     except Exception as exc:
         log.warning("per-user AI config resolution failed for user %s, using env defaults: %s", user_id, exc)
         base_url = settings.ai_base_url
@@ -299,6 +319,8 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
         "model": (model or "").strip(),
         "key_source": key_source,
         "key_error": key_error,
+        "timeout": user_timeout,
+        "max_retries": user_max_retries,
     }
 
 
@@ -321,7 +343,7 @@ def _ambient_user_id() -> Optional[int]:
 
 @dataclass
 class _ResolvedAI:
-    cfg: Dict[str, str]
+    cfg: Dict[str, Any]
     db: Optional[Any] = None
     user_id: Optional[int] = None
     owned_session: bool = False  # caller must close db (ambient lookup)
@@ -687,7 +709,7 @@ async def chat_completion(
     prompt: str,
     *,
     temperature: float = 0.2,
-    timeout: Optional[int] = None,
+    timeout: Optional[float] = None,
     json_mode: bool = True,
     max_tokens: Optional[int] = None,
     ai_config: Optional[Dict[str, str]] = None,
@@ -704,6 +726,16 @@ async def chat_completion(
     All of those are retried *automatically with a targeted fix* — more output
     tokens, or without ``response_format`` — before the caller ever sees an
     ``invalid_json`` / ``empty_response`` / ``truncated_response`` error.
+
+    Wait budget (per wire attempt): explicit ``timeout`` → the caller's
+    per-user ``ai.timeout`` setting → ``AI_TIMEOUT`` (default 300s, generous
+    enough for heavy reasoning models). The TCP+TLS connect phase gets its own
+    short deadline (``AI_CONNECT_TIMEOUT``) so a genuinely unreachable
+    endpoint still fails fast. A read/write wait that expires is reported
+    honestly as ``timeout`` — never ``unreachable`` — and is *not* retried
+    automatically: the provider accepted the request and may still be
+    generating (and billing), so another attempt would spend — and bill —
+    a second full generation.
     """
     # Resolution order: explicit ai_config > per-user DB config (explicit or
     # ambient request/worker user, with owner fallback) > env defaults.
@@ -718,6 +750,8 @@ async def chat_completion(
                 "model": (ai_config.get("model") or cfg["model"]).strip(),
                 "key_source": "explicit" if ai_config.get("api_key") else cfg.get("key_source"),
                 "key_error": cfg.get("key_error"),
+                "timeout": cfg.get("timeout"),
+                "max_retries": cfg.get("max_retries"),
             }
         if not cfg["api_key"]:
             if cfg.get("key_error"):
@@ -773,7 +807,22 @@ async def chat_completion(
 
         headers = {"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}
         url = f"{cfg['base_url']}/chat/completions"
-        attempts = max(1, settings.ai_max_retries)
+        # Wait budget: explicit per-call override → per-user setting → env default.
+        try:
+            cfg_timeout = float(cfg.get("timeout") or settings.ai_timeout)
+        except (TypeError, ValueError):
+            cfg_timeout = settings.ai_timeout
+        effective_timeout = float(timeout) if timeout is not None else cfg_timeout
+        if not effective_timeout or effective_timeout <= 0:
+            effective_timeout = settings.ai_timeout
+        try:
+            attempts = max(1, int(cfg.get("max_retries") or settings.ai_max_retries))
+        except (TypeError, ValueError):
+            attempts = max(1, settings.ai_max_retries)
+        # Short connect deadline inside the long generation wait: DNS/TLS/TCP
+        # failures surface in seconds while a healthy generation gets minutes.
+        connect_timeout = min(settings.ai_connect_timeout, effective_timeout)
+        client_timeout = httpx.Timeout(effective_timeout, connect=connect_timeout)
         last_error: Optional[str] = None
 
         # State accumulated across the wire attempts of this logical call.
@@ -786,15 +835,22 @@ async def chat_completion(
         fixups = 0            # provider-parameter fix-ups (don't consume attempts)
         call_started = time.perf_counter()
 
-        def _ledger_failure(error: str) -> None:
-            """Record the final failure with the tokens actually spent."""
+        def _ledger_failure(error: str, *, meta: Optional[Dict[str, Any]] = None) -> None:
+            """Record the final failure with the tokens actually spent.
+
+            For waits that expired the provider may still have generated (and
+            billed) tokens the app never saw — the row keeps 0 tokens but
+            carries the attempts spent and an explicit billing caveat instead
+            of silently claiming nothing was spent.
+            """
             if db and user_id:
                 track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"],
                                prompt_tokens=usage_totals["prompt_tokens"],
                                completion_tokens=usage_totals["completion_tokens"],
                                total_tokens=usage_totals["total_tokens"], success=False,
                                error=error[:2000],
-                               latency_ms=int((time.perf_counter() - call_started) * 1000))
+                               latency_ms=int((time.perf_counter() - call_started) * 1000),
+                               meta=meta or {})
 
         attempt = 0
         while attempt < attempts:
@@ -803,17 +859,61 @@ async def chat_completion(
             started = time.perf_counter()
             try:
                 async with _sem():
-                    async with httpx.AsyncClient(timeout=timeout or settings.ai_timeout) as client:
+                    async with httpx.AsyncClient(timeout=client_timeout) as client:
                         response = await client.post(url, headers=headers, json=payload)
+            except httpx.TimeoutException as exc:
+                # httpx stringifies timeouts as "" — the message is built
+                # explicitly so the detail is never blank. The phase matters:
+                # a *connect* timeout means the endpoint was never reached
+                # (honest `unreachable`, safe to retry); a read/write/pool
+                # timeout means the request was accepted and the model may
+                # still be generating — honest `timeout`, must NOT be retried
+                # (each retry would spend and bill another full generation).
+                waited = time.perf_counter() - started
+                if isinstance(exc, httpx.ConnectTimeout):
+                    last_error = (
+                        f"http_error: connection to {cfg['base_url']} timed out after "
+                        f"{connect_timeout:g}s (attempt {attempt}/{attempts}) — check the "
+                        f"base_url in Settings → AI API"
+                    )
+                    inc("jobhunter_ai_requests_total", workflow=workflow, status="network_error")
+                    if attempt < attempts:
+                        await _sleep_backoff(attempt)
+                        continue
+                    breaker.record_failure(last_error)
+                    _ledger_failure(last_error, meta={"attempts": attempt,
+                                                       "timeout_seconds": effective_timeout,
+                                                       "connect_timeout_seconds": connect_timeout,
+                                                       "possibly_billed": False,
+                                                       "usage_unknown": False})
+                    raise AIClientError(last_error, reason=REASON_UNREACHABLE, retryable=True) from exc
+                last_error = (
+                    f"timeout: model '{cfg['model']}' was still generating after "
+                    f"{effective_timeout:g}s (attempt {attempt}/{attempts}, waited {waited:.1f}s) — "
+                    f"the endpoint was reached; {attempt} attempt(s) spent and each may still "
+                    f"have been billed. Raise Timeout in Settings → AI API (or AI_TIMEOUT) and retry"
+                )
+                inc("jobhunter_ai_requests_total", workflow=workflow, status="timeout")
+                log.warning("AI %s: %s", workflow, last_error)
+                breaker.record_failure(last_error)
+                _ledger_failure(last_error, meta={"attempts": attempt,
+                                                   "timeout_seconds": effective_timeout,
+                                                   "possibly_billed": True,
+                                                   "usage_unknown": True})
+                raise AIClientError(last_error, reason=REASON_TIMEOUT, retryable=True) from exc
             except httpx.HTTPError as exc:
-                last_error = f"http_error: {exc}"
+                raw = str(exc).strip() or type(exc).__name__
+                last_error = f"http_error: {raw} (attempt {attempt}/{attempts})"
                 inc("jobhunter_ai_requests_total", workflow=workflow, status="network_error")
                 if attempt < attempts:
                     await _sleep_backoff(attempt)
                     continue
                 breaker.record_failure(last_error)
-                _ledger_failure(last_error)
-                raise AIClientError(last_error, retryable=True) from exc
+                _ledger_failure(last_error, meta={"attempts": attempt,
+                                                   "timeout_seconds": effective_timeout,
+                                                   "possibly_billed": False,
+                                                   "usage_unknown": False})
+                raise AIClientError(last_error, reason=REASON_UNREACHABLE, retryable=True) from exc
             finally:
                 observe("jobhunter_ai_latency_seconds", time.perf_counter() - started, workflow=workflow)
 
@@ -873,11 +973,11 @@ async def chat_completion(
                 if not retryable:
                     if response.status_code in (401, 403):
                         breaker.record_failure(last_error)
-                    _ledger_failure(last_error)
+                    _ledger_failure(last_error, meta={"attempts": attempt})
                     raise AIClientError(last_error, status=response.status_code, retryable=False)
 
                 breaker.record_failure(last_error)
-                _ledger_failure(last_error)
+                _ledger_failure(last_error, meta={"attempts": attempt})
                 raise AIClientError(last_error, status=response.status_code, retryable=True)
 
             # ---------------------------------------------------------------- #
@@ -893,7 +993,7 @@ async def chat_completion(
                     plain_retries += 1
                     continue
                 breaker.record_failure(last_error)
-                _ledger_failure(last_error)
+                _ledger_failure(last_error, meta={"attempts": attempt})
                 raise AIClientError(last_error, retryable=True) from exc
 
             extracted = _extract_content(data)
@@ -913,7 +1013,7 @@ async def chat_completion(
                     plain_retries += 1
                     continue
                 breaker.record_failure(last_error)
-                _ledger_failure(last_error)
+                _ledger_failure(last_error, meta={"attempts": attempt})
                 raise AIClientError(last_error, retryable=True)
 
             if not json_mode:
@@ -977,11 +1077,11 @@ async def chat_completion(
             break
 
         if final_error is not None:
-            _ledger_failure(str(final_error))
+            _ledger_failure(str(final_error), meta={"attempts": attempt})
             raise final_error
         if parsed_result is None and text_result is None:
             breaker.record_failure(last_error or "unknown error")
-            _ledger_failure(last_error or "unknown error")
+            _ledger_failure(last_error or "unknown error", meta={"attempts": attempt})
             raise AIClientError(last_error or "unknown error", retryable=True)
 
         prompt_tokens = usage_totals["prompt_tokens"]
@@ -1009,6 +1109,7 @@ async def chat_completion(
                 total_tokens=total_tokens,
                 success=True,
                 latency_ms=latency_ms,
+                meta={"attempts": attempt, "timeout_seconds": effective_timeout},
             )
 
         if not json_mode:
@@ -1097,7 +1198,7 @@ async def ping(workflow: Optional[str] = None, timeout: int = 5, db=None, user_i
                 pass
 
 
-async def _ping_with_config(cfg: Dict[str, str], timeout: int) -> Dict[str, Any]:
+async def _ping_with_config(cfg: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     key = (cfg.get("api_key") or "").strip()
     base = (cfg.get("base_url") or "").strip().rstrip("/")
     model = (cfg.get("model") or "").strip()
@@ -1130,10 +1231,25 @@ async def _ping_with_config(cfg: Dict[str, str], timeout: int) -> Dict[str, Any]
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(f"{base}/models", headers=headers)
+    except httpx.TimeoutException as exc:
+        # The endpoint may be reachable but slow (httpx stringifies timeouts
+        # as "" — say so explicitly). NOT cached: slowness is transient.
+        if isinstance(exc, httpx.ConnectTimeout):
+            return {"online": False, "reason": "unreachable",
+                    "error": f"connection to {base} timed out after {timeout}s",
+                    "latency_ms": None,
+                    "hint": f"Could not reach {base} — check the base URL and network connectivity.",
+                    **meta}
+        return {"online": False, "reason": "timeout",
+                "error": f"the provider was still answering after {timeout}s",
+                "latency_ms": None,
+                "hint": "The provider is reachable but slow — retry, or raise the probe timeout.",
+                **meta}
     except httpx.HTTPError as exc:
         # Transient network errors are NOT cached — connectivity can recover
         # at any moment, unlike a definitive auth rejection.
-        return {"online": False, "reason": "unreachable", "error": str(exc), "latency_ms": None,
+        raw = str(exc).strip() or type(exc).__name__
+        return {"online": False, "reason": "unreachable", "error": raw, "latency_ms": None,
                 "hint": f"Could not reach {base} — check the base URL and network connectivity.", **meta}
 
     if response.status_code == 200:
@@ -1153,6 +1269,16 @@ async def _ping_with_config(cfg: Dict[str, str], timeout: int) -> Dict[str, Any]
                 headers=headers,
                 json={"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
             )
+    except httpx.TimeoutException:
+        # The chat endpoint was reached but is slow (reasoning models "think"
+        # even for a 1-token ping) — that is a wait problem, not proof the
+        # key is wrong. Report what /models told us.
+        result = {"online": False, "latency_ms": int((time.perf_counter() - started) * 1000),
+                  "status": response.status_code, "reason": "timeout",
+                  "detail": _provider_error(response) or f"chat probe still answering after {timeout}s",
+                  "probe": "models", **meta}
+        _PING_CACHE[cache_key] = (now + _PING_TTL_SECONDS, result)
+        return result
     except httpx.HTTPError:
         # Chat endpoint unreachable: report what /models told us.
         result = {"online": False, "latency_ms": int((time.perf_counter() - started) * 1000),

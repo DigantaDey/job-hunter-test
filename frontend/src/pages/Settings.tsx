@@ -10,7 +10,7 @@ export default function Settings(){
   const [saving, setSaving]=useState(false)
   const [msg, setMsg]=useState('')
   const [showKey, setShowKey]=useState(false)
-  const [aiForm, setAiForm]=useState({base_url:'', model:'', api_key:'', rpm:60})
+  const [aiForm, setAiForm]=useState({base_url:'', model:'', api_key:'', rpm:60, timeout:300})
   const [aiStatus, setAiStatus]=useState<any>(null)
   const [aiSaving, setAiSaving]=useState(false)
   const [extracted, setExtracted]=useState<any>(null)
@@ -26,7 +26,8 @@ export default function Settings(){
         base_url: data.ai.base_url || status?.user_config?.base_url || 'https://api.openai.com/v1',
         model: data.ai.model || status?.user_config?.model || 'gpt-4o-mini',
         api_key: '',
-        rpm: data.ai.rpm || status?.user_config?.rpm || 60
+        rpm: data.ai.rpm || status?.user_config?.rpm || 60,
+        timeout: data.ai.timeout || 300
       })
     }
   }
@@ -48,11 +49,16 @@ export default function Settings(){
       if(!aiForm.model || aiForm.model.length < 2){
         setMsg('model must be at least 2 chars like gpt-4o-mini'); return
       }
+      const timeoutSecs = Number(aiForm.timeout) || 300
+      if (timeoutSecs < 5 || timeoutSecs > 1800) {
+        setMsg('timeout must be between 5 and 1800 seconds — heavy reasoning models need minutes'); return
+      }
       const payload:any = {
         ai: {
           base_url: aiForm.base_url,
           model: aiForm.model,
           rpm: Number(aiForm.rpm)||60,
+          timeout: timeoutSecs,
         }
       }
       if(aiForm.api_key && aiForm.api_key.trim()){
@@ -151,7 +157,11 @@ export default function Settings(){
               <div className="text-[11px] mono text-zinc-500 mt-1 flex items-center gap-2"><Shield className="w-3 h-3"/> Stored encrypted with per-user HKDF • {data.ai.api_key_set ? `Key set: ${data.ai.api_key_masked||'***'}` : 'No key set — AI will use heuristics fallback'} • Owner key is global fallback for members without their own key</div>
             </div>
             <div className="space-y-2">
-              <div><label className="text-xs mono">RPM</label><input type="number" value={aiForm.rpm} onChange={e=>setAiForm({...aiForm, rpm: Number(e.target.value)})} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
+              <div className="grid grid-cols-2 gap-2">
+                <div><label className="text-xs mono">RPM</label><input type="number" value={aiForm.rpm} onChange={e=>setAiForm({...aiForm, rpm: Number(e.target.value)})} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
+                <div><label className="text-xs mono" title="How long to wait for the model to finish generating, per request. Heavy reasoning models need minutes.">Timeout (s)</label><input type="number" min={5} max={1800} value={aiForm.timeout} onChange={e=>setAiForm({...aiForm, timeout: Number(e.target.value)})} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
+              </div>
+              <div className="text-[11px] mono text-zinc-500">Timeout: how long to wait for the model per request (5–1800s). Reasoning models on large tasks need minutes — raise this if slow models time out.</div>
               <button onClick={saveAiDefault} disabled={aiSaving} className="w-full px-4 py-2.5 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50"><Save className="w-4 h-4"/> {aiSaving?'Saving…':'Save AI Default'}</button>
             </div>
           </div>

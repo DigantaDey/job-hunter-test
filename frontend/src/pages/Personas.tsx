@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import client, { apiError, aiOutage, type AIOutage } from '../api/client'
+import client, { apiError, aiOutage, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
 import { Users, Plus, Sparkles, Target, Brain, RefreshCw, Loader2, Check, Trash2, Pencil, XCircle, BadgeCheck } from 'lucide-react'
 
 /**
@@ -77,7 +77,7 @@ export default function Personas() {
     } finally { setBusy('') }
   }
 
-  const suggest = () => run('suggest', () => client.get('/api/personas/suggestions')
+  const suggest = () => run('suggest', () => client.get('/api/personas/suggestions', { timeout: AI_REQUEST_TIMEOUT_MS })
     .then(r => setSuggestions(r.data.tracks || [])), 'Suggestions refreshed')
 
   const create = () => run('create', async () => {
@@ -96,7 +96,7 @@ export default function Personas() {
   }), `Track "${t.name}" created`)
 
   const reflect = (p: Persona) => run(`reflect-${p.id}`,
-    () => client.post(`/api/personas/${p.id}/reflect`, null, { params: { force: true } }),
+    () => client.post(`/api/personas/${p.id}/reflect`, null, { params: { force: true }, timeout: AI_REQUEST_TIMEOUT_MS }),
     'Portrait rebuilt from your activity')
 
   const activate = (p: Persona) => run(`activate-${p.id}`, () => client.post(`/api/personas/${p.id}/activate`),

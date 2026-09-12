@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import client, { apiError } from '../api/client'
+import client, { apiError, AI_REQUEST_TIMEOUT_MS } from '../api/client'
 import { Mail, Send, Check, Pencil, Search, Building2, User, Clock, AlertTriangle, Loader2, Briefcase, ExternalLink, ShieldCheck, ShieldAlert, XCircle } from 'lucide-react'
 import { aiOutage, type AIOutage } from '../api/client'
 
@@ -35,7 +35,7 @@ export default function Emails(){
       // The endpoint takes a JSON body (EmailGenerate), not query params.
       // job_id is what makes the draft about a real posting — the bucket then
       // shows the title, link and JD excerpt next to the message.
-      await client.post('/api/emails/generate', {company: company || (job?.company ?? ''), job_id: jobId ? Number(jobId) : null, department: dept})
+      await client.post('/api/emails/generate', {company: company || (job?.company ?? ''), job_id: jobId ? Number(jobId) : null, department: dept}, { timeout: AI_REQUEST_TIMEOUT_MS })
       setCompany(''); setJobId(''); setNotice(null); load()
     }catch(e:any){
       const o = aiOutage(e)
