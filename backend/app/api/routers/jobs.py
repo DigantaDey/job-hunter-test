@@ -465,8 +465,12 @@ async def classify_company(user: CurrentUser, db: DbSession, company: str = Quer
 @router.get("/pipelines/stats")
 def pipelines(user: CurrentUser, db: DbSession):
     from app.core.rate_limiter import rate_limiter
+    from app.services.job_queue import ai_queue_view
 
-    stats = queue_stats(db, user_id=user.id)
+    # The "AI queue" is the durable queue (v2.1.1): the ai_queue block is
+    # built from real pipeline_jobs rows only — never synthesized.
+    stats: Dict[str, Any] = queue_stats(db, user_id=user.id)  # type: ignore[arg-type]
+    stats["ai_queue"] = ai_queue_view(db, user_id=user.id)  # type: ignore[arg-type]
     stats["rate_limiter"] = rate_limiter.stats()
     return stats
 

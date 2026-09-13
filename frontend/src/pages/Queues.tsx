@@ -99,7 +99,7 @@ export default function Queues(){
           {jobs.length===0 ? <div className="p-8 text-center mono text-sm text-zinc-500">No jobs in this pipeline</div> :
             jobs.map((j:any)=> (
               <div key={j.id} className="p-3 flex gap-3 text-sm">
-                <div className={`w-2 h-2 rounded-full mt-2 shrink-0 ${j.status==='done'?'bg-emerald-500': j.status==='failed'?'bg-red-500': j.status==='processing'?'bg-blue-500': j.status==='needs_input'?'bg-amber-500':'bg-zinc-400'}`} />
+                <div className={`w-2 h-2 rounded-full mt-2 shrink-0 ${j.status==='done'?'bg-emerald-500': j.status==='failed'?'bg-red-500': j.status==='processing'?'bg-blue-500': j.status==='paused'?'bg-amber-400': j.status==='needs_input'?'bg-amber-500':'bg-zinc-400'}`} />
                 <div className="min-w-0 flex-1">
                   <div className="mono text-xs text-zinc-500">#{j.id} • {j.pipeline} • P{j.priority} • {new Date(j.created_at).toLocaleString()}</div>
                   <div className="font-medium mono text-xs mt-1 truncate">{JSON.stringify(j.payload).slice(0,120)}</div>

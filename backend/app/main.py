@@ -38,7 +38,6 @@ from app.core.middleware import (
 from app.db import SessionLocal, init_db
 from app.metrics_server import start_metrics_server
 from app.services.ai_client import set_workflow_overrides
-from app.services.ai_pipeline import ai_pipeline
 from app.services.job_queue import recover_stalled
 from app.worker import Worker
 
@@ -131,7 +130,6 @@ async def lifespan(app: FastAPI):
                     await task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
-        ai_pipeline.running = False
         from app.services.http import close_client
 
         await close_client()

@@ -8,13 +8,29 @@ single-container deploys) or as its own process for real horizontal scaling:
 
 The worker claims durable items from ``pipeline_jobs`` (see ``job_queue``), so
 restarts and rolling deploys never lose work.
+
+Self-healing (v2.1.1): two layers keep capacity honest.
+
+1. A single bad item cannot kill a slot: ``_loop`` wraps ``_run_item`` so any
+   exception is logged with the item id, counted
+   (``jobhunter_worker_item_errors_total``) and the loop keeps serving — the
+   row is left to the lease machinery, which re-queues it once the lease
+   expires.
+2. A slot that dies anyway (DB connect/teardown failures, anything that
+   escapes layer 1) is caught by the supervisor in :meth:`Worker.start`: it
+   is logged once with its traceback, counted
+   (``jobhunter_worker_task_crashes_total{task=...}``) and respawned with a
+   small, capped backoff. One bad item can no longer shrink the queue's
+   capacity to zero — silently.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import signal
-from typing import List, Optional, Sequence
+from collections import defaultdict
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence
 
 from app.core.config import settings
 from app.core.logging import LogContext, configure_logging, get_logger
@@ -22,7 +38,6 @@ from app.core.metrics import inc, set_gauge
 from app.db import SessionLocal, init_db
 from app.metrics_server import start_metrics_server
 from app.services.ai_client import is_ai_error, is_transient_ai_error
-from app.services.ai_pipeline import ai_pipeline
 from app.services.ai_watchdog import AIWatchdog
 from app.services.handlers import HANDLERS
 from app.services.job_queue import (
@@ -41,7 +56,13 @@ log = get_logger("app.worker")
 
 
 class Worker:
-    """Claims and executes pipeline jobs with bounded concurrency."""
+    """Claims and executes pipeline jobs with bounded concurrency.
+
+    :meth:`start` supervises every child task (the claim loops plus the AI
+    watchdog): a task that dies with an exception is logged once with its
+    traceback, counted and respawned, so a crashed slot is visible and
+    self-heals instead of vanishing.
+    """
 
     def __init__(self, pipelines: Sequence[str] = PIPELINES, concurrency: Optional[int] = None,
                  poll_interval: Optional[float] = None):
@@ -50,8 +71,88 @@ class Worker:
         self.poll_interval = poll_interval or settings.worker_poll_interval
         self.running = False
         self.worker_id = worker_id()
-        self._tasks: List[asyncio.Task] = []
+        #: slot name (``loop-0..N-1``, ``watchdog``) -> live task
+        self._tasks: Dict[str, asyncio.Task] = {}
+        #: consecutive crash count per slot (drives the capped backoff)
+        self._crash_counts: Dict[str, int] = defaultdict(int)
+        self._last_crash: Optional[Dict[str, str]] = None
 
+    # ------------------------------------------------------------------ #
+    # Slot management & supervision
+    # ------------------------------------------------------------------ #
+    def _slot_names(self) -> List[str]:
+        return [f"loop-{i}" for i in range(self.concurrency)] + ["watchdog"]
+
+    def _spawn(self, name: str) -> None:
+        if not self.running:
+            return
+        if name == "watchdog":
+            task = asyncio.create_task(self.watchdog.run())
+        else:
+            task = asyncio.create_task(self._loop())
+        task.set_name(f"jobhunter-{self.worker_id}-{name}")
+        self._tasks[name] = task
+
+    def _spawn_all(self) -> None:
+        for name in self._slot_names():
+            self._spawn(name)
+
+    def _slot_for(self, task: asyncio.Task) -> Optional[str]:
+        for name, slot_task in self._tasks.items():
+            if slot_task is task:
+                return name
+        return None
+
+    def _respawn_delay(self, name: Optional[str]) -> float:
+        """Small, capped backoff: doubles per consecutive crash of the slot."""
+        base = max(0.0, settings.worker_respawn_backoff_seconds)
+        cap = max(base, max(0.0, settings.worker_crash_backoff_max_seconds))
+        streak = self._crash_counts.get(name, 0) if name else 0
+        return min(cap, base * max(1, streak))
+
+    def _handle_dead_task(self, task: asyncio.Task) -> None:
+        """React to one finished child task.
+
+        Cancellation (``stop()``) and clean shutdown are never crashes.
+        Anything else is a crash: logged exactly once — with the traceback —
+        and counted, so no child exception is ever swallowed.
+        """
+        name = self._slot_for(task) or "unknown"
+        if name != "unknown":
+            self._tasks.pop(name, None)
+        if task.cancelled() or not self.running:
+            return  # stop() in flight — a clean shutdown, never a respawn
+        exc = task.exception()
+        if exc is None:
+            # Loops exit only when ``running`` goes False; an unexpected clean
+            # exit still loses capacity, so restore the slot quietly.
+            log.warning("worker task '%s' exited while the worker is running — respawning", name)
+            return
+        log.error("worker task '%s' crashed: %s: %s", name, type(exc).__name__, exc, exc_info=exc)
+        inc("jobhunter_worker_task_crashes_total", task=name)
+        self._crash_counts[name] += 1
+        self._last_crash = {
+            "task": name,
+            "at": datetime.utcnow().isoformat() + "Z",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    def task_health(self) -> Dict[str, Any]:
+        """Live slot snapshot for ``GET /api/ops/status`` (``workers.tasks``).
+
+        ``alive`` counts claim loops that are actually running — a slot in
+        respawn backoff shows up as ``expected > alive``.
+        """
+        loops = [t for name, t in self._tasks.items() if name.startswith("loop-")]
+        return {
+            "expected": self.concurrency,
+            "alive": sum(1 for t in loops if not t.done()),
+            "last_crash": self._last_crash,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Execution
+    # ------------------------------------------------------------------ #
     async def _recover(self) -> None:
         db = SessionLocal()
         try:
@@ -121,9 +222,33 @@ class Worker:
             if item is None:
                 await asyncio.sleep(self.poll_interval)
                 continue
-            await self._run_item(item.id, item.pipeline)
+            try:
+                await self._run_item(item.id, item.pipeline)
+            except Exception:
+                # Layer 1 of the self-healing contract: a single item must
+                # never kill a worker slot. Log it (with traceback) and count
+                # it; the loop keeps serving. The row is left to the lease
+                # machinery — recover_stalled re-queues it once the lease
+                # expires (the handler's own error path may already have
+                # failed/paused/re-queued it).
+                inc("jobhunter_worker_item_errors_total", pipeline=item.pipeline)
+                log.exception("worker item %s (%s) escaped _run_item — slot continues",
+                              item.id, item.pipeline)
 
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
     async def start(self) -> None:
+        """Run the worker until :meth:`stop`, supervising every child task.
+
+        The pre-v2.1.1 implementation gathered its tasks with
+        ``return_exceptions=True``: the first crash quietly ended that slot
+        and was never logged or surfaced. Now ``start`` itself is the
+        supervisor — it wakes on every finished child task, and each crash is
+        logged once with its traceback, counted in
+        ``jobhunter_worker_task_crashes_total`` and respawned with a small,
+        capped backoff. ``stop()`` suppresses respawns.
+        """
         configure_logging()
         init_db()
         self.running = True
@@ -131,21 +256,33 @@ class Worker:
         set_gauge("jobhunter_worker_running", 1, worker=self.worker_id)
         log.info("worker %s started: pipelines=%s concurrency=%s",
                  self.worker_id, ",".join(self.pipelines), self.concurrency)
-        self._tasks = [asyncio.create_task(self._loop()) for _ in range(self.concurrency)]
-        ai_task = asyncio.create_task(ai_pipeline.worker_loop())
-        self._tasks.append(ai_task)
-        # Re-probes the AI-availability signal and drains paused work when the
-        # provider is back — the resume half of the pause/resume contract.
         self.watchdog = AIWatchdog()
-        self._tasks.append(asyncio.create_task(self.watchdog.run()))
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._spawn_all()
+        while self.running:
+            if not self._tasks:
+                # Every slot is dead and stop() has not been called — rebuild
+                # with backoff instead of running with zero capacity.
+                await asyncio.sleep(self._respawn_delay(None))
+                if self.running:
+                    self._spawn_all()
+                continue
+            done, _pending = await asyncio.wait(list(self._tasks.values()),
+                                                return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                self._handle_dead_task(task)
+            if not self.running:
+                break
+            for name in self._slot_names():
+                if name not in self._tasks:
+                    await asyncio.sleep(self._respawn_delay(name))
+                    if self.running and name not in self._tasks:
+                        self._spawn(name)
 
     async def stop(self) -> None:
         self.running = False
-        ai_pipeline.running = False
         if hasattr(self, "watchdog"):
             self.watchdog.stop()
-        for task in self._tasks:
+        for task in list(self._tasks.values()):
             task.cancel()
         inc("jobhunter_worker_stops_total", worker=self.worker_id)
         set_gauge("jobhunter_worker_running", 0, worker=self.worker_id)
