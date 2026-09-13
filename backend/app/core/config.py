@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.2.1"
+    version: str = "2.2.2"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -166,6 +166,10 @@ class Settings(BaseSettings):
     worker_concurrency: int = 2
     worker_poll_interval: float = 1.0
     worker_lease_seconds: int = 120
+    #: Default per-item failure budget: ``job_queue.fail()`` dead-letters an
+    #: item once it has recorded this many *handler failures*. Claims, pauses
+    #: (AI outages) and lease expiries do not count against it — see the
+    #: ``app.services.job_queue`` module docstring.
     worker_max_attempts: int = 3
     worker_max_runtime_seconds: int = 900
     #: Supervisor: base delay before respawning a worker slot that died with

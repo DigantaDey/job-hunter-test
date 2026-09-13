@@ -10,6 +10,32 @@ persists every unit of work in ``pipeline_jobs`` and gives workers:
 * stall recovery — expired leases are re-queued;
 * dedupe keys so re-running discovery/apply cannot double-enqueue;
 * per-tenant scoping so a worker only ever touches its user's rows.
+
+Retry accounting — the contract (v2.2.2)
+----------------------------------------
+``PipelineJob.attempts`` counts **handler failures**, nothing else:
+
+* :func:`claim` / :func:`claim_item` take a lease and leave ``attempts``
+  alone. Being handed to a worker is not a failure, and a claim that ends in
+  a pause or a crash must not spend budget the work never used.
+* :func:`fail` increments ``attempts`` *first* and then applies the budget:
+  ``attempts >= max_attempts`` → ``dead``, otherwise re-queue with backoff.
+  So ``max_attempts=3`` means exactly three recorded failures, and the third
+  one is the one that dead-letters.
+* :func:`pause` (transient AI outage) consumes **no** attempt — an outage is
+  not the work's fault. It has its own, separate safety valve: the
+  ``paused_count`` in the payload, capped at :data:`AI_PAUSE_MAX`.
+* :func:`recover_stalled` applies the same rule to an expired lease: a
+  stalled item whose *failure* count has reached ``max_attempts`` is
+  dead-lettered, otherwise it is re-queued.
+
+The two budgets are independent by design. ``attempts``/``max_attempts``
+answers "how many times has this work actually broken?"; ``paused_count``/
+``AI_PAUSE_MAX`` answers "how many outages has it sat through?". Mixing them
+(the pre-v2.2.2 behaviour, which incremented ``attempts`` at claim time) let
+a pause → resume → claim cycle spend failure budget without a single failure,
+so an item with ``max_attempts=3`` dead-lettered on its *first* real failure
+after three outage cycles.
 """
 from __future__ import annotations
 
@@ -54,6 +80,12 @@ def enqueue(
     """
     Add a work item. Returns ``None`` when an identical item is already queued
     (dedupe key), which keeps repeated user clicks idempotent.
+
+    ``max_attempts`` is the *failure* budget (default
+    ``settings.worker_max_attempts``): the item is dead-lettered once
+    :func:`fail` has recorded that many failures. Reusing a finished row
+    (a user-driven re-run) resets both budgets — ``attempts`` to 0 and, with
+    the payload, ``paused_count``.
     """
     if pipeline not in PIPELINES:
         raise ValueError(f"unknown pipeline '{pipeline}'")
@@ -117,7 +149,13 @@ def enqueue(
 
 
 def claim(db: Session, *, pipelines: Sequence[str], lease_seconds: Optional[int] = None) -> Optional[PipelineJob]:
-    """Atomically claim the next runnable item (priority, then arrival order)."""
+    """Atomically claim the next runnable item (priority, then arrival order).
+
+    Claiming takes a lease only — it does **not** increment ``attempts``,
+    which counts handler failures (see :func:`fail` and the module
+    docstring). A pause/resume or crash/re-queue cycle therefore costs the
+    item nothing.
+    """
     now = datetime.utcnow()
     lease = timedelta(seconds=lease_seconds or settings.worker_lease_seconds)
     candidate_id = (
@@ -142,7 +180,6 @@ def claim(db: Session, *, pipelines: Sequence[str], lease_seconds: Optional[int]
                 PipelineJob.status: "processing",
                 PipelineJob.locked_by: worker_id(),
                 PipelineJob.lease_expires_at: now + lease,
-                PipelineJob.attempts: PipelineJob.attempts + 1,
                 PipelineJob.updated_at: now,
             },
             synchronize_session=False,
@@ -167,6 +204,9 @@ def claim_item(db: Session, item_id: int, *, lease_seconds: Optional[int] = None
 
     Returns ``None`` when the item is not claimable (already processing, done, or
     scheduled for the future) so two workers can never run the same item.
+
+    Like :func:`claim`, this takes a lease only — ``attempts`` counts handler
+    failures and is left untouched.
     """
     now = datetime.utcnow()
     updated = (
@@ -177,7 +217,6 @@ def claim_item(db: Session, item_id: int, *, lease_seconds: Optional[int] = None
                 PipelineJob.status: "processing",
                 PipelineJob.locked_by: worker_id(),
                 PipelineJob.lease_expires_at: now + timedelta(seconds=lease_seconds or settings.worker_lease_seconds),
-                PipelineJob.attempts: PipelineJob.attempts + 1,
                 PipelineJob.updated_at: now,
             },
             synchronize_session=False,
@@ -205,6 +244,11 @@ def complete(db: Session, item: PipelineJob, *, result: Optional[Dict[str, Any]]
 #: green. If the *same* work keeps failing on retry (a 400 the probe cannot
 #: see, a provider that only fails on real prompts, …) it must not loop
 #: forever — after this many pauses it is dead-lettered with its last error.
+#:
+#: This is the **pause budget**, tracked as ``paused_count`` in the payload and
+#: deliberately separate from ``attempts``/``max_attempts`` (the *failure*
+#: budget): an outage must not spend a work item's failure budget, and a work
+#: item's failures must not spend its outage budget.
 AI_PAUSE_MAX = 12
 
 
@@ -219,6 +263,13 @@ def pause(db: Session, item: PipelineJob, error: str) -> str:
     signal is green. Work must be idempotent to be safe to pause this way
     (see the audit in the v2.1 CHANGELOG: every queued AI path creates its
     side effects only after the AI call succeeds, or upserts by unique key).
+
+    The whole cycle is free, not just this call: ``drain_paused`` re-queues
+    the item and :func:`claim` takes a lease without touching ``attempts``, so
+    N pause/resume cycles leave the failure budget exactly as they found it
+    (v2.2.2 — claiming used to increment it, which let an outage spend budget
+    the work never used). The only cap on this path is :data:`AI_PAUSE_MAX`,
+    counted separately in the payload's ``paused_count``.
     """
     # (mypy sees ORM attribute assignments as Column-typed — same known noise
     # class as fail()/complete(); ignored here to keep the mypy delta at zero.)
@@ -285,11 +336,22 @@ def paused_count(db: Session, *, user_id: Optional[int] = None) -> int:
 
 
 def fail(db: Session, item: PipelineJob, error: str, *, retryable: bool = True) -> str:
-    """Record a failure; retry with backoff or move to the dead-letter state."""
+    """Record a handler failure; retry with backoff or move to the dead-letter state.
+
+    This is the **only** place ``attempts`` grows: it counts failures, and the
+    increment happens *before* the budget check, so ``max_attempts=3`` means
+    three recorded failures and the third one is the one that dead-letters
+    (``attempts >= max_attempts`` → ``dead``). Claims, pauses and lease
+    expiries never touch it — see the module docstring.
+    """
     item.error = (error or "unknown error")[:2000]
     item.locked_by = ""
     item.lease_expires_at = None
+    item.attempts = int(item.attempts or 0) + 1  # type: ignore[assignment]
     if retryable and item.attempts < (item.max_attempts or settings.worker_max_attempts):
+        # Backoff is keyed on the failure just recorded, so the progression
+        # is unchanged from the caller's point of view: first failure →
+        # ``base ** 1 * 5``s, second → ``base ** 2 * 5``s, … capped at 600s.
         delay = min(600, int(settings.ai_backoff_base ** item.attempts * 5))
         item.status = "queued"
         item.scheduled_at = datetime.utcnow() + timedelta(seconds=delay)
@@ -315,7 +377,15 @@ def needs_input(db: Session, item: PipelineJob, *, reason: str = "") -> None:
 
 
 def recover_stalled(db: Session, *, pipelines: Optional[Sequence[str]] = None) -> int:
-    """Re-queue items whose lease expired (worker crash / deploy)."""
+    """Re-queue items whose lease expired (worker crash / deploy).
+
+    A stalled item is one nobody ever called :func:`fail` for, so the decision
+    is made on its *failure* count: ``attempts >= max_attempts`` → dead-letter
+    (its budget was already spent by real failures — this is also what stops a
+    row written before v2.2.2, whose counter was inflated by claims, from
+    looping forever), otherwise re-queue and let it run again. Recovering a
+    lease never increments ``attempts`` itself.
+    """
     now = datetime.utcnow()
     query = db.query(PipelineJob).filter(
         PipelineJob.status == "processing",

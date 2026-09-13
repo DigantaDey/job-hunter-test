@@ -91,7 +91,9 @@ export const AUTO_STATE_COPY: Record<AutoRunState, { label: string; cls: string;
   paused: {
     label: 'Paused',
     cls: 'bg-amber-50 border-amber-200 text-amber-800',
-    note: 'Paused by an AI outage — it resumes on its own.',
+    // v2.2.2: the queue's retry budget counts *failures*, so being parked by an
+    // outage (and resumed) costs the run none of its attempts.
+    note: 'Paused by an AI outage — it resumes on its own and spends no retry.',
   },
   needs_input: {
     label: 'Needs your input',

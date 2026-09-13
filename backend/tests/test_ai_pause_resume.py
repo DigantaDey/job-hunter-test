@@ -13,9 +13,10 @@ The contract under test (see CHANGELOG 2.1.0):
    retry storm.
 3. **Queued work** that hits a transient outage mid-run is *paused* (re-queued
    with backoff, never marked failed or completed, the pause does not consume
-   an attempt). When the provider is back, the watchdog (or the one-click
-   ``POST /api/settings/ai/resume``) drains it and the worker completes it
-   **without duplicates**.
+   an attempt — and since v2.2.2 neither does the claim that follows, because
+   ``attempts`` counts handler failures only). When the provider is back, the
+   watchdog (or the one-click ``POST /api/settings/ai/resume``) drains it and
+   the worker completes it **without duplicates**.
 4. **Nothing is persisted before the AI call succeeds** — an upload interrupted
    by an outage leaves no half-built resume/profile behind, so the retry is
    safe.
@@ -257,7 +258,10 @@ async def test_queued_job_paused_on_outage_then_recovers_without_duplicates(
     db.refresh(item)
     assert item.status == "paused", f"an AI outage must pause, not fail: {item.status} ({item.error})"
     assert item.finished_at is None, "paused work is never 'completed'"
-    assert item.attempts == 1, "the claim consumed the attempt; the pause must not"
+    # v2.2.2: attempts counts handler *failures*. The claim took a lease and
+    # the pause parked the item — neither is a failure, so the budget is intact
+    # (was: == 1, when the claim itself incremented the counter).
+    assert item.attempts == 0, "neither the claim nor the pause may consume a failure attempt"
     assert (item.payload or {}).get("paused_count") == 1
     assert paused_count(db, user_id=resume.user_id) == 1
     db.refresh(resume)

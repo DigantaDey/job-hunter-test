@@ -308,6 +308,14 @@ def recover(request: Request, user: CurrentUser, db: DbSession):
 
 @router.post("/ops/queue/retry-dead")
 def retry_dead(request: Request, user: CurrentUser, db: DbSession):
+    """Re-queue every dead item with a **fresh budget on both counters**.
+
+    ``attempts`` (handler failures) and ``payload.paused_count`` (AI-outage
+    pauses) are separate budgets — see :mod:`app.services.job_queue`. Resetting
+    only ``attempts`` meant an item that had dead-lettered on the pause cap was
+    re-queued with ``AI_PAUSE_MAX + 1`` pauses already banked, so its very next
+    outage killed it again and the operator's retry looked like a no-op.
+    """
     owner = require_owner(user)
     dead = db.query(PipelineJob).filter(PipelineJob.status == "dead").all()
     for item in dead:
@@ -315,5 +323,9 @@ def retry_dead(request: Request, user: CurrentUser, db: DbSession):
         item.attempts = 0
         item.scheduled_at = datetime.utcnow()
         item.error = ""
+        payload = item.payload
+        if isinstance(payload, dict) and "paused_count" in payload:
+            # Reassign (not mutate): a JSON column only persists on assignment.
+            item.payload = {k: v for k, v in payload.items() if k != "paused_count"}
     db.commit()
     return {"ok": True, "requeued": len(dead), "by": owner.email}
