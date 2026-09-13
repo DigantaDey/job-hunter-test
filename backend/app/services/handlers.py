@@ -328,6 +328,10 @@ async def handle_funding(db: Session, item: PipelineJob) -> Dict[str, Any]:
     sync = (funding_radar.sync_funding_db(db, user.id, companies, window)
             if report.get("scan_status") == funding_radar.SCAN_OK else {})
     funding_radar.store_scan_report(db, int(user.id), report)
+    try:
+        funding_radar.persist_funding_scan(db, int(user.id), report, companies if report.get("scan_status") == funding_radar.SCAN_OK else [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("funding history persist (queued) failed for user %s: %s", user.id, exc)
     if _is_auto(item):
         # Auto runs are held to the same per-action budget the interactive radar
         # charges (``POST /funding/companies`` counts ``len(companies)`` per scan).

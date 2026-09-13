@@ -106,6 +106,8 @@ export default function Funding() {
   const [lastReport, setLastReport] = useState<ScanReport | null>(null)
   const [windowDays, setWindowDays] = useState<number>(45)
   const [outage, setOutage] = useState<AIOutage | null>(null)
+  const [history, setHistory] = useState<any[]>([])
+  const [historyCollapsed, setHistoryCollapsed] = useState<boolean>(false)
 
   const load = useCallback(async (refresh = false) => {
     setError('')
@@ -122,6 +124,9 @@ export default function Funding() {
       setLastReport(data.last_report || null)
       setWindowDays(data.window_days || 45)
       if (refresh) setOutage(null)
+      // load recent scans (funding history)
+      try { const h = await client.get('/api/funding/history', { params:{limit:5}}); setHistory(h.data.history||h.data||[])} catch {}
+
     } catch (e: any) {
       // A refresh the model could not rank comes back as the v2.1 outage shape:
       // show the diagnosis (and keep the rows already on the radar).
@@ -191,16 +196,16 @@ export default function Funding() {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="text-xl font-semibold tracking-tight flex items-center gap-2">
-          <TrendingUp className="w-5 h-5" /> Funding Radar
-          <span className="text-xs mono font-normal text-zinc-500">Seed → Series D • fresh ≤{windowDays}d • AI-ranked against your profile</span>
+      <div className="flex flex-col sm:flex-row flex-wrap items-start sm:items-center justify-between gap-3">
+        <h1 className="text-xl font-semibold tracking-tight flex flex-col sm:flex-row items-start sm:items-center gap-2">
+          <span className="flex items-center gap-2"><TrendingUp className="w-5 h-5" /> Funding Radar</span>
+          <span className="text-xs mono font-normal text-zinc-500">Seed → Series D • fresh ≤{windowDays}d • AI-ranked</span>
         </h1>
-        <div className="flex gap-2">
-          <button onClick={() => setShowContextInput(v => !v)} className="px-3 py-2 rounded-full border dark:border-zinc-700 text-xs inline-flex items-center gap-1.5 bg-white dark:bg-zinc-800">
+        <div className="flex flex-wrap gap-2 chips-wrap">
+          <button onClick={() => setShowContextInput(v => !v)} className="px-3 py-2 rounded-full border dark:border-zinc-700 text-xs inline-flex items-center gap-1.5 bg-white dark:bg-zinc-800 min-h-[44px]">
             <Target className="w-3.5 h-3.5" /> Add focus
           </button>
-          <button onClick={rescan} disabled={scanning} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50">
+          <button onClick={rescan} disabled={scanning} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50 min-h-[44px]">
             {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} AI re-scan
           </button>
         </div>
@@ -258,15 +263,15 @@ export default function Funding() {
       </div>
 
       {/* stage filters + count */}
-      <div className="card p-3 flex flex-wrap items-center gap-2">
+      <div className="card p-3 flex flex-col sm:flex-row flex-wrap items-start sm:items-center gap-2 chips-wrap">
         <span className="text-xs mono text-zinc-500">{visible.length} companies</span>
         {typeof scanned === 'number' && scanStatus === 'ok' && (
           <span className="text-[11px] mono text-zinc-400">{scanned} events scanned by AI</span>
         )}
-        <div className="ml-auto flex flex-wrap gap-1">
-          <button onClick={() => setStageFilter([])} className={`text-xs px-3 py-1 rounded-full border mono ${stageFilter.length === 0 ? 'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900' : 'bg-white dark:bg-zinc-800'}`}>All stages</button>
+        <div className="ml-auto flex flex-wrap gap-1 chips-wrap">
+          <button onClick={() => setStageFilter([])} className={`text-xs px-3 py-2 rounded-full border mono min-h-[44px] ${stageFilter.length === 0 ? 'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900' : 'bg-white dark:bg-zinc-800'}`}>All stages</button>
           {STAGES.map(s => (
-            <button key={s} onClick={() => toggleStage(s)} className={`text-xs px-3 py-1 rounded-full border mono ${stageFilter.includes(s) ? 'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900' : 'bg-white dark:bg-zinc-800'}`}>{s}</button>
+            <button key={s} onClick={() => toggleStage(s)} className={`text-xs px-3 py-2 rounded-full border mono min-h-[44px] ${stageFilter.includes(s) ? 'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900' : 'bg-white dark:bg-zinc-800'}`}>{s}</button>
           ))}
         </div>
       </div>
@@ -338,8 +343,32 @@ export default function Funding() {
         </div>
       )}
 
+      {/* Recent scans — funding history (mobile snap/collapse) */}
+      <div className="card p-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-medium mono flex items-center gap-2"><Calendar className="w-4 h-4"/> Recent scans</h3>
+          <button onClick={()=>setHistoryCollapsed(v=>!v)} className="text-xs px-3 py-2 rounded-full border mono min-h-[44px] sm:hidden">{historyCollapsed ? 'Expand' : 'Collapse'}</button>
+          <span className="hidden sm:inline text-xs mono text-zinc-500">{history.length} scans</span>
+        </div>
+        {!historyCollapsed && (
+          <div className="mt-3 flex gap-3 overflow-x-auto history-snap pb-2 snap-x snap-mandatory sm:grid sm:grid-cols-2 sm:overflow-visible">
+            {history.length===0 ? <div className="text-xs mono text-zinc-500">No scans yet</div> :
+              history.slice(0,5).map((h:any, idx:number)=>(
+                <div key={h.id||idx} className="min-w-[280px] sm:min-w-0 card p-3 border bg-zinc-50 dark:bg-zinc-800 snap-start flex-shrink-0 sm:flex-shrink">
+                  <div className="text-xs mono font-medium flex items-center gap-2">
+                    <span className={`px-2 py-0.5 rounded-full text-[11px] ${h.status==='ok'?'bg-emerald-100 text-emerald-700':'bg-amber-100 text-amber-700'}`}>{h.status||h.scan_status}</span>
+                    <span className="text-zinc-500">{h.scanned_at ? new Date(h.scanned_at).toLocaleDateString() : ''}</span>
+                  </div>
+                  <div className="text-xs mono text-zinc-600 dark:text-zinc-400 mt-1">{h.companies_found ?? h.counts?.total ?? 0} companies • {h.events_seen ?? h.scanned ?? 0} events</div>
+                  {h.reason && <div className="text-[11px] mono text-zinc-500 mt-1 line-clamp-2">{h.reason}</div>}
+                </div>
+              ))}
+          </div>
+        )}
+      </div>
+
       {loading ? (
-        <div className="grid md:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {[...Array(6)].map((_, i) => <div key={i} className="card p-4 h-28 animate-pulse bg-zinc-100 dark:bg-zinc-800" />)}
         </div>
       ) : visible.length === 0 ? (
@@ -364,12 +393,12 @@ export default function Funding() {
           )}
         </div>
       ) : (
-        <div className="grid md:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {visible.map(c => (
             <div key={c.id} className="card p-4 flex flex-col">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
-                  <div className="text-sm font-semibold truncate">{c.name}</div>
+                  <div className="text-sm font-semibold truncate flex items-center gap-2">{c.name} <a href={`/jobs?company=${encodeURIComponent(c.name)}`} className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 mono no-underline min-h-[44px] inline-flex items-center">jobs →</a></div>
                   <div className="text-xs mono text-zinc-500 flex flex-wrap items-center gap-x-2">
                     <span className="inline-flex items-center gap-1"><Calendar className="w-3 h-3" /> {raisedLabel(c)}</span>
                     {c.website && (
@@ -427,7 +456,7 @@ export default function Funding() {
               <div className="mt-3 flex items-center gap-2">
                 {/* The backend decides from provider facts: a real posting is
                     tracked as a job, otherwise a founder draft needs approval. */}
-                <button onClick={() => process(c)} disabled={!!busy} className="ml-auto flex-1 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50">
+                <button onClick={() => process(c)} disabled={!!busy} className="ml-auto flex-1 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 min-h-[44px] focus:ring-2 focus:ring-blue-500">
                   {busy === c.name
                     ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     : (c.open_positions || []).length > 0 ? <Briefcase className="w-3.5 h-3.5" /> : <Mail className="w-3.5 h-3.5" />}

@@ -15,11 +15,12 @@ from app.core.auth import require_consent
 from app.core.config import settings
 from app.core.entitlements import can, enforce, get_user_plan, increment_usage
 from app.core.logging import get_logger
-from app.models.models import Job, JobEvent, PipelineJob, Profile, UserInputRequest
-from app.schemas.schemas import JobDetail, JobOut
+from app.models.models import FundingCompany, Job, JobEvent, PipelineJob, Profile, UserInputRequest
+from app.schemas.schemas import JobDetail
 from app.services import persona as persona_service
 from app.services.apply_flow import mark_applied, prepare_application
 from app.services.classifier import ai_company_size
+from app.services.company_normalize import normalize_company_name
 from app.services.discovery import discovery_sources_config
 from app.services.events import record_job_event
 from app.services.job_queue import enqueue, queue_stats
@@ -39,7 +40,7 @@ def _job_or_404(db: Session, user_id: int, job_id: int) -> Job:
 # --------------------------------------------------------------------------- #
 # Reads
 # --------------------------------------------------------------------------- #
-@router.get("/jobs", response_model=List[JobOut])
+@router.get("/jobs")
 def list_jobs(
     user: CurrentUser,
     db: DbSession,
@@ -50,7 +51,14 @@ def list_jobs(
     min_score: Optional[float] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    company: Optional[str] = None,
 ):
+    # v2.2.5 linkage: build funded normalized set for the funding chip
+    funded_norms: set[str] = set()
+    for row in db.query(FundingCompany).filter(FundingCompany.user_id == user.id).all():
+        n = normalize_company_name(row.name)
+        if n:
+            funded_norms.add(n)
     query = db.query(Job).filter(Job.user_id == user.id)
     if status:
         query = query.filter(Job.status == status)
@@ -63,7 +71,47 @@ def list_jobs(
     if q:
         pattern = f"%{q}%"
         query = query.filter(Job.title.ilike(pattern) | Job.company.ilike(pattern) | Job.location.ilike(pattern))
-    return query.order_by(Job.score.desc(), Job.discovered_at.desc()).offset(offset).limit(limit).all()
+    # Company exact normalized filter (prompt B): exact match only, suffix-stripped
+    if company is not None and str(company).strip():
+        target = normalize_company_name(company)
+        # Need to fetch then filter in Python because SQL can't do suffix stripping
+        rows = query.order_by(Job.score.desc(), Job.discovered_at.desc()).all()
+        rows = [r for r in rows if normalize_company_name(r.company) == target]
+        # apply offset/limit after filtering
+        sliced = rows[offset: offset + limit]
+        out = []
+        for r in sliced:
+            funding_norm = normalize_company_name(r.company)
+            is_funded = bool(funding_norm and funding_norm in funded_norms)
+            d = {
+                "id": r.id, "title": r.title, "company": r.company, "location": r.location, "url": r.url,
+                "source": r.source, "status": r.status, "score": r.score, "company_size": r.company_size,
+                "discovered_at": r.discovered_at, "posted_at": r.posted_at, "applied_at": r.applied_at,
+                "error": r.error,
+                "funding": is_funded,
+                "is_funded": is_funded,
+                "funding_match": is_funded,
+                "has_open_positions": is_funded,
+            }
+            out.append(d)
+        return out
+    rows = query.order_by(Job.score.desc(), Job.discovered_at.desc()).offset(offset).limit(limit).all()
+    out = []
+    for r in rows:
+        funding_norm = normalize_company_name(r.company)
+        is_funded = bool(funding_norm and funding_norm in funded_norms)
+        d = {
+            "id": r.id, "title": r.title, "company": r.company, "location": r.location, "url": r.url,
+            "source": r.source, "status": r.status, "score": r.score, "company_size": r.company_size,
+            "discovered_at": r.discovered_at, "posted_at": r.posted_at, "applied_at": r.applied_at,
+            "error": r.error,
+            "funding": is_funded,
+            "is_funded": is_funded,
+            "funding_match": is_funded,
+            "has_open_positions": is_funded,
+        }
+        out.append(d)
+    return out
 
 
 @router.get("/jobs/sources")

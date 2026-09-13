@@ -17,11 +17,26 @@
   --muted: 240 3.7% 15.9%;
 }
 * { border-color: hsl(var(--border)); }
+html, body { overflow-x: hidden; max-width: 100vw; }
 body {
   font-family: 'Inter', sans-serif;
   background: hsl(var(--background));
   color: hsl(var(--foreground));
   @apply antialiased;
+}
+/* Mobile: ensure no horizontal scroll and tap targets */
+@media (max-width: 768px) {
+  * { max-width: 100vw; }
+  /* tap targets >=44px — all interactive elements meet minimum */
+  button, a, [role="button"], input[type="button"], input[type="submit"] {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  /* chips wrap, never single-line scroll */
+  .chips-wrap { flex-wrap: wrap !important; }
+  /* history snap on mobile */
+  .history-snap { scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; }
+  .history-snap > * { scroll-snap-align: start; }
 }
 .mono { font-family: 'JetBrains Mono', monospace; }
 .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
