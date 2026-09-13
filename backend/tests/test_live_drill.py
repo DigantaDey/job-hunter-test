@@ -31,6 +31,43 @@ VALID_KEY = "sk-e2e-valid-key-abcdef123456"
 # - call log (workflow + timestamp)
 # ---------------------------------------------------------------------------
 
+def _stub_company_name(title: str) -> str:
+    """Company name from a headline like ``"VectorLoom AI raises $12M Series A"``."""
+    cut = re.split(r"\s+(?:raises|raised|secures|secured|announces|announced|closes|closed)\b",
+                   " ".join(str(title or "").split()), maxsplit=1, flags=re.IGNORECASE)[0]
+    return " ".join(cut.split()[:4]).strip(" ,-–—:;.")
+
+
+def _extract_payload(prompt: str) -> Dict[str, Any]:
+    """Contract-compliant funding-extract answer: one company per cited result.
+
+    Mirrors the funding_scan stand-in for the search path: ``source_index`` is
+    always in range and the name comes from the result's own title, so the
+    grounding guardrail (name must appear in the cited result's text) accepts
+    it — the fake provider obeys the product's own rules.
+    """
+    results: List[Any] = []
+    m = re.search(r"Search results:\s*(\[.*\])\s*\nReturn JSON only", prompt or "", re.DOTALL)
+    if m:
+        try:
+            results = json.loads(m.group(1))
+        except Exception:
+            results = []
+    comps = []
+    for idx, row in enumerate(results if isinstance(results, list) else []):
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "")
+        name = _stub_company_name(title)
+        if not name:
+            continue
+        stage = re.search(r"\b(Series [ABCD]|Seed)\b", title, re.IGNORECASE)
+        comps.append({"name": name, "source_index": idx,
+                      "stage": stage.group(1).title() if stage else "Undisclosed",
+                      "raised_usd": None, "raised_at": None, "industry": ""})
+    return {"companies": comps}
+
+
 def _payload_for(workflow: str, prompt: str) -> Dict[str, Any]:
     low = (prompt or "").lower()
     if workflow == "parse":
@@ -59,6 +96,8 @@ def _payload_for(workflow: str, prompt: str) -> Dict[str, Any]:
             "recommendation_reason": "Matches core stack and domain perfectly.",
         }
     if workflow == "funding_scan":
+        if "funding-extract-v1" in (prompt or "").lower():
+            return _extract_payload(prompt)
         m = re.search(r"Funding events:\s*(\[.*?\])\s*\nReturn JSON only", prompt, re.DOTALL)
         events: List[Any] = []
         if m:
@@ -107,6 +146,8 @@ def _payload_for(workflow: str, prompt: str) -> Dict[str, Any]:
 
 def _detect_workflow(prompt: str) -> str:
     low = (prompt or "").lower()
+    if "funding-extract-v1" in low:
+        return "funding_scan"  # the search-path extraction shares the workflow
     if "funding-scan-v2" in low:
         return "funding_scan"
     if "extract a complete, structured profile" in low:
@@ -521,6 +562,61 @@ def test_c4_funding_honesty(live_client, live_fake_server, fake_mode, db, monkey
     funding_sources.PROVIDERS.pop("demo", None)
     monkeypatch.setattr("app.core.config.settings.funding_provider", "sec_edgar")
     monkeypatch.setattr("app.core.config.settings.allow_synthetic_funding_data", False)
+
+
+# ---------------------------------------------------------------------------
+# C4b funding honesty via the web-search path (v2.2.6)
+# ---------------------------------------------------------------------------
+def test_c4b_search_path_bypasses_edgar(live_client, live_fake_server, fake_mode, db, monkeypatch):
+    """C4 variant: a configured search engine replaces the blocked EDGAR path.
+
+    With RESPECT_ROBOTS_TXT=true (the default) the direct efts.sec.gov fetch
+    fails with PermissionError; with FUNDING_SEARCH_PROVIDER=stub the scan runs
+    through the search API instead — scan_status=ok, zero requests to
+    efts.sec.gov, history rows persisted with provider_errors {}.
+    """
+    fake_mode("ok")
+    client = live_client
+    auth, user = _make_pro_user(client, db, f"c4b-{uuid.uuid4().hex[:6]}@example.com")
+    from app.services import funding_search
+    monkeypatch.setattr("app.core.config.settings.funding_search_provider", "stub")
+    assert funding_search.search_configured() is True
+
+    # Any outbound request through the shared client is a contract violation:
+    # the stub search is hermetic, so a scan of the search path must make none.
+    outbound: List[str] = []
+
+    async def forbidden(method, url, **kwargs):
+        outbound.append(str(url))
+        raise AssertionError(f"no outbound request may be made on the search path: {url}")
+
+    monkeypatch.setattr("app.services.http.request", forbidden)
+
+    resp = client.get("/api/funding/companies?refresh=true&include_unverified=true", headers=auth)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("scan_status") == "ok", body
+    companies = body.get("companies") or []
+    assert companies, "the stub search corpus must surface companies"
+    assert all(c["source"] == "search" for c in companies)
+    assert all(c["verified"] is False for c in companies), "stub rows stay labelled unverified"
+    assert all("efts.sec.gov" not in (c.get("url") or "") for c in companies)
+    assert body["last_report"]["providers"] == ["search"]
+    assert body["last_report"]["counts"] == {"search": 3}
+    assert not (body["last_report"].get("errors") or {})
+    assert outbound == [], f"zero requests to efts.sec.gov expected, saw {outbound}"
+
+    from app.models.models import FundingScan, FundingScanCompany
+    scans = db.query(FundingScan).filter(FundingScan.user_id == user.id,
+                                         FundingScan.status == "ok").all()
+    assert scans, "expected ok scan row"
+    mem = db.query(FundingScanCompany).filter(
+        FundingScanCompany.scan_id.in_([s.id for s in scans])).all()
+    assert len(mem) >= 1, "expected membership rows"
+
+    # The search block on /api/funding/providers reflects the configuration.
+    prov = client.get("/api/funding/providers", headers=auth).json()
+    assert prov["search"] == {"provider": "stub", "configured": True, "hint": ""}
 
 
 # ---------------------------------------------------------------------------

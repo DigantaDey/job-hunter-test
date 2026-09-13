@@ -232,10 +232,13 @@ def test_alembic_migrations_apply_to_a_fresh_database(tmp_path):
     assert again.returncode == 0, again.stderr
     connection.close()
 
-    # And reversible: rolling the release back one step drops the table cleanly,
-    # and upgrading again rebuilds it. A migration that cannot be undone is a
-    # release that cannot be rolled back.
-    down = subprocess.run([sys.executable, "-m", "alembic", "downgrade", "-1"],
+    # And reversible: rolling the scheduled_runs revision back drops the table
+    # cleanly, and upgrading again rebuilds it. A migration that cannot be
+    # undone is a release that cannot be rolled back. Pinned to the *revision*,
+    # not to ``-1``: since v2.2.5 the chain continues past this migration, and
+    # a relative step then undoes the wrong one (the same stale-``-1`` bug the
+    # funding history test documents).
+    down = subprocess.run([sys.executable, "-m", "alembic", "downgrade", "b2c3d4e5f6a7"],
                           cwd=backend, env=env, capture_output=True, text=True)
     assert down.returncode == 0, down.stderr
     connection = sqlite3.connect(db_path)

@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.2.5"
+    version: str = "2.2.6"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -293,6 +293,14 @@ class Settings(BaseSettings):
     # Funding
     # ------------------------------------------------------------------ #
     funding_provider: str = "sec_edgar"
+    #: Web-search provider for funding scans. When resolved, scans discover
+    #: funding events through a search API instead of the direct SEC EDGAR
+    #: full-text endpoint (``efts.sec.gov``), whose robots.txt disallows
+    #: automated access to ``/LATEST/search-index``. ``tavily`` | ``stub``
+    #: (hermetic, deterministic — tests/dev) | empty (auto: ``tavily`` when
+    #: ``FUNDING_SEARCH_API_KEY`` is set, else the direct sec_edgar path).
+    funding_search_provider: str = ""
+    funding_search_api_key: str = ""
     sec_edgar_user_agent: str = ""
     crunchbase_api_key: str = ""
     tracxn_api_key: str = ""
@@ -436,6 +444,13 @@ class Settings(BaseSettings):
     def _split_keywords(cls, value: Any) -> List[str]:
         return _csv(value)
 
+    @field_validator("funding_provider", "funding_search_provider")
+    @classmethod
+    def _normalize_funding_provider(cls, value: str) -> str:
+        """Provider ids are lowercase everywhere; ``FUNDING_PROVIDER=SEC_EDGAR``
+        used to become ``unknown_provider`` and silently kill the radar."""
+        return (value or "").strip().lower()
+
     @field_validator("environment")
     @classmethod
     def _normalize_environment(cls, value: str) -> str:
@@ -543,6 +558,11 @@ class Settings(BaseSettings):
     @property
     def ai_enabled(self) -> bool:
         return bool(self.ai_api_key)
+
+    @property
+    def funding_search_effective(self) -> str:
+        """The resolved funding-search provider (``""`` = not configured)."""
+        return resolve_funding_search_provider(self.funding_search_provider, self.funding_search_api_key)
 
     @property
     def autofill_runtime_ready(self) -> bool:
@@ -695,6 +715,10 @@ class Settings(BaseSettings):
             "sources_live": list(LIVE_SOURCES),
             "sources_credentialed": list(CREDENTIALED_SOURCES),
             "funding_provider": self.funding_provider,
+            # Secret-free funding-search status: the SPA renders it as the
+            # search-provider badge on the Funding page. The key never appears.
+            "funding_search_provider": self.funding_search_effective,
+            "funding_search_configured": bool(self.funding_search_effective),
             "synthetic_data_allowed": self.allow_synthetic_funding_data,
             "local_data_mode": self.is_sqlite,
         }
@@ -702,6 +726,33 @@ class Settings(BaseSettings):
 
 #: Consent keys a user must accept before automation can touch their data.
 REQUIRED_CONSENTS = ("terms", "privacy", "automation")
+
+
+#: Funding search providers with an implementation in
+#: ``app.services.funding_search`` (a registry entry, not just a plan).
+FUNDING_SEARCH_PROVIDERS = ("tavily", "stub")
+
+
+def resolve_funding_search_provider(provider: str, api_key: str) -> str:
+    """Resolved funding-search provider id (``""`` when the search path is off).
+
+    Single source of truth shared by :mod:`app.services.funding_search` and
+    :meth:`Settings.public_settings`, so the API surface and the scan behaviour
+    can never disagree about whether a search engine is configured:
+
+    * ``stub``   — always usable (hermetic, deterministic, no network);
+    * ``tavily`` — needs ``FUNDING_SEARCH_API_KEY``;
+    * empty/``auto`` — ``tavily`` when a key is set, else ``""`` (direct path);
+    * anything else — ``""`` (unknown values are surfaced as a hint, they never
+      silently pick a provider).
+    """
+    wanted = (provider or "").strip().lower()
+    key = (api_key or "").strip()
+    if wanted == "stub":
+        return "stub"
+    if wanted in ("", "auto", "tavily"):
+        return "tavily" if key else ""
+    return ""
 
 
 @lru_cache(maxsize=1)
@@ -721,6 +772,8 @@ __all__ = [
     "LIVE_SOURCES",
     "CREDENTIALED_SOURCES",
     "REQUIRED_CONSENTS",
+    "FUNDING_SEARCH_PROVIDERS",
+    "resolve_funding_search_provider",
     "BACKEND_DIR",
     "REPO_DIR",
 ]

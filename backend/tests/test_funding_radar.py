@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.models.models import FundingCompany, User
-from app.services import funding_radar, funding_sources
+from app.services import funding_radar, funding_search, funding_sources
 from app.services.funding_sources import (
     FundingEvent,
     FundingProviderError,
@@ -1074,3 +1074,417 @@ def test_migration_upgrades_a_real_2_1_1_database(tmp_path):
     assert "has_open_positions" in [r[1] for r in con.execute("PRAGMA table_info(funding_companies)")]
     con.close()
     alembic("upgrade", "head")
+
+
+# =========================================================================== #
+# 7. Web-search provider path (v2.2.6) — efts.sec.gov is bypassed when a
+#    search engine is configured; the direct EDGAR path stays honest when not.
+#
+#  Contract under test:
+#  1. With FUNDING_SEARCH_* configured, a scan that used to hit the blocked
+#     EDGAR endpoint runs through the search API instead — zero requests to
+#     efts.sec.gov, scan_status=ok, events extracted from snippets with a
+#     citation (url/snippet from the cited result row, never from the model).
+#  2. Without a configured search provider, the direct EDGAR path keeps its
+#     robots check: robots-blocked → scan_failed + provider_errors.sec_edgar
+#     (an honest 200 body, never a 500, never a fake empty radar).
+#  3. Search-provider failures are data: provider_errors.search on the scan
+#     report; transport failures retry once, 4xx never.
+#  4. The history contract is unchanged (persist_funding_scan stores
+#     provider_errors.search like any other provider error).
+# =========================================================================== #
+def _search_rows(*names: str, days_ago: int = 5) -> list:
+    """Realistic search rows (as tavily would return them) for given names."""
+    from datetime import datetime as _dt
+
+    published = (_dt.utcnow() - timedelta(days=days_ago)).replace(microsecond=0).isoformat() + "Z"
+    rows = []
+    for name in names:
+        rows.append({
+            "title": f"{name} raises $12M Series A for its platform",
+            "url": f"https://example.com/press/{normalize_company_name(name).replace(' ', '-')}",
+            "snippet": f"{name} announced a $12 million Series A round to grow its platform and engineering team.",
+            "published_at": published,
+            "query": "ai startup funding round",
+        })
+    return rows
+
+
+def _script_search_ai(monkeypatch, extract=None, rank=None):
+    """Configure AI and script the two funding_scan passes separately.
+
+    The search path makes ONE extraction call (contract ``funding-extract-v1``)
+    inside the provider and ONE ranking call in the radar; the dispatcher
+    splits them by contract marker so a test can script each.
+    """
+    monkeypatch.setattr("app.core.config.settings.ai_api_key", "sk-hermetic-funding-test")
+
+    async def fake_completion(workflow, prompt, **kwargs):
+        assert workflow == "funding_scan"
+        if "funding-extract-v1" in prompt:
+            fake_completion.extract_prompts.append(prompt)
+            return extract(prompt) if callable(extract) else extract
+        fake_completion.rank_prompts.append(prompt)
+        return rank(prompt) if callable(rank) else rank
+
+    fake_completion.extract_prompts = []
+    fake_completion.rank_prompts = []
+    monkeypatch.setattr("app.services.ai_client.chat_completion", fake_completion)
+    return fake_completion
+
+
+def _forbid_outbound(monkeypatch):
+    """Any outbound request on the search path is a contract violation."""
+    seen: list = []
+
+    async def forbidden(method, url, **kwargs):
+        seen.append(str(url))
+        raise AssertionError(f"no outbound request may be made on this path: {url}")
+
+    monkeypatch.setattr("app.services.http.request", forbidden)
+    return seen
+
+
+def test_funding_search_settings_resolution(monkeypatch):
+    """The resolver matrix + secret-free public_settings exposure."""
+    from app.core.config import resolve_funding_search_provider
+
+    assert resolve_funding_search_provider("", "") == ""            # off: direct path
+    assert resolve_funding_search_provider("", "tvly-x") == "tavily"  # auto via key
+    assert resolve_funding_search_provider("auto", "tvly-x") == "tavily"
+    assert resolve_funding_search_provider("tavily", "") == ""      # key missing
+    assert resolve_funding_search_provider("TAVILY", "tvly-x") == "tavily"
+    assert resolve_funding_search_provider("stub", "") == "stub"    # hermetic, keyless
+    assert resolve_funding_search_provider("serpapi", "key") == ""  # unknown → off + hint
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "funding_search_provider", "tavily")
+    monkeypatch.setattr(settings, "funding_search_api_key", "tvly-secret-value")
+    payload = settings.public_settings()
+    assert payload["funding_search_configured"] is True
+    assert payload["funding_search_provider"] == "tavily"
+    assert "tvly-secret-value" not in repr(payload)
+
+
+@pytest.mark.asyncio
+async def test_search_provider_replaces_edgar_and_never_touches_efts(monkeypatch):
+    """Acceptance 1: tavily configured → the scan runs on the search path."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "funding_search_provider", "tavily")
+    monkeypatch.setattr(settings, "funding_search_api_key", "tvly-hermetic")
+    queries: list = []
+
+    async def fake_search(query, *, window_days, limit):
+        queries.append(query)
+        assert window_days == 30 and limit <= funding_sources.SEARCH_RESULTS_PER_QUERY
+        return _search_rows("VectorLoom AI")
+
+    monkeypatch.setattr(funding_search, "search", fake_search)
+    outbound = _forbid_outbound(monkeypatch)
+    fake = _script_search_ai(
+        monkeypatch,
+        extract=lambda prompt: {"companies": [{"name": "VectorLoom AI", "source_index": 0,
+                                               "stage": "Series A", "raised_usd": 12000000,
+                                               "raised_at": None, "industry": "ai infra"}]},
+        rank=lambda prompt: {"companies": [{"name": "VectorLoom AI", "matched": True, "rank": 1,
+                                            "why": "Series A ai infra round."}]},
+    )
+
+    events, report = await funding_sources.fetch_funding_events(
+        {"funding_focus": ["ai infra"]}, window_days=30, limit=5, provider="sec_edgar")
+
+    assert report["providers"] == ["search"], "the sec_edgar slot is replaced by search"
+    assert report["counts"] == {"search": 1}
+    assert report["scan_status"] == "ok"
+    assert outbound == [] and not any("efts.sec.gov" in q for q in queries)
+    assert len(fake.extract_prompts) == 1 and len(fake.rank_prompts) == 0  # ranking happens in the radar
+    assert any("ai infra" in q for q in queries), "queries are built from the search context"
+    assert events[0].name == "VectorLoom AI" and events[0].source == "search"
+    assert events[0].verified is True and "example.com/press" in events[0].url
+
+
+@pytest.mark.asyncio
+async def test_search_events_cite_the_result_row_not_the_model(monkeypatch):
+    """url, snippet and summary come from the cited row; the model only parses."""
+    rows = _search_rows("Nightowl Robotics", days_ago=3)
+    _script_search_ai(
+        monkeypatch,
+        extract=lambda prompt: {"companies": [{"name": "Nightowl Robotics", "source_index": 0,
+                                               "stage": "seed", "raised_usd": 6500000,
+                                               "raised_at": "2026-09-01", "industry": "robotics"}]},
+    )
+    events = await funding_sources.ai_extract_events_from_results(
+        rows, {"funding_focus": ["robotics"]}, search_provider_id="tavily", window_days=45)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.url == rows[0]["url"]                    # from the row…
+    assert event.meta["snippet"] == rows[0]["snippet"]    # …not the model
+    assert event.summary.startswith(rows[0]["title"]) and rows[0]["snippet"] in event.summary
+    assert event.stage == "Seed"                          # model-parsed, normalised
+    assert event.raised_usd == 6_500_000                  # model-parsed from the snippet
+    assert event.raised_at is not None and event.raised_at.date().isoformat() == "2026-09-01"
+    assert event.meta["search_provider"] == "tavily" and event.meta["query"]
+    assert event.verified is True
+    # An unparsable model date falls back to the row's published_at.
+    _script_search_ai(
+        monkeypatch,
+        extract=lambda prompt: {"companies": [{"name": "Nightowl Robotics", "source_index": 0,
+                                               "stage": "Undisclosed", "raised_at": "recently"}]},
+    )
+    (fallback,) = await funding_sources.ai_extract_events_from_results(
+        rows, {}, search_provider_id="tavily", window_days=45)
+    assert fallback.raised_at is not None and fallback.meta["raised_at_estimated"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_extraction_rejects_ungrounded_company(monkeypatch):
+    """A name no result text contains is fabrication → the answer is rejected."""
+    from app.services.ai_guardrails import AIUnavailableError
+
+    _script_search_ai(
+        monkeypatch,
+        extract={"companies": [{"name": "Totally Made Up Corp", "source_index": 0,
+                                "stage": "Seed", "raised_usd": None}]},
+    )
+    with pytest.raises(AIUnavailableError) as excinfo:
+        await funding_sources.ai_extract_events_from_results(
+            _search_rows("Nightowl Robotics"), {}, search_provider_id="tavily")
+    assert excinfo.value.reason == "guardrail_failed"
+    assert excinfo.value.state == "blocked_needs_action"
+    assert "Totally Made Up Corp" in excinfo.value.detail
+
+
+@pytest.mark.asyncio
+async def test_search_provider_failure_is_provider_errors_search(monkeypatch):
+    """Acceptance contract: search failures surface as provider_errors.search."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "funding_search_provider", "tavily")
+    monkeypatch.setattr(settings, "funding_search_api_key", "tvly-hermetic")
+    monkeypatch.setattr(funding_sources, "PROVIDER_RETRY_DELAY_SECONDS", 0.0)
+    _script_search_ai(monkeypatch)  # configured, never reached
+
+    calls: list = []
+
+    async def failing_search(query, *, window_days, limit):
+        calls.append(query)
+        raise funding_search.FundingSearchError("tavily returned HTTP 401", status=401)
+
+    monkeypatch.setattr(funding_search, "search", failing_search)
+    events, report = await funding_sources.fetch_funding_events(
+        {"funding_focus": ["ai"]}, provider="sec_edgar")
+    assert events == []
+    assert report["scan_status"] == "scan_failed"
+    assert "search" in report["errors"] and "401" in report["errors"]["search"]
+    assert len(calls) == 1, "a 4xx search failure is not retried"
+
+    transport_calls: list = []
+
+    async def flaky_search(query, *, window_days, limit):
+        transport_calls.append(query)
+        raise funding_search.FundingSearchError("connection reset")
+
+    monkeypatch.setattr(funding_search, "search", flaky_search)
+    events, report = await funding_sources.fetch_funding_events(
+        {"funding_focus": ["ai"]}, provider="sec_edgar")
+    assert len(transport_calls) == 2, "a transport failure gets exactly one retry"
+    assert report["scan_status"] == "scan_failed" and "search" in report["errors"]
+
+
+@pytest.mark.asyncio
+async def test_robots_blocked_edgar_without_search_key_stays_honest(monkeypatch):
+    """Acceptance 2: no search key + robots block → scan_failed, never a 500."""
+    import app.services.robots as robots
+
+    async def disallowed(url, user_agent=None):
+        return False
+
+    monkeypatch.setattr(robots, "can_fetch", disallowed)
+    events, report = await funding_sources.fetch_funding_events(
+        {"funding_focus": ["ai"]}, provider="sec_edgar")
+    assert funding_search.search_configured() is False  # the default: no key
+    assert events == []
+    assert report["scan_status"] == "scan_failed"
+    assert "sec_edgar" in report["errors"]
+    assert "robots.txt" in report["errors"]["sec_edgar"]
+    assert len(report["errors"]["sec_edgar"]) <= 300
+
+
+@pytest.mark.asyncio
+async def test_tavily_wire_parsing_and_robots_not_consulted(monkeypatch):
+    """The tavily call is an authenticated API RPC: no robots check, key in the header.
+
+    The shared client is still the (guard-vetted) gateway — only the robots
+    step is skipped, because robots.txt governs crawling published pages, not
+    a JSON API the key licenses us to call.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "funding_search_provider", "tavily")
+    monkeypatch.setattr(settings, "funding_search_api_key", "tvly-wire-test")
+    captured: dict = {}
+
+    async def fake_request(method, url, **kwargs):
+        captured.update({"method": method, "url": url, **kwargs})
+        return FakeResponse({"results": [
+            {"title": "Wire Co raises $5M Seed", "url": "https://example.com/wire",
+             "content": "Wire Co closed a $5 million Seed round.",
+             "published_date": "2026-09-10"},
+        ]})
+
+    monkeypatch.setattr("app.services.http.request", fake_request)
+    rows = await funding_search.search("ai startup funding round", window_days=30, limit=5)
+    assert captured["method"] == "POST" and captured["url"] == funding_search.TAVILY_ENDPOINT
+    assert captured["json_body"]["query"] == "ai startup funding round"
+    assert captured["json_body"]["days"] == 30
+    assert captured["respect_robots"] is False
+    assert captured["headers"]["Authorization"] == "Bearer tvly-wire-test"
+    assert rows == [{"title": "Wire Co raises $5M Seed", "url": "https://example.com/wire",
+                     "snippet": "Wire Co closed a $5 million Seed round.",
+                     "published_at": "2026-09-10"}]
+
+    async def unauthorized(method, url, **kwargs):
+        return FakeResponse(None, status_code=401)
+
+    monkeypatch.setattr("app.services.http.request", unauthorized)
+    with pytest.raises(funding_search.FundingSearchError) as excinfo:
+        await funding_search.search("q", window_days=30, limit=5)
+    assert excinfo.value.status == 401
+
+
+@pytest.mark.asyncio
+async def test_ai_outage_during_extraction_propagates_not_scan_failed(monkeypatch):
+    """An AI outage inside the extraction pass follows the v2.1 outage contract.
+
+    It must reach the caller (→ pausable 503 / blocked, queue pause) — never be
+    swallowed into provider_errors.search, which would present an AI outage as
+    "no provider returned data".
+    """
+    from app.core.config import settings
+    from app.services.ai_client import AIClientError
+
+    monkeypatch.setattr(settings, "funding_search_provider", "tavily")
+    monkeypatch.setattr(settings, "funding_search_api_key", "tvly-hermetic")
+
+    async def fake_search(query, window_days=45, limit=8):
+        return _search_rows("VectorLoom AI")
+
+    monkeypatch.setattr(funding_search, "search", fake_search)
+
+    async def ai_down(workflow, prompt, **kwargs):
+        raise AIClientError("scripted transient outage", reason="provider_error", retryable=True)
+
+    monkeypatch.setattr("app.services.ai_client.chat_completion", ai_down)
+    with pytest.raises(AIClientError):
+        await funding_sources.fetch_funding_events({"funding_focus": ["ai"]}, provider="sec_edgar")
+
+
+def test_companies_refresh_with_tavily_end_to_end_default_view(client, auth, db, monkeypatch, ai_configured):
+    """Acceptance 1 verbatim: robots on + tavily + key → refresh=true → ok.
+
+    Companies reach the *default* view (no include_unverified): a real search
+    publication is a checkable citation, so its events are verified=True. The
+    recorded wire shows zero requests to efts.sec.gov.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "funding_search_provider", "tavily")
+    monkeypatch.setattr(settings, "funding_search_api_key", "tvly-e2e")
+    wire: list = []
+
+    async def fake_request(method, url, **kwargs):
+        wire.append(str(url))
+        return FakeResponse({"results": [
+            {"title": "VectorLoom AI raises $12M Series A for its platform",
+             "url": "https://example.com/press/vectorloom",
+             "content": ("VectorLoom AI announced a $12 million Series A round to grow its "
+                         "platform and engineering team."),
+             "published_date": (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%d")},
+        ]})
+
+    monkeypatch.setattr("app.services.http.request", fake_request)
+
+    body = client.get("/api/funding/companies?refresh=true", headers=auth).json()
+    assert body["scan_status"] == "ok", body
+    assert [row["name"] for row in body["companies"]] == ["VectorLoom AI"]
+    assert body["companies"][0]["verified"] is True and body["companies"][0]["source"] == "search"
+    assert body["last_report"]["counts"] == {"search": 1}
+    assert wire and all("efts.sec.gov" not in url for url in wire), wire
+
+
+def test_companies_refresh_with_stub_search_end_to_end(client, auth, db, monkeypatch, ai_configured):
+    """Acceptance 1 end to end: stub search → ok scan, persisted history, no EDGAR.
+
+    The stub provider is hermetic (deterministic corpus, no network); its rows
+    are synthetic, so the extracted events are labelled ``verified=False`` and
+    need ``include_unverified=true`` — the same honesty as the demo dataset.
+    """
+    from app.core.config import settings
+    from app.models.models import FundingScan, FundingScanCompany
+
+    monkeypatch.setattr(settings, "funding_search_provider", "stub")
+    _forbid_outbound(monkeypatch)
+
+    body = client.get("/api/funding/companies?refresh=true&include_unverified=true",
+                      headers=auth).json()
+    assert body["scan_status"] == "ok", body
+    names = {row["name"] for row in body["companies"]}
+    assert {"VectorLoom AI", "Nightowl Robotics", "Cobalt Health"} <= names
+    assert all(row["source"] == "search" for row in body["companies"])
+    assert all(row["verified"] is False for row in body["companies"])   # stub = unverified
+    assert all(row["url"].startswith("https://example.com/") for row in body["companies"])
+    assert body["last_report"]["counts"] == {"search": 3}
+    assert body["last_report"]["providers"] == ["search"]
+    assert body["last_report"].get("errors") in ({}, None)
+
+    scans = db.query(FundingScan).order_by(FundingScan.id.desc()).all()
+    assert scans and scans[0].status == "ok" and scans[0].provider_errors == {}
+    assert scans[0].companies_found == len(body["companies"])
+    assert db.query(FundingScanCompany).filter(
+        FundingScanCompany.scan_id == scans[0].id).count() == scans[0].companies_found
+
+    # History contract unchanged: the scan is retrievable via /funding/history.
+    history = client.get("/api/funding/history?limit=5", headers=auth).json()["scans"]
+    assert history and history[0]["status"] == "ok" and history[0]["companies"]
+
+
+def test_providers_endpoint_exposes_search_status(client, auth, monkeypatch):
+    """GET /api/funding/providers carries the search block (configured/hint)."""
+    from app.core.config import settings
+
+    body = client.get("/api/funding/providers", headers=auth).json()
+    assert body["search"]["configured"] is False
+    assert body["search"]["provider"] == ""
+    assert "FUNDING_SEARCH" in body["search"]["hint"]
+    assert {row["id"] for row in body["providers"]} >= {"sec_edgar", "search"}
+    search_row = next(row for row in body["providers"] if row["id"] == "search")
+    assert search_row["configured"] is False
+
+    monkeypatch.setattr(settings, "funding_search_provider", "tavily")
+    body = client.get("/api/funding/providers", headers=auth).json()
+    assert body["search"]["configured"] is False           # key still missing
+    assert body["search"]["hint"] == "FUNDING_SEARCH_PROVIDER=tavily needs FUNDING_SEARCH_API_KEY"
+
+    monkeypatch.setattr(settings, "funding_search_api_key", "tvly-hermetic")
+    body = client.get("/api/funding/providers", headers=auth).json()
+    assert body["search"] == {"provider": "tavily", "configured": True, "hint": ""}
+
+
+@pytest.mark.asyncio
+async def test_provider_id_is_case_insensitive(monkeypatch):
+    """Small bug fix: FUNDING_PROVIDER=SEC_EDGAR used to be unknown_provider."""
+    from app.core.config import settings
+
+    async def fake_request(method, url, **kwargs):
+        return FakeResponse({"hits": {"hits": [
+            {"_id": "a:b", "_source": {"display_names": ["Case Co"], "file_date": "2026-09-10",
+                                       "ciks": ["7"]}}]}})
+
+    monkeypatch.setattr("app.services.http.request", fake_request)
+    monkeypatch.setattr(settings, "funding_provider", "SEC_EDGAR")
+    events, report = await funding_sources.fetch_funding_events({"keywords": ["ai"]}, limit=5)
+    assert report["scan_status"] == "ok", report["errors"]
+    assert report["counts"]["sec_edgar"] == 1 and events[0].name == "Case Co"

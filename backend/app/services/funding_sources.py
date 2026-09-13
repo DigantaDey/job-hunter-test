@@ -3,8 +3,15 @@ Funding data providers.
 
 Real, verifiable sources first:
 
+* ``search`` — a web-search engine (``app.services.funding_search``, v2.2.6)
+  when one is configured. Scans never touch ``efts.sec.gov`` on this path:
+  queries are built from the AI-extracted search context, and the AI extracts
+  events from the result snippets with a per-event citation (``url`` +
+  ``snippet`` from the cited row).
 * ``sec_edgar`` — SEC EDGAR full-text search for **Form D** filings (private
   placement notices). Free, public, keyless; every event links to the filing.
+  This stays the verified direct path **when no search provider is
+  configured** — its robots.txt constraint is never bypassed.
 * ``crunchbase`` / ``tracxn`` — official APIs when the operator holds a licence.
 * ``imported`` — an operator-supplied JSON/CSV export URL (documented schema),
   which is how teams publish their licensed Crunchbase/Tracxn extracts.
@@ -51,6 +58,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import inc
+from app.services import funding_search
 from app.services import http as http_client
 from app.services.net_guard import OutboundURLBlocked
 from app.services.sources.base import parse_datetime
@@ -76,6 +84,14 @@ PROVIDER_RETRY_DELAY_SECONDS = 0.5
 MAX_AI_CANDIDATES = 60
 #: Marker the prompt carries so tests (and logs) can pin the exact contract.
 RANK_CONTRACT = "funding-scan-v2"
+#: Marker of the search-results extraction pass (search snippets → events).
+EXTRACT_CONTRACT = "funding-extract-v1"
+#: Upper bound on search results one extraction pass may be asked about.
+MAX_EXTRACT_RESULTS = 24
+#: Search queries built from the AI-extracted search context per scan.
+MAX_SEARCH_QUERIES = 3
+#: Results requested per query — enough coverage, few API calls.
+SEARCH_RESULTS_PER_QUERY = 8
 
 
 def normalize_stage(value: str) -> str:
@@ -469,18 +485,103 @@ async def _demo(context: Dict[str, Any], window_days: int, limit: int) -> List[F
     return events
 
 
+async def _search(context: Dict[str, Any], window_days: int, limit: int) -> List[FundingEvent]:
+    """
+    Discover funding events through the configured web-search provider.
+
+    Runs only when :func:`funding_search.search_configured` — otherwise it is
+    reported as ``not_configured`` like any other unusable provider and the
+    direct ``sec_edgar`` path stays the mechanism. The path:
+
+    1. build queries from the AI-extracted search context
+       (:func:`_search_queries` — the context *is* the model's keywords, so no
+       second query-writing call is needed);
+    2. :func:`funding_search.search` per query, de-duplicated by URL — the
+       search API, not ``efts.sec.gov``, is the only outbound call;
+    3. :func:`ai_extract_events_from_results` turns snippets into
+       :class:`FundingEvent` rows, each citing the result it came from
+       (``url`` + ``snippet`` come from that row, never from the model).
+
+    The extracted events then flow through the *same* funding-scan workflow as
+    every other provider: :func:`ai_rank_events` judges relevance against the
+    candidate's focus before anything reaches the radar.
+    """
+    if not funding_search.search_configured():
+        return []
+    queries = _search_queries(context)
+    results: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for query in queries:
+        try:
+            rows = await funding_search.search(query, window_days=window_days,
+                                               limit=SEARCH_RESULTS_PER_QUERY)
+        except funding_search.FundingSearchError as exc:
+            # A 4xx (bad key, bad request) must not be retried — same policy as
+            # every other provider's HTTP status.
+            raise FundingProviderError(f"search provider failed: {exc}",
+                                       status=exc.status) from exc
+        for row in rows:
+            url = str(row.get("url") or "")
+            key = url.casefold() or f"snippet:{hash(str(row.get('snippet') or ''))}"
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
+            merged = dict(row)
+            merged["query"] = query
+            results.append(merged)
+        if len(results) >= MAX_EXTRACT_RESULTS:
+            break
+    if not results:
+        # The search provider answered fine and genuinely found nothing — an
+        # honest empty result set, not an outage.
+        inc("jobhunter_funding_events_total", provider="search", value=0)
+        return []
+    events = await ai_extract_events_from_results(
+        results[:MAX_EXTRACT_RESULTS], context,
+        search_provider_id=funding_search.search_provider(),
+        window_days=window_days,
+    )
+    inc("jobhunter_funding_events_total", provider="search", value=len(events))
+    return events[: max(1, limit) * 2]
+
+
+def _search_queries(context: Dict[str, Any]) -> List[str]:
+    """Deterministic search queries from the AI-extracted search context.
+
+    ``search_context`` (``app.api.deps.search_context``) is itself produced by
+    the keyword-extractor model, so these queries are already "keywords + AI" —
+    building them needs no extra model call. Funding focus leads, then
+    industries, then keywords; a role adds one hiring-angled query.
+    """
+    def _terms(key: str) -> List[str]:
+        return [str(v).strip() for v in (context.get(key) or []) if str(v).strip()]
+
+    leads = (_terms("funding_focus") or _terms("industries") or _terms("keywords"))[:2]
+    queries = [f"{term} startup funding round" for term in leads]
+    if not queries:
+        queries = ["startup funding announcement"]
+    roles = _terms("roles")
+    if roles:
+        queries.append(f"{roles[0]} startup raises funding round")
+    return queries[:MAX_SEARCH_QUERIES]
+
+
 PROVIDERS = {
     "sec_edgar": _sec_edgar,
     "crunchbase": _crunchbase,
     "tracxn": _tracxn,
     "imported": _imported,
+    "search": _search,
     "demo": _demo,
 }
 
 
 def provider_status() -> List[Dict[str, Any]]:
+    provider = funding_search.search_provider()
+    search_label = f"Web search ({provider})" if provider else "Web search (not configured)"
     return [
         {"id": "sec_edgar", "label": "SEC EDGAR Form D (live, keyless)", "configured": True, "verified": True},
+        {"id": "search", "label": search_label, "configured": funding_search.search_configured(), "verified": True},
         {"id": "crunchbase", "label": "Crunchbase API", "configured": bool(settings.crunchbase_api_key), "verified": True},
         {"id": "tracxn", "label": "Tracxn API", "configured": bool(settings.tracxn_api_key), "verified": True},
         {"id": "imported", "label": "Imported dataset URL", "configured": bool(settings.funding_import_url), "verified": True},
@@ -508,6 +609,14 @@ async def _run_provider(provider_id: str, context: Dict[str, Any], window_days: 
         except TimeoutError:  # asyncio.wait_for's own deadline (3.11: == TimeoutError)
             last_error = FundingProviderError(f"timed out after {timeout:g}s")
         except Exception as exc:  # noqa: BLE001 - a provider failure is data, not a crash
+            from app.services.ai_client import is_ai_error
+
+            if is_ai_error(exc):
+                # The v2.1 AI outage contract outranks provider-data capture:
+                # an AI failure inside a provider (the search path's
+                # extraction pass) must reach the caller as a pausable/blocked
+                # outcome — never become "provider failed" data.
+                raise
             last_error = exc
             if not _is_retryable_provider_error(exc):
                 break
@@ -535,9 +644,25 @@ async def fetch_funding_events(
     — ``"scan_failed"`` when nothing could be fetched at all.
     """
     requested = [provider] if provider else [settings.funding_provider]
-    requested = [str(p).strip() for p in (requested or []) if str(p or "").strip()]
+    # Provider ids are matched lowercase: a per-user setting or queued payload
+    # carrying "SEC_EDGAR" used to become unknown_provider and kill the scan.
+    requested = [str(p).strip().lower() for p in (requested or []) if str(p or "").strip()]
     if not requested or requested == ["auto"]:
         requested = [p["id"] for p in provider_status() if p["configured"]]
+
+    # v2.2.6 — when a web-search provider is configured it REPLACES the direct
+    # sec_edgar slot: efts.sec.gov's robots.txt disallows the automated
+    # full-text search endpoint, so with RESPECT_ROBOTS_TXT=true (the default)
+    # a scan that went straight to EDGAR failed as scan_failed. The search
+    # path discovers the same Form D rounds (plus public announcements) and
+    # never touches efts.sec.gov. With no search provider configured, the
+    # direct EDGAR path stays exactly as it was — robots check included.
+    if "sec_edgar" in requested and funding_search.search_configured():
+        deduped: List[str] = []
+        for pid in ("search" if pid == "sec_edgar" else pid for pid in requested):
+            if pid not in deduped:
+                deduped.append(pid)
+        requested = deduped
 
     report: Dict[str, Any] = {
         "providers": requested, "counts": {}, "errors": {}, "scan_status": "ok",
@@ -563,6 +688,13 @@ async def fetch_funding_events(
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - reported, never silent
+            from app.services.ai_client import is_ai_error
+
+            if is_ai_error(exc):
+                # AI outages are the caller's contract (pausable 503, blocked
+                # 503 or a dead-lettered queue item), not a per-provider
+                # error entry.
+                raise
             report["errors"][provider_id] = f"{type(exc).__name__}: {exc}"[:300]
             continue
         report["counts"][provider_id] = len(found)
@@ -821,3 +953,203 @@ async def ai_rank_events(
     })
     inc("jobhunter_funding_ai_matched_total", value=len(matched))
     return matched + rejected + unjudged, diagnostics
+
+
+# --------------------------------------------------------------------------- #
+# The search-path extraction pass — search snippets → grounded FundingEvents
+# --------------------------------------------------------------------------- #
+EXTRACT_SYSTEM = (
+    "You are the funding-radar event extraction engine. You read web search results and "
+    "decide which of them describe a real, recent funding round for a named company. The "
+    "result text is the only truth: you never invent companies, stages, amounts, dates or "
+    "industries, you never merge two companies into one, and you always cite the result "
+    "each event came from. Hiring plans are not funding events and open roles are out of "
+    "scope."
+)
+
+
+def _result_for_prompt(row: Dict[str, Any], index: int) -> Dict[str, Any]:
+    """The compact, factual slice of a search result the model may see."""
+    return {
+        "index": index,
+        "title": str(row.get("title") or "")[:300],
+        "url": str(row.get("url") or "")[:500],
+        "snippet": str(row.get("snippet") or "")[:400],
+        "published_at": row.get("published_at") or None,
+    }
+
+
+def _result_text(row: Dict[str, Any]) -> str:
+    """Casefolded, whitespace-collapsed text grounding is checked against."""
+    return " ".join(f"{row.get('title') or ''} {row.get('snippet') or ''}".split()).casefold()
+
+
+def _grounded_result(name: str, cited_index: Any, results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The result row a company name is actually grounded in, or ``None``.
+
+    The model's ``source_index`` is a citation, not a licence: the name must
+    appear in the cited row's own text (title + snippet). If it does not, the
+    other rows are checked charitably (the model may simply have cited the
+    wrong index) — but a name that appears in *no* row is fabrication, exactly
+    like an invented name in the ranking pass.
+    """
+    needle = normalize_company_name(name)
+    alt = _alternative_key(name)
+    if not needle or len(needle) < 2:
+        return None
+    order: List[int] = []
+    try:
+        cited = int(cited_index)
+        if 0 <= cited < len(results):
+            order.append(cited)
+    except (TypeError, ValueError):
+        pass
+    order.extend(i for i in range(len(results)) if i not in order)
+    for index in order:
+        text = _result_text(results[index])
+        if needle in text or (alt and alt in text):
+            return results[index]
+        tokens = [t for t in alt.split() if len(t) > 1]
+        if tokens and all(t in text for t in tokens):
+            return results[index]
+    return None
+
+
+async def ai_extract_events_from_results(
+    results: List[Dict[str, Any]],
+    context: Dict[str, Any],
+    *,
+    search_provider_id: str = "",
+    window_days: int = 45,
+    db=None,
+    user_id: Optional[int] = None,
+) -> List[FundingEvent]:
+    """
+    Turn web-search results into :class:`FundingEvent` rows in one grounded pass.
+
+    Same workflow and guardrails as :func:`ai_rank_events` (v2.1): the model
+    only decides *which* results describe a funding round and parses their
+    text; ``url``, ``snippet`` and ``published_at`` always come from the cited
+    result row, never from the model. A company name that appears in no
+    result's text is fabrication → the whole answer is rejected with
+    ``guardrail_failed`` / ``blocked_needs_action``. An answer of "no
+    companies" is legitimate here — search results may genuinely contain no
+    funding announcement.
+
+    Events from a real search provider are ``verified=True`` (each row links a
+    checkable publication); the hermetic ``stub`` provider's rows are labelled
+    ``verified=False`` — synthetic fixtures never look authoritative.
+    """
+    if not results:
+        return []
+
+    from app.services.ai_client import (
+        AIClientError,
+        chat_completion,
+        fit_prompt_part,
+        input_budget_chars,
+    )
+    from app.services.ai_guardrails import AIUnavailableError
+
+    budget = input_budget_chars(db=db, user_id=user_id)
+    focus = {key: context.get(key) for key in
+             ("funding_focus", "industries", "roles", "seniority", "keywords", "locations")
+             if context.get(key)}
+    focus_json, _focus_truncated = fit_prompt_part(json.dumps(focus, default=str), budget,
+                                                   label="funding_extract.focus")
+    sent = list(results[:MAX_EXTRACT_RESULTS])
+    results_json, truncated = "", False
+    while sent:
+        results_json, truncated = fit_prompt_part(
+            json.dumps([_result_for_prompt(row, index) for index, row in enumerate(sent)], default=str),
+            budget, label="funding_extract.results")
+        if not truncated or len(sent) == 1:
+            break
+        sent = sent[: max(1, len(sent) // 2)]
+
+    prompt = (
+        f"Contract: {EXTRACT_CONTRACT}\n"
+        f"Today: {datetime.utcnow().date().isoformat()}. Only funding rounds announced within the "
+        f"last {max(1, int(window_days))} days count; anything older must be skipped.\n"
+        "Below are web search results (index, title, url, snippet, published_at) gathered for a "
+        "candidate's funding focus. Decide which results describe a REAL funding round for a "
+        "NAMED company (Seed to Series D, a private placement / Form D, or an announced "
+        "investment). Skip opinion pieces, round-up listicles without a specific round, rumors, "
+        "and anything outside the window.\n"
+        "For each such result extract STRICTLY from its own text: the company name exactly as "
+        "published, the round stage, the amount in USD when stated, the announce date "
+        "(YYYY-MM-DD when stated), and a short industry tag. Always cite the result you used "
+        "with source_index. Never add, rename or complete a company no snippet mentions.\n"
+        f"Candidate focus: {focus_json}\n"
+        f"Search results: {results_json}\n"
+        'Return JSON only: {"companies": [{"name": "<as published>", "source_index": <int>, '
+        '"stage": "Seed|Series A|Series B|Series C|Series D|Undisclosed", "raised_usd": <number|null>, '
+        '"raised_at": "<YYYY-MM-DD>"|null, "industry": "<from the snippet>"}]}'
+    )
+    data = await chat_completion("funding_scan", prompt, system=EXTRACT_SYSTEM, temperature=0.1,
+                                 db=db, user_id=user_id)
+    payload = data.get("content") if isinstance(data, dict) and "content" in data else data
+    rows = payload.get("companies") if isinstance(payload, dict) else None
+    if rows is None and isinstance(payload, list):
+        rows = payload
+    if not isinstance(rows, list):
+        raise AIClientError(
+            "invalid_json: funding_extract did not return a 'companies' list",
+            reason="invalid_json", retryable=True,
+        )
+
+    events: List[FundingEvent] = []
+    seen: set[str] = set()
+    unknown: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        cited = _grounded_result(name, row.get("source_index"), sent)
+        if cited is None:
+            unknown.append(name[:160])
+            continue
+        key = normalize_company_name(name)
+        if not key or key in seen:
+            continue  # the same company from two articles: the first citation wins
+        seen.add(key)
+        title = str(cited.get("title") or "")
+        snippet = str(cited.get("snippet") or "")
+        raised = parse_datetime(row.get("raised_at")) or parse_datetime(cited.get("published_at"))
+        url = str(cited.get("url") or "")
+        events.append(FundingEvent(
+            name=name[:200],
+            stage=normalize_stage(str(row.get("stage") or "")),
+            raised_at=raised,
+            website="",
+            industry=str(row.get("industry") or "").strip()[:120],
+            # The citation IS the summary: the model's own prose never becomes
+            # the event text.
+            summary=f"{title} — {snippet}".strip()[:1200],
+            raised_usd=_safe_float(row.get("raised_usd")),
+            source="search",
+            verified=search_provider_id != "stub",
+            url=url[:500],
+            meta={
+                "snippet": snippet[:600],
+                "result_title": title[:300],
+                "search_provider": search_provider_id,
+                "query": str(cited.get("query") or "")[:200],
+                # The row is real; the *day* may be an article-date stand-in.
+                "raised_at_estimated": raised is None,
+            },
+        ))
+
+    if unknown:
+        log.warning("funding_extract returned %s name(s) outside the search result set: %s",
+                    len(unknown), unknown[:5])
+        raise AIUnavailableError(
+            "guardrail_failed",
+            workflow="funding_scan",
+            state="blocked_needs_action",
+            detail=(f"The model returned {len(unknown)} company name(s) that no search result "
+                    f"text contains: {', '.join(unknown[:5])}"),
+        )
+    return events

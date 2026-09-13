@@ -4,6 +4,70 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.6] — 2026-09-13
+
+**Funding radar: scan through a search engine when one is configured.** With
+`RESPECT_ROBOTS_TXT=true` (the default) every funding scan failed out of the
+box: the only discovery mechanism was a hard-coded fetch of
+`https://efts.sec.gov/LATEST/search-index`, and `efts.sec.gov`'s robots.txt
+disallows automated access to it — so production scans reported `scan_failed`
+with `PermissionError: robots.txt disallows …` forever. The fix is not a
+robots bypass: when an operator configures a web-search provider, scans run
+through that API and never touch `efts.sec.gov` at all; when none is
+configured, the direct EDGAR path stays exactly as it was (robots-checked,
+honestly `scan_failed` on a block — never a 500, never a fake empty radar).
+
+### Added
+
+- **`app.services.funding_search`** — the search backend behind the radar:
+  `search(query, *, window_days, limit)` returning
+  `[{title, url, snippet, published_at}]`. Providers: `tavily` (the Tavily
+  search API, `FUNDING_SEARCH_API_KEY`; an authenticated API RPC, so the
+  robots check does not apply, while the SSRF guard still vets every hop) and
+  `stub` (deterministic hermetic fixture, no network — events extracted from
+  it are labelled `verified=False`, like demo data). Configured via
+  `FUNDING_SEARCH_PROVIDER=tavily|stub` + `FUNDING_SEARCH_API_KEY` (empty =
+  auto: tavily when a key is set, else the direct sec_edgar path); one shared
+  resolver so settings, scans and `/api/meta` can never disagree. Failures
+  raise — the scan reports them as `provider_errors.search`; 4xx is never
+  retried, transport errors retry once, like every other provider.
+- **`search` funding provider** — when a search engine is configured it
+  replaces the direct `sec_edgar` slot in every scan resolution (explicit,
+  per-user or `auto`). Queries are built deterministically from the
+  AI-extracted search context (funding focus → industries → keywords, plus a
+  role-angled query; max 3), results are de-duplicated by URL, and a grounded
+  AI pass (`funding-extract-v1`) extracts `FundingEvent`s from the snippets:
+  the cited row's `url`/`snippet`/`published_at` are the only sources for
+  those fields, and a company name that appears in no result's text is
+  fabrication — the whole answer is rejected
+  (`guardrail_failed`/`blocked_needs_action`), the same trust model as the
+  ranking pass. Extracted events then flow through the unchanged workflow:
+  window/stage filters, `ai_rank_events`, `sync_funding_db`,
+  `persist_funding_scan` (history contract untouched).
+- **Search status surfaced** — `GET /api/funding/providers` (and
+  `public_settings()`/`/api/meta`) expose a secret-free
+  `{provider, configured, hint}` block; the Funding page renders a badge:
+  green `search: tavily` when configured, amber `direct EDGAR only` with the
+  setup hint when not (search-derived rows link their publication as
+  `source`, not `filing`).
+- **Hermetic coverage** — stub-search end-to-end drill (C4b) plus unit/API
+  tests: the search path makes zero requests to `efts.sec.gov`; robots-blocked
+  EDGAR without a key stays `scan_failed` + `provider_errors.sec_edgar`;
+  extraction citations and the fabrication guardrail; search-failure
+  reporting and retry semantics; provider-endpoint search status.
+
+### Fixed
+
+- `FUNDING_PROVIDER` values are normalised to lowercase at the config edge
+  and in scan resolution — `FUNDING_PROVIDER=SEC_EDGAR` (or a per-user
+  setting with capital letters) used to resolve to `unknown_provider` and
+  report a dead radar instead of running the configured provider.
+- `test_alembic_migrations_apply_to_a_fresh_database` rolled back with
+  `downgrade -1`, which since v2.2.5 undoes the funding-history migration
+  rather than `scheduled_runs` (the same stale-relative-step bug the funding
+  history test already documents). The rollback is now pinned to the
+  revision.
+
 ## [2.2.5] — 2026-09-13
 
 ### Added

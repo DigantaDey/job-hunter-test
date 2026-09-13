@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import client, { apiError, aiOutage, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
 import { AIOutageBanner } from '../components/AIBanner'
-import { TrendingUp, ExternalLink, Mail, Briefcase, Loader2, Sparkles, RefreshCw, Calendar, Target, Building2, CheckCircle2, AlertTriangle, ShieldAlert, PauseCircle } from 'lucide-react'
+import { TrendingUp, ExternalLink, Mail, Briefcase, Loader2, Sparkles, RefreshCw, Calendar, Target, Building2, CheckCircle2, AlertTriangle, ShieldAlert, PauseCircle, Globe } from 'lucide-react'
 import { Link } from 'react-router-dom'
 
 type OpenPosition = { title: string; url?: string }
@@ -66,10 +66,18 @@ type ResumeInfo = {
   extraction_source?: string
 }
 
+/** Search-provider status from GET /api/funding/providers (secret-free). */
+type SearchProviderInfo = {
+  provider: string
+  configured: boolean
+  hint?: string
+}
+
 const STAGES = ['Seed', 'Series A', 'Series B', 'Series C', 'Series D']
 
 const SOURCE_LABELS: Record<string, string> = {
   sec_edgar: 'SEC EDGAR Form D',
+  search: 'web search',
   crunchbase: 'Crunchbase',
   tracxn: 'Tracxn',
   imported: 'imported dataset',
@@ -108,6 +116,9 @@ export default function Funding() {
   const [outage, setOutage] = useState<AIOutage | null>(null)
   const [history, setHistory] = useState<any[]>([])
   const [historyCollapsed, setHistoryCollapsed] = useState<boolean>(false)
+  // v2.2.6 search-provider badge: how this radar scans (web search API vs the
+  // direct — robots-checked — EDGAR path). Fetched once, secret-free.
+  const [searchInfo, setSearchInfo] = useState<SearchProviderInfo | null>(null)
 
   const load = useCallback(async (refresh = false) => {
     setError('')
@@ -144,6 +155,14 @@ export default function Funding() {
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  // Search-provider status (badge): a non-critical read — a failure just
+  // leaves the badge unrendered, never the page.
+  useEffect(() => {
+    client.get('/api/funding/providers')
+      .then(({ data }) => setSearchInfo(data?.search || null))
+      .catch(() => {})
+  }, [])
 
   const rescan = async () => {
     setScanning(true); setResult(null); setError(''); setOutage(null)
@@ -215,6 +234,21 @@ export default function Funding() {
       <div className="card p-4 bg-gradient-to-br from-blue-50 to-violet-50 dark:from-blue-950/30 dark:to-violet-950/30 border-blue-200 dark:border-blue-900">
         <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
           <Sparkles className="w-4 h-4 text-blue-600" /> Search context auto-extracted by AI
+          {searchInfo && (searchInfo.configured ? (
+            <span
+              className="text-[11px] px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 border border-emerald-200 dark:bg-emerald-950 dark:text-emerald-300 dark:border-emerald-800 mono inline-flex items-center gap-1"
+              title={`Funding scans run through the ${searchInfo.provider} search API — efts.sec.gov is never contacted directly.`}
+            >
+              <Globe className="w-3 h-3" /> search: {searchInfo.provider}
+            </span>
+          ) : (
+            <span
+              className="text-[11px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-200 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-800 mono inline-flex items-center gap-1"
+              title={searchInfo.hint || 'No search provider configured — scans use direct SEC EDGAR (robots-checked; may fail with scan_failed).'}
+            >
+              <Globe className="w-3 h-3" /> direct EDGAR only
+            </span>
+          ))}
           {context?.source && (
             <span className="text-[11px] px-2 py-0.5 rounded-full bg-white dark:bg-zinc-900 border mono text-zinc-600 dark:text-zinc-300">
               {/* The backend tags the persona merge as "ai+persona" / "mined+persona" —
@@ -424,7 +458,7 @@ export default function Funding() {
                 )}
                 {c.url && (
                   <a href={c.url} target="_blank" rel="noreferrer" className="text-[11px] px-2 py-0.5 rounded-full mono border bg-white dark:bg-zinc-900 dark:border-zinc-700 text-blue-600 dark:text-blue-400 inline-flex items-center gap-1">
-                    filing <ExternalLink className="w-3 h-3" />
+                    {c.source === 'search' ? 'source' : 'filing'} <ExternalLink className="w-3 h-3" />
                   </a>
                 )}
               </div>
