@@ -16,6 +16,8 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.models import Email, Job, PipelineJob, User
 from app.services import funding_radar
+from app.services.ai_client import is_ai_error
+from app.services.ai_guardrails import describe_ai_error
 from app.services.apply_flow import execute_application, prepare_application
 from app.services.discovery import discover_for_user
 from app.services.outreach import draft_email, send_email
@@ -113,6 +115,14 @@ async def handle_email(db: Session, item: PipelineJob) -> Dict[str, Any]:
 
 
 async def handle_funding(db: Session, item: PipelineJob) -> Dict[str, Any]:
+    """Run a queued funding scan.
+
+    AI is a hard dependency (v2.1): a transient outage raises and the worker
+    *pauses* the item (drained when the provider is back), a blocked outcome
+    dead-letters it. Either way the reason is persisted to the user's
+    ``funding.last_report`` first, so the Funding page can say why the radar did
+    not refresh instead of showing a silently stale list.
+    """
     user = _user(db, item)
     if not user:
         raise RuntimeError("user_missing")
@@ -127,13 +137,27 @@ async def handle_funding(db: Session, item: PipelineJob) -> Dict[str, Any]:
     window = int(payload.get("window_days") or get_setting(db, user.id, "funding", "freshness_days",
                                                           settings.funding_freshness_days))
     provider = payload.get("provider") or get_setting(db, user.id, "funding", "provider", settings.funding_provider)
-    companies, report = await funding_radar.scan_funded_companies(
-        context, stages=payload.get("stages"), window_days=window,
-        limit=int(payload.get("limit") or settings.funding_limit), provider=provider,
-        db=db, user_id=int(user.id),
-    )
-    sync = funding_radar.sync_funding_db(db, user.id, companies, window)
-    return {"scanned": len(companies), "provider_report": report, **sync}
+    try:
+        companies, report = await funding_radar.scan_funded_companies(
+            context, stages=payload.get("stages"), window_days=window,
+            limit=int(payload.get("limit") or settings.funding_limit), provider=provider,
+            db=db, user_id=int(user.id),
+        )
+    except Exception as exc:
+        if is_ai_error(exc):
+            outage = describe_ai_error(exc, workflow="funding_scan")
+            funding_radar.store_scan_report(
+                db, int(user.id), funding_radar.outage_report(outage),
+                scan_status=funding_radar.SCAN_PAUSED if outage.pausable else funding_radar.SCAN_BLOCKED,
+                reason=outage.reason,
+            )
+        raise
+    # A scan that fetched nothing must not prune the radar (see sync_funding_db).
+    sync = (funding_radar.sync_funding_db(db, user.id, companies, window)
+            if report.get("scan_status") == funding_radar.SCAN_OK else {})
+    funding_radar.store_scan_report(db, int(user.id), report)
+    return {"scanned": len(companies), "scan_status": report.get("scan_status"),
+            "reason": report.get("reason"), "provider_report": report, **sync}
 
 
 async def handle_ai(db: Session, item: PipelineJob) -> Dict[str, Any]:

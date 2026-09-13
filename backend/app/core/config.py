@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.1.1"
+    version: str = "2.1.2"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -288,6 +288,13 @@ class Settings(BaseSettings):
     allow_synthetic_funding_data: bool = False
     funding_freshness_days: int = 45
     funding_limit: int = 18
+    #: Per-provider wall-clock budget for one funding scan. A hung provider must
+    #: not stall the whole radar (the scan is retried once on network errors).
+    funding_provider_timeout_seconds: float = 20.0
+    #: How often an *implicit* refresh (opening the Funding page) may re-scan.
+    #: Deliberately independent of ``funding_freshness_days`` (which decides how
+    #: old an event may be and still appear on the radar).
+    funding_refresh_hours: int = 12
 
     # ------------------------------------------------------------------ #
     # Contacts

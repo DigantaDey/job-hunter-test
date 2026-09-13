@@ -379,22 +379,44 @@ class PipelineJob(Base):
 
 
 class FundingCompany(Base):
+    """One company on a user's funding radar.
+
+    Identity for dedupe is the *normalised* name (strip + casefold, see
+    :func:`funding_radar.normalize_company_name`): providers disagree about
+    casing, and "Stripe"/"stripe" used to become two rows. The ``name`` column
+    keeps the provider's canonical casing for display.
+
+    ``discovered_at`` is **first seen** and is never rewritten; ``last_seen_at``
+    is the most recent scan that still returned the company, and is the clock
+    the prune window runs on (see :func:`funding_radar.prune_funding_db`).
+
+    ``meta`` carries the provider's own payload (filing URL, amount, and — when
+    a provider really reports them — ``open_positions``). Nothing here is
+    inferred: v2.1.2 removed the never-set ``has_open_positions`` flag that let
+    the API claim a company was hiring when no code path could ever know.
+    """
+
     __tablename__ = "funding_companies"
-    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_funding_user_name"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_funding_user_name"),
+        Index("ix_funding_user_seen", "user_id", "last_seen_at"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     name = Column(String, nullable=False)
-    stage = Column(String, default="Series A")  # Seed, Series A-D
+    stage = Column(String, default="Undisclosed")  # Seed, Series A-D, Undisclosed
     raised_at = Column(DateTime, default=utcnow)
     website = Column(String, default="")
     industry = Column(String, default="")
     summary = Column(Text, default="")
     keywords_matched = Column(JSON, default=list)
-    source = Column(String, default="demo")  # sec-edgar | crunchbase | tracxn | demo
+    source = Column(String, default="demo")  # sec_edgar | crunchbase | tracxn | imported | demo
     verified = Column(Boolean, default=False, nullable=False)
-    has_open_positions = Column(Boolean, default=False)
+    #: First scan that surfaced this company (never rewritten).
     discovered_at = Column(DateTime, default=utcnow)
+    #: Most recent scan that still returned it — the prune clock.
+    last_seen_at = Column(DateTime, default=utcnow)
     meta = Column(JSON, default=dict)
 
 
