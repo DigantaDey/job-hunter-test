@@ -1057,7 +1057,12 @@ def test_migration_upgrades_a_real_2_1_1_database(tmp_path):
     assert ("Stripe", 2) in rows, "another user's rows are untouched"
     con.close()
 
-    alembic("downgrade", "-1")                               # reversible
+    # Reversible — pinned to the *revision*, not to ``-1``. The chain grows every
+    # release (v2.2 added ``scheduled_runs`` on top of this one), and relative
+    # steps then undo the wrong migration: with ``-1`` this assert was checking
+    # that a *different* migration could be rolled back, i.e. it was testing the
+    # position of head rather than the reversibility of this revision.
+    alembic("downgrade", PRE_FUNDING_HONESTY_REVISION)
     con = sqlite3.connect(db)
     assert "has_open_positions" in [r[1] for r in con.execute("PRAGMA table_info(funding_companies)")]
     con.close()

@@ -1,8 +1,14 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import client, { apiError as apiErrorMessage } from '../api/client'
-import { Settings as SettingsIcon, Save, Bot, Search, Sliders, Mail, Shield, Zap, TrendingUp, Eye, EyeOff, CheckCircle, AlertTriangle, Globe, Key, Cpu } from 'lucide-react'
+import { Settings as SettingsIcon, Save, Bot, Search, Sliders, Mail, Shield, Zap, TrendingUp, Eye, EyeOff, CheckCircle, AlertTriangle, Globe, Key, Cpu, CalendarClock } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { AIStatusBanner } from '../components/AIBanner'
+import { AUTO_BLOCKERS, AUTO_WORKFLOW_LABELS, autoStateCopy, fmtCadence, fmtWhen, type AutoOverview } from '../lib/automation'
 
 const WORKFLOWS = ['parse','keyword_extract','scoring','resume_gen','classify','email_gen','form_detect','funding_scan','tagging','interview','company_intel']
+
+/** How often the Auto-mode card re-reads its schedule/history while it is on screen. */
+const AUTOMATION_POLL_MS = 30_000
 
 export default function Settings(){
   const [data, setData]=useState<any>(null)
@@ -14,12 +20,46 @@ export default function Settings(){
   const [aiStatus, setAiStatus]=useState<any>(null)
   const [aiSaving, setAiSaving]=useState(false)
   const [extracted, setExtracted]=useState<any>(null)
+  // Auto mode (v2.2): the schedule is the backend's, never recomputed here.
+  const [auto, setAuto]=useState<AutoOverview|null>(null)
+  const [autoBusy, setAutoBusy]=useState(false)
+  const [autoNote, setAutoNote]=useState('')
+  const mounted=useRef(true)
+
+  const loadAuto=async()=>{
+    try{
+      const {data}=await client.get('/api/automation')
+      if(mounted.current) setAuto(data as AutoOverview)
+    }catch{
+      // A failed poll must not blank the card: keep the last read.
+    }
+  }
+
+  /**
+   * Flipping auto mode goes through the same PUT /api/settings the rest of this
+   * page uses — one settings contract, one tier gate. A 403 `upgrade_required`
+   * carries a human message, so it is shown as the message (never an error code,
+   * never a checkbox that silently snaps back), and the switch is re-read either
+   * way so what is on screen is what the server stored.
+   */
+  const setAutoMode=async(on:boolean)=>{
+    setAutoBusy(true); setAutoNote('')
+    try{
+      await client.put('/api/settings', { automation: { auto_mode: on } })
+    }catch(e:any){
+      const detail=e?.response?.data?.detail
+      setAutoNote(detail && typeof detail==='object' && detail.message ? String(detail.message) : apiErrorMessage(e))
+    }
+    await load()
+    setAutoBusy(false)
+  }
 
   const load=async()=>{
     const {data}=await client.get('/api/settings'); setData(data)
     const {data:wfc}=await client.get('/api/ai/config'); setWfConfig(wfc.overrides||wfc||{})
     const {data:status}=await client.get('/api/settings/ai/status'); setAiStatus(status)
     try{ const {data:ctx}=await client.get('/api/context/keywords'); setExtracted(ctx) }catch{ setExtracted(null) }
+    await loadAuto()
     // Prefill AI form from settings
     if(data?.ai){
       setAiForm({
@@ -34,6 +74,18 @@ export default function Settings(){
     }
   }
   useEffect(()=>{ load() },[])
+
+  // While this page is open the schedule is live — last/next run, the quota and
+  // the AI banner refresh on a 30s timer, cleared on unmount so a background
+  // tab never polls (same interval the Jobs banner uses).
+  useEffect(()=>{
+    mounted.current = true
+    const t = setInterval(()=>{
+      void loadAuto()
+      void client.get('/api/settings/ai/status').then(r=>{ if(mounted.current) setAiStatus(r.data) }).catch(()=>undefined)
+    }, AUTOMATION_POLL_MS)
+    return ()=>{ mounted.current = false; clearInterval(t) }
+  },[])
 
   const updateWf = (wf:string, key:string, value:string)=> setWfConfig({...wfConfig, [wf]: {...(wfConfig[wf]||{}), [key]: value}})
   const saveWf = async(wf:string)=>{
@@ -100,6 +152,12 @@ export default function Settings(){
   if(!data) return <div className="p-8 mono text-sm">Loading settings…</div>
 
   const isOwner = data.ai?.is_owner || aiStatus?.is_owner
+  // Auto mode: the switch's editability and the cadence table both come from
+  // GET /api/settings (`automation.can_use/cadence/locked_reason`) — the same
+  // predicates the PUT gate and the sweep use, so the card can never advertise a
+  // schedule the server would refuse.
+  const canAuto = !!data.automation?.can_use
+  const autoCadence = (data.automation?.cadence || {}) as Record<string, number>
 
   return (
     <div className="space-y-4">
@@ -266,7 +324,6 @@ export default function Settings(){
             <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={data.general.strict_skeleton} onChange={e=>update('general','strict_skeleton',e.target.checked)}/> Strictly maintain uploaded skeleton</label>
             <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={data.general.auto_approve_email} onChange={e=>update('general','auto_approve_email',e.target.checked)}/> Auto-approve emails (else bucket)</label>
             <div><label className="text-xs mono">Default resume format</label><select value={data.general.default_resume_format} onChange={e=>update('general','default_resume_format',e.target.value)} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"><option value="ai_generated">AI generated</option><option value="user_skeleton">User skeleton</option></select></div>
-            <div><label className="text-xs mono">Additional questions (free-form)</label><textarea value={data.general.additional_questions||''} onChange={e=>update('general','additional_questions',e.target.value)} rows={3} placeholder="e.g. Work authorization, visa status…" className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/></div>
           </div>
         </div>
 
@@ -286,7 +343,133 @@ export default function Settings(){
               <label key={k} className="flex items-center gap-2 text-sm p-3 rounded-xl border dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800"><input type="checkbox" checked={!!v} onChange={e=>update('workflows',k,e.target.checked)}/><span className="mono text-xs">{k}</span></label>
             ))}
           </div>
-          <div className="mt-3 text-[11px] mono text-zinc-500">All settings are in categories — AI (OpenAI compatible default + per-workflow overrides), Scraping, General, Application, Email, Workflows — editable, with rate limiter, keywords, profile details, additional questions etc. Owner sets global default, members inherit or override.</div>
+          <div className="mt-3 text-[11px] mono text-zinc-500">All settings are in categories — AI (OpenAI compatible default + per-workflow overrides), Scraping, General, Application, Email, Workflows, Automation — editable, with rate limiter, keywords and profile details. Owner sets global default, members inherit or override.</div>
+        </div>
+
+        {/* Auto mode — scheduled work (v2.2). Switch, cadence, clocks, last runs. */}
+        <div className="card p-5 lg:col-span-2">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <h3 className="font-medium flex items-center gap-2">
+                <CalendarClock className="w-4 h-4" /> Auto mode
+                {auto && (
+                  <span className={`text-[11px] mono px-2 py-0.5 rounded-full border ${!auto.enabled ? 'bg-zinc-100 border-zinc-300 text-zinc-600' : auto.active ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                    {!auto.enabled ? 'off' : auto.active ? 'scheduled' : 'on — not queueing right now'}
+                  </span>
+                )}
+              </h3>
+              <p className="text-xs mono text-zinc-500 mt-1 max-w-3xl leading-relaxed">
+                Job discovery, the funding radar and application prep run on a cadence instead of on a click. Auto mode only decides <em>when to queue</em>: the queue, its retries, the AI-outage pause and your plan limits are exactly the ones a manual run goes through — and nothing is ever submitted to an employer without you.
+              </p>
+            </div>
+            <label className={`shrink-0 flex items-center gap-2 text-sm p-3 rounded-xl border ${canAuto ? 'bg-white dark:bg-zinc-900 cursor-pointer' : 'bg-zinc-50 dark:bg-zinc-800'}`} title={canAuto ? 'Starts work on the cadence below' : (data.automation?.locked_reason || 'Locked on your plan')}>
+              <input type="checkbox" checked={!!data.automation?.auto_mode} disabled={!canAuto || autoBusy} onChange={e=>void setAutoMode(e.target.checked)} />
+              <span className="mono text-xs">{autoBusy ? 'Saving…' : canAuto ? (data.automation?.auto_mode ? 'On' : 'Off') : 'Locked'}</span>
+            </label>
+          </div>
+
+          {autoNote && (
+            <div role="alert" className="mt-3 p-3 rounded-xl border border-red-300 bg-red-50 dark:bg-red-950 dark:border-red-800 text-red-700 dark:text-red-300 text-xs mono">{autoNote}</div>
+          )}
+          {!canAuto && (
+            <div className="mt-2 text-[11px] mono text-zinc-500">
+              Locked on the free tier — <Link to="/billing" className="underline font-medium">upgrade to Pro</Link> for scheduled runs (discovery every 12 h, funding radar every 24 h).
+            </div>
+          )}
+          {auto && canAuto && !auto.consent_ok && (
+            <div className="mt-2 p-3 rounded-xl border border-amber-200 bg-amber-50 dark:bg-amber-950 dark:border-amber-800 text-amber-800 dark:text-amber-200 text-xs mono">
+              The automation disclosure has not been accepted, so nothing is queued even with the switch on. Accept it in <Link to="/account" className="underline font-medium">Account → Consent</Link>.
+            </div>
+          )}
+          <AIStatusBanner status={aiStatus} />
+          {auto && auto.enabled && !auto.active && auto.blocking?.length ? (
+            <div className="mt-2 text-[11px] mono text-amber-700 dark:text-amber-300">
+              Not queueing right now: {auto.blocking.map(code=>AUTO_BLOCKERS[code] || code).join(' · ')}.
+            </div>
+          ) : null}
+          {auto && auto.enabled && !auto.schedulable && (
+            <div className="mt-2 text-[11px] mono text-zinc-500">The scheduler is disabled on this server (AUTO_SCHEDULER_INTERVAL_SECONDS=0), so no sweep runs.</div>
+          )}
+
+          <div className="mt-4 overflow-x-auto">
+            <table className="w-full text-left text-xs mono">
+              <thead className="text-zinc-500">
+                <tr>
+                  <th className="py-1 pr-3 font-medium">Workflow</th>
+                  <th className="py-1 pr-3 font-medium">Cadence</th>
+                  <th className="py-1 pr-3 font-medium">Last run</th>
+                  <th className="py-1 font-medium">Next</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.keys(AUTO_WORKFLOW_LABELS).map(wf=>{
+                  const secs = autoCadence[wf]
+                  const last = auto?.last_run?.[wf] || null
+                  const next = auto?.next_run?.[wf] ?? null
+                  const chip = autoStateCopy(last?.state)
+                  const toggleOff = !!auto && wf in (auto.toggles || {}) && auto.toggles[wf] === false
+                  return (
+                    <tr key={wf} className="border-t dark:border-zinc-800 align-top">
+                      <td className="py-1.5 pr-3">
+                        {AUTO_WORKFLOW_LABELS[wf]}
+                        {toggleOff ? <div className="text-[10px] text-zinc-500">its AI-workflow toggle is off — never scheduled</div> : null}
+                      </td>
+                      <td className="py-1.5 pr-3">{fmtCadence(secs)}</td>
+                      <td className="py-1.5 pr-3">
+                        {last ? (
+                          <div className="flex flex-col gap-0.5">
+                            <span className={`self-start text-[10px] px-1.5 py-0.5 rounded-full border ${chip?.cls || 'bg-zinc-100 border-zinc-300 text-zinc-700'}`}>{chip?.label || String(last.state)}</span>
+                            <span className="text-[10px] text-zinc-500">{fmtWhen(last.at)}</span>
+                            {last.reason ? <span className="text-[10px] text-zinc-500 break-words">{String(last.reason).slice(0,120)}</span> : null}
+                          </div>
+                        ) : <span className="text-zinc-500">never run</span>}
+                      </td>
+                      <td className="py-1.5">{next ? fmtWhen(next) : <span className="text-zinc-500">{auto?.enabled ? 'waiting' : '—'}</span>}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-1 text-[10px] mono text-zinc-500">
+            “Next” is the first moment the sweep may start that run — the loop wakes every {Math.max(1, Math.round((auto?.sweep_interval_seconds ?? 300) / 60))} min, so a run can start up to that much later. It shows “waiting” while a run is in flight or auto mode is blocked.
+          </div>
+
+          {auto?.quota && (
+            <div className="mt-3 text-[11px] mono text-zinc-500">
+              Automation runs this month: <strong className="text-inherit">{auto.quota.used}{auto.quota.limit ? `/${auto.quota.limit}` : ''}</strong>
+              {auto.quota.limit ? ` · ${auto.quota.remaining} left` : ' · no cap on this plan'}
+              {' '}— charged when an auto run finishes, and it resets with the calendar month.
+            </div>
+          )}
+
+          <div className="mt-4">
+            <div className="text-xs mono font-medium">Recent scheduled runs</div>
+            {!auto || !auto.recent?.length ? (
+              <div className="mt-1 text-[11px] mono text-zinc-500">
+                Nothing scheduled yet{auto?.enabled ? ' — the next sweep starts within a few minutes and appears here.' : ' — turn auto mode on to start.'}
+              </div>
+            ) : (
+              <ul className="mt-1 space-y-1">
+                {auto.recent.slice(0,5).map((row, i)=>{
+                  const chip = autoStateCopy(row.state)
+                  return (
+                    <li key={`${row.workflow}-${row.at}-${i}`} className="flex flex-wrap items-center gap-2 text-[11px] mono p-2 rounded-lg border dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/50">
+                      <span className={`px-1.5 py-0.5 rounded-full border ${chip?.cls || 'bg-zinc-100 border-zinc-300 text-zinc-700'}`}>{chip?.label || String(row.state)}</span>
+                      <span>{AUTO_WORKFLOW_LABELS[row.workflow || ''] || row.workflow || 'Auto run'}</span>
+                      <span className="text-zinc-500">{fmtWhen(row.at)}</span>
+                      {row.queue_id ? <Link to="/queues" className="underline text-zinc-600 dark:text-zinc-300">queue #{row.queue_id}</Link> : null}
+                      {row.job_id ? <Link to="/jobs" className="underline text-zinc-600 dark:text-zinc-300">job #{row.job_id}</Link> : null}
+                      {row.state !== 'done' && chip?.note ? <span className="text-zinc-500">{chip.note}</span> : null}
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+            <div className="mt-2 text-[11px] mono text-zinc-500 leading-relaxed">
+              Skipped cycles are listed rather than hidden, and a skipped cycle does not reset the cadence — the work happens as soon as the reason clears. A run that failed or needs input is in <Link to="/queues" className="underline font-medium">Queues</Link>, where you can retry it like any other job.
+            </div>
+          </div>
         </div>
       </div>
     </div>

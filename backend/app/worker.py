@@ -22,6 +22,12 @@ Self-healing (v2.1.1): two layers keep capacity honest.
    (``jobhunter_worker_task_crashes_total{task=...}``) and respawned with a
    small, capped backoff. One bad item can no longer shrink the queue's
    capacity to zero — silently.
+
+Since v2.2 the supervisor also owns the **auto-mode scheduler** child task (the
+per-user cadence sweep, see :mod:`app.services.auto_scheduler`), so scheduled
+work inherits the same crash logging and respawn instead of growing a second,
+weaker loop next to it. The scheduler enqueues into this same queue; the worker
+process that claims the items is unchanged.
 """
 from __future__ import annotations
 
@@ -39,6 +45,7 @@ from app.db import SessionLocal, init_db
 from app.metrics_server import start_metrics_server
 from app.services.ai_client import is_ai_error, is_transient_ai_error
 from app.services.ai_watchdog import AIWatchdog
+from app.services.auto_scheduler import AutoScheduler
 from app.services.handlers import HANDLERS
 from app.services.job_queue import (
     PIPELINES,
@@ -58,10 +65,10 @@ log = get_logger("app.worker")
 class Worker:
     """Claims and executes pipeline jobs with bounded concurrency.
 
-    :meth:`start` supervises every child task (the claim loops plus the AI
-    watchdog): a task that dies with an exception is logged once with its
-    traceback, counted and respawned, so a crashed slot is visible and
-    self-heals instead of vanishing.
+    :meth:`start` supervises every child task (the claim loops, the AI watchdog
+    and the auto-mode scheduler): a task that dies with an exception is logged
+    once with its traceback, counted and respawned, so a crashed slot is visible
+    and self-heals instead of vanishing.
     """
 
     def __init__(self, pipelines: Sequence[str] = PIPELINES, concurrency: Optional[int] = None,
@@ -71,23 +78,37 @@ class Worker:
         self.poll_interval = poll_interval or settings.worker_poll_interval
         self.running = False
         self.worker_id = worker_id()
-        #: slot name (``loop-0..N-1``, ``watchdog``) -> live task
+        #: slot name (``loop-0..N-1``, ``watchdog``, ``auto-scheduler``) -> live task
         self._tasks: Dict[str, asyncio.Task] = {}
         #: consecutive crash count per slot (drives the capped backoff)
         self._crash_counts: Dict[str, int] = defaultdict(int)
         self._last_crash: Optional[Dict[str, str]] = None
+        #: Auto mode (v2.2) — one more supervised child task, built here so the
+        #: slot list is answerable before ``start()``. It holds no session: a
+        #: scheduler that is constructed but never started costs nothing.
+        self.scheduler = AutoScheduler()
 
     # ------------------------------------------------------------------ #
     # Slot management & supervision
     # ------------------------------------------------------------------ #
     def _slot_names(self) -> List[str]:
-        return [f"loop-{i}" for i in range(self.concurrency)] + ["watchdog"]
+        names = [f"loop-{i}" for i in range(self.concurrency)] + ["watchdog"]
+        # Auto mode (v2.2) is one more supervised child rather than a second
+        # supervisor: it inherits the crash logging and the capped-backoff
+        # respawn for free. With AUTO_SCHEDULER_INTERVAL_SECONDS=0 the slot is
+        # not in this list at all, so nothing is spawned and the respawn loop
+        # below never looks for it — auto mode is off, not spinning.
+        if self.scheduler.enabled:
+            names.append("auto-scheduler")
+        return names
 
     def _spawn(self, name: str) -> None:
         if not self.running:
             return
         if name == "watchdog":
             task = asyncio.create_task(self.watchdog.run())
+        elif name == "auto-scheduler":
+            task = asyncio.create_task(self.scheduler.run())
         else:
             task = asyncio.create_task(self._loop())
         task.set_name(f"jobhunter-{self.worker_id}-{name}")
@@ -204,6 +225,22 @@ class Worker:
                 if isinstance(result, dict) and result.get("status") == "needs_input":
                     needs_input(db, item, reason="waiting for user input")
                 else:
+                    # v2.2 auto mode, the quota half: an auto-triggered run
+                    # charges the monthly automation budget once, on success.
+                    # Items that paused or failed charge nothing (an outage is not
+                    # the user's fault), and manual runs are charged by their own
+                    # router at trigger time — so this is the only place auto runs
+                    # are counted, and nothing is ever counted twice. Before this
+                    # existed the Dashboard's used/limit readout was wired to a
+                    # counter nothing incremented.
+                    if dict(item.payload or {}).get("trigger") == "auto":
+                        from app.core.entitlements import increment_usage
+
+                        try:
+                            increment_usage(db, int(item.user_id), "automation_runs_per_month", 1)
+                        except Exception as exc:  # pragma: no cover - never lose the run over the ledger
+                            log.warning("could not charge automation quota for item %s: %s",
+                                        item.id, exc)
                     complete(db, item, result=result if isinstance(result, dict) else {"result": str(result)})
         finally:
             db.close()
@@ -257,6 +294,10 @@ class Worker:
         log.info("worker %s started: pipelines=%s concurrency=%s",
                  self.worker_id, ",".join(self.pipelines), self.concurrency)
         self.watchdog = AIWatchdog()
+        # Auto mode sweeps every AUTO_SCHEDULER_INTERVAL_SECONDS and enqueues
+        # whatever is due (see app/services/auto_scheduler.py); a crash in it is
+        # logged, counted and respawned exactly like a claim loop.
+        self.scheduler.running = self.running
         self._spawn_all()
         while self.running:
             if not self._tasks:
@@ -282,6 +323,8 @@ class Worker:
         self.running = False
         if hasattr(self, "watchdog"):
             self.watchdog.stop()
+        if hasattr(self, "scheduler"):
+            self.scheduler.stop()  # end the sweep loop before its sleep is cancelled
         for task in list(self._tasks.values()):
             task.cancel()
         inc("jobhunter_worker_stops_total", worker=self.worker_id)

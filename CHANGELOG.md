@@ -4,6 +4,263 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.0] — 2026-09-13
+
+**Auto mode.** Pro and Pro+ can now hand their search to a scheduler that queues
+work on a cadence instead of waiting for a click — and every decision it makes,
+including every decision *not* to run, is written down where the user can read
+it. Until now the promise was a phantom: `can_use_scheduled_workflows` was True
+for both paid plans and **nothing consumed it**, `automation_runs_per_month` was
+a quota **nothing incremented**, and the Dashboard's automation readout was wired
+to that permanently-zero counter. All three are now real.
+
+### Added
+
+- **`backend/app/services/auto_scheduler.py`** — the scheduler, and the only
+  place any schedule is written. `AutoScheduler.run()` is the loop,
+  `AutoScheduler.sweep()` one pass (callable from tests and by an operator),
+  `AutoScheduler.sweep_user()` one user's pass.
+  *It only decides when to enqueue.* Every unit of work is a normal
+  `pipeline_jobs` row run by the **existing** handlers, so claim/retry/
+  pause/dead-letter semantics, per-user AI keys and the v2.1 pause contract
+  apply to auto work exactly as they do to a clicked run. `job_queue.py` is
+  untouched.
+- **The cadence table** (`CADENCE_SECONDS`) — one documented table, read by the
+  sweep, `GET /api/settings`, `GET /api/automation` and the dashboard:
+
+  | plan | discovery | funding radar | application prep |
+  |---|---|---|---|
+  | `pro_plus` | 7 200 s (2 h) | 21 600 s (6 h) | 86 400 s (24 h) |
+  | `pro` | 43 200 s (12 h) | 86 400 s (24 h) | — (not on this plan) |
+  | `free` | no entry — and the settings gate refuses to store `auto_mode: true` | | |
+
+  Pro deliberately has **no application-prep**: a prepared application spends the
+  tailored-resume budget, so the daily automated pass is the Pro+ tier's. Adding a
+  row there is the whole change when a cadence is added — no other module
+  hardcodes a schedule.
+- **"Due" is one rule, used by the writer and the readers** (`is_due` /
+  `next_run_at` / `run_clock`): the last auto run **in a finished state**
+  (`done | paused | failed | needs_input`, `FINISHED_STATES`) older than the
+  cadence. A window that never ran is always due, the comparison is inclusive at
+  exactly one cadence, and a *skip* never resets the clock — so work happens as
+  soon as its blocker clears instead of a lost day later.
+- **One enqueue per cadence window, ever.** The window is
+  `cycle_bucket = epoch_seconds // cadence` — taken as **UTC explicitly**, because
+  every timestamp in this schema is naive UTC and `datetime.timestamp()` on a
+  naive value would shift every window by the host's offset on a non-UTC machine.
+  The bucket is written into `scheduled_runs.cycle_bucket` **and** into the
+  queue's `dedupe_key` (`auto:{workflow}:{user_id}:{bucket}`), so two sweeps —
+  even in two worker processes — create exactly one item.
+- **AI gate before enqueue** (`attempt`): `await ai_availability(db, user_id)`;
+  any state other than `online` enqueues *nothing* and records
+  `skipped_outage` with the provider's reason, a `retry_after_hint` and a hint.
+  `ai_availability` is a 60 s-cached probe, so checking costs nothing, and the
+  v2.1 pause contract still covers an outage that starts mid-run — queueing work
+  we already know will pause is churn, quota burn and a worse queue for everyone.
+- **`scheduled_runs`** (model + migration `c3d4e5f6a7b8`, down_revision
+  `b2c3d4e5f6a7`): the scheduler's clock, its idempotency guard and its history —
+  `user_id, workflow, cycle_bucket, triggered_at, queue_job_id, job_id, state,
+  reason, meta`, indexed on `(user_id, workflow, triggered_at)` and
+  `(user_id, workflow, cycle_bucket)`. Idempotent (skips when the table exists),
+  SQLite- and Postgres-valid, reversible; `reconcile()` folds each open row's
+  queue status back into the history at the start of the user's pass
+  (`queued → done|paused|needs_input|failed`, `dead` → `failed`), which is what
+  advances the clock and releases the in-flight guard — no new hook in the queue.
+- **Quota, charged where the work actually happened.** `Worker._run_item` charges
+  `automation_runs_per_month` **once, on success, for items whose payload says
+  `trigger: "auto"`** — the single place auto runs are counted, because a paused
+  or failed run is not work the user got. Manual triggers keep charging it at
+  request time (`jobs.py:282/313/426`), so no path counts twice and no path counts
+  nothing. Before the enqueue, `quota_block()` checks the run budget *and* the
+  per-action budgets a manual click is held to
+  (`jobs_discovered_per_month`, `jobs_discovered_per_day`,
+  `funding_companies_per_month`, `applications_per_month`) — `handle_funding` now
+  charges `funding_companies_per_month` for an auto scan it just ran, exactly as
+  the interactive `POST /funding/companies` does, so a schedule can never be a way
+  around a cap. Exhaustion stops all queueing (`skipped_quota`) and tells the user
+  **once per calendar period** (in-app only, `link=/billing`).
+- **What a run costs and how loud it is:** `AUTO_PRIORITY = 6` (behind every
+  interactive trigger: discovery 3, funding 5, application 1),
+  `AUTO_APPLICATION_PER_PASS = 1` (one job per pass, highest score first — the
+  next pass takes the next job), `AUTO_DISCOVERY_LIMIT = 40` (auto is not a
+  cheaper way to run a bigger scan). Auto application-prep refuses to touch a job
+  that already has an open item (`job_has_open_item`), so an auto pass and a
+  manual `POST /jobs/{id}/apply` can never both hold the same application, and it
+  marks the job `queued` + records the job event like the manual path does.
+- **Keywords are read, never invented.** `discovery_payload` merges
+  `scraping.keywords` with the active persona's stored `search_context.keywords`
+  (deduped, user's own first, capped at 20) and carries `trigger: "auto"`;
+  `funding_payload` mirrors `POST /funding/refresh` and deliberately omits
+  `context`, because building it means `search_context(force_refresh=True)` — an
+  AI call that belongs *inside* the pausable item, not in the loop that decides
+  whether to create one. No sweep calls the model to work out its own input.
+- **Workflow toggles are respected**: `SETTING_FOR_WORKFLOW` maps discovery and the
+  funding radar to `workflows.ai_for_discovery` and application-prep to
+  `workflows.ai_for_resume` (documented there — those are the only two toggles the
+  settings surface has; auto mode invents no switch the user cannot find).
+  A workflow the user switched off is never scheduled.
+- **`GET /api/automation`** (`backend/app/api/routers/automation.py`, registered
+  in `app/api/routes.py`, `CurrentUser` + `DbSession` ⇒ 401 unauthenticated and
+  no id to forge): `{enabled, can_use, active, schedulable, plan, cadence,
+  toggles, consent_ok, sweep_interval_seconds, blocking[],
+  last_run{workflow:{at,state,job_id,queue_id,reason}}, next_run{workflow:iso|null},
+  recent[≤5], quota:{used,limit,remaining}}`. Its `cadence` is the sweep's table,
+  its `can_use` is the settings gate's capability, its due/next clock is
+  `is_due`/`next_run_at`, and its `quota.remaining` uses
+  `entitlements_snapshot`'s sentinel — one implementation, so no surface can
+  drift. `next_run` is `null` (never a fake countdown) while auto mode is off or
+  blocked, or while that workflow's item is still open; every timestamp carries an
+  **explicit `+00:00`** because a naive UTC string is read as browser-local by
+  `new Date()` and an hours-out "next run" is not cosmetic.
+- **Settings surface** (`user_settings.py`): a ninth category `automation` with
+  `auto_mode` (default `false`, writable on every tier so switching it *off* is
+  never blocked). `PUT /api/settings` refuses to **enable** it without
+  `can_use_scheduled_workflows` — `403 {code:"upgrade_required", capability,
+  message, fields:["auto_mode"]}`, the exact shape and place of the v2.1
+  token-limit gate — and `GET /api/settings` now returns
+  `automation.can_use`, `automation.cadence` and `automation.locked_reason`, so
+  the UI disables precisely what the server would reject.
+- **`.env.example` / config**: `AUTO_SCHEDULER_INTERVAL_SECONDS=300` — how often
+  the sweep runs, i.e. how sharply a cadence boundary is hit, **never** how often
+  a workflow runs. **`0` disables auto mode process-wide**: the child task is not
+  spawned, and `GET /api/automation` reports `scheduler_disabled` instead of
+  pretending a sweep will happen.
+- **Worker**: the scheduler is a **child task of `Worker.start()`** beside the AI
+  watchdog, so it inherits the supervisor (crash → logged with traceback,
+  counted, respawned with capped backoff) rather than growing a second one;
+  `_slot_names()` lists `auto-scheduler` only when it is enabled, so `task_health`
+  and the disabled case stay honest.
+- **Frontend**: an **Auto mode** card in Settings beside the workflow toggles —
+  the switch through the existing `PUT /api/settings` path (with the locked
+  `!can_use` state and the 403 message shown as the server's *message*, never as
+  a code or a silent snap-back), a read-only cadence table (workflow → cadence →
+  last run → next), the last/next clock, the five most recent runs in their real
+  states, the run budget line, the consent and AI-outage notices (the shared
+  `components/AIBanner.tsx`), and a 30 s poll that exists only while the card is
+  mounted. `frontend/src/lib/automation.ts` holds the state→copy map and the
+  formatters so Settings and the Dashboard cannot disagree;
+  `Dashboard.tsx` gains one auto-mode line fed by the new `automation.auto_mode` /
+  `automation.next_run` fields. Skipped cycles are listed, not hidden:
+  `skipped_outage` reads **"AI unavailable — will run next cycle"**.
+- **Dashboard/ops**: `summary.automation` gains `auto_mode`, `auto_mode_active`
+  and `next_run` (same clock as `/api/automation`); existing keys are unchanged.
+  A read failure degrades that block to "off" rather than blanking the dashboard.
+
+### Fixed
+
+Also fixed, all inside the surface this release touched:
+
+- **The persona memory fed by queued discovery was dead code
+  (`handle_discovery`, `handlers.py:155`).**
+  It read `result["job_ids"]`, a key `discover_for_user` has never returned (the
+  summary carries `jobs`), so `record_signal` never fired after a queued
+  discovery run — the only kind there is — and the track never learned. Now it
+  reads the created jobs.
+- **`auto_mode` is coerced, not guessed.** `PUT /api/settings` did no boolean
+  validation, and `bool("false")` is `True`: a client sending the *string*
+  `"false"` would have stored an *enabled* scheduler on a switch that looks off —
+  quota burn on a request to stop. `(automation, auto_mode)` now goes through
+  `coerce_bool` (real bools, `0/1`, and the truthy/falsy words UI and env style
+  produce), anything else is `400 {code:"invalid_setting_value", fields}`, and the
+  gate reads the coerced value.
+- **The Settings page offered a field that does not exist.** The "Additional
+  questions" textarea wrote `general.additional_questions`, which no backend
+  category defines and `_meta.writable` filters out — every save silently
+  discarded it while the card's own copy claimed all sections were editable. The
+  field is gone and the copy now lists the real categories (`… Email, Workflows,
+  Automation`).
+- **`test_funding_radar.py` asserted a position in the migration chain.** It
+  ran `alembic downgrade -1` and expected the *funding-honesty* revision to be
+  undone, which was true only while it happened to be head; adding
+  `scheduled_runs` made it roll back the wrong migration. It now downgrades to
+  `PRE_FUNDING_HONESTY_REVISION` explicitly, i.e. it tests what it says —
+  reversibility of that revision — and `test_alembic_migrations_apply_to_a_fresh_database`
+  gained `scheduled_runs` (table + columns) plus a real
+  downgrade-and-re-upgrade round trip.
+
+### Tests
+
+- `backend/tests/test_auto_scheduler.py` — 26 hermetic tests: the cadence table
+  and the boundary-inclusive due clock; `cycle_bucket`/`dedupe_key` window maths
+  (UTC, stable inside a window, advancing across it); free-tier `PUT` → 403
+  `upgrade_required` and nothing stored vs. a paid round-trip exposing its
+  cadence; `"false"`/`"maybe"` coercion; one enqueue per window and the second
+  sweep inside it adding nothing; Pro not running on Pro+'s 2 h; missing consent →
+  `skipped_no_consent` and the work due the moment consent exists; AI outage →
+  zero queue rows, `skipped_outage` with the provider's reason, then enqueue
+  after a scripted recovery; a disabled workflow toggle never scheduled; auto
+  mode switched off mid-flight leaving the in-flight run to finish while nothing
+  new starts; quota exhaustion → no enqueue, `skipped_quota`, **exactly one**
+  notification across three sweeps; the finished-run charge (`used 0 → 1`, a
+  manual run charging nothing, no duplicated history row); a paused run charging
+  nothing; application-prep queueing the top scored `ready_to_apply` job,
+  marking it `queued`, taking the next job next window, and recording
+  `nothing_ready` when nothing is; one user's corrupt `scraping.freshness_hours`
+  failing exactly that workflow (row + `jobhunter_auto_sweep_errors_total`) while
+  their other workflow and the next user are untouched; `run()` surviving a sweep
+  that raises and counting it; interval `0` never sweeping; the
+  `GET /api/automation` contract (including 401, and that another user sees their
+  own empty state); the additive dashboard block agreeing with
+  `/api/automation`'s next run to the second; both auto notifications
+  (threshold, top-3, honest provenance note, per-run dedupe, "only new verified
+  rows this run"); and the persona-signal fix above.
+- Full backend suite: **415 passing** (389 before this release). Ruff clean;
+  mypy A/B: **765 → 767**, the two added lines being
+  `Invalid base class "Base"` / `Variable "app.db.Base" is not valid as a type`
+  on the new model — the per-class pair every one of the 26 existing models in
+  that file already emits — and zero new errors in any other file: the new
+  module, the worker hook, the router and the handler changes are all
+  mypy-clean to the baseline's standard. `tsc --noEmit` and `npm run build`
+  clean.
+
+### Found but not fixed
+
+Out of scope for this change (recorded with file:line rather than touched):
+
+- `backend/app/services/handlers.py:138` — `handle_discovery` calls
+  `discover_for_user` **without `profile=`**, so `use_ai=bool(profile_data)` is
+  False and *no* queued discovery run — manual or auto — ever asks the model for
+  a verdict: `score_source` stays `preliminary` and the AI company-size pass
+  never runs. It is what makes an auto discovery pass cheap today; fixing it
+  changes the cost of every discovery trigger. The v2.2 notification says
+  "Scored by keyword overlap — open a job for the AI verdict" instead of hiding
+  it, and `GET /jobs/{id}/intelligence` really does compute the verdict.
+- `backend/app/api/routers/funding.py:207` — the queued `POST /funding/refresh`
+  enforces `funding_companies_per_month` and nothing in `handle_funding` ever
+  charged it for a manual run (only the synchronous `funding.py:168` path does),
+  so a clicked queue scan bypasses the cap. Auto runs now charge it; the manual
+  queued path is left as shipped, because closing it changes what a paying user
+  hits 429 on.
+- `backend/app/services/handlers.py:213` — `handle_funding` never reads the
+  `persona_id` its payload carries (`POST /api/funding/refresh` sets it and the
+  auto payload mirrors that request), so the scan always runs against the *user's*
+  settings: with two personas, the second one's funding focus is not what gets
+  scanned. The id is stored on the item and dropped.
+- `backend/app/worker.py:134` (`_handle_dead_task`) — a child task that exits *cleanly*
+  while the worker is running is respawned with backoff, forever. Auto mode
+  avoided it by never spawning the task when the interval is `0` (rather than
+  spawning a loop that exits), but the underlying respawn-a-dead-slot behaviour
+  is still there for any future optional slot.
+- `backend/app/api/routers/jobs.py:412` — `applications_per_month` is charged when
+  the user confirms an application, not when one is queued, so a queued
+  application nobody confirms consumes no budget. Auto mode's pre-check reads
+  that same counter and inherits the gap.
+- `backend/app/models/models.py:593` — `Notification.kind` is a free-form
+  `String(40)` whose value set lives only in a comment, and that comment
+  advertises `automation_failed`, which nothing has ever produced. v2.2 adds two
+  more kinds (`funding_match`, `quota_exhausted`) through the same untyped field;
+  the SPA renders `n.kind` verbatim so nothing breaks, but there is no contract to
+  check a new kind against (the same shape as the `jobs.score_source` note filed in
+  2.1.2).
+- `frontend/src/pages/Settings.tsx:87` — `save()` builds its payload from
+  `_meta.writable` and drops anything else with no signal, which is exactly how
+  `general.additional_questions` spent a whole release writing a key no category
+  defines. Every field the page renders is writable now (the one that was not is
+  removed above), but there is no per-field read-only affordance outside the two
+  `disabled` cases, so the next field added to the form without also being added
+  to `WRITABLE_KEYS` will silently discard input behind a green "Saved ✓". A
+  read-side per-field allowlist is the real fix and is not a ~30-line change.
+
 ## [2.1.2] — 2026-09-13
 
 The funding radar is now **actually AI-driven**: one grounded model pass decides

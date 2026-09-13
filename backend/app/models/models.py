@@ -378,6 +378,55 @@ class PipelineJob(Base):
     error = Column(Text, default="")
 
 
+class ScheduledRun(Base):
+    """One auto-mode scheduling decision for one (user, workflow).
+
+    Written by :mod:`app.services.auto_scheduler` — it is *not* the run itself
+    (the work is a ``pipeline_jobs`` row, linked here by ``queue_job_id``) but
+    the scheduler's record of what it decided. That single table drives three
+    things, so the UI, the cadence clock and the quota-notification dedupe can
+    never disagree with each other:
+
+    * the ``due`` check — a workflow is due when its newest *completed* run
+      (``done|paused|failed|needs_input``) is older than the plan's cadence;
+      a run still in ``queued`` state means work is in flight, not that the
+      user is due again;
+    * the history the Settings card and ``GET /api/automation`` show — every
+      state is honest, including the skips (``skipped_outage`` /
+      ``skipped_quota`` / ``skipped_no_consent``);
+    * the per-window idempotency guard: ``cycle_bucket`` is the cadence window
+      this decision belongs to, so two sweeps inside one window cannot enqueue
+      the same work twice.
+
+    ``job_id`` is the *Job* the run targets (application-prep only; ``null``
+    otherwise), and ``reason`` carries the human-readable why for a skip or a
+    failure so the UI never has to guess.
+    """
+
+    __tablename__ = "scheduled_runs"
+    __table_args__ = (
+        Index("ix_scheduled_runs_user_workflow", "user_id", "workflow", "triggered_at"),
+        Index("ix_scheduled_runs_user_bucket", "user_id", "workflow", "cycle_bucket"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    #: discovery | funding | application_prep (see auto_scheduler.CADENCE_SECONDS)
+    workflow = Column(String(40), nullable=False)
+    #: The cadence window this decision belongs to (epoch seconds // cadence).
+    cycle_bucket = Column(Integer, nullable=False, default=0)
+    triggered_at = Column(DateTime, default=utcnow, nullable=False)
+    #: The queue item this decision enqueued (``null`` for a skip).
+    queue_job_id = Column(Integer, nullable=True)
+    #: The job an application-prep run targets; ``null`` for the other workflows.
+    job_id = Column(Integer, nullable=True)
+    #: queued|done|paused|failed|needs_input|skipped_outage|skipped_quota|skipped_no_consent
+    state = Column(String(30), default="queued", nullable=False)
+    reason = Column(Text, default="")
+    meta = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+
 class FundingCompany(Base):
     """One company on a user's funding radar.
 

@@ -118,6 +118,12 @@ def defaults() -> Dict[str, Dict[str, Any]]:
             "ai_for_resume": True,
             "ai_for_emails": True,
         },
+        "automation": {
+            # Auto mode (v2.2): the scheduler only enqueues work for users who
+            # switched it on. Off by default — nothing runs automatically that
+            # the user did not ask for.
+            "auto_mode": False,
+        },
     }
 
 
@@ -135,7 +141,33 @@ WRITABLE_KEYS: Dict[str, set] = {
     "funding": {"context_notes", "industries", "freshness_days", "provider", "include_unverified"},
     "compliance": {"automation_acknowledged", "outreach_acknowledged", "rate_limit_per_day"},
     "workflows": {"ai_for_discovery", "ai_for_scoring", "ai_for_resume", "ai_for_emails"},
+    # `auto_mode` is writable on every tier (turning scheduling *off* is never
+    # restricted); turning it *on* is tier-gated in ``apply_updates``.
+    "automation": {"auto_mode"},
 }
+
+
+def coerce_bool(value: Any) -> Any:
+    """Strict-ish boolean coercion for settings values: ``None`` when the value
+    is not a boolean at all.
+
+    A JSON client sending ``"false"`` (a *string*) must not silently switch
+    auto mode on — ``bool("false")`` is True, and a user who asked for automation
+    to stop would keep paying quota for work they refused. Truthy/falsy *words*
+    are accepted (UI switches and env-style values both arrive here), anything
+    else is rejected by the caller.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "on", "enabled"}:
+            return True
+        if text in {"false", "0", "no", "off", "disabled", ""}:
+            return False
+    return None
 
 
 def validate_openai_compatible(base_url: str, model: str, api_key: str = "") -> Optional[str]:
@@ -416,6 +448,20 @@ def grouped(db: Session, user: User, *, reveal_secrets: bool = False) -> Dict[st
     if not result["ai"]["token_limits_editable"]:
         result["ai"]["token_limits_locked_reason"] = "upgrade to adjust token limits"
 
+    # Auto mode (v2.2), same rule: the switch is disabled in the UI exactly when
+    # the PUT gate would reject it, and the cadence the card displays is read
+    # from the very table the scheduler sweeps on — the schedule a user is shown
+    # is the schedule they get, never a copy that can drift.
+    from app.core.entitlements import can as capability_can
+    from app.core.entitlements import get_user_plan
+    from app.services.auto_scheduler import plan_cadence
+
+    automation = result.setdefault("automation", {})
+    automation["can_use"] = bool(capability_can(db, int(user.id), "can_use_scheduled_workflows"))
+    automation["cadence"] = plan_cadence(get_user_plan(db, int(user.id)))
+    if not automation["can_use"]:
+        automation["locked_reason"] = "Locked on the free tier — upgrade to Pro / Pro+"
+
     # Show if using owner fallback
     try:
         owner = db.query(User).filter(User.role == "owner").order_by(User.id.asc()).first()
@@ -458,6 +504,26 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
                 },
             )
 
+    # Server-side tier gate for auto mode (v2.2), same shape as the gate above.
+    # The entitlement it enforces (`can_use_scheduled_workflows`) used to be a
+    # flag nothing consumed; the scheduler now only enqueues for users whose plan
+    # has it. Switching auto mode *off* is never gated — a lock that only blocks
+    # enabling can never trap a user who wants out.
+    if "automation" in payload and "auto_mode" in (payload["automation"] or {}):
+        if coerce_bool((payload["automation"] or {}).get("auto_mode")):
+            from app.core.entitlements import can as capability_can
+
+            if not capability_can(db, int(user.id), "can_use_scheduled_workflows"):
+                raise HTTPException(
+                    403,
+                    {
+                        "code": "upgrade_required",
+                        "capability": "can_use_scheduled_workflows",
+                        "message": "Scheduled auto mode is a Pro / Pro+ feature — upgrade to enable it.",
+                        "fields": ["auto_mode"],
+                    },
+                )
+
     # Pre-validate OpenAI compatible format if ai category present
     if "ai" in payload:
         ai_payload = payload["ai"] or {}
@@ -486,6 +552,19 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
         for key, value in values.items():
             if key not in allowed:
                 raise HTTPException(400, f"Unknown settings key '{category}.{key}'")
+            if (category, key) == ("automation", "auto_mode"):
+                # Coerce strictly. Storing the *string* "false" would be truthy
+                # to the scheduler, i.e. a user who turned auto mode off would
+                # keep consuming quota on a switch that looks off.
+                coerced = coerce_bool(value)
+                if coerced is None:
+                    raise HTTPException(
+                        400,
+                        {"code": "invalid_setting_value",
+                         "message": "'automation.auto_mode' must be true or false",
+                         "fields": ["auto_mode"]},
+                    )
+                value = coerced
             if key in {"rpm", "port", "freshness_hours", "daily_limit", "max_retries",
                        "daily_application_limit", "rate_limit_per_day"}:
                 try:
