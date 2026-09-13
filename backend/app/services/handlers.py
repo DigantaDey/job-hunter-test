@@ -15,14 +15,15 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.entitlements import can
 from app.core.logging import get_logger
 from app.models.models import Email, FundingCompany, Job, PipelineJob, User
 from app.services import funding_radar
 from app.services.ai_client import is_ai_error
 from app.services.ai_guardrails import describe_ai_error
-from app.services.apply_flow import execute_application, prepare_application
+from app.services.apply_flow import execute_application, latest_profile, prepare_application
 from app.services.auto_scheduler import FUNDING_MATCH_NOTIFICATION_KIND, HIGH_MATCH_NOTIFICATION_KIND
-from app.services.discovery import discover_for_user
+from app.services.discovery import AI_RESCORE_NO_PROFILE, AI_RESCORE_PLAN_FREE, discover_for_user
 from app.services.outreach import draft_email, send_email
 from app.services.user_settings import get_setting
 
@@ -76,11 +77,13 @@ def _notify_auto_discovery(db: Session, item: PipelineJob, user: User,
         return
     ids = [int(job["id"]) for job in surfaced if job.get("id") is not None]
     rows = db.query(Job).filter(Job.id.in_(ids), Job.user_id == user.id).all() if ids else []
-    # Honest provenance: a queued discovery run scores with the deterministic
-    # keyword estimate unless the AI verdict was computed, so the notification
-    # must not call an estimate a match the model made. (The gap itself — the
-    # discovery handler never passes the profile the AI scoring needs — is
-    # recorded in the 2.2.0 PR as out-of-scope.)
+    # Honest provenance. Since v2.2.3 a queued run *can* carry the model's
+    # verdict (Pro + a profile on file → the top AI_RESCORE_TOP rows), so the
+    # caveat is dropped only when every surfaced row really is an AI verdict.
+    # A mixed run keeps it — the top slice is 12 rows while the notification
+    # surfaces the three highest scorers, which need not all be in it — and so
+    # does a free-tier or profile-less run, where every row is a keyword
+    # estimate (see ``ai_rescore.skipped`` in the run's report for which).
     provenance = {str(row.score_source or "preliminary") for row in rows} or {"preliminary"}
     ai_scored = provenance == {"ai"}
     lines = [f"• {(job.get('company') or '?')} — {job.get('title') or 'Untitled'} "
@@ -135,6 +138,38 @@ async def handle_discovery(db: Session, item: PipelineJob) -> Dict[str, Any]:
         memory = persona_service.memory_summary(persona)
         persona_context = {"name": persona.name, "target_role": persona.target_role,
                            "observed_skills": list((memory.get("observed_skills") or {}).keys())[:12]}
+
+    # ---------------- the AI top slice (v2.2.3) ----------------
+    # ``discover_for_user`` gives the top ``AI_RESCORE_TOP`` candidates the
+    # guardrailed AI verdict *if and only if* it is handed a profile — and this
+    # handler never handed it one, so every queued discovery row was a keyword
+    # estimate and the AI verdict existed only per job
+    # (``GET /api/jobs/{job_id}/intelligence``, Pro). Two gates, both the
+    # product's own:
+    #
+    # 1. the user's latest ``Profile`` row — the identical query
+    #    ``/intelligence`` runs (``apply_flow.latest_profile``). No profile (or
+    #    an empty one) means there is nothing to score against, and the model
+    #    must not be asked to invent a match.
+    # 2. ``can_use_advanced_matching`` — the entitlement ``/intelligence``
+    #    enforces per job. It is a *permission* check, not a quota: no
+    #    ``enforce()``, no new entitlement, no counter, nothing consumed.
+    #
+    # Withholding the profile (rather than passing it with ``use_ai=False``) is
+    # what makes a free-tier run cost exactly **zero** AI calls: the same
+    # profile also switches on the AI company-size verdict for the top
+    # ``AI_CLASSIFY_TOP`` rows. A free user's board is not a back door around
+    # the plan gate. The reason is reported in the run's ``ai_rescore`` block,
+    # because "your board is all estimates" has two different fixes.
+    profile_row = latest_profile(db, int(user.id))
+    profile_data: Dict[str, Any] = dict((profile_row.data if profile_row else {}) or {})
+    ai_rescore_skipped: Optional[str] = None
+    if not profile_data:
+        ai_rescore_skipped = AI_RESCORE_NO_PROFILE
+    elif not can(db, int(user.id), "can_use_advanced_matching"):
+        ai_rescore_skipped = AI_RESCORE_PLAN_FREE
+        profile_data = {}
+
     result = await discover_for_user(
         db,
         user,
@@ -144,6 +179,8 @@ async def handle_discovery(db: Session, item: PipelineJob) -> Dict[str, Any]:
         live_enabled=bool(payload.get("live_enabled", config["live_enabled"])),
         source_ids=payload.get("sources") or config["sources"],
         board_tokens=payload.get("board_tokens") or config["board_tokens"],
+        profile=profile_data or None,
+        ai_rescore_skipped=ai_rescore_skipped,
         persona_id=payload.get("persona_id") or (persona.id if persona else None),
         persona_context=persona_context,
     )

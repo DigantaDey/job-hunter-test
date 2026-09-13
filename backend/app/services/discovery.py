@@ -7,6 +7,12 @@ the top candidates get (rate-limited) AI calls, so a discovery run cannot blow
 the configured RPM budget or the AI bill. The AI verdicts are a hard
 dependency for the top slice — an outage pauses the queued run (v2.1), which
 re-executes when the provider is back.
+
+The AI top slice is also **plan-gated** (v2.2.3): the caller passes a profile
+only when the user has ``can_use_advanced_matching``, so a free-tier run makes
+zero AI calls and stays fully preliminary — the same gate
+``GET /api/jobs/{job_id}/intelligence`` enforces per job. Every run reports what
+happened in its ``ai_rescore`` block, so a board full of estimates says why.
 """
 from __future__ import annotations
 
@@ -33,6 +39,14 @@ log = get_logger("app.discovery")
 AI_RESCORE_TOP = 12
 AI_CLASSIFY_TOP = 5
 FORM_DETECT_TOP = 8
+
+#: The only two reasons the AI top slice may be skipped, reported verbatim in
+#: the run's ``ai_rescore.skipped`` (``None`` means the slice ran). They are a
+#: vocabulary, not free text: an operator — or the empty-board work — reads one
+#: of these to find out *why* a board is full of keyword estimates, and the two
+#: fixes are different ("upload a resume" vs "upgrade the plan").
+AI_RESCORE_NO_PROFILE = "no_profile"
+AI_RESCORE_PLAN_FREE = "plan_free"
 
 
 def _demo_pool_enabled() -> bool:
@@ -65,6 +79,11 @@ async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[
     dead-letters with the diagnosis). Nothing is persisted before this point,
     so a paused-and-resumed run creates exactly the same rows as an
     uninterrupted one.
+
+    ``use_ai`` is the caller's decision, not this function's: the queued run
+    (``handlers.handle_discovery``) sets it from the user's profile *and* their
+    ``can_use_advanced_matching`` entitlement, so a free-tier batch never
+    reaches the loop below.
     """
     for candidate in candidates:
         score, reason = preliminary_score(profile_data, candidate["description"])
@@ -97,8 +116,24 @@ async def discover_for_user(
     profile: Optional[Dict[str, Any]] = None,
     persona_id: Optional[int] = None,
     persona_context: Optional[Dict[str, Any]] = None,
+    ai_rescore_skipped: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run one discovery pass for a user (optionally scoped to one persona)."""
+    """Run one discovery pass for a user (optionally scoped to one persona).
+
+    ``profile`` is the AI switch. Passing a non-empty profile turns on the
+    guardrailed AI verdict for the top :data:`AI_RESCORE_TOP` candidates (and
+    the AI company-size verdict for the top :data:`AI_CLASSIFY_TOP`); passing
+    nothing keeps the whole run on the deterministic pre-rank. Callers therefore
+    decide *who* gets the AI slice — ``handlers.handle_discovery`` withholds the
+    profile from users without ``can_use_advanced_matching``, which is what makes
+    a free-tier run cost zero AI calls.
+
+    ``ai_rescore_skipped`` is the caller's reason for withholding it
+    (:data:`AI_RESCORE_NO_PROFILE` / :data:`AI_RESCORE_PLAN_FREE`); it is
+    reported verbatim in the run's ``ai_rescore`` block so an operator can tell
+    a plan gate apart from a missing resume. It is only read when no profile was
+    passed.
+    """
 
     profile_data = profile or {}
     started = datetime.utcnow()
@@ -158,6 +193,11 @@ async def discover_for_user(
     candidates = [c for c in candidates if c["dedupe_key"] not in existing_keys]
 
     # ---------------- score / classify ----------------
+    # The batch slice gets exactly what the per-job path (``/intelligence``)
+    # gives the model: this run's session, the owning user (so the AI gateway
+    # resolves *their* key, budgets and ledger) and the persona context, so a
+    # persona-scoped run scores against the track. ``use_ai`` is the plan gate
+    # the caller applied by passing (or withholding) ``profile``.
     await _score_candidates(profile_data, candidates, use_ai=bool(profile_data),
                             db=db, user_id=user.id, persona=persona_context)
 
@@ -251,12 +291,28 @@ async def discover_for_user(
 
     elapsed = (datetime.utcnow() - started).total_seconds()
     inc("jobhunter_discovery_runs_total", result="ok")
+    # Provenance for the whole run (v2.2.3). The AI top slice is gated by the
+    # caller on the profile *and* the plan, so "every job on this board is a
+    # keyword estimate" has two very different causes — and this block is the
+    # only place an operator (or the empty-board work) can read which one
+    # happened. It rides in the queue item's result JSON: no schema change, no
+    # migration.
+    ai_enabled = bool(profile_data)
+    ai_rescore: Dict[str, Any] = {
+        "enabled": ai_enabled,
+        "skipped": None if ai_enabled else str(ai_rescore_skipped or AI_RESCORE_NO_PROFILE),
+        # Rows, not calls: a candidate the model could not verdict (guardrail
+        # rejection, no text to score) is not an AI-scored job, and a run whose
+        # insert lost a uniqueness race created nothing to score.
+        "scored": sum(1 for job in created if str(job.score_source or "") == "ai"),
+    }
     summary = {
         "scanned": len(unique),
         "fresh": len(fresh),
         "inserted": len(created),
         "sources": source_report,
         "elapsed_seconds": round(elapsed, 2),
+        "ai_rescore": ai_rescore,
         "jobs": [
             {"id": job.id, "title": job.title, "company": job.company, "source": job.source,
              "score": job.score, "location": job.location, "url": job.url}
@@ -264,9 +320,11 @@ async def discover_for_user(
         ],
     }
     log.info(
-        "discovery: %s scanned, %s inserted in %.1fs",
+        "discovery: %s scanned, %s inserted in %.1fs (ai_rescore enabled=%s skipped=%s scored=%s)",
         summary["scanned"], summary["inserted"], elapsed,
-        extra={"extra_fields": {"user_id": user.id, **{k: summary[k] for k in ("scanned", "fresh", "inserted")}}},
+        ai_rescore["enabled"], ai_rescore["skipped"] or "-", ai_rescore["scored"],
+        extra={"extra_fields": {"user_id": user.id, **{k: summary[k] for k in ("scanned", "fresh", "inserted")},
+                                "ai_rescore": ai_rescore}},
     )
     return summary
 

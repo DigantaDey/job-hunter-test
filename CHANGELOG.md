@@ -4,6 +4,147 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.3] — 2026-09-13
+
+**Discovery: queued runs get the real AI verdict for the top slice (tier-gated).**
+`discover_for_user` has always supported a guardrailed AI verdict for the top
+`AI_RESCORE_TOP` (12) candidates — `score_source='ai'` with evidence, and a
+*hard* dependency on the model (transient outage → the queued run pauses and
+re-executes when the provider is back; needs-action → it dead-letters with the
+diagnosis; nothing persisted before the slice, so a paused-and-resumed run
+creates exactly the same rows as an uninterrupted one). Its only caller,
+`handlers.handle_discovery`, never loaded the user's profile, so
+`use_ai=bool(profile_data)` was permanently `False`: **every** discovered job was
+a keyword-overlap estimate, the AI top slice and its whole pause contract were
+dead code, and the AI verdict existed only per job
+(`GET /api/jobs/{job_id}/intelligence`, Pro). Auto-mode notifications compensated
+with the honest caveat "Scored by keyword overlap — open a job for the AI
+verdict." The handler now loads the profile the same way `/intelligence` does and
+gates it on the entitlement `/intelligence` already enforces.
+
+Backend-only plumbing plus report provenance: no schema change, no migration, no
+new environment variable, and no new entitlement or quota.
+
+### Added
+
+- **`ai_rescore` in the discovery report** —
+  `{"enabled": bool, "skipped": <reason|null>, "scored": <int>}`, where `skipped`
+  is exactly one of `no_profile` (no profile row, or one with empty `data`),
+  `plan_free` (no `can_use_advanced_matching`) or `null` when the slice ran, and
+  `scored` is how many job rows actually persisted with `score_source='ai'`
+  (rows, not calls: a candidate the model could not verdict — guardrail
+  rejection, no text to score — is not an AI-scored job, and a run whose insert
+  lost a uniqueness race created nothing to score). It rides in the queue item's
+  `payload.result` alongside `scanned` / `fresh` / `inserted` / `jobs`, so there
+  is nothing to migrate. When jobs were found but the slice was skipped, this is
+  the only way an operator — or the upcoming empty-board work — can tell *why* a
+  board is full of estimates, and the two reasons have different fixes ("upload a
+  resume" vs "upgrade the plan").
+- **The reason vocabulary is a constant pair**, `AI_RESCORE_NO_PROFILE` /
+  `AI_RESCORE_PLAN_FREE` in `app.services.discovery`, so the caller and the
+  reporter cannot drift into free text. Precedence is documented and deliberate:
+  a missing/empty profile is reported before the plan gate (it is checked first,
+  and there is nothing to score against either way).
+- **The block is in the run's log line too** — `discovery: N scanned, M inserted
+  in X.Xs (ai_rescore enabled=… skipped=… scored=…)` with the same dict under
+  `extra_fields.ai_rescore` for JSON logs. `GET /api/pipelines/jobs` strips
+  `payload.result` (unchanged), so the row and the log are where it is read.
+- **`backend/tests/test_discovery_ai_rescore.py`** (12 tests, hermetic — the
+  repo's scripted local provider on the wire paths, the deterministic stand-in
+  where no wire is involved, a faked source fan-out, no network): the Pro
+  top slice and its report; a free run that completes with **zero** wire calls;
+  no-profile and empty-profile; a mid-slice outage that pauses, persists nothing
+  and then completes exactly once after the watchdog drains; the v2.2.2 failure
+  budget surviving a pause/resume cycle (driven through the worker, not just the
+  queue functions); a 401-style needs-action failure dead-lettering with the
+  diagnosis; the auto-mode notification with and without the caveat; a run with
+  nothing to score; and the SPA's provenance badge still covering both values.
+
+### Changed
+
+- **`handle_discovery` loads the profile and hands it to the batch run.** The
+  user's latest `Profile` row (`Profile.user_id == user.id`, newest `created_at`
+  first) via `apply_flow.latest_profile` — the identical query
+  `GET /api/jobs/{job_id}/intelligence` runs — and its `data` dict is what turns
+  the AI top slice on.
+- **The AI verdict is tier-gated with the existing entitlement.**
+  `can(db, user.id, "can_use_advanced_matching")` decides, and it is a
+  *permission* check: no `enforce()`, no new entitlement, no quota, nothing
+  consumed. The profile is **withheld wholesale** when the gate is closed rather
+  than passed with `use_ai=False`, because the same profile also switches on the
+  AI company-size verdict for the top `AI_CLASSIFY_TOP` (5) rows — so a free-tier
+  run makes exactly zero AI calls, which is what the test asserts on the wire. A
+  free user's board is not a back door around the plan gate `/intelligence`
+  enforces.
+- **Free-tier runs are otherwise unchanged**: they complete, every row is
+  `score_source='preliminary'`, and the estimate is the same "insufficient data"
+  default every batch run produced before this release (the profile is not passed
+  at all, so the deterministic pre-rank has nothing to overlap against).
+- **The batch slice gets the same context the per-job path gives the model** —
+  verified at the call site rather than assumed: `db=db`, `user_id=user.id` (so
+  the gateway resolves *that* user's key, token budgets and credit ledger) and
+  `persona=<the persona_context handle_discovery already builds>`, so a
+  persona-scoped run scores against the track. The test asserts the persona block
+  reaches the wire prompt.
+- **Auto-mode high-match notifications drop the caveat only when it is untrue.**
+  `_notify_auto_discovery` already read `score_source` off the surfaced rows; now
+  that a queued run can produce `ai` rows, a Pro run whose three highest scorers
+  all carry the model's verdict no longer tells the user they were "Scored by
+  keyword overlap". A mixed run keeps it — the top slice is 12 rows while the
+  notification surfaces the three highest scorers, so "the run AI-scored
+  something" is not the same claim as "these three numbers came from the model" —
+  and so does an all-preliminary one. No new notification kinds; the stale
+  "recorded in the 2.2.0 PR as out-of-scope" comment is gone.
+- **README**: the discovery paragraph said postings are "scored (AI or
+  calibrated heuristic)" — a claim that was only true per job. It now says what
+  the batch does: a deterministic pre-rank for everything, plus the guardrailed
+  AI verdict for the top 12 on Pro, with free-tier runs staying on the labelled
+  estimate.
+
+### Fixed
+
+- **A related bug found while wiring the slice up: `score_job` labelled a verdict
+  the model never gave as `"ai"`.** When there is nothing to score — an empty job
+  description (every source adapter defaults a missing one to `""`), or a profile
+  with no text in it — `ai_score_detailed` answers from the deterministic
+  breakdown *without calling the model* and marks its own detail
+  `source="insufficient_data"`, but `score_job` wrapped that in
+  `score_source="ai"` with the reason `"AI: Not enough profile or job text to
+  score"`. Turning the batch slice on made that reachable at scale: a source that
+  returns titles and URLs only would have produced a board of rows badged **"AI
+  verified"** in the SPA, an `ai_rescore.scored` count claiming verdicts that
+  never happened, and — worst — an auto-mode notification that *dropped* the
+  keyword-overlap caveat because its top three rows all said `ai`.
+  `score_job` now returns the provenance it has always documented for the case
+  (`insufficient_data`), which is also what the free tier's
+  `preliminary_score_detailed` already returned for the same input and what the
+  SPA's `SourceBadge` already has a chip for ("no data"). Both callers benefit
+  (the batch slice and `/intelligence`), no default, rubric, guardrail or
+  top-slice size changed, and the existing test that exercises this function
+  already accepted `insufficient_data` as a legal answer. Covered by two new
+  tests: a whole run with nothing to score reports
+  `{"enabled": true, "skipped": null, "scored": 0}` and makes zero scoring calls,
+  and `score_job` reports `insufficient_data` for both doors while a real pair is
+  still `"ai"`.
+
+### Unchanged, deliberately
+
+- **The two failure postures stay distinct — they were not merged.** The batch
+  path is hard: `_score_candidates` calls `score_job(...,
+  allow_preliminary=False)`, which raises, and the worker turns a transient
+  outage into a pause and a needs-action failure into a dead letter. The per-job
+  path stays soft: `/intelligence` returns `ai_error` (never papered over), and
+  the free tier gets the preliminary breakdown plus `upgrade_hint`.
+- **`score_job`'s defaults, the rubric, the guardrails and `AI_RESCORE_TOP = 12`
+  are untouched**, as is the cost-control design: one model call per candidate in
+  the top slice, deterministic labelling for the bulk.
+- **v2.2.2's queue semantics are untouched and now have an integration-level
+  guard**: `attempts` counts handler failures only, `pause()` consumes none, and
+  a run that sat out an outage still retries its first real failure and
+  dead-letters on the Nth.
+- **No new environment variable** (`.env.example` is unchanged), no migration and
+  no schema change.
+
 ## [2.2.2] — 2026-09-13
 
 **Queue fix: `attempts` counts failures, not claims.** The durable queue
