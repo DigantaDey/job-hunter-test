@@ -424,7 +424,14 @@ export default function Settings(){
                           </div>
                         ) : <span className="text-zinc-500">never run</span>}
                       </td>
-                      <td className="py-1.5">{next ? fmtWhen(next) : <span className="text-zinc-500">{auto?.enabled ? 'waiting' : '—'}</span>}</td>
+                      <td className="py-1.5">
+                        {/* `next_run: null` = no next run to promise. Never a date:
+                            off → "—", on but blocked → "blocked", on and runnable
+                            (so a run is in flight right now) → "running now". */}
+                        {next
+                          ? (new Date(next).getTime() <= Date.now() ? <span title={fmtWhen(next)}>due — starts at the next sweep</span> : fmtWhen(next))
+                          : <span className="text-zinc-500">{!auto?.enabled ? '—' : auto.active ? 'running now — next set when it finishes' : 'blocked — see above'}</span>}
+                      </td>
                     </tr>
                   )
                 })}
@@ -432,7 +439,7 @@ export default function Settings(){
             </table>
           </div>
           <div className="mt-1 text-[10px] mono text-zinc-500">
-            “Next” is the first moment the sweep may start that run — the loop wakes every {Math.max(1, Math.round((auto?.sweep_interval_seconds ?? 300) / 60))} min, so a run can start up to that much later. It shows “waiting” while a run is in flight or auto mode is blocked.
+            “Next” is the first moment the sweep may start that run — the loop wakes every {Math.max(1, Math.round((auto?.sweep_interval_seconds ?? 300) / 60))} min, so a run can start up to that much later. No time is promised while a run is in flight or auto mode is blocked. This card re-reads the schedule every {AUTOMATION_POLL_MS / 1000}s while open.
           </div>
 
           {auto?.quota && (

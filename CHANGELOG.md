@@ -4,6 +4,106 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.1] — 2026-09-13
+
+**Frontend finishing pass over the v2.1–v2.2 surfaces.** The three backend
+tickets shipped their own UI; this release audits those four pages against the
+live contracts (`GET /api/pipelines/stats`, `/api/pipelines/jobs`,
+`/api/funding/companies`, `/api/automation`, plus `/api/dashboard/summary`),
+closes the visibility gaps and removes the dead paths the backend landing left
+behind. Frontend-only — no queue, scheduler, funding or billing logic changed.
+
+### Added
+
+- **Queues — `paused` and `dead` summary chips.** The per-pipeline chip row now
+  renders all seven statuses `queue_stats` returns (`queued processing done
+  failed needs_input paused dead`) instead of five. `paused` is amber when
+  non-zero (it is the v2.1 headline state), `dead` is grey, and every chip has a
+  hover hint saying what the state means.
+- **Queues — the amber row explains itself.** A `paused` job row now carries
+  "AI outage — will resume automatically" next to its status pill; a `dead` row
+  says "gave up after N attempts". Kept to the list row — no separate section.
+- **Settings — Auto-mode card stays fresh.** The card re-reads
+  `GET /api/automation` (and the AI status banner) every 30 s while the page is
+  mounted, cleared on unmount; a failed poll keeps the last read instead of
+  blanking the card (verified: consent restored on the server flipped the card
+  from "on — not queueing" to "scheduled" within one tick, and a broken poll
+  left it untouched). The footnote now says so.
+- **Dashboard — paused work is visible on the front door.** When any pipeline
+  has paused items the hero shows "N paused — AI outage, will resume
+  automatically" (links to Queues) and the "Open queues" pill appends
+  "• N paused".
+
+### Changed
+
+- **`next_run: null` is never a date, and never a vague "waiting".** Settings
+  renders it as "—" (auto mode off), "blocked — see above" (on but
+  `active=false`), or "running now — next set when it finishes" (on and active,
+  i.e. that workflow's run is in flight). A `next_run` already in the past
+  reads "due — starts at the next sweep" rather than "in 0s". Dashboard renders
+  the same null as "off" / "on — blocked" / "running now" using
+  `auto_mode_active`, which the summary endpoint already returned but the UI
+  ignored.
+- **Copy:** the AI pipeline card no longer advertises a "green/red online dot"
+  it never had; it describes what it is — a durable priority queue that pauses
+  on an AI outage and resumes on its own. Funding's `mined` context label now
+  says why it is deterministic ("nothing for the model to read yet").
+
+### Fixed
+
+- **Queues: the "Next in AI queue" panel never rendered.** It read
+  `stats.ai.ai_queue`, but `GET /api/pipelines/stats` puts `ai_queue` (and
+  `rate_limiter`) at the *top level* of the payload, as siblings of the
+  per-pipeline buckets — so the live v2.1.1 durable-queue preview
+  (`queue_preview` top-3 + `processing_now`) was silently hidden behind a
+  falsy guard on every render. It now reads `stats.ai_queue`, shows an explicit
+  "idle — nothing waiting" when empty, flags paused entries as "resumes
+  automatically", and shows the row id so it can be matched to the job list.
+- **Queues: removed the dead `?? stats[p.id]?.ai_queue?.[k]` fallback.**
+  `ai_queue` has no per-status keys, so the branch could never fire; the chip
+  reads `stats[p.id]?.[k] ?? 0` only.
+- **Dashboard: the "Pipelines (FIFO)" Running / Completed / Failed trio was the
+  *application* pipeline only.** `automation.running/completed/failed` in
+  `/api/dashboard/summary` are computed from one pipeline, while the label
+  claims all of them. The same payload carries `automation.queues` (every
+  pipeline's seven buckets), so the trio now totals across pipelines
+  (running = queued + processing; failed = failed + dead), falling back to the
+  old fields if `queues` is absent.
+- **Funding: `context.source` label leaked the raw tag.** The persona merge
+  tags the context `ai+persona` / `mined+persona`; the exact-match labels only
+  caught bare `ai` / `mined`, so users with a persona (every user — a default
+  one is ensured) saw the raw string. Matched on the prefix.
+- **Funding: paused / blocked panels now say the rows below are the last
+  successful scan** (the `scan_failed` panel already did), so an outage over a
+  populated radar is never mistaken for fresh results.
+
+### Contract audit (no change needed)
+
+Every rendered value on Queues, Funding, Settings (auto card) and Dashboard
+was traced to a field the live endpoint returns. Confirmed present:
+`companies[].{source,verified,why,rank,open_positions,raised_at_estimated}`,
+`scan_status/reason/scanned/last_report.{errors,ai.*}/window_days/refreshed_at/
+resume/persona/context.persona`; `automation.{can_use,cadence,locked_reason}`
+on `GET /api/settings`; `overview.{active,blocking,toggles,sweep_interval_seconds,
+last_run,next_run,recent,quota}`; `entitlements.usage.automation_runs_per_month`
+and `limits.automation_runs_per_month`; `rate_limiter.{rpm,remaining,throttled}`.
+All AI-backed failures on these pages route through `aiOutage()` +
+`AIOutageBanner` / `AIStatusBanner`; the auto-mode 403 shows the server's
+`detail.message`, never the code. No "v2.1.1 pending" placeholder copy remained.
+
+### State walkthrough
+
+Run on a live app (real worker, stub OpenAI-compatible server for the "online"
+leg, unreachable `base_url` for the outage leg): Queues in empty / outage
+(3 paused + 1 dead, chips and preview matched `GET /api/pipelines/stats`
+exactly) / online (watchdog resumed all three → `done: 3`); Funding in
+`scan_failed` (provider error list), `paused` (retry hint), `blocked` ("Fix"
+line + Settings link), `ok` + partial provider failure ("Partial scan:
+crunchbase (not_configured)") and `ok` + `no_matching_events`; Settings auto
+card on free (Locked + upgrade link), Pro+ with `skipped_outage` runs, in-flight
+(`next_run: null` → "running now"), consent revoked ("blocked — see above",
+`blocking` listed) and the 30 s refresh; Dashboard in each of those.
+
 ## [2.2.0] — 2026-09-13
 
 **Auto mode.** Pro and Pro+ can now hand their search to a scheduler that queues
