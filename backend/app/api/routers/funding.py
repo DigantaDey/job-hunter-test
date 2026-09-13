@@ -24,7 +24,7 @@ from app.core.config import settings
 from app.core.entitlements import enforce, increment_usage
 from app.core.logging import get_logger
 from app.models.models import FundingCompany, Job, Profile
-from app.services import funding_radar
+from app.services import funding_radar, funding_search
 from app.services import persona as persona_service
 from app.services.ai_client import is_ai_error
 from app.services.ai_guardrails import describe_ai_error
@@ -54,8 +54,17 @@ async def funding_context(user: CurrentUser, db: DbSession, persona_id: Optional
 
 @router.get("/providers")
 def providers():
+    """Provider registry plus the web-search status (configured / setup hint).
+
+    ``search.provider`` is the *resolved* provider id (``""`` when none is
+    configured — the scan then uses the direct sec_edgar path); ``hint`` tells
+    the operator what to set, and never contains the key itself.
+    """
     return {"providers": provider_status(), "active": settings.funding_provider,
-            "synthetic_allowed": settings.allow_synthetic_funding_data}
+            "synthetic_allowed": settings.allow_synthetic_funding_data,
+            "search": {"provider": funding_search.search_provider(),
+                       "configured": funding_search.search_configured(),
+                       "hint": funding_search.search_hint()}}
 
 
 @router.get("/history")

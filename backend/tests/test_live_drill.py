@@ -12,8 +12,8 @@ import re
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List
 
 import pytest
@@ -30,6 +30,43 @@ VALID_KEY = "sk-e2e-valid-key-abcdef123456"
 # - exact JSON contracts per workflow
 # - call log (workflow + timestamp)
 # ---------------------------------------------------------------------------
+
+def _stub_company_name(title: str) -> str:
+    """Company name from a headline like ``"VectorLoom AI raises $12M Series A"``."""
+    cut = re.split(r"\s+(?:raises|raised|secures|secured|announces|announced|closes|closed)\b",
+                   " ".join(str(title or "").split()), maxsplit=1, flags=re.IGNORECASE)[0]
+    return " ".join(cut.split()[:4]).strip(" ,-–—:;.")
+
+
+def _extract_payload(prompt: str) -> Dict[str, Any]:
+    """Contract-compliant funding-extract answer: one company per cited result.
+
+    Mirrors the funding_scan stand-in for the search path: ``source_index`` is
+    always in range and the name comes from the result's own title, so the
+    grounding guardrail (name must appear in the cited result's text) accepts
+    it — the fake provider obeys the product's own rules.
+    """
+    results: List[Any] = []
+    m = re.search(r"Search results:\s*(\[.*\])\s*\nReturn JSON only", prompt or "", re.DOTALL)
+    if m:
+        try:
+            results = json.loads(m.group(1))
+        except Exception:
+            results = []
+    comps = []
+    for idx, row in enumerate(results if isinstance(results, list) else []):
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "")
+        name = _stub_company_name(title)
+        if not name:
+            continue
+        stage = re.search(r"\b(Series [ABCD]|Seed)\b", title, re.IGNORECASE)
+        comps.append({"name": name, "source_index": idx,
+                      "stage": stage.group(1).title() if stage else "Undisclosed",
+                      "raised_usd": None, "raised_at": None, "industry": ""})
+    return {"companies": comps}
+
 
 def _payload_for(workflow: str, prompt: str) -> Dict[str, Any]:
     low = (prompt or "").lower()
@@ -59,6 +96,8 @@ def _payload_for(workflow: str, prompt: str) -> Dict[str, Any]:
             "recommendation_reason": "Matches core stack and domain perfectly.",
         }
     if workflow == "funding_scan":
+        if "funding-extract-v1" in (prompt or "").lower():
+            return _extract_payload(prompt)
         m = re.search(r"Funding events:\s*(\[.*?\])\s*\nReturn JSON only", prompt, re.DOTALL)
         events: List[Any] = []
         if m:
@@ -107,6 +146,8 @@ def _payload_for(workflow: str, prompt: str) -> Dict[str, Any]:
 
 def _detect_workflow(prompt: str) -> str:
     low = (prompt or "").lower()
+    if "funding-extract-v1" in low:
+        return "funding_scan"  # the search-path extraction shares the workflow
     if "funding-scan-v2" in low:
         return "funding_scan"
     if "extract a complete, structured profile" in low:
@@ -284,6 +325,7 @@ def _make_pro_user(client: TestClient, db, email: str):
 
 def _upload_resume(client: TestClient, auth: Dict[str, str]):
     import io
+
     from reportlab.lib.pagesizes import LETTER
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.platypus import Paragraph, SimpleDocTemplate
@@ -332,7 +374,9 @@ def test_c1_outage_pause_drain_resume(live_client, live_fake_server, fake_mode, 
     if not resume:
         from app.models.models import Resume as R
         r = R(user_id=user.id, filename="t.pdf", filepath="/tmp/t.pdf", type="master", profile_snapshot={}, tags=[], status="approved")
-        db.add(r); db.commit(); db.refresh(r)
+        db.add(r)
+        db.commit()
+        db.refresh(r)
         resume = r
     item = enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id}, dedupe_key=f"c1-tag-{uuid.uuid4().hex[:4]}")
     assert item is not None
@@ -363,10 +407,12 @@ def test_c2_attempt_accounting(live_client, live_fake_server, fake_mode, db):
     client = live_client
     auth, user = _make_pro_user(client, db, f"c2-{uuid.uuid4().hex[:6]}@example.com")
     from app.models.models import PipelineJob, Resume
-    from app.services.job_queue import enqueue, claim
+    from app.services.job_queue import claim, enqueue
     from app.worker import Worker
     r = Resume(user_id=user.id, filename="c2.pdf", filepath="/tmp/c2.pdf", type="master", profile_snapshot={}, tags=[], status="approved")
-    db.add(r); db.commit(); db.refresh(r)
+    db.add(r)
+    db.commit()
+    db.refresh(r)
     item = enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": r.id}, dedupe_key=f"c2-{uuid.uuid4().hex[:6]}", max_attempts=3)
     worker = Worker(pipelines=["ai"])
     asyncio.run(worker._run_item(item.id, "ai"))
@@ -420,6 +466,7 @@ def test_c3_blocked_needs_action(live_client, live_fake_server, fake_mode, db):
     client = live_client
     auth, user = _make_pro_user(client, db, f"c3-{uuid.uuid4().hex[:6]}@example.com")
     import asyncio as _asyncio
+
     from app.services.ai_client import ai_availability
     avail = _asyncio.run(ai_availability(db=db, user_id=user.id, probe_timeout=2))
     assert avail.get("state") == "blocked_needs_action", avail
@@ -435,7 +482,9 @@ def test_c3_blocked_needs_action(live_client, live_fake_server, fake_mode, db):
     from app.services.job_queue import enqueue
     from app.worker import Worker
     r = Resume(user_id=user.id, filename="c3.pdf", filepath="/tmp/c3.pdf", type="master", profile_snapshot={}, tags=[], status="approved")
-    db.add(r); db.commit(); db.refresh(r)
+    db.add(r)
+    db.commit()
+    db.refresh(r)
     item = enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": r.id}, dedupe_key=f"c3-{uuid.uuid4().hex[:6]}")
     worker = Worker(pipelines=["ai"])
     _asyncio.run(worker._run_item(item.id, "ai"))
@@ -452,7 +501,7 @@ def test_c3_blocked_needs_action(live_client, live_fake_server, fake_mode, db):
     try:
         try:
             comps, report = _asyncio.run(funding_radar.scan_funded_companies({"funding_focus": ["fintech"]}, provider="sec_edgar", limit=5, db=db, user_id=user.id))
-            assert False, "should have raised blocked"
+            raise AssertionError("should have raised blocked")
         except Exception as exc:
             assert is_ai_error(exc), f"expected AI error got {exc}"
         resp = client.get("/api/funding/companies?refresh=true&include_unverified=true", headers=auth)
@@ -505,6 +554,7 @@ def test_c4_funding_honesty(live_client, live_fake_server, fake_mode, db, monkey
     async def demo_provider(ctx, wd, lim):
         now = datetime.utcnow()
         return [funding_sources.FundingEvent(name="DemoCo Alpha", stage="Seed", industry="fintech", raised_at=now, source="demo", verified=False, summary="Demo event fintech")]
+    orig_demo = funding_sources.PROVIDERS.get("demo")
     funding_sources.PROVIDERS["demo"] = demo_provider
     monkeypatch.setattr("app.core.config.settings.funding_provider", "demo")
     resp2 = client.get("/api/funding/companies?refresh=true&include_unverified=true", headers=auth)
@@ -518,9 +568,70 @@ def test_c4_funding_honesty(live_client, live_fake_server, fake_mode, db, monkey
     scan_ids = [s.id for s in scans_ok]
     mem = db.query(FundingScanCompany).filter(FundingScanCompany.scan_id.in_(scan_ids)).all()
     assert len(mem) >= 1, "expected membership rows"
-    funding_sources.PROVIDERS.pop("demo", None)
+    # Restore the real demo provider: an unconditional pop() used to remove the
+    # registry entry itself, polluting every test file that ran after this one
+    # (its "demo" lookups then became unknown_provider).
+    if orig_demo:
+        funding_sources.PROVIDERS["demo"] = orig_demo
+    else:
+        funding_sources.PROVIDERS.pop("demo", None)
     monkeypatch.setattr("app.core.config.settings.funding_provider", "sec_edgar")
     monkeypatch.setattr("app.core.config.settings.allow_synthetic_funding_data", False)
+
+
+# ---------------------------------------------------------------------------
+# C4b funding honesty via the web-search path (v2.2.6)
+# ---------------------------------------------------------------------------
+def test_c4b_search_path_bypasses_edgar(live_client, live_fake_server, fake_mode, db, monkeypatch):
+    """C4 variant: a configured search engine replaces the blocked EDGAR path.
+
+    With RESPECT_ROBOTS_TXT=true (the default) the direct efts.sec.gov fetch
+    fails with PermissionError; with FUNDING_SEARCH_PROVIDER=stub the scan runs
+    through the search API instead — scan_status=ok, zero requests to
+    efts.sec.gov, history rows persisted with provider_errors {}.
+    """
+    fake_mode("ok")
+    client = live_client
+    auth, user = _make_pro_user(client, db, f"c4b-{uuid.uuid4().hex[:6]}@example.com")
+    from app.services import funding_search
+    monkeypatch.setattr("app.core.config.settings.funding_search_provider", "stub")
+    assert funding_search.search_configured() is True
+
+    # Any outbound request through the shared client is a contract violation:
+    # the stub search is hermetic, so a scan of the search path must make none.
+    outbound: List[str] = []
+
+    async def forbidden(method, url, **kwargs):
+        outbound.append(str(url))
+        raise AssertionError(f"no outbound request may be made on the search path: {url}")
+
+    monkeypatch.setattr("app.services.http.request", forbidden)
+
+    resp = client.get("/api/funding/companies?refresh=true&include_unverified=true", headers=auth)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("scan_status") == "ok", body
+    companies = body.get("companies") or []
+    assert companies, "the stub search corpus must surface companies"
+    assert all(c["source"] == "search" for c in companies)
+    assert all(c["verified"] is False for c in companies), "stub rows stay labelled unverified"
+    assert all("efts.sec.gov" not in (c.get("url") or "") for c in companies)
+    assert body["last_report"]["providers"] == ["search"]
+    assert body["last_report"]["counts"] == {"search": 3}
+    assert not (body["last_report"].get("errors") or {})
+    assert outbound == [], f"zero requests to efts.sec.gov expected, saw {outbound}"
+
+    from app.models.models import FundingScan, FundingScanCompany
+    scans = db.query(FundingScan).filter(FundingScan.user_id == user.id,
+                                         FundingScan.status == "ok").all()
+    assert scans, "expected ok scan row"
+    mem = db.query(FundingScanCompany).filter(
+        FundingScanCompany.scan_id.in_([s.id for s in scans])).all()
+    assert len(mem) >= 1, "expected membership rows"
+
+    # The search block on /api/funding/providers reflects the configuration.
+    prov = client.get("/api/funding/providers", headers=auth).json()
+    assert prov["search"] == {"provider": "stub", "configured": True, "hint": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -534,9 +645,9 @@ def test_c5_discovery_top_slice(live_client, live_fake_server, fake_mode, db, mo
     assert resp.status_code == 200, resp.text
     monkeypatch.setattr("app.core.config.settings.include_demo_pool", True)
     LiveFakeHandler.call_log = []
+    from app.models.models import Job
     from app.services.job_queue import enqueue
     from app.worker import Worker
-    from app.models.models import Job
     item = enqueue(db, user_id=user_pro.id, pipeline="discovery", payload={"keywords": [], "freshness_hours": 168, "limit": 30, "live_enabled": False, "sources": [], "board_tokens": []}, dedupe_key=f"c5-disc-{uuid.uuid4().hex[:6]}")
     worker = Worker(pipelines=["discovery"])
     asyncio.run(worker._run_item(item.id, "discovery"))
@@ -601,9 +712,9 @@ def test_c6_why_empty(live_client, live_fake_server, fake_mode, db, monkeypatch)
     auth, user = _make_pro_user(client, db, f"c6-{uuid.uuid4().hex[:6]}@example.com")
     monkeypatch.setattr("app.core.config.settings.live_scraping_enabled", False)
     monkeypatch.setattr("app.core.config.settings.include_demo_pool", False)
+    from app.services import sources as src_reg
     from app.services.job_queue import enqueue
     from app.worker import Worker
-    from app.services import sources as src_reg
     item = enqueue(db, user_id=user.id, pipeline="discovery", payload={"keywords": ["python"], "freshness_hours": 24, "limit": 10, "live_enabled": True, "sources": [], "board_tokens": []}, dedupe_key=f"c6-{uuid.uuid4().hex[:6]}")
     worker = Worker(pipelines=["discovery"])
     asyncio.run(worker._run_item(item.id, "discovery"))
@@ -619,7 +730,7 @@ def test_c6_why_empty(live_client, live_fake_server, fake_mode, db, monkeypatch)
     monkeypatch.setattr("app.core.config.settings.live_scraping_enabled", True)
     async def fake_fetch(keywords, limit=40, since_hours=168, sources=None, board_tokens=None):
         requested = sources if sources is not None else ["greenhouse"]
-        return [], {"requested": requested, "ok": {}, "errors": {s: "network down" for s in requested}, "total": 0}
+        return [], {"requested": requested, "ok": {}, "errors": dict.fromkeys(requested, "network down"), "total": 0}
     monkeypatch.setattr(src_reg, "fetch_all", fake_fetch)
     item2 = enqueue(db, user_id=user.id, pipeline="discovery", payload={"keywords": ["python"], "freshness_hours": 24, "limit": 10, "live_enabled": True, "sources": ["greenhouse", "lever"], "board_tokens": []}, dedupe_key=f"c6-2-{uuid.uuid4().hex[:6]}")
     asyncio.run(worker._run_item(item2.id, "discovery"))
@@ -659,7 +770,7 @@ def test_c7_auto_mode(live_client, live_fake_server, fake_mode, db, monkeypatch)
     from app.services.auto_scheduler import AutoScheduler
     scheduler = AutoScheduler(interval_seconds=10)
     result = asyncio.run(scheduler.sweep())
-    from app.models.models import ScheduledRun, PipelineJob
+    from app.models.models import PipelineJob, ScheduledRun
     runs = db.query(ScheduledRun).filter(ScheduledRun.user_id == user_pro.id).all()
     assert len(runs) >= 1, f"expected scheduled_runs row got {runs}"
     q_items = db.query(PipelineJob).filter(PipelineJob.user_id == user_pro.id, PipelineJob.pipeline.in_(["discovery", "funding", "application"])).all()

@@ -265,6 +265,8 @@ def stub_ai_response(workflow: str, prompt: str) -> Dict[str, Any]:
     if workflow == "company_intel":
         return {"summary": "stub", "industry": "fintech", "size": "small", "tech_stack": ["python"]}
     if workflow == "funding_scan":
+        if "funding-extract-v1" in (prompt or ""):
+            return _stub_funding_extract(prompt)
         return _stub_funding_scan(prompt)
     return {"ok": True}
 
@@ -300,6 +302,70 @@ def _stub_funding_scan(prompt: str) -> Dict[str, Any]:
             "rank": index,
             "why": (f"{stage} round{f' in {industry}' if industry else ''} — the event's own "
                     f"fields match the recorded focus."),
+        })
+    return {"companies": companies}
+
+
+def _stub_company_name(title: str) -> str:
+    """Company name from a headline like ``"VectorLoom AI raises $12M Series A"``.
+
+    Deterministic and deliberately simple: the part of the title before the
+    round verb, capped at four words. Every name it produces is a substring of
+    the title, so the extraction guardrail (name must be grounded in the cited
+    result's text) accepts it — the stand-in obeys the product's own rules.
+    """
+    import re as _re
+
+    text = " ".join(str(title or "").split())
+    cut = _re.split(r"\s+(?:raises|raised|secures|secured|announces|announced|closes|closed)\b",
+                    text, maxsplit=1, flags=_re.IGNORECASE)[0]
+    return " ".join(cut.split()[:4]).strip(" ,-–—:;.")
+
+
+def _stub_funding_extract(prompt: str) -> Dict[str, Any]:
+    """A contract-compliant extraction from the search results in the prompt.
+
+    Mirrors ``_stub_funding_scan`` for the v2.2.6 search path: one company per
+    cited result, ``source_index`` always in range, and the name taken from the
+    result's own title so the grounding check accepts it. Stage/amount come
+    from the title text when present (the same fields a real model would
+    parse); the date is left to the cited row's ``published_at``.
+    """
+    import json as _json
+    import re as _re
+
+    results: Any = []
+    match = _re.search(r"Search results:\s*(\[.*\])\s*\nReturn JSON only", prompt or "", _re.DOTALL)
+    if match:
+        try:
+            results = _json.loads(match.group(1))
+        except ValueError:
+            results = []
+    companies: list = []
+    for index, row in enumerate(results if isinstance(results, list) else []):
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "")
+        name = _stub_company_name(title)
+        if not name:
+            continue
+        stage_match = _re.search(r"\b(Series [ABCD]|Seed)\b", title, _re.IGNORECASE)
+        amount_match = _re.search(r"\$([\d.,]+)\s*(B|M|K)?\b", title)
+        raised_usd = None
+        if amount_match:
+            try:
+                value = float(amount_match.group(1).replace(",", ""))
+                unit = (amount_match.group(2) or "M").upper()
+                raised_usd = value * {"B": 1e9, "M": 1e6, "K": 1e3}[unit]
+            except (ValueError, KeyError):
+                raised_usd = None
+        companies.append({
+            "name": name,
+            "source_index": index,
+            "stage": stage_match.group(1).title() if stage_match else "Undisclosed",
+            "raised_usd": raised_usd,
+            "raised_at": None,
+            "industry": "",
         })
     return {"companies": companies}
 
@@ -390,8 +456,10 @@ def _scripted_answer(prompt_text: str) -> Any:
     pipeline exactly like the stub would — only the wire path is real.
     """
     lowered = (prompt_text or "").lower()
-    # Checked first: the funding prompt carries the contract marker, and no other
-    # workflow's detector may claim it (its event text can contain any word).
+    # Checked first: the funding prompts carry contract markers, and no other
+    # workflow's detector may claim them (their event text can contain any word).
+    if "funding-extract-v1" in lowered:
+        return stub_ai_response("funding_scan", prompt_text)  # extraction shares the workflow
     if "funding-scan-v2" in lowered:
         return stub_ai_response("funding_scan", prompt_text)
     if "extract a complete, structured profile" in lowered:
