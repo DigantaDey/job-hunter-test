@@ -115,9 +115,11 @@ Full checklist: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 **Discovery** — keyword context is mined from your resume + preferences (optionally by AI), then
 each enabled source is queried concurrently. Every posting is normalised to one shape, deduplicated
-(`source:external_id`, falling back to `company:title`), scored (AI or calibrated heuristic),
-classified by company size and persisted with its source, salary and remote flags. Sources that
-need a key report *why* they are unavailable instead of silently returning nothing.
+(`source:external_id`, falling back to `company:title`), scored — a deterministic pre-rank for all
+of them, plus the guardrailed AI verdict for the top 12 on Pro (a free-tier run makes no AI calls
+and stays on the labelled estimate; every row carries its `score_source` and the run reports
+`ai_rescore`) — classified by company size and persisted with its source, salary and remote flags.
+Sources that need a key report *why* they are unavailable instead of silently returning nothing.
 
 **Applications** — a job's apply flow detects the portal (Greenhouse/Lever/Workday/custom), detects
 required fields from the real HTML, maps them from your profile, and either:

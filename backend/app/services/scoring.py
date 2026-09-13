@@ -496,10 +496,23 @@ async def score_job(
     * ``pending``     — AI unreachable; carries the full diagnosis to show the user;
     * ``preliminary`` — deterministic pre-rank, only when the caller opts in
       (bulk discovery, where scoring 200 postings with the model is not viable);
-    * ``insufficient_data`` — nothing to score.
+    * ``insufficient_data`` — nothing to score, so the model was never asked.
     """
     try:
         detail = await ai_score_detailed(profile, jd, db=db, user_id=user_id, persona=persona)
+        if str(detail.get("source") or "") == "insufficient_data":
+            # (v2.2.3) Nothing to score — an empty job description (every source
+            # adapter defaults a missing one to "") or a profile with no text in
+            # it. ``ai_score_detailed`` answers from the deterministic breakdown
+            # *without calling the model*, so this is not an AI verdict and must
+            # not be labelled one: the label drives the UI badge, a batch run's
+            # ``ai_rescore.scored`` count and the auto-notification's
+            # keyword-overlap caveat, none of which may claim a verdict the model
+            # never gave. ``insufficient_data`` is the provenance this function
+            # has always documented for the case, and the one the free tier's
+            # ``preliminary_score_detailed`` already returns for it.
+            return {"score": float(detail["score"]), "reason": str(detail["reason"]),
+                    "score_source": "insufficient_data", "detail": detail, "error": None}
         return {"score": float(detail["score"]), "reason": f"AI: {detail['reason']}",
                 "score_source": "ai", "detail": detail, "error": None}
     except AIUnavailableError as exc:
