@@ -440,9 +440,9 @@ class FundingCompany(Base):
     the prune window runs on (see :func:`funding_radar.prune_funding_db`).
 
     ``meta`` carries the provider's own payload (filing URL, amount, and — when
-    a provider really reports them — ``open_positions``). Nothing here is
-    inferred: v2.1.2 removed the never-set ``has_open_positions`` flag that let
-    the API claim a company was hiring when no code path could ever know.
+    a provider really reports them — ``open_positions``).
+    ``has_open_positions`` is kept fresh in both directions (v2.2.5): at scan
+    persist time and at discovery completion, via the shared matcher.
     """
 
     __tablename__ = "funding_companies"
@@ -467,6 +467,51 @@ class FundingCompany(Base):
     #: Most recent scan that still returned it — the prune clock.
     last_seen_at = Column(DateTime, default=utcnow)
     meta = Column(JSON, default=dict)
+    #: v2.2.5 linkage — does this user have ≥1 live job whose company
+    #: normalizes to this name (via company_normalize.normalize_company_name).
+    has_open_positions = Column(Boolean, default=False, nullable=False)
+
+
+class FundingScan(Base):
+    """One funding scan for one user — the history the radar renders.
+
+    v2.2.5: the radar persisted only the union (FundingCompany rows) and nothing
+    per-scan, so the page could show only "what's on the radar now", not "what
+    each scan found, and what changed". Every completed scan (ok or
+    scan_failed) writes one row here, plus membership rows in
+    funding_scan_companies that record exactly what that scan returned, ranked.
+    """
+
+    __tablename__ = "funding_scans"
+    __table_args__ = (
+        Index("ix_funding_scans_user_scanned", "user_id", "scanned_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    scanned_at = Column(DateTime, default=utcnow, nullable=False)
+    status = Column(String(20), default="ok", nullable=False)  # ok | scan_failed
+    provider_errors = Column(JSON, default=dict)
+    events_seen = Column(Integer, default=0, nullable=False)
+    companies_found = Column(Integer, default=0, nullable=False)
+    meta = Column(JSON, default=dict)
+
+
+class FundingScanCompany(Base):
+    """Membership: which companies a particular funding scan returned."""
+
+    __tablename__ = "funding_scan_companies"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "company_id", name="uq_scan_company"),
+        Index("ix_funding_scan_companies_scan", "scan_id"),
+        Index("ix_funding_scan_companies_company", "company_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    scan_id = Column(Integer, ForeignKey("funding_scans.id", ondelete="CASCADE"), nullable=False)
+    company_id = Column(Integer, ForeignKey("funding_companies.id", ondelete="CASCADE"), nullable=False)
+    rank = Column(Integer, nullable=False)
+    why = Column(Text, default="")
 
 
 class AuditLog(Base):

@@ -764,7 +764,10 @@ def test_last_report_records_the_successful_scan(client, auth, db, monkeypatch):
     company = body["companies"][0]
     assert company["why"] == "Seed fintech round in payments."
     assert company["rank"] == 1
-    assert "has_open_positions" not in company          # the dead flag left the contract
+    # v2.2.5 re-introduces has_open_positions as a live linkage flag (kept fresh both directions)
+    assert "has_open_positions" in company
+    assert isinstance(company["has_open_positions"], bool)
+    assert company["has_open_positions"] is False  # no job for this company yet
     assert company["open_positions"] == []
     assert company["raised_at_estimated"] is False
 
@@ -1039,11 +1042,15 @@ def test_migration_upgrades_a_real_2_1_1_database(tmp_path):
 
     con = sqlite3.connect(db)
     columns = [row[1] for row in con.execute("PRAGMA table_info(funding_companies)")]
-    assert "has_open_positions" not in columns, "the dead flag must leave the schema"
+    # v2.2.5 re-adds has_open_positions as a live linkage flag kept fresh both directions
+    assert "has_open_positions" in columns, "v2.2.5 re-introduces has_open_positions"
     assert "last_seen_at" in columns
     indexes = {row[0] for row in con.execute(
         "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='funding_companies'")}
     assert "ix_funding_user_seen" in indexes, "prune needs the (user_id, last_seen_at) index"
+    # v2.2.5 history tables
+    assert "funding_scans" in [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")], "funding_scans history table"
+    assert "funding_scan_companies" in [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")], "funding_scan_companies membership"
 
     rows = {(row[0], row[1]): row for row in con.execute(
         "SELECT name, user_id, discovered_at, last_seen_at, meta FROM funding_companies")}

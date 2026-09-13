@@ -4,6 +4,16 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.5] — 2026-09-13
+
+### Added
+- **Funding radar history** — `funding_scans` + `funding_scan_companies` tables persist every scan (`ok` / `scan_failed`) with `provider_errors`, `events_seen`, `companies_found`, `meta`; diff `new`/`lost` via membership sets; `GET /api/funding/history?limit=5` capped at 30; retention 30 scans/user; UI “Recent scans” with snap scroll on mobile and collapse.
+- **Funding ↔ jobs linkage** — shared `normalize_company_name` exact match (punct/suffix stripping ≤200 chars); `FundingCompany.has_open_positions` kept fresh both directions (funding sync and discovery persist); `GET /api/jobs` adds `funding` field + `?company=` exact normalized filter; UI chips both directions (funding chip on jobs, company chip on funding → jobs).
+- **E2E live drill suite** — in-process `ThreadingHTTPServer` fake OpenAI on `127.0.0.1:0` with modes `ok`/`fail500`/`fail401` (401 on **both** `/models` and `/chat/completions`), exact JSON contracts per workflow, call log (`workflow`+timestamp), marker `live_drill`; session hermetic fixture (tmp SQLite, `INCLUDE_DEMO_POOL=true`, `AI_*` pointed at fake, watchdog interval small, Worker thread) + 7 drills C1-C7 <60s each exercising pause→watchdog→drain, attempt accounting, blocked, funding honesty, discovery top-12, `why_empty`, auto-mode.
+
+### Changed
+- **Mobile pass** — viewports ≤768 px: no horizontal scroll at 360/390, chips `flex-wrap`, single-column cards `grid-cols-1`, banner stacking `flex-col` on `sm`, funding history snap/collapse, tap targets `min-h/w ≥44px`, no hover-only interactions (all hover affordances have `focus`/`active`/`click` equivalents).
+
 ## [2.2.4] — 2026-09-13
 
 **Discovery: an empty board says why it is empty.** In a live environment without

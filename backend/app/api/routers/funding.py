@@ -16,7 +16,7 @@ import hashlib
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request
 
 from app.api.deps import CurrentUser, DbSession, search_context
 from app.core import audit
@@ -58,6 +58,13 @@ def providers():
             "synthetic_allowed": settings.allow_synthetic_funding_data}
 
 
+@router.get("/history")
+def funding_history(user: CurrentUser, db: DbSession, limit: int = Query(5, ge=1, le=30)):
+    lim = min(30, max(1, int(limit or 5)))
+    scans = funding_radar.get_funding_history(db, int(user.id), limit=lim)
+    return {"scans": scans, "limit": lim}
+
+
 def _days_ago(moment) -> Optional[int]:
     if not moment:
         return None
@@ -91,6 +98,7 @@ def _company_payload(row: FundingCompany) -> Dict[str, Any]:
                             "url": str(p.get("url") or "")[:500]} for p in positions[:5]],
         "discovered_at": row.discovered_at,
         "last_seen_at": row.last_seen_at,
+        "has_open_positions": bool(getattr(row, "has_open_positions", False)),
         "url": meta.get("url", ""),
     }
 
@@ -160,6 +168,10 @@ async def list_companies(
                 # Nothing was fetched — do not prune a radar during an outage.
                 companies = []
             report = funding_radar.store_scan_report(db, int(user.id), report)
+            try:
+                funding_radar.persist_funding_scan(db, int(user.id), report, companies)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("funding history persist failed for user %s: %s", user.id, exc)
             audit.audit(db, "funding.scan" if report.get("scan_status") == SCAN_OK else "funding.scan_failed",
                         user=user, target=provider,
                         detail={"found": len(companies), "scan_status": report.get("scan_status"),

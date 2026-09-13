@@ -65,8 +65,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import inc
-from app.models.models import FundingCompany
+from app.models.models import FundingCompany, FundingScan, FundingScanCompany, Job
 from app.services import funding_sources
+from app.services.company_normalize import normalize_company_name as normalize_link_name
 from app.services.funding_sources import (
     STAGES,
     FundingEvent,
@@ -282,6 +283,11 @@ def sync_funding_db(db: Session, user_id: int, companies: List[Dict[str, Any]],
         row.last_seen_at = now
         row.meta = meta
     db.commit()
+    # v2.2.5 linkage — keep has_open_positions fresh via the shared matcher.
+    try:
+        refresh_funding_has_open_positions(db, user_id)
+    except Exception as exc:  # noqa: BLE001 - sync is best-effort
+        log.warning("has_open_positions sync failed for user %s: %s", user_id, exc)
     pruned = prune_funding_db(db, user_id, window_days)
     inc("jobhunter_funding_sync_total", added=added, updated=updated, pruned=pruned)
     return {"added": added, "updated": updated, "pruned": pruned}
@@ -304,6 +310,182 @@ def prune_funding_db(db: Session, user_id: int, window_days: int) -> int:
         db.commit()
         inc("jobhunter_funding_pruned_total", value=int(deleted))
     return int(deleted or 0)
+
+
+def refresh_funding_has_open_positions(db: Session, user_id: int) -> int:
+    """Keep FundingCompany.has_open_positions fresh via the shared matcher.
+
+    Exact match on the shared normalized name only — no fuzzy, no substring.
+    Called from sync_funding_db and from discovery persistence (both directions).
+    """
+    rows = db.query(FundingCompany).filter(FundingCompany.user_id == int(user_id)).all()
+    if not rows:
+        return 0
+    jobs = db.query(Job).filter(Job.user_id == int(user_id)).all()
+    job_norms = {normalize_link_name(j.company) for j in jobs if str(j.company or "").strip()}
+    job_norms.discard("")
+    changed = 0
+    for fc in rows:
+        norm = normalize_link_name(fc.name)
+        should = bool(norm and norm in job_norms)
+        if bool(fc.has_open_positions) != should:
+            fc.has_open_positions = should
+            changed += 1
+    if changed:
+        db.commit()
+    return changed
+
+
+def _prune_funding_scans(db: Session, user_id: int, keep: int = 30) -> int:
+    """Retention: keep 30 newest scans per user."""
+    rows = (
+        db.query(FundingScan.id)
+        .filter(FundingScan.user_id == int(user_id))
+        .order_by(FundingScan.scanned_at.desc(), FundingScan.id.desc())
+        .all()
+    )
+    ids = [r[0] for r in rows]
+    if len(ids) <= keep:
+        return 0
+    to_delete = ids[keep:]
+    db.query(FundingScanCompany).filter(FundingScanCompany.scan_id.in_(to_delete)).delete(synchronize_session=False)
+    deleted = db.query(FundingScan).filter(FundingScan.id.in_(to_delete)).delete(synchronize_session=False)
+    db.commit()
+    return int(deleted or 0)
+
+
+def persist_funding_scan(
+    db: Session, user_id: int, report: Dict[str, Any] | None, companies: List[Dict[str, Any]] | None
+):
+    """Persist one funding scan and its membership (v2.2.5 history).
+
+    Called for every completed scan (ok or scan_failed) — the history records
+    what *this* scan returned, not the union. Handles retention (30 newest).
+    """
+    report = dict(report or {})
+    companies = list(companies or [])
+    status = str(report.get("scan_status") or SCAN_OK)
+    if status not in (SCAN_OK, SCAN_FAILED):
+        if status in (SCAN_PAUSED, SCAN_BLOCKED):
+            return None
+        status = SCAN_FAILED if status else SCAN_OK
+    events_seen = int(report.get("scanned") or report.get("fetched") or report.get("total") or 0)
+    companies_found = int(report.get("returned") if report.get("returned") is not None else len(companies))
+    provider_errors = report.get("errors") or report.get("provider_errors") or {}
+    if not isinstance(provider_errors, dict):
+        provider_errors = {"error": str(provider_errors)[:300]}
+    now = datetime.utcnow()
+    scan = FundingScan(
+        user_id=int(user_id),
+        scanned_at=now,
+        status=status,
+        provider_errors=dict(provider_errors),
+        events_seen=events_seen,
+        companies_found=companies_found,
+        meta=dict(report),
+    )
+    db.add(scan)
+    db.flush()
+    if companies:
+        existing: Dict[str, FundingCompany] = {}
+        link_lookup: Dict[str, FundingCompany] = {}
+        for row in db.query(FundingCompany).filter(FundingCompany.user_id == int(user_id)).all():
+            fk = funding_sources.normalize_company_name(row.name)
+            if fk and fk not in existing:
+                existing[fk] = row
+            lk = normalize_link_name(row.name)
+            if lk and lk not in link_lookup:
+                link_lookup[lk] = row
+        for idx, comp in enumerate(companies):
+            name = str(comp.get("name") or "").strip()
+            if not name:
+                continue
+            fk = funding_sources.normalize_company_name(name)
+            row = existing.get(fk)
+            if row is None:
+                lk = normalize_link_name(name)
+                row = link_lookup.get(lk) if lk else None
+            if row is None:
+                continue
+            rank = int(comp.get("rank") or (idx + 1))
+            why = str(comp.get("why") or "")[:500]
+            db.add(FundingScanCompany(scan_id=scan.id, company_id=row.id, rank=rank, why=why))
+    db.commit()
+    db.refresh(scan)
+    _prune_funding_scans(db, int(user_id))
+    return scan
+
+
+def get_funding_history(db: Session, user_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+    """Recent funding scans with diff new/lost (v2.2.5)."""
+    lim = min(30, max(1, int(limit or 5)))
+    scans: List[FundingScan] = (
+        db.query(FundingScan)
+        .filter(FundingScan.user_id == int(user_id))
+        .order_by(FundingScan.scanned_at.desc(), FundingScan.id.desc())
+        .limit(lim)
+        .all()
+    )
+    if not scans:
+        return []
+    scan_ids = [s.id for s in scans]
+    memberships: List[FundingScanCompany] = (
+        db.query(FundingScanCompany).filter(FundingScanCompany.scan_id.in_(scan_ids)).all()
+    )
+    from collections import defaultdict
+    mem_by_scan: Dict[int, List[FundingScanCompany]] = defaultdict(list)
+    company_ids: set[int] = set()
+    for m in memberships:
+        mem_by_scan[m.scan_id].append(m)
+        company_ids.add(int(m.company_id))
+    comps: Dict[int, FundingCompany] = {}
+    if company_ids:
+        for c in db.query(FundingCompany).filter(FundingCompany.id.in_(company_ids)).all():
+            comps[int(c.id)] = c
+    sets: Dict[int, set[int]] = {sid: {int(m.company_id) for m in mem_by_scan.get(sid, [])} for sid in scan_ids}
+    result: List[Dict[str, Any]] = []
+    for idx, scan in enumerate(scans):
+        cur_set = sets.get(scan.id, set())
+        prev_set = sets.get(scans[idx + 1].id, set()) if idx + 1 < len(scans) else set()
+        new_ids = sorted(cur_set - prev_set)
+        lost_ids = sorted(prev_set - cur_set)
+        members = sorted(mem_by_scan.get(scan.id, []), key=lambda m: int(m.rank))
+        company_list: List[Dict[str, Any]] = []
+        for m in members:
+            c = comps.get(int(m.company_id))
+            if not c:
+                continue
+            company_list.append(
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "stage": c.stage,
+                    "rank": int(m.rank),
+                    "why": m.why or "",
+                    "verified": bool(c.verified),
+                    "source": c.source,
+                }
+            )
+        result.append(
+            {
+                "id": scan.id,
+                "scanned_at": scan.scanned_at.isoformat() if scan.scanned_at else None,
+                "status": scan.status,
+                "provider_errors": scan.provider_errors or {},
+                "events_seen": int(scan.events_seen or 0),
+                "companies_found": int(scan.companies_found or 0),
+                "companies": company_list,
+                "new_count": len(new_ids),
+                "lost_count": len(lost_ids),
+                "new_company_ids": new_ids,
+                "lost_company_ids": lost_ids,
+                "new_ids": new_ids,
+                "lost_ids": lost_ids,
+                "diff": {"new": new_ids, "lost": lost_ids, "new_count": len(new_ids), "lost_count": len(lost_ids)},
+                "meta": scan.meta or {},
+            }
+        )
+    return result
 
 
 def funding_needs_refresh(db: Session, user_id: int,
@@ -407,6 +589,9 @@ __all__ = [
     "SCAN_FAILED",
     "SCAN_PAUSED",
     "SCAN_BLOCKED",
+    "persist_funding_scan",
+    "get_funding_history",
+    "refresh_funding_has_open_positions",
     "SCAN_STATES",
     "REASON_NO_MATCHING_EVENTS",
     "REASON_NO_EVENTS",

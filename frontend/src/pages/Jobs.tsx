@@ -24,7 +24,7 @@ function SourceBadge({ source }: { source?: string }) {
 
 export default function Jobs(){
   const [jobs, setJobs] = useState<any[]>([])
-  const [filter, setFilter] = useState({status:'', source:'', q:''})
+  const [filter, setFilter] = useState({status:'', source:'', q:'', company:'', funding:''})
   const [selected, setSelected] = useState<any>(null)
   const [intelligence, setIntelligence] = useState<any>(null)
   const [companyIntel, setCompanyIntel] = useState<any>(null)
@@ -54,9 +54,12 @@ export default function Jobs(){
     if(filter.status) p.status=filter.status
     if(filter.source) p.source=filter.source
     if(filter.q) p.q=filter.q
+    if(filter.company) p.company=filter.company
+    if(filter.funding) p.funding=filter.funding
     client.get('/api/jobs',{params:p}).then(r=>setJobs(r.data))
   }
-  useEffect(()=>{ load() },[filter.status, filter.source])
+  useEffect(()=>{ const sp=new URLSearchParams(window.location.search); const c=sp.get('company')||''; const f=sp.get('funding')||''; if(c||f) setFilter(s=>({...s, company:c, funding:f})); },[])
+  useEffect(()=>{ load() },[filter.status, filter.source, filter.company, filter.funding])
   useEffect(()=>{
     const id=setTimeout(load, 400)
     return ()=>clearTimeout(id)
@@ -122,7 +125,7 @@ export default function Jobs(){
       <div className="flex flex-wrap gap-3 items-center justify-between">
         <h1 className="text-xl font-semibold tracking-tight flex items-center gap-2"><Building2 className="w-5 h-5"/> Job discovery — with intelligence</h1>
         <div className="flex gap-2">
-          <button onClick={discover} disabled={discoverBusy} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50">
+          <button onClick={discover} disabled={discoverBusy} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50 min-h-[44px]">
             {discoverBusy ? <Loader2 className="w-4 h-4 animate-spin"/> : <Search className="w-4 h-4"/>} Discover jobs
           </button>
         </div>
@@ -130,9 +133,10 @@ export default function Jobs(){
       {discoverMsg && <div className="text-xs mono p-2 rounded-lg bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300">Keywords: {discoverMsg}</div>}
       {outage && <AIOutageBanner outage={outage} what="no tailored resume was created" onDismiss={()=>setOutage(null)} />}
 
-      <div className="card p-3 flex flex-wrap gap-2 items-center">
+      <div className="card p-3 flex flex-col sm:flex-row flex-wrap gap-2 items-start sm:items-center chips-wrap">
         <div className="flex items-center gap-2 text-xs mono text-zinc-500"><Filter className="w-3.5 h-3.5"/> Filter:</div>
-        <select value={filter.status} onChange={e=>setFilter({...filter, status:e.target.value})} className="text-sm border rounded-full px-3 py-1.5 bg-white dark:bg-zinc-900 dark:border-zinc-700">
+        <div className="flex flex-wrap gap-2 chips-wrap w-full sm:w-auto">
+        <select value={filter.status} onChange={e=>setFilter({...filter, status:e.target.value})} className="text-sm border rounded-full px-3 py-2 bg-white dark:bg-zinc-900 dark:border-zinc-700 min-h-[44px]">
           <option value="">All status</option>
           <option value="discovered">Discovered</option>
           <option value="queued">Queued</option>
@@ -141,7 +145,7 @@ export default function Jobs(){
           <option value="applied">Applied</option>
           <option value="failed">Failed</option>
         </select>
-        <select value={filter.source} onChange={e=>setFilter({...filter, source:e.target.value})} className="text-sm border rounded-full px-3 py-1.5 bg-white dark:bg-zinc-900 dark:border-zinc-700">
+        <select value={filter.source} onChange={e=>setFilter({...filter, source:e.target.value})} className="text-sm border rounded-full px-3 py-2 bg-white dark:bg-zinc-900 dark:border-zinc-700 min-h-[44px]">
           <option value="">All sources</option>
           <option value="greenhouse">Greenhouse</option>
           <option value="lever">Lever</option>
@@ -150,13 +154,20 @@ export default function Jobs(){
           <option value="workday">Workday</option>
           <option value="smartrecruiters">SmartRecruiters</option>
         </select>
+        {filter.company && (
+          <button onClick={()=>setFilter({...filter, company:''})} className="text-xs px-3 py-2 rounded-full bg-blue-600 text-white mono inline-flex items-center gap-1 min-h-[44px]" aria-label="Clear company filter">🏢 {filter.company} ×</button>
+        )}
+        {filter.funding && (
+          <button onClick={()=>setFilter({...filter, funding:''})} className="text-xs px-3 py-2 rounded-full bg-violet-600 text-white mono inline-flex items-center gap-1 min-h-[44px]" aria-label="Clear funding filter">💰 funded ×</button>
+        )}
+        </div>
         <div className="relative ml-auto w-full sm:w-64">
           <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400"/>
-          <input value={filter.q} onChange={e=>setFilter({...filter,q:e.target.value})} placeholder="Search title, company…" className="w-full pl-9 pr-3 py-1.5 rounded-full border text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/>
+          <input value={filter.q} onChange={e=>setFilter({...filter,q:e.target.value})} placeholder="Search title, company…" className="w-full pl-9 pr-3 py-2 rounded-full border text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700 min-h-[44px]"/>
         </div>
       </div>
 
-      <div className="grid lg:grid-cols-[1.1fr_0.9fr] gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-4">
         <div className="card overflow-hidden">
           <div className="p-3 border-b dark:border-zinc-800 flex items-center justify-between">
             <span className="text-sm font-medium mono">{jobs.length} jobs</span>
@@ -165,12 +176,12 @@ export default function Jobs(){
           <div className="max-h-[75vh] overflow-auto divide-y dark:divide-zinc-800">
             {jobs.length===0 ? <EmptyBoardBanner lastRun={lastRunLoading ? undefined : lastRun} busy={discoverBusy} onDiscover={discover}/> :
               jobs.map(j=> (
-              <button key={j.id} onClick={()=>selectJob(j.id)} className={`w-full text-left p-4 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 flex gap-3 ${selected?.id===j.id ? 'bg-blue-50 dark:bg-blue-950/30' : ''}`}>
+              <button key={j.id} onClick={()=>selectJob(j.id)} className={`w-full text-left p-4 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 focus:bg-blue-50 flex gap-3 min-h-[44px] ${selected?.id===j.id ? 'bg-blue-50 dark:bg-blue-950/30' : ''}`}>
                 <div className="w-10 h-10 rounded-xl bg-zinc-900 dark:bg-zinc-800 text-white flex items-center justify-center text-xs font-bold shrink-0">{j.company.slice(0,2).toUpperCase()}</div>
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium flex items-center gap-2 truncate">{j.title} <span className="text-[11px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 mono">{j.source}</span></div>
-                  <div className="text-xs text-zinc-500 truncate">{j.company} • {j.location} • <span className="mono">{j.company_size}</span></div>
-                  <div className="text-xs mono text-zinc-500 mt-1 line-clamp-1">{j.url}</div>
+                  <div className="text-sm font-medium flex items-center gap-2 truncate">{j.title} <span className="text-[11px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 mono">{j.source}</span> {j.funding && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 border border-violet-200 mono">💰 funded</span>}</div>
+                  <div className="text-xs text-zinc-500 truncate flex flex-wrap gap-1">{j.company} • {j.location} • <span className="mono">{j.company_size}</span> {j.has_open_positions && <span className="text-[10px] px-1 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-700 mono">open roles</span>}</div>
+                  <div className="text-xs mono text-zinc-500 mt-1 line-clamp-1 break-all">{j.url}</div>
                 </div>
                 <div className="shrink-0 flex flex-col items-end gap-1">
                   <span className={`text-[11px] px-2 py-1 rounded-full mono border ${j.score>=75?'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950 dark:border-emerald-800 dark:text-emerald-300': j.score>=60?'bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-950':'bg-zinc-100 dark:bg-zinc-800'}`}>{j.score} score</span>

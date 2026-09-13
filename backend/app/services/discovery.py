@@ -360,6 +360,13 @@ async def discover_for_user(
             message=f"Discovered from {job.source} (score {job.score:.0f})",
             meta={"source": job.source, "posted_at": job.posted_at.isoformat() if job.posted_at else None},
         )
+    # v2.2.5 linkage — keep has_open_positions fresh via the shared matcher both directions.
+    if created:
+        try:
+            from app.services.funding_radar import refresh_funding_has_open_positions
+            refresh_funding_has_open_positions(db, int(user.id))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("has_open_positions sync (discovery) failed for user %s: %s", user.id, exc)
 
     # ---------------- form structure for the best new jobs ----------------
     form_tasks = [detect_form_structure(job.url, job.source, use_ai=False) for job in created[:FORM_DETECT_TOP]]
