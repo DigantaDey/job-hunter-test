@@ -4,6 +4,224 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.1.2] — 2026-09-13
+
+The funding radar is now **actually AI-driven**: one grounded model pass decides
+relevance, order and the reason — and when that pass cannot happen, the radar
+says so instead of handing over a list the model never saw.
+
+### Changed
+
+- **AI ranking is a hard dependency** (`funding_radar.scan_funded_companies`).
+  The `if await _ai_enabled():` gate is deleted along with the function: with no
+  key (or an invalid/undecryptable one) the scan raises the standard v2.1
+  blocked outcome — `reason="no_api_key"` / `"stored_key_unreadable"`,
+  `state="blocked_needs_action"`, `status="ai_blocked"`, fix pointing at
+  Settings → AI API — **before any provider is called**, so a blocked radar
+  burns no outbound requests and no quota. A transient outage
+  (timeout/unreachable/429/5xx/breaker) stays pausable: `GET /funding/companies?refresh=true`
+  answers `503 status="ai_paused"` + `retry_after_hint`, and the queued
+  `handle_funding` item takes the existing worker path (transient → `pause()`,
+  blocked → `fail(retryable=False)`). `worker.py` and `job_queue.py` are
+  untouched. **No code path returns events the model never ranked.**
+- **One grounded AI pass replaces the keyword filter.**
+  `funding_sources.ai_rank_events` does relevance-filter + rank + explain in a
+  single `chat_completion("funding_scan", …)` (contract marker
+  `funding-scan-v2`) and returns `(RankedEvent(event, matched, rank, why),
+  diagnostics)`. `why` is one sentence citing the event's own fields, cleaned of
+  markdown/HTML and capped; it is stored per row (`meta.why`) and returned by
+  `GET /api/funding/companies`. Grounding guardrails: a company name that is not
+  in the fetched event set rejects the whole answer (`guardrail_failed` →
+  blocked/dead, never a fallback to the unranked list); stage, amount, date,
+  source and URL always come from the event, and a model that restates them
+  differently is counted in `diagnostics.field_conflicts` and ignored. Corporate
+  suffixes are tolerated ("ACME INC." → "Acme") only when the match is
+  unambiguous. Events the model did not mention come back `matched=False` —
+  silence is never a match. `_matched_keywords` survives **as a provenance label
+  only**.
+- **The model judges a wider pool than the radar shows**: `min(60, limit × 2)`
+  events are fetched and ranked, `limit` are returned — "the freshest 18 were
+  all irrelevant" no longer hides a matching event from a week earlier.
+- **Provider robustness.** Each provider runs under
+  `FUNDING_PROVIDER_TIMEOUT_SECONDS` (new, default `20`) and is retried **once**
+  on a transport error — never on a 4xx (`FundingProviderError.status`) and never
+  on an SSRF-guard/robots verdict. Providers no longer swallow their own
+  failures into an empty list: a non-200, a non-JSON body or a broken import
+  export becomes `report.errors[provider_id]`, and a provider that was requested
+  but is not configured is reported as `not_configured` (choosing `crunchbase`
+  without a licence no longer looks like "nobody raised money").
+- **`GET /api/funding/companies` gained `scan_status` + `last_report`**
+  (`ok | scan_failed | paused | blocked`) plus `reason` and `scanned`. When
+  **every** requested provider fails, the scan returns `[]` with
+  `scan_status="scan_failed"`, `reason="provider_errors"` and the per-provider
+  errors; partial success stays `ok` with `last_report.errors` visible. The most
+  recent report is persisted per user as the settings row
+  **`funding.last_report`** (chosen over `FundingCompany.meta` because the
+  report matters most exactly when the scan produced no rows to hang it on; it
+  is server-written and deliberately not in `WRITABLE_KEYS`, so a client cannot
+  forge a green scan) and is stored by both the sync endpoint and the queued
+  handler. An explicit `?refresh=true` that cannot be ranked answers with the
+  outage shape; an *implicit* refresh (page open) records it and still returns
+  the rows already on the radar, so a broken key never blanks the page.
+- **Empty-but-legit is a first-class result**: zero relevant matches after the
+  AI pass → `scan_status="ok"`, `companies: []`,
+  `reason="no_matching_events"`, and the UI reads "Scanned N events, none
+  matched your focus." Unrelated events are never returned to fill the gap.
+- **Dedupe and stability.** `sync_funding_db` looks rows up by
+  `normalize_company_name` (strip + collapse whitespace + casefold) and stores
+  the provider's canonical casing from first sight, so "Stripe" then "stripe" is
+  one row. `discovered_at` is now **first seen** and is never rewritten; the new
+  `funding_companies.last_seen_at` is the prune clock
+  (`COALESCE(last_seen_at, discovered_at)`), prune is a single bulk `DELETE`
+  served by the new `ix_funding_user_seen` index, and it only runs after a scan
+  that succeeded — an outage no longer prunes the radar. Provider `meta` is
+  merged rather than replaced (filing URL/CIK survive), while `open_positions`
+  is deliberately never carried over from an older scan. Migration
+  `b2c3d4e5f6a7` adds and back-fills `last_seen_at`, drops
+  `has_open_positions` and collapses the duplicates the old upsert already wrote
+  (keeping the earliest row of each group); prune semantics are documented in
+  the `funding_radar` module docstring.
+- **`process_company` is decided by provider facts, not a dead flag.** If the
+  row's `meta` carries real `open_positions` (a newly documented field of the
+  `imported` / `crunchbase` / `tracxn` providers) it tracks that posting as a
+  Job labelled `positions_source="provider"`; otherwise it goes straight to the
+  founder-outreach draft, which still requires approval. Such a Job is scored
+  `score_source="funding_context"` /
+  `"Scored from funding context — no job description available"` and its stored
+  description contains only factual funding-event and provider-posting text.
+- **`funding_needs_refresh` uses `FUNDING_REFRESH_HOURS`** (new, default `12`),
+  measured from the last scan attempt (`last_report.attempted_at`, falling back
+  to the newest row for pre-2.1.2 data) instead of being derived from the
+  freshness window.
+- **Frontend (`Funding.tsx`)** renders the new contract: the shared
+  `AIOutageBanner` for a 503, plus persisted-state cards for `scan_failed`
+  (per-provider errors + "Try the scan again"), `paused` ("will resume
+  automatically — no unranked list is shown as a result") and `blocked` (link to
+  Settings → AI API), a "Partial scan" notice when only some providers failed,
+  the AI's `why` on every card, provider provenance (`SEC EDGAR Form D • verified`
+  / `synthetic demo data`), real provider-reported openings, and honest empty
+  states ("Scanned 34 events, none matched your focus.").
+
+### Removed
+
+- **`FundingCompany.has_open_positions`** — a flag no code path ever set to
+  `True`. It left the API response and the UI (where it rendered an "open
+  roles" / "no opening" badge and chose the button copy), and the branch it
+  gated is now driven by `meta.open_positions`.
+- **The fabricated job posting.** `process_company` no longer builds
+  `"Open Role at {name}"` described as `"{name} recently raised {stage}…"` and
+  no longer feeds that invented text to the AI job scorer
+  (`"Engineering role at …"` is gone from the backend).
+- **The keyword-string relevance filter** (and its inverted form) from
+  `scan_funded_companies`; `keyword_score` is no longer imported there.
+
+### Fixed
+
+Also fixed, all inside the funding-radar surface:
+
+- **Inverted relevance filter** — `relevant = [...]; if relevant: events = relevant`
+  meant zero keyword matches *disabled* the filter and returned every unrelated
+  event. Relevance is now the model's verdict and "nothing matched" returns
+  nothing (`reason="no_matching_events"`).
+- **Silent unranked list** — no AI key used to return the raw provider list as
+  though it were the product.
+- **All-providers-failed looked like an empty radar** — every provider exception
+  was swallowed into `report["errors"]` that nothing surfaced; now it is
+  `scan_status="scan_failed"` in the response, in `funding.last_report` and in a
+  `funding.scan_failed` audit row.
+- **Fabricated JD scoring** (above) — a guessed context was scored as if it were
+  a real posting.
+- **Duplicate rows and churn** — case-sensitive upsert, `discovered_at`
+  rewritten on every sync, prune as a per-row `DELETE` loop, one `SELECT` per
+  company in `sync_funding_db` (N+1).
+- **Refresh interval math** — `window_days * 12 hours` coupled two unrelated
+  knobs (a 45-day window meant ~22.5 days between scans).
+- **`POST /funding/{name}/process` used `ilike(company_name)`** — `%`/`_` in the
+  path acted as wildcards over that user's rows, and the lookup ignored the
+  casing normalisation the sync applies. It now matches on the same normalised
+  key (with an exact-match fast path).
+- **Funding Jobs shared the default `dedupe_key` (`""`)** — two provider
+  postings for one user would have collided on `UNIQUE(user_id, dedupe_key)`;
+  each now gets `funding_radar:<sha256(company|title)[:24]>`.
+- **`include_unverified` was only honoured on the non-refresh branch**, so the
+  same page hid unverified rows right after a scan and showed them on the next
+  open.
+- **An event with no parseable date was stamped `raised_at = utcnow()`** and
+  rendered as "raised today"; it is now flagged `raised_at_estimated` in `meta`,
+  exposed on the row, and the UI shows "date not disclosed".
+- **`refreshed_at` was `max(discovered_at)` of the *filtered* rows** (and with
+  first-seen semantics would have gone stale); it now comes from the persisted
+  report's `scanned_at`.
+- **Misleading copy**: the radar header claimed a fixed "fresh ≤45d" (now the
+  user's actual `window_days`), "AI-matched to your profile" is now true, and
+  the per-card button no longer promises "Apply usual flow" for a company nobody
+  knows is hiring ("Track the open role" only when the provider reported one,
+  otherwise "Draft founder outreach"). `Jobs.tsx` learnt a `funding_context`
+  score badge so the new provenance does not render as a raw snake_case string.
+
+### Added
+
+- **New env knobs:** `FUNDING_PROVIDER_TIMEOUT_SECONDS` (default `20`) and
+  `FUNDING_REFRESH_HOURS` (default `12`), both documented in `.env.example`.
+- **Imported-dataset schema:** `careers_url` and `open_positions`
+  (`[{title, url, location, summary}]`, a JSON list, or
+  `"title::url|title::url"`) — the only route by which real hiring data reaches
+  the apply flow.
+- **New metrics:** `jobhunter_funding_provider_errors_total{provider}`,
+  `jobhunter_funding_provider_retries_total{provider}`,
+  `jobhunter_funding_pruned_total`, `jobhunter_funding_ai_matched_total`.
+- **New audit action:** `funding.scan_failed` (with `scan_status`, `reason` and
+  the per-provider errors).
+- **Response fields:** `scan_status`, `last_report`, `reason`, `scanned` on
+  `GET /api/funding/companies`; `why`, `rank`, `open_positions`,
+  `raised_at_estimated`, `last_seen_at` per company; `positions_source`,
+  `score_source` and `url_source` on the `process` result.
+- **Tests** (`backend/tests/test_funding_radar.py`, extended in place): blocked
+  refresh with no key (no companies, no rows, no provider calls) and the
+  implicit-refresh variant that keeps the last good rows; queued blocked and
+  guardrail outcomes dead-lettering without persisting a fabricated row; one
+  grounded pass proving the unranked path is gone; 5 events → exactly the 2 the
+  model matched (and 0 → `no_matching_events`); stage/amount taken from the
+  event while the model's conflicting values are recorded; suffix-tolerant
+  grounding; unusable/empty model answers surfaced; provider timeout + single
+  retry, 4xx with no retry, all-failed `scan_failed` (response + report + audit),
+  partial failure staying `ok` with visible errors, requested-but-unconfigured
+  providers; `"Stripe"`/`"  stripe "` → one row with merged meta; first-seen
+  preservation, prune on `last_seen_at`, undated rows never pruned;
+  `funding_needs_refresh` interval math; persisted `last_report`;
+  `include_unverified` on refresh; `process_company` drafting a founder email
+  when no positions are reported, tracking exactly one honest Job per company
+  (idempotent, with its own `dedupe_key`) and the wildcard-free lookup; and the
+  alembic upgrade of a populated 2.1.1 database (back-fill, duplicate collapse,
+  `DROP COLUMN`, index, reversible downgrade). Wire-level (`real_ai`, scripted
+  provider): sync outage → pausable 503 with `retry_after_hint`, and queued
+  outage → `paused` → drained → `done` with rows and exactly two wire attempts.
+
+### Found but not fixed
+
+Out of scope for this change (recorded with file:line rather than touched):
+
+- `backend/app/services/user_settings.py:388` — `grouped()` dumps every stored
+  settings row into its category bucket (only `ai_workflows` is skipped), so
+  server-written rows now surface in `GET /api/settings`: `funding.last_report`
+  is readable by the client and simply ignored by the Settings UI. There is no
+  read-side allowlist to hide internal/report rows.
+- `backend/app/services/user_settings.py:228` — `set_setting()` never consults
+  `WRITABLE_KEYS`; the allowlist is enforced only by `apply_updates()` on the
+  router path. "A client cannot forge a green scan" therefore rests on the
+  router, not on the storage layer, and any future internal caller can write a
+  key the API contract calls read-only.
+- `backend/app/models/models.py:204` + `backend/app/schemas/schemas.py:63` —
+  `jobs.score_source` is a free-form `String(20)` / `Optional[str]` with the
+  allowed set documented only in a comment. Nothing validates it, so a new or
+  misspelled source renders as a raw snake_case chip in
+  `frontend/src/pages/Jobs.tsx` until someone adds a badge entry (this PR had to
+  add one for `funding_context`).
+- `backend/app/core/metrics.py:110,131,170,201` — pre-existing mypy errors
+  (`int(<object>)` overloads, `__exit__ -> bool`, `object` not iterable) that
+  are part of the 772-error baseline. Left alone; the A/B for this PR adds zero
+  new errors and removes eight.
+
 ## [2.1.1] — 2026-09-13
 
 The pipeline queue is now **self-healing**, and the "AI queue" is a **real

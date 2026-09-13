@@ -58,8 +58,10 @@ class JobDetail(JobOut):
     company_info: Dict[str, Any]
     extra: Dict[str, Any]
     applied_with_resume_id: Optional[int] = None
-    # ai | preliminary | pending | rejected | insufficient_data — the list must
-    # never present a keyword-overlap estimate as a model verdict.
+    # ai | preliminary | pending | rejected | insufficient_data | funding_context
+    # — the list must never present a keyword-overlap estimate as a model
+    # verdict, and ``funding_context`` (a tracked funding-radar posting with no
+    # job description to score) is labelled as such rather than scored.
     score_source: Optional[str] = None
     score_detail: Optional[dict] = None
     persona_id: Optional[int] = None

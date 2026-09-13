@@ -265,8 +265,43 @@ def stub_ai_response(workflow: str, prompt: str) -> Dict[str, Any]:
     if workflow == "company_intel":
         return {"summary": "stub", "industry": "fintech", "size": "small", "tech_stack": ["python"]}
     if workflow == "funding_scan":
-        return {"ranked": []}
+        return _stub_funding_scan(prompt)
     return {"ok": True}
+
+
+def _stub_funding_scan(prompt: str) -> Dict[str, Any]:
+    """A contract-compliant relevance verdict for the funding radar.
+
+    The stand-in must obey the same rules a real model is given: only company
+    names that appear in the prompt (the grounding guardrail rejects anything
+    else), and a one-sentence ``why`` that cites the event's own fields. Marking
+    everything relevant keeps the deterministic suites on the AI path — the
+    funding tests script their own verdicts when they need a specific split.
+    """
+    import json as _json
+    import re as _re
+
+    events: Any = []
+    match = _re.search(r"Funding events:\s*(\[.*?\])\s*\nReturn JSON only", prompt or "", _re.DOTALL)
+    if match:
+        try:
+            events = _json.loads(match.group(1))
+        except ValueError:
+            events = []
+    companies: list = []
+    for index, event in enumerate(events if isinstance(events, list) else [], start=1):
+        if not isinstance(event, dict) or not event.get("name"):
+            continue
+        stage = str(event.get("stage") or "Undisclosed")
+        industry = str(event.get("industry") or "").strip()
+        companies.append({
+            "name": event["name"],
+            "matched": True,
+            "rank": index,
+            "why": (f"{stage} round{f' in {industry}' if industry else ''} — the event's own "
+                    f"fields match the recorded focus."),
+        })
+    return {"companies": companies}
 
 
 # --------------------------------------------------------------------------- #
@@ -355,6 +390,10 @@ def _scripted_answer(prompt_text: str) -> Any:
     pipeline exactly like the stub would — only the wire path is real.
     """
     lowered = (prompt_text or "").lower()
+    # Checked first: the funding prompt carries the contract marker, and no other
+    # workflow's detector may claim it (its event text can contain any word).
+    if "funding-scan-v2" in lowered:
+        return stub_ai_response("funding_scan", prompt_text)
     if "extract a complete, structured profile" in lowered:
         return stub_ai_response("parse", prompt_text)
     if "score how well this candidate" in lowered:
@@ -375,8 +414,6 @@ def _scripted_answer(prompt_text: str) -> Any:
         return stub_ai_response("interview", prompt_text)
     if "form" in lowered and "json" in lowered:
         return stub_ai_response("form_detect", prompt_text)
-    if "rank" in lowered and "funding" in lowered:
-        return stub_ai_response("funding_scan", prompt_text)
     return {"ok": True}
 
 

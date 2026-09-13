@@ -14,6 +14,7 @@ function SourceBadge({ source }: { source?: string }) {
     pending: { label: 'AI pending', cls: 'bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300', title: 'The model could not be reached' },
     rejected: { label: 'rejected', cls: 'bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300', title: 'The model answered but failed the accuracy guardrail' },
     insufficient_data: { label: 'no data', cls: 'bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300', title: 'Not enough text to score' },
+    funding_context: { label: 'funding context', cls: 'bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-300', title: 'Tracked from a funding provider’s own open-position data — there is no job description to score' },
   }
   const info = map[source || ''] || { label: source || 'unknown', cls: 'bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300', title: '' }
   return <span title={info.title} className={`text-[10px] px-2 py-0.5 rounded-full font-normal mono ${info.cls}`}>{info.label}</span>
