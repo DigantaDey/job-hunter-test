@@ -4,6 +4,63 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.1.1] — 2026-09-13
+
+The pipeline queue is now **self-healing**, and the "AI queue" is a **real
+durable queue** — the same `pipeline_jobs` table every other pipeline uses,
+not an in-memory deque that nothing ever wrote to.
+
+### Added
+
+- **`ai_queue` block in `GET /api/pipelines/stats`** — the stats endpoint the
+  Queues page polls. `queue_preview` lists up to 3 in-flight items with
+  `pipeline='ai'` (ordered by priority, then arrival) as
+  `{id, workflow, priority, status}` with `status` in
+  `queued|processing|paused|needs_input`; `processing_now` is the claimed
+  item or `null`. Built exclusively from real `pipeline_jobs` rows —
+  `tag_resume` work from resume uploads/generation is now visible in the
+  "Next in AI queue" panel, and the panel drains to `[]`/`null` when the
+  queue is empty.
+- **`workers.tasks` in `GET /api/ops/status`** —
+  `{"expected": N, "alive": N, "last_crash": {"task", "at", "error"} | null}`
+  so operators can see a slot that died and is in respawn backoff.
+- **New env knobs:** `WORKER_RESPAWN_BACKOFF_SECONDS` (default `0.25`) and
+  `WORKER_CRASH_BACKOFF_MAX_SECONDS` (default `2.0`) — the supervisor's
+  capped respawn backoff.
+- **New metrics:** `jobhunter_worker_item_errors_total{pipeline=...}` (an item
+  whose execution escaped `_run_item`) and
+  `jobhunter_worker_task_crashes_total{task=...}` (a worker slot/watchdog that
+  died and was respawned).
+- **Tests:** loop liveness across a crashing handler, supervisor respawn of a
+  dead slot (crash metric + logged traceback), the `ai_queue` stats contract
+  (queued → processing → done, empty case, priority ordering), and restart
+  durability (a row forced to `processing` with an expired lease is returned
+  by `recover_stalled` at startup and completed by the worker — no
+  duplicates).
+
+### Changed
+
+- **Self-healing worker slots.** A single bad item can no longer kill a worker
+  slot: `_loop` wraps `_run_item`, so any exception is logged with the item
+  id, counted (`jobhunter_worker_item_errors_total`) and the loop keeps
+  serving — the row is left to the existing lease machinery
+  (`recover_stalled` re-queues it once the lease expires). A new **supervisor**
+  in `Worker.start()` watches every child task (claim loops + AI watchdog): a
+  task that dies is logged once with its traceback, counted
+  (`jobhunter_worker_task_crashes_total{task=...}`) and respawned with a small,
+  capped backoff; `stop()` suppresses respawns. The old
+  `gather(return_exceptions=True)` — which swallowed every crash silently and
+  quietly drained capacity to zero — is gone.
+
+### Removed
+
+- **The in-memory `app/services/ai_pipeline.py`.** It was an in-process
+  priority deque that (a) no code path ever enqueued into, (b) marked
+  executor-less items "done" after a fixed sleep with a fabricated result,
+  and (c) evaporated on restart. The AI pipeline is the durable
+  `pipeline_jobs` queue — real rows only. The `ai_pipeline.running` hooks in
+  `worker.py`/`main.py` went with it.
+
 ## [2.1.0] — 2026-09-13
 
 AI becomes a **hard dependency with an honest pause/resume contract**, and the

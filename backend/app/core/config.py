@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.1.0"
+    version: str = "2.1.1"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -168,6 +168,12 @@ class Settings(BaseSettings):
     worker_lease_seconds: int = 120
     worker_max_attempts: int = 3
     worker_max_runtime_seconds: int = 900
+    #: Supervisor: base delay before respawning a worker slot that died with
+    #: an exception (seconds). Doubled per consecutive crash of that slot,
+    #: capped by ``worker_crash_backoff_max_seconds``. 0 = respawn immediately.
+    worker_respawn_backoff_seconds: float = 0.25
+    #: Supervisor: upper bound on the respawn backoff above.
+    worker_crash_backoff_max_seconds: float = 2.0
     #: Optional stable name for this worker process (defaults to host:pid).
     worker_id: str = ""
 

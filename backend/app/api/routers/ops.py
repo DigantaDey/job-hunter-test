@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 
@@ -250,18 +250,31 @@ def dashboard(user: CurrentUser, db: DbSession):
 
 
 @router.get("/ops/status")
-async def ops_status(user: CurrentUser, db: DbSession):
+async def ops_status(request: Request, user: CurrentUser, db: DbSession):
     """Single pane of glass for the Ops page."""
     db_health = check_db_health()
     ai = await ping(timeout=3, db=db, user_id=user.id) if is_configured(db=db, user_id=user.id) else {"online": False, "reason": "no_api_key"}
     depths = queue_stats(db, user_id=None)
+    worker = getattr(request.app.state, "worker", None)
+    worker_tasks: Dict[str, Any] = (
+        worker.task_health()
+        if worker is not None
+        else {"expected": settings.worker_concurrency, "alive": 0, "last_crash": None}
+    )
     return {
         "version": settings.version,
         "environment": settings.environment,
         "database": {**db_health, "migrations": migration_state()},
         "ai": {**ai, "breakers": breaker_snapshot(), "rate_limiter": rate_limiter.stats()},
         "queues": depths,
-        "workers": {"in_api": settings.run_worker_in_api, "concurrency": settings.worker_concurrency, "lease_seconds": settings.worker_lease_seconds},
+        "workers": {
+            "in_api": settings.run_worker_in_api,
+            "concurrency": settings.worker_concurrency,
+            "lease_seconds": settings.worker_lease_seconds,
+            # Self-healing slots (v2.1.1): expected vs actually alive, plus
+            # the most recent crash the supervisor logged, if any.
+            "tasks": worker_tasks,
+        },
         "metrics": metrics.snapshot(),
     }
 

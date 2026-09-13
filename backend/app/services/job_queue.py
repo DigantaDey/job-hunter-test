@@ -357,6 +357,54 @@ def queue_stats(db: Session, *, user_id: Optional[int] = None) -> Dict[str, Dict
     return stats
 
 
+#: In-flight states that belong in the AI queue view. The AI pipeline IS the
+#: durable queue (v2.1.1 removed the old in-process priority deque) — real
+#: rows only, nothing synthesized.
+AI_QUEUE_STATUSES = ("queued", "processing", "paused", "needs_input")
+
+
+def ai_queue_view(db: Session, *, user_id: Optional[int] = None) -> Dict[str, Any]:
+    """Live view of the AI queue, built exclusively from durable rows.
+
+    The Queues page renders two panels from this block:
+
+    * ``queue_preview`` — up to 3 in-flight items with ``pipeline='ai'``,
+      ordered by priority then arrival (``queued|processing|paused|needs_input``);
+    * ``processing_now`` — the claimed item, if any (``null`` when idle).
+    """
+
+    def workflow_of(row: PipelineJob) -> str:
+        payload: Dict[str, Any] = row.payload if isinstance(row.payload, dict) else {}
+        task = payload.get("task")
+        return str(task) if task else "ai"
+
+    def ai_rows():
+        query = db.query(PipelineJob).filter(PipelineJob.pipeline == "ai")
+        if user_id is not None:
+            query = query.filter(PipelineJob.user_id == user_id)
+        return query
+
+    preview = [
+        {"id": row.id, "workflow": workflow_of(row), "priority": row.priority, "status": row.status}
+        for row in ai_rows()
+        .filter(PipelineJob.status.in_(list(AI_QUEUE_STATUSES)))
+        .order_by(PipelineJob.priority.asc(), PipelineJob.created_at.asc(), PipelineJob.id.asc())
+        .limit(3)
+    ]
+    processing = (
+        ai_rows()
+        .filter(PipelineJob.status == "processing")
+        .order_by(PipelineJob.id.asc())
+        .first()
+    )
+    return {
+        "queue_preview": preview,
+        "processing_now": (
+            {"id": processing.id, "workflow": workflow_of(processing)} if processing else None
+        ),
+    }
+
+
 def recent_items(db: Session, *, user_id: int, pipeline: Optional[str] = None, status: Optional[str] = None,
                  limit: int = 50) -> List[PipelineJob]:
     query = db.query(PipelineJob).filter(PipelineJob.user_id == user_id)
