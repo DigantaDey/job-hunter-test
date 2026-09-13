@@ -2,6 +2,27 @@ import { useEffect, useState } from 'react'
 import client, { apiError } from '../api/client'
 import { Layers, Bot, Search, Send, Clock, CheckCircle, AlertTriangle, Pause, Play, ArrowRight, UserCheck } from 'lucide-react'
 
+/** The seven statuses `queue_stats` returns per pipeline — rendered in this order. */
+const STATUS_CHIPS = ['queued','processing','done','failed','needs_input','paused','dead'] as const
+type ChipStatus = typeof STATUS_CHIPS[number]
+
+const STATUS_HINTS: Record<ChipStatus, string> = {
+  queued: 'Waiting for a worker slot',
+  processing: 'Running right now',
+  done: 'Finished',
+  failed: 'Failed — will be retried until max attempts, then marked dead',
+  needs_input: 'Waiting on your answers (User Input Needed queue below)',
+  paused: 'AI outage — parked, resumes automatically when the provider is back',
+  dead: 'Exhausted its retries — nothing more will happen without a manual retry',
+}
+
+/** Amber for a non-zero paused count, grey for dead, neutral otherwise. */
+function chipTone(k: ChipStatus, n: number): string {
+  if (k==='paused' && n>0) return 'bg-amber-50 dark:bg-amber-950 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-800'
+  if (k==='dead') return 'bg-zinc-200/70 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-200'
+  return 'bg-zinc-50 dark:bg-zinc-800 text-zinc-500'
+}
+
 export default function Queues(){
   const [stats, setStats] = useState<any>(null)
   const [jobs, setJobs] = useState<any[]>([])
@@ -35,7 +56,7 @@ export default function Queues(){
   const pipelines = [
     {id:'discovery', label:'Job Discovery', icon: Search, desc:'Scrapes via keywords + freshness, AI finds structure', color:'bg-blue-600'},
     {id:'application', label:'Job Application', icon: Send, desc:'Autofill profile, credential, submit; external redirect handled', color:'bg-violet-600'},
-    {id:'ai', label:'AI API', icon: Bot, desc:'Prioritized FIFO, rate-limited, green/red online dot', color:'bg-emerald-600'},
+    {id:'ai', label:'AI API', icon: Bot, desc:'Durable priority queue, rate-limited; pauses on an AI outage and resumes on its own', color:'bg-emerald-600'},
   ]
 
   return (
@@ -49,20 +70,36 @@ export default function Queues(){
               <div className={`w-9 h-9 rounded-xl ${p.color} text-white flex items-center justify-center`}><p.icon className="w-5 h-5"/></div>
               <div><div className="text-sm font-medium">{p.label}</div><div className="text-xs text-zinc-500 leading-tight">{p.desc}</div></div>
             </div>
-            <div className="grid grid-cols-5 gap-1 mt-3 text-center">
-              {['queued','processing','done','failed','needs_input'].map(k=> (
-                <div key={k} className="bg-zinc-50 dark:bg-zinc-800 rounded-lg py-2">
-                  <div className="text-sm font-semibold mono">{stats[p.id]?.[k] ?? stats[p.id]?.ai_queue?.[k] ?? 0}</div>
-                  <div className="text-[10px] mono uppercase text-zinc-500">{k}</div>
-                </div>
-              ))}
+            {/* All seven durable statuses the backend counts (queue_stats). `paused`
+                is the v2.1 headline state: an AI outage parks the work and it
+                resumes on its own; `dead` is a job that exhausted its retries. */}
+            <div className="grid grid-cols-4 sm:grid-cols-7 gap-1 mt-3 text-center">
+              {STATUS_CHIPS.map(k=> {
+                const n = stats[p.id]?.[k] ?? 0
+                return (
+                  <div key={k} className={`rounded-lg py-2 ${chipTone(k, n)}`} title={STATUS_HINTS[k]}>
+                    <div className="text-sm font-semibold mono">{n}</div>
+                    <div className="text-[10px] mono uppercase leading-tight">{k.replace('_',' ')}</div>
+                  </div>
+                )
+              })}
             </div>
-            {p.id==='ai' && stats.ai?.ai_queue?.queue_preview && (
+            {/* GET /api/pipelines/stats puts `ai_queue` and `rate_limiter` at the
+                TOP level of the payload (siblings of the per-pipeline buckets),
+                not under `stats.ai` — reading `stats.ai.ai_queue` meant this
+                panel never rendered. */}
+            {p.id==='ai' && stats.ai_queue && (
               <div className="mt-3 text-xs mono bg-zinc-50 dark:bg-zinc-800 rounded-xl p-2">
                 <div className="font-medium flex items-center gap-1"><Clock className="w-3 h-3"/> Next in AI queue</div>
-                {(stats.ai.ai_queue.queue_preview as any[]).slice(0,3).map((q:any)=> <div key={q.id} className="flex justify-between text-[11px] mt-1"><span>{q.workflow} • P{q.priority}</span><span className="text-zinc-500">{q.status}</span></div>)}
-                {stats.ai.ai_queue.processing_now && <div className="mt-1 text-emerald-600 dark:text-emerald-400">Processing: {stats.ai.ai_queue.processing_now.workflow}</div>}
-                <div className="mt-2 flex gap-2 text-[11px]"><span className="px-2 py-1 rounded-full bg-white dark:bg-zinc-900 border mono">RPM {stats.rate_limiter.remaining}/{stats.rate_limiter.rpm}</span><span className="px-2 py-1 rounded-full bg-white dark:bg-zinc-900 border mono">Throttled {stats.rate_limiter.throttled}</span></div>
+                {(stats.ai_queue.queue_preview as any[] || []).length===0 && !stats.ai_queue.processing_now && <div className="text-[11px] mt-1 text-zinc-500">idle — nothing waiting</div>}
+                {(stats.ai_queue.queue_preview as any[] || []).slice(0,3).map((q:any)=> (
+                  <div key={q.id} className="flex justify-between gap-2 text-[11px] mt-1">
+                    <span>#{q.id} {q.workflow} • P{q.priority}</span>
+                    <span className={q.status==='paused'?'text-amber-700 dark:text-amber-300':'text-zinc-500'}>{q.status}{q.status==='paused'?' — resumes automatically':''}</span>
+                  </div>
+                ))}
+                {stats.ai_queue.processing_now && <div className="mt-1 text-emerald-600 dark:text-emerald-400">Processing: #{stats.ai_queue.processing_now.id} {stats.ai_queue.processing_now.workflow}</div>}
+                {stats.rate_limiter && <div className="mt-2 flex gap-2 text-[11px]"><span className="px-2 py-1 rounded-full bg-white dark:bg-zinc-900 border mono">RPM {stats.rate_limiter.remaining}/{stats.rate_limiter.rpm}</span><span className="px-2 py-1 rounded-full bg-white dark:bg-zinc-900 border mono">Throttled {stats.rate_limiter.throttled}</span></div>}
               </div>
             )}
           </div>
@@ -105,7 +142,12 @@ export default function Queues(){
                   <div className="font-medium mono text-xs mt-1 truncate">{JSON.stringify(j.payload).slice(0,120)}</div>
                   {j.error && <div className="text-xs text-red-600 dark:text-red-400 mt-1">{j.error}</div>}
                 </div>
-                <span className="text-xs mono px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 h-fit">{j.status}</span>
+                <div className="flex flex-col items-end gap-1 shrink-0">
+                  <span className={`text-xs mono px-2 py-1 rounded-full h-fit ${j.status==='paused'?'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-200': j.status==='dead'?'bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200':'bg-zinc-100 dark:bg-zinc-800'}`}>{j.status}</span>
+                  {/* v2.1: amber must never be a mystery — say what happens next. */}
+                  {j.status==='paused' && <span className="text-[11px] mono text-amber-700 dark:text-amber-300 text-right">AI outage — will resume automatically</span>}
+                  {j.status==='dead' && <span className="text-[11px] mono text-zinc-500 text-right">gave up after {j.attempts ?? j.max_attempts} attempts</span>}
+                </div>
               </div>
             ))}
         </div>

@@ -212,7 +212,9 @@ export default function Funding() {
           <Sparkles className="w-4 h-4 text-blue-600" /> Search context auto-extracted by AI
           {context?.source && (
             <span className="text-[11px] px-2 py-0.5 rounded-full bg-white dark:bg-zinc-900 border mono text-zinc-600 dark:text-zinc-300">
-              {context.source === 'ai' ? 'AI (profile + resume + context)' : context.source === 'mined' ? 'mined from your data (deterministic)' : context.source}
+              {/* The backend tags the persona merge as "ai+persona" / "mined+persona" —
+                  match on the prefix so the label never leaks the raw tag. */}
+              {context.source.startsWith('ai') ? 'AI (profile + resume + context)' : context.source.startsWith('mined') ? 'mined from your data (deterministic — nothing for the model to read yet)' : context.source}
             </span>
           )}
           {refreshedAt && <span className="text-[11px] mono text-zinc-500 ml-auto">updated {new Date(refreshedAt).toLocaleTimeString()}</span>}
@@ -304,7 +306,7 @@ export default function Funding() {
           <div className="text-xs mono mt-1 text-amber-700 dark:text-amber-300">
             {lastReport?.ai?.message || 'The AI provider could not be reached.'}
             {lastReport?.ai?.retry_after_hint ? ` Retrying in ~${Math.round(lastReport.ai.retry_after_hint)}s.` : ''}
-            {' '}No unranked list is shown as a result.
+            {' '}No unranked list is shown as a result{companies.length ? ' — the companies below are from the last successful scan' : ''}.
           </div>
         </div>
       )}
@@ -316,6 +318,7 @@ export default function Funding() {
           <div className="text-xs mono mt-1 text-red-700 dark:text-red-300">
             {lastReport?.ai?.message || 'The AI model is not available for this account.'}
             {lastReport?.ai?.fix ? <><br /><strong>Fix:</strong> {lastReport.ai.fix}</> : null}
+            {companies.length ? <><br />The companies below are from the last successful scan; nothing was deleted.</> : null}
           </div>
           <Link to="/settings#ai" className="mt-2 inline-block px-3 py-1.5 rounded-full bg-red-600 text-white text-xs mono">Open Settings → AI API</Link>
         </div>

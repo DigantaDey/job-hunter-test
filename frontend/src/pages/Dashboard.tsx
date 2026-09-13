@@ -39,18 +39,34 @@ export default function Dashboard() {
   const apps = summary.applications || {}
   const outreach = summary.outreach || {}
   const automation = summary.automation || {}
+  // The hero trio is labelled "Pipelines" but `automation.running/completed/
+  // failed` are computed from the *application* pipeline only. The same payload
+  // carries `automation.queues` (= GET /api/pipelines/stats buckets for every
+  // pipeline, incl. paused/dead), so total it here instead of relabelling.
+  const buckets: Record<string, Record<string, number>> = automation.queues || {}
+  const sumStatus = (...keys: string[]) => Object.values(buckets).reduce((n, b) => n + keys.reduce((m, k) => m + (b?.[k] ?? 0), 0), 0)
+  const hasBuckets = Object.keys(buckets).length > 0
+  const pipeRunning = hasBuckets ? sumStatus('queued', 'processing') : (automation.running ?? 0)
+  const pipeCompleted = hasBuckets ? sumStatus('done') : (automation.completed ?? 0)
+  const pipeFailed = hasBuckets ? sumStatus('failed', 'dead') : (automation.failed ?? 0)
+  const pipePaused = hasBuckets ? sumStatus('paused') : 0
   const autoNextIso: string | null = automation.next_run || null
   const autoNextMs = autoNextIso ? new Date(autoNextIso).getTime() : NaN
+  // `next_run: null` is "no next run to promise": the switch is on but blocked
+  // (`auto_mode_active` false — plan, consent, scheduler) or every workflow's run
+  // is in flight right now. Neither is rendered as a date.
   const autoModeLine = !automation.auto_mode
     ? 'off'
     : !autoNextIso || Number.isNaN(autoNextMs)
-      ? 'waiting'
+      ? (automation.auto_mode_active ? 'running now' : 'on — blocked')
       : autoNextMs <= Date.now()
         ? 'due next sweep'
         : fmtRelativeToNow(autoNextIso)
   const autoNextTitle = autoNextIso && !Number.isNaN(autoNextMs)
     ? `Next scheduled auto run no earlier than ${new Date(autoNextMs).toLocaleString([], { hour12: false })} — the sweep that starts it runs every few minutes, so it can begin a little later.`
-    : 'Auto-mode schedule, cadence and history: Settings → Auto mode'
+    : automation.auto_mode && !automation.auto_mode_active
+      ? 'Auto mode is on but not queueing right now (plan, consent or the scheduler) — the reason is in Settings → Auto mode'
+      : 'Auto-mode schedule, cadence and history: Settings → Auto mode'
 
   const statCards = [
     {label:'Discovered', value: summary.jobs?.total ?? 0, sub: `${summary.jobs?.last_24h ?? 0} last 24h`, icon: Search, color:'text-blue-600', bg:'bg-blue-50 dark:bg-blue-950'},
@@ -80,10 +96,15 @@ export default function Dashboard() {
             <div className="bg-white/10 backdrop-blur rounded-2xl p-4 border border-white/10 min-w-[280px]">
               <div className="text-xs mono text-zinc-300 flex items-center gap-2"><Activity className="w-3.5 h-3.5"/> Pipelines (FIFO) • Entitlements</div>
               <div className="grid grid-cols-3 gap-3 mt-3 text-center">
-                <div><div className="text-lg font-semibold mono">{automation.running ?? 0}</div><div className="text-[11px] mono text-zinc-400">Running</div></div>
-                <div><div className="text-lg font-semibold mono">{automation.completed ?? 0}</div><div className="text-[11px] mono text-zinc-400">Completed</div></div>
-                <div><div className="text-lg font-semibold mono">{automation.failed ?? 0}</div><div className="text-[11px] mono text-zinc-400">Failed</div></div>
+                <div><div className="text-lg font-semibold mono">{pipeRunning}</div><div className="text-[11px] mono text-zinc-400">Running</div></div>
+                <div><div className="text-lg font-semibold mono">{pipeCompleted}</div><div className="text-[11px] mono text-zinc-400">Completed</div></div>
+                <div><div className="text-lg font-semibold mono">{pipeFailed}</div><div className="text-[11px] mono text-zinc-400">Failed</div></div>
               </div>
+              {pipePaused > 0 && (
+                <Link to="/queues" className="mt-2 block text-[11px] mono text-amber-300 text-center" title="Parked by an AI outage — resumes on its own when the provider is back">
+                  {pipePaused} paused — AI outage, will resume automatically
+                </Link>
+              )}
               <div className="mt-3 space-y-2 text-[11px] mono">
                 <div className="flex justify-between"><span>AI credits</span><span>{aiUsage.credits_used ?? 0}/{aiUsage.limit ?? ent?.limits?.ai_credits_per_month ?? 50000}</span></div>
                 <div className="w-full bg-white/10 rounded-full h-1.5 overflow-hidden"><div className="bg-blue-500 h-1.5 rounded-full" style={{width: `${Math.min(100, ((aiUsage.credits_used||0)/(aiUsage.limit||50000))*100)}%`}} /></div>
@@ -158,7 +179,7 @@ export default function Dashboard() {
           <div className="card p-5">
             <h3 className="font-medium flex items-center gap-2"><ListChecks className="w-4 h-4"/> Command center</h3>
             <div className="mt-3 grid gap-2">
-              <Link to="/queues" className="p-3 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm flex items-center justify-between">Open queues <span className="text-xs mono bg-white/20 px-2 py-0.5 rounded-full">{automation.running ?? 0} running</span></Link>
+              <Link to="/queues" className="p-3 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm flex items-center justify-between">Open queues <span className="text-xs mono bg-white/20 px-2 py-0.5 rounded-full">{pipeRunning} running{pipePaused ? ` • ${pipePaused} paused` : ''}</span></Link>
               <Link to="/emails" className="p-3 rounded-xl border dark:border-zinc-800 text-sm flex items-center justify-between">Email bucket <Mail className="w-4 h-4 text-zinc-500"/><span className="text-xs mono">{outreach.sent ?? 0} sent • {outreach.pending_approval ?? 0} pending</span></Link>
               <Link to="/vault" className="p-3 rounded-xl border dark:border-zinc-800 text-sm flex items-center justify-between">Vault <Vault className="w-4 h-4 text-zinc-500"/><span className="text-xs mono">{summary.vault ?? 0} creds</span></Link>
               <Link to="/interview" className="p-3 rounded-xl border dark:border-zinc-800 text-sm flex items-center justify-between">Interview Prep <Brain className="w-4 h-4 text-zinc-500"/></Link>
