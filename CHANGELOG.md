@@ -67,6 +67,14 @@ honestly `scan_failed` on a block — never a 500, never a fake empty radar).
   rather than `scheduled_runs` (the same stale-relative-step bug the funding
   history test already documents). The rollback is now pinned to the
   revision.
+- CI lint is green again: `ruff check backend` had 15 pre-existing errors in
+  `tests/test_live_drill.py` since v2.2.5 (import order, semicolon
+  statements, `assert False`), failing the SQLite job at the lint step.
+- `test_c4_funding_honesty` no longer leaks its stand-in into the provider
+  registry: it removed the *real* `demo` provider with an unconditional
+  `PROVIDERS.pop("demo")`, so any module running after it saw
+  `unknown_provider` for demo lookups. It now restores the original entry
+  (the default suite order had masked this).
 
 ## [2.2.5] — 2026-09-13
 

@@ -12,8 +12,8 @@ import re
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List
 
 import pytest
@@ -325,6 +325,7 @@ def _make_pro_user(client: TestClient, db, email: str):
 
 def _upload_resume(client: TestClient, auth: Dict[str, str]):
     import io
+
     from reportlab.lib.pagesizes import LETTER
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.platypus import Paragraph, SimpleDocTemplate
@@ -373,7 +374,9 @@ def test_c1_outage_pause_drain_resume(live_client, live_fake_server, fake_mode, 
     if not resume:
         from app.models.models import Resume as R
         r = R(user_id=user.id, filename="t.pdf", filepath="/tmp/t.pdf", type="master", profile_snapshot={}, tags=[], status="approved")
-        db.add(r); db.commit(); db.refresh(r)
+        db.add(r)
+        db.commit()
+        db.refresh(r)
         resume = r
     item = enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id}, dedupe_key=f"c1-tag-{uuid.uuid4().hex[:4]}")
     assert item is not None
@@ -404,10 +407,12 @@ def test_c2_attempt_accounting(live_client, live_fake_server, fake_mode, db):
     client = live_client
     auth, user = _make_pro_user(client, db, f"c2-{uuid.uuid4().hex[:6]}@example.com")
     from app.models.models import PipelineJob, Resume
-    from app.services.job_queue import enqueue, claim
+    from app.services.job_queue import claim, enqueue
     from app.worker import Worker
     r = Resume(user_id=user.id, filename="c2.pdf", filepath="/tmp/c2.pdf", type="master", profile_snapshot={}, tags=[], status="approved")
-    db.add(r); db.commit(); db.refresh(r)
+    db.add(r)
+    db.commit()
+    db.refresh(r)
     item = enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": r.id}, dedupe_key=f"c2-{uuid.uuid4().hex[:6]}", max_attempts=3)
     worker = Worker(pipelines=["ai"])
     asyncio.run(worker._run_item(item.id, "ai"))
@@ -461,6 +466,7 @@ def test_c3_blocked_needs_action(live_client, live_fake_server, fake_mode, db):
     client = live_client
     auth, user = _make_pro_user(client, db, f"c3-{uuid.uuid4().hex[:6]}@example.com")
     import asyncio as _asyncio
+
     from app.services.ai_client import ai_availability
     avail = _asyncio.run(ai_availability(db=db, user_id=user.id, probe_timeout=2))
     assert avail.get("state") == "blocked_needs_action", avail
@@ -476,7 +482,9 @@ def test_c3_blocked_needs_action(live_client, live_fake_server, fake_mode, db):
     from app.services.job_queue import enqueue
     from app.worker import Worker
     r = Resume(user_id=user.id, filename="c3.pdf", filepath="/tmp/c3.pdf", type="master", profile_snapshot={}, tags=[], status="approved")
-    db.add(r); db.commit(); db.refresh(r)
+    db.add(r)
+    db.commit()
+    db.refresh(r)
     item = enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": r.id}, dedupe_key=f"c3-{uuid.uuid4().hex[:6]}")
     worker = Worker(pipelines=["ai"])
     _asyncio.run(worker._run_item(item.id, "ai"))
@@ -493,7 +501,7 @@ def test_c3_blocked_needs_action(live_client, live_fake_server, fake_mode, db):
     try:
         try:
             comps, report = _asyncio.run(funding_radar.scan_funded_companies({"funding_focus": ["fintech"]}, provider="sec_edgar", limit=5, db=db, user_id=user.id))
-            assert False, "should have raised blocked"
+            raise AssertionError("should have raised blocked")
         except Exception as exc:
             assert is_ai_error(exc), f"expected AI error got {exc}"
         resp = client.get("/api/funding/companies?refresh=true&include_unverified=true", headers=auth)
@@ -546,6 +554,7 @@ def test_c4_funding_honesty(live_client, live_fake_server, fake_mode, db, monkey
     async def demo_provider(ctx, wd, lim):
         now = datetime.utcnow()
         return [funding_sources.FundingEvent(name="DemoCo Alpha", stage="Seed", industry="fintech", raised_at=now, source="demo", verified=False, summary="Demo event fintech")]
+    orig_demo = funding_sources.PROVIDERS.get("demo")
     funding_sources.PROVIDERS["demo"] = demo_provider
     monkeypatch.setattr("app.core.config.settings.funding_provider", "demo")
     resp2 = client.get("/api/funding/companies?refresh=true&include_unverified=true", headers=auth)
@@ -559,7 +568,13 @@ def test_c4_funding_honesty(live_client, live_fake_server, fake_mode, db, monkey
     scan_ids = [s.id for s in scans_ok]
     mem = db.query(FundingScanCompany).filter(FundingScanCompany.scan_id.in_(scan_ids)).all()
     assert len(mem) >= 1, "expected membership rows"
-    funding_sources.PROVIDERS.pop("demo", None)
+    # Restore the real demo provider: an unconditional pop() used to remove the
+    # registry entry itself, polluting every test file that ran after this one
+    # (its "demo" lookups then became unknown_provider).
+    if orig_demo:
+        funding_sources.PROVIDERS["demo"] = orig_demo
+    else:
+        funding_sources.PROVIDERS.pop("demo", None)
     monkeypatch.setattr("app.core.config.settings.funding_provider", "sec_edgar")
     monkeypatch.setattr("app.core.config.settings.allow_synthetic_funding_data", False)
 
@@ -630,9 +645,9 @@ def test_c5_discovery_top_slice(live_client, live_fake_server, fake_mode, db, mo
     assert resp.status_code == 200, resp.text
     monkeypatch.setattr("app.core.config.settings.include_demo_pool", True)
     LiveFakeHandler.call_log = []
+    from app.models.models import Job
     from app.services.job_queue import enqueue
     from app.worker import Worker
-    from app.models.models import Job
     item = enqueue(db, user_id=user_pro.id, pipeline="discovery", payload={"keywords": [], "freshness_hours": 168, "limit": 30, "live_enabled": False, "sources": [], "board_tokens": []}, dedupe_key=f"c5-disc-{uuid.uuid4().hex[:6]}")
     worker = Worker(pipelines=["discovery"])
     asyncio.run(worker._run_item(item.id, "discovery"))
@@ -697,9 +712,9 @@ def test_c6_why_empty(live_client, live_fake_server, fake_mode, db, monkeypatch)
     auth, user = _make_pro_user(client, db, f"c6-{uuid.uuid4().hex[:6]}@example.com")
     monkeypatch.setattr("app.core.config.settings.live_scraping_enabled", False)
     monkeypatch.setattr("app.core.config.settings.include_demo_pool", False)
+    from app.services import sources as src_reg
     from app.services.job_queue import enqueue
     from app.worker import Worker
-    from app.services import sources as src_reg
     item = enqueue(db, user_id=user.id, pipeline="discovery", payload={"keywords": ["python"], "freshness_hours": 24, "limit": 10, "live_enabled": True, "sources": [], "board_tokens": []}, dedupe_key=f"c6-{uuid.uuid4().hex[:6]}")
     worker = Worker(pipelines=["discovery"])
     asyncio.run(worker._run_item(item.id, "discovery"))
@@ -715,7 +730,7 @@ def test_c6_why_empty(live_client, live_fake_server, fake_mode, db, monkeypatch)
     monkeypatch.setattr("app.core.config.settings.live_scraping_enabled", True)
     async def fake_fetch(keywords, limit=40, since_hours=168, sources=None, board_tokens=None):
         requested = sources if sources is not None else ["greenhouse"]
-        return [], {"requested": requested, "ok": {}, "errors": {s: "network down" for s in requested}, "total": 0}
+        return [], {"requested": requested, "ok": {}, "errors": dict.fromkeys(requested, "network down"), "total": 0}
     monkeypatch.setattr(src_reg, "fetch_all", fake_fetch)
     item2 = enqueue(db, user_id=user.id, pipeline="discovery", payload={"keywords": ["python"], "freshness_hours": 24, "limit": 10, "live_enabled": True, "sources": ["greenhouse", "lever"], "board_tokens": []}, dedupe_key=f"c6-2-{uuid.uuid4().hex[:6]}")
     asyncio.run(worker._run_item(item2.id, "discovery"))
@@ -755,7 +770,7 @@ def test_c7_auto_mode(live_client, live_fake_server, fake_mode, db, monkeypatch)
     from app.services.auto_scheduler import AutoScheduler
     scheduler = AutoScheduler(interval_seconds=10)
     result = asyncio.run(scheduler.sweep())
-    from app.models.models import ScheduledRun, PipelineJob
+    from app.models.models import PipelineJob, ScheduledRun
     runs = db.query(ScheduledRun).filter(ScheduledRun.user_id == user_pro.id).all()
     assert len(runs) >= 1, f"expected scheduled_runs row got {runs}"
     q_items = db.query(PipelineJob).filter(PipelineJob.user_id == user_pro.id, PipelineJob.pipeline.in_(["discovery", "funding", "application"])).all()
