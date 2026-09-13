@@ -14,6 +14,7 @@ from app.api.routers import (
     account,
     analytics,
     auth,
+    automation,
     billing,
     emails,
     funding,
@@ -44,5 +45,6 @@ router.include_router(analytics.router)
 router.include_router(notifications.router)
 router.include_router(interview.router)
 router.include_router(personas.router)
+router.include_router(automation.router)
 
 __all__ = ["router", "search_context"]

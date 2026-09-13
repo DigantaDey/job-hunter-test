@@ -175,10 +175,33 @@ def test_alembic_migrations_apply_to_a_fresh_database(tmp_path):
     connection = sqlite3.connect(db_path)
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for expected in ("users", "jobs", "job_events", "audit_logs", "pipeline_jobs", "email_opt_outs",
-                     "refresh_tokens", "api_keys", "alembic_version"):
+                     "refresh_tokens", "api_keys", "scheduled_runs", "alembic_version"):
         assert expected in tables
+
+    # The v2.2 auto-mode history table is described by the chain itself (not just
+    # by ``create_all``), including the columns the scheduler and the Settings
+    # card read.
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(scheduled_runs)")}
+    assert {"user_id", "workflow", "cycle_bucket", "triggered_at", "state", "queue_job_id",
+            "job_id", "reason", "meta"} <= columns, columns
 
     # Idempotent: a second upgrade is a no-op.
     again = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
                            cwd=backend, env=env, capture_output=True, text=True)
     assert again.returncode == 0, again.stderr
+    connection.close()
+
+    # And reversible: rolling the release back one step drops the table cleanly,
+    # and upgrading again rebuilds it. A migration that cannot be undone is a
+    # release that cannot be rolled back.
+    down = subprocess.run([sys.executable, "-m", "alembic", "downgrade", "-1"],
+                          cwd=backend, env=env, capture_output=True, text=True)
+    assert down.returncode == 0, down.stderr
+    connection = sqlite3.connect(db_path)
+    after_down = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    connection.close()
+    assert "scheduled_runs" not in after_down, after_down
+
+    up = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
+                        cwd=backend, env=env, capture_output=True, text=True)
+    assert up.returncode == 0, up.stderr

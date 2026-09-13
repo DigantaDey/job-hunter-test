@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import client from '../api/client'
 import { Briefcase, CheckCircle, AlertTriangle, Clock, Mail, FileText, Vault, Sparkles, TrendingUp, ArrowRight, Activity, Search, ListChecks, Zap, BarChart3, Target, Brain, DollarSign, Bell } from 'lucide-react'
 import { Link } from 'react-router-dom'
+import { fmtRelativeToNow } from '../lib/automation'
 
 export default function Dashboard() {
   const [summary, setSummary] = useState<any>(null)
@@ -38,6 +39,18 @@ export default function Dashboard() {
   const apps = summary.applications || {}
   const outreach = summary.outreach || {}
   const automation = summary.automation || {}
+  const autoNextIso: string | null = automation.next_run || null
+  const autoNextMs = autoNextIso ? new Date(autoNextIso).getTime() : NaN
+  const autoModeLine = !automation.auto_mode
+    ? 'off'
+    : !autoNextIso || Number.isNaN(autoNextMs)
+      ? 'waiting'
+      : autoNextMs <= Date.now()
+        ? 'due next sweep'
+        : fmtRelativeToNow(autoNextIso)
+  const autoNextTitle = autoNextIso && !Number.isNaN(autoNextMs)
+    ? `Next scheduled auto run no earlier than ${new Date(autoNextMs).toLocaleString([], { hour12: false })} — the sweep that starts it runs every few minutes, so it can begin a little later.`
+    : 'Auto-mode schedule, cadence and history: Settings → Auto mode'
 
   const statCards = [
     {label:'Discovered', value: summary.jobs?.total ?? 0, sub: `${summary.jobs?.last_24h ?? 0} last 24h`, icon: Search, color:'text-blue-600', bg:'bg-blue-50 dark:bg-blue-950'},
@@ -76,6 +89,16 @@ export default function Dashboard() {
                 <div className="w-full bg-white/10 rounded-full h-1.5 overflow-hidden"><div className="bg-blue-500 h-1.5 rounded-full" style={{width: `${Math.min(100, ((aiUsage.credits_used||0)/(aiUsage.limit||50000))*100)}%`}} /></div>
                 <div className="flex justify-between"><span>Outreach</span><span>{outreach.sent ?? 0}/{ent?.limits?.outreach_per_month ?? 10}</span></div>
                 <div className="flex justify-between"><span>Automation</span><span>{ent?.usage?.automation_runs_per_month?.used ?? 0}/{ent?.limits?.automation_runs_per_month ?? 5}</span></div>
+                {/* v2.2 — auto mode. Both fields come from the scheduler's own
+                    state (ops dashboard `auto_mode`/`next_run`), never recomputed
+                    here: "waiting" means switched on but blocked, or a run of that
+                    workflow is already in flight. */}
+                <div className="flex justify-between">
+                  <span>Auto mode</span>
+                  <Link to="/settings" className="underline decoration-dotted" title={autoNextTitle}>
+                    {autoModeLine}
+                  </Link>
+                </div>
               </div>
             </div>
           </div>

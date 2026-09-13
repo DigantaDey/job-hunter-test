@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.1.2"
+    version: str = "2.2.0"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -176,6 +176,14 @@ class Settings(BaseSettings):
     worker_crash_backoff_max_seconds: float = 2.0
     #: Optional stable name for this worker process (defaults to host:pid).
     worker_id: str = ""
+    #: How often the auto-mode scheduler sweeps for users whose ``auto_mode``
+    #: switch is on (seconds). Each sweep enqueues whatever is *due* under the
+    #: plan's cadence (see ``app/services/auto_scheduler.py``) — the interval
+    #: only decides how precisely a cadence boundary is hit, never how often a
+    #: workflow runs. ``0`` disables auto mode entirely (the child task is not
+    #: spawned, and nothing is ever enqueued automatically); manual runs, the
+    #: queue and the AI watchdog are unaffected.
+    auto_scheduler_interval_seconds: float = 300.0
 
     # ------------------------------------------------------------------ #
     # Defaults used when a user has not saved their own settings

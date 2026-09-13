@@ -12,6 +12,7 @@ from app.core import metrics
 from app.core.auth import require_owner
 from app.core.config import settings
 from app.core.entitlements import entitlements_snapshot
+from app.core.logging import get_logger
 from app.core.rate_limiter import rate_limiter
 from app.core.security import constant_time_equals
 from app.db import check_db_health, migration_state
@@ -29,9 +30,11 @@ from app.models.models import (
 )
 from app.schemas.schemas import ErrorLogOut
 from app.services.ai_client import breaker_snapshot, is_configured, ping
+from app.services.auto_scheduler import brief as auto_scheduler_brief
 from app.services.job_queue import queue_stats, recover_stalled
 
 router = APIRouter(tags=["ops"])
+log = get_logger("app.ops_api")
 
 
 def _users_with_key() -> List[int]:
@@ -185,6 +188,16 @@ def dashboard(user: CurrentUser, db: DbSession):
     # Entitlements
     entitlements = entitlements_snapshot(db, user.id)
 
+    # Auto mode (v2.2). Read from the scheduler's own state so the dashboard and
+    # the Settings card can never disagree about whether work is scheduled. The
+    # block is optional decoration on the front door: on a database that has not
+    # been migrated yet it reports "off" instead of blanking the dashboard.
+    try:
+        auto_mode = auto_scheduler_brief(db, int(user.id))
+    except Exception as exc:  # noqa: BLE001 - decorative, never fatal
+        log.warning("auto-mode state unavailable for user %s: %s", user.id, exc)
+        auto_mode = {"auto_mode": False, "active": False, "next_run": None, "blocking": ["state_unavailable"]}
+
     return {
         "jobs": {
             "total": total_jobs,
@@ -210,6 +223,13 @@ def dashboard(user: CurrentUser, db: DbSession):
             "failed": automation_failed,
             "needs_input": job_counts.get("needs_input", 0),
             "queues": pipeline_stats,
+            # v2.2 (additive): auto mode. ``auto_mode`` is the user's switch,
+            # ``next_run`` the earliest moment any workflow of theirs is due
+            # again (``null`` when it is off, blocked or a run is in flight) —
+            # both read from the scheduler's own state, never recomputed here.
+            "auto_mode": auto_mode["auto_mode"],
+            "auto_mode_active": auto_mode["active"],
+            "next_run": auto_mode["next_run"],
         },
         "outreach": {
             "sent": outreach_sent,
