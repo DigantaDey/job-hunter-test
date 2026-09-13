@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import client, { apiError, aiOutage, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
 import { AIOutageBanner } from '../components/AIBanner'
+import { EmptyBoardBanner } from '../components/EmptyBoardBanner'
+import { useDiscoveryLastRun } from '../hooks/useDiscoveryLastRun'
 import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader2, Wand2, CheckCircle, AlertCircle, Eye, Brain, Target, MapPin, DollarSign, GraduationCap, Zap, TrendingUp, FileText } from 'lucide-react'
 
 /**
@@ -36,6 +38,17 @@ export default function Jobs(){
   const [generateMsg, setGenerateMsg] = useState('')
   const [generatedLinks, setGeneratedLinks] = useState<any>(null)
 
+  /**
+   * The board is not filtered by a track today, so there is no persona to scope
+   * the read to — this is the slot where a persona-scoped board would put its
+   * selection. The hook forwards it as `?persona_id=`, so the verdict is about
+   * *that* track's last run rather than the newest run of any track.
+   */
+  const personaFilter: number | null = null
+  // Read only while it can be shown — an empty board is the only place the
+  // "why" belongs, and a full board must not pay for the call.
+  const { run: lastRun, loading: lastRunLoading, reload: reloadLastRun } = useDiscoveryLastRun(jobs.length === 0, personaFilter)
+
   const load = ()=>{
     const p:any={}
     if(filter.status) p.status=filter.status
@@ -67,6 +80,9 @@ export default function Jobs(){
       setDiscoverMsg(`${(data.keywords || []).slice(0, 8).join(' • ')}`)
       setTimeout(load, 2000)
       setTimeout(load, 4500)
+      // The queued run's own verdict is what the empty-board banner shows, so it
+      // is re-read once the polls above have had time to pick the jobs up.
+      setTimeout(reloadLastRun, 5000)
     }catch(e:any){ setDiscoverMsg(apiError(e)) }
     finally{ setDiscoverBusy(false)}
   }
@@ -147,7 +163,7 @@ export default function Jobs(){
             <span className="text-xs mono text-zinc-500">Intelligence → click job</span>
           </div>
           <div className="max-h-[75vh] overflow-auto divide-y dark:divide-zinc-800">
-            {jobs.length===0 ? <div className="p-8 text-center text-sm mono text-zinc-500">No jobs. Try Discover jobs — uses extracted keywords + freshness, with AI form detection.</div> :
+            {jobs.length===0 ? <EmptyBoardBanner lastRun={lastRunLoading ? undefined : lastRun} busy={discoverBusy} onDiscover={discover}/> :
               jobs.map(j=> (
               <button key={j.id} onClick={()=>selectJob(j.id)} className={`w-full text-left p-4 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 flex gap-3 ${selected?.id===j.id ? 'bg-blue-50 dark:bg-blue-950/30' : ''}`}>
                 <div className="w-10 h-10 rounded-xl bg-zinc-900 dark:bg-zinc-800 text-white flex items-center justify-center text-xs font-bold shrink-0">{j.company.slice(0,2).toUpperCase()}</div>

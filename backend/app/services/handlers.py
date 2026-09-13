@@ -9,7 +9,7 @@ code path.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -123,6 +123,36 @@ def _notify_auto_funding(db: Session, item: PipelineJob, user: User, started_at:
                 meta={"added": count})
 
 
+def _payload_sources(payload: Any, config: Dict[str, Any]) -> Optional[List[str]]:
+    """Which sources this queued run fetches: ``None`` = defaults, ``[]`` = none.
+
+    The queue payload's ``sources`` key is optional, and *absent* is not the same
+    claim as *empty*:
+
+    * absent or ``None`` — the enqueuer had no opinion (older rows, or a caller
+      that wants the user's configuration) → use ``discovery_sources_config``,
+      which itself resolves ``None`` to the enabled-by-default adapters;
+    * an explicit list, including ``[]`` — the enqueuer's choice, honoured
+      verbatim. ``[]`` means fetch nothing, which is how a run can honestly
+      report ``why_empty="no_sources_configured"``.
+
+    ``config["sources"]`` may itself be ``[]`` — the settings layer has always
+    distinguished unset from empty — and that is passed through untouched. A
+    non-list value (a hand-written payload, a corrupted row) falls back to the
+    configuration rather than to "everything", so a bad row cannot silently widen
+    a run.
+    """
+    selected = payload.get("sources") if isinstance(payload, dict) else None
+    if selected is None:
+        return list(config["sources"])
+    if isinstance(selected, str):
+        # The settings layer accepts a comma-separated string for the same key.
+        return [token.strip() for token in selected.split(",") if token.strip()]
+    if isinstance(selected, (list, tuple, set)):
+        return [str(source_id) for source_id in selected]
+    return list(config["sources"])
+
+
 async def handle_discovery(db: Session, item: PipelineJob) -> Dict[str, Any]:
     user = _user(db, item)
     if not user:
@@ -177,7 +207,13 @@ async def handle_discovery(db: Session, item: PipelineJob) -> Dict[str, Any]:
         freshness_hours=int(payload.get("freshness_hours") or settings.default_freshness_hours),
         limit=int(payload.get("limit") or 30),
         live_enabled=bool(payload.get("live_enabled", config["live_enabled"])),
-        source_ids=payload.get("sources") or config["sources"],
+        # ``None``/absent means "use the user's configuration"; an explicit ``[]``
+        # means "fetch nothing". The old ``payload.get("sources") or
+        # config["sources"]`` collapsed the two, and ``fetch_all`` collapsed them
+        # again — so a user who had deliberately saved zero sources was still
+        # fetched from every available adapter, and an empty board could never be
+        # reported as ``no_sources_configured``.
+        source_ids=_payload_sources(payload, config),
         board_tokens=payload.get("board_tokens") or config["board_tokens"],
         profile=profile_data or None,
         ai_rescore_skipped=ai_rescore_skipped,

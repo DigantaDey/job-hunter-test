@@ -175,11 +175,111 @@ def job_events(job_id: int, user: CurrentUser, db: DbSession):
 # --------------------------------------------------------------------------- #
 # Discovery
 # --------------------------------------------------------------------------- #
+#: How far back the persona filter may scan. The filter runs in Python (see
+#: :func:`discovery_last_run`), so the scan is bounded rather than open-ended —
+#: and 200 completed runs is far past anything the empty-board banner needs.
+LAST_RUN_SCAN_LIMIT = 200
+
+
+def _payload_persona(payload: Dict[str, Any]) -> Optional[int]:
+    """The track a queued run was scoped to, as an ``int`` — or ``None``.
+
+    Enqueuers write an int (``trigger_discovery``, the auto-mode scheduler), but a
+    payload assembled from a query string can carry ``"2"``, and this is the one
+    place the comparison happens — exactly the normalisation a SQL JSON subscript
+    cannot do portably. ``None`` (unscoped) never matches a filter, and a bool is
+    not an id even though Python thinks it is an int.
+    """
+    value = payload.get("persona_id")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@router.get("/jobs/discovery/last-run")
+def discovery_last_run(user: CurrentUser, db: DbSession, persona_id: Optional[int] = Query(None)):
+    """The latest *completed* discovery run for this user — why the board is empty.
+
+    An empty board used to say only "no fresh jobs", which is three different
+    situations with three different fixes (enable a source, retry after an
+    outage, widen the freshness window). This is the read side of the report
+    :func:`app.services.discovery.discover_for_user` already writes into the
+    queue item's result JSON: the classification happens once, at run time, and
+    is *never* re-derived here, so the queue row, the run's log line and this
+    response cannot disagree.
+
+    Only the summary blocks come back. The stored report also embeds the run's
+    job rows (and grows with every run), so returning it whole would put tens of
+    KB of job data on the wire for a one-line banner.
+
+    A run is "the last run" only when it actually finished *and* left a report:
+    ``pipeline == "discovery"``, ``status == "done"``, ``payload.result`` a dict.
+    A dead or failed run has no report and must not produce a banner state — and
+    must not shadow an older completed one, which is why the row scan skips
+    report-less rows instead of stopping at the newest one.
+
+    ``persona_id`` filters on the queue item's payload **in Python**, not with a
+    SQL JSON subscript: the two supported databases do not agree about that
+    operation (SQLite's ``json_extract`` and PostgreSQL's ``->>`` differ on the
+    type they hand back, so the same comparison matches on one backend and
+    silently matches nothing on the other, and SQLite raises ``malformed JSON``
+    on a payload cell it cannot parse — one bad row would 500 the whole read).
+    Filtering here keeps the comparison in one place and lets an unreadable row be
+    skipped instead of poisoning the answer.
+    """
+    rows = (
+        db.query(PipelineJob)
+        .filter(
+            PipelineJob.user_id == user.id,
+            PipelineJob.pipeline == "discovery",
+            PipelineJob.status == "done",
+        )
+        # ``id`` is the queue's own chronology: two rows completed in the same
+        # instant still have a deterministic order, and a paused run that
+        # re-executed keeps the place it was enqueued in.
+        .order_by(PipelineJob.id.desc())
+        .limit(LAST_RUN_SCAN_LIMIT)
+        .all()
+    )
+    row: Optional[PipelineJob] = None
+    report: Optional[Dict[str, Any]] = None
+    for candidate in rows:
+        payload: Dict[str, Any] = dict(candidate.payload or {})
+        stored = payload.get("result")
+        if not isinstance(stored, dict):
+            continue
+        if persona_id is not None and _payload_persona(payload) != persona_id:
+            continue
+        row, report = candidate, stored
+        break
+
+    if row is None or report is None:
+        raise HTTPException(404, "No completed discovery run")
+
+    # The run's own clock when the report carries one (it always does since
+    # v2.2.4); the queue row's finish time for a report written before that.
+    at = report.get("started_at") or (
+        (row.finished_at or row.created_at).isoformat() if (row.finished_at or row.created_at) else None
+    )
+    response: Dict[str, Any] = {"at": at, "added": len(report.get("jobs") or [])}
+    # Absent, never null: ``why_empty`` exists only on a run that added nothing,
+    # and ``summary`` / ``ai_rescore`` only on reports new enough to carry them.
+    for key in ("why_empty", "summary", "ai_rescore"):
+        if report.get(key) is not None:
+            response[key] = report[key]
+    return response
+
+
 class DiscoveryRequest(BaseModel):
     keywords: Optional[List[str]] = None
     freshness_hours: Optional[int] = Field(default=None, ge=1, le=24 * 90)
     limit: int = Field(default=40, ge=1, le=200)
     live_enabled: Optional[bool] = None
+    #: ``None`` = use the caller's saved configuration; ``[]`` = fetch nothing.
+    #: The distinction is deliberate and survives to the queued payload.
     sources: Optional[List[str]] = None
     persona_id: Optional[int] = None
 
@@ -219,6 +319,12 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
         get_setting(db, user.id, "scraping", "freshness_hours", settings.default_freshness_hours)
     )
     live_enabled = payload.live_enabled if payload.live_enabled is not None else config["live_enabled"]
+    # ``sources`` keeps the unset-vs-empty distinction all the way down (v2.2.4):
+    # ``None`` → the user's configuration, ``[]`` → fetch nothing. The old
+    # ``payload.sources or config["sources"]`` turned a deliberate empty list into
+    # every configured source, and the response then claimed the run would fetch
+    # sources the caller had just asked it not to.
+    sources = list(payload.sources) if payload.sources is not None else list(config["sources"])
 
     item = enqueue(
         db,
@@ -229,7 +335,7 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
             "freshness_hours": freshness,
             "limit": payload.limit,
             "live_enabled": live_enabled,
-            "sources": payload.sources or config["sources"],
+            "sources": sources,
             "board_tokens": config["board_tokens"],
             "persona_id": persona.id if persona else None,
         },
@@ -242,7 +348,7 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
         "duplicate": item is None,
         "keywords": keywords[:20],
         "freshness_hours": freshness,
-        "sources": payload.sources or config["sources"],
+        "sources": sources,
         "live_enabled": live_enabled,
     }
 
