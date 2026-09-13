@@ -69,7 +69,9 @@ def test_claim_is_exclusive_and_priority_ordered(db, owner):
     first = claim(db, pipelines=["discovery"])
     assert first.id == high.id  # priority wins over arrival order
     assert first.status == "processing"
-    assert first.attempts == 1
+    # v2.2.2: attempts counts handler *failures*, not claims — a claim takes a
+    # lease and leaves the failure budget alone (was: == 1).
+    assert first.attempts == 0
     assert first.lease_expires_at > datetime.utcnow()
 
     second = claim(db, pipelines=["discovery"])
@@ -96,13 +98,16 @@ def test_failure_retries_with_backoff_then_dead_letters(db, owner):
     assert item.status == "queued"
     assert item.scheduled_at > datetime.utcnow()
 
-    # Make it runnable again and exhaust the attempts.
+    # Make it runnable again and exhaust the failure budget.
     item.scheduled_at = datetime.utcnow() - timedelta(seconds=1)
     db.commit()
     claimed = claim(db, pipelines=["application"])
-    assert claimed.attempts == 2
+    # v2.2.2: one recorded failure so far, and the second claim adds nothing
+    # (was: == 2, when claims incremented the counter).
+    assert claimed.attempts == 1
     assert fail(db, claimed, "boom again") == "dead"
     assert claimed.status == "dead"
+    assert claimed.attempts == 2, "max_attempts=2 → the second failure is the cap"
 
 
 def test_non_retryable_failure_dead_letters_immediately(db, owner):

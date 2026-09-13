@@ -68,6 +68,47 @@ def test_ops_status_reports_components(client, auth):
     assert "ai" in body and "rate_limiter" in body["ai"]
 
 
+def test_retry_dead_resets_both_budgets(client, auth, db):
+    """``POST /api/ops/queue/retry-dead`` gives a dead item a fresh start on
+    BOTH counters (v2.2.2): the failure budget (``attempts``) and the
+    AI-outage pause budget (``payload.paused_count``).
+
+    Resetting only ``attempts`` re-queued a pause-capped item with
+    ``AI_PAUSE_MAX + 1`` pauses already banked, so its very next outage
+    dead-lettered it again and the operator's retry looked like a no-op.
+    """
+    from app.services.job_queue import AI_PAUSE_MAX, enqueue, fail, pause
+
+    owner = db.query(User).filter(User.email == "owner@example.com").first()
+
+    # One item dead on failures, one dead on the pause cap.
+    exhausted = enqueue(db, user_id=owner.id, pipeline="discovery", max_attempts=1,
+                        dedupe_key="retry-dead:failures")
+    assert fail(db, exhausted, "boom") == "dead"
+    parked = enqueue(db, user_id=owner.id, pipeline="ai", max_attempts=3,
+                     payload={"task": "tag_resume"}, dedupe_key="retry-dead:pauses")
+    parked.payload = {**(parked.payload or {}), "paused_count": AI_PAUSE_MAX}
+    db.commit()
+    assert pause(db, parked, "ai_transient_outage") == "dead"
+    db.expire_all()
+    assert db.query(PipelineJob).filter(PipelineJob.status == "dead").count() == 2
+
+    assert client.post("/api/ops/queue/retry-dead", headers=auth).json()["requeued"] == 2
+
+    db.expire_all()
+    for item in db.query(PipelineJob).all():
+        assert item.status == "queued"
+        assert item.attempts == 0, "the failure budget is fresh"
+        assert item.error == ""
+        assert "paused_count" not in (item.payload or {}), "the pause budget is fresh too"
+
+    # …and the pause-capped item can actually sit out another outage now.
+    parked = db.query(PipelineJob).filter(PipelineJob.dedupe_key == "retry-dead:pauses").one()
+    assert pause(db, parked, "ai_transient_outage") == "paused"
+    assert parked.attempts == 0
+    assert (parked.payload or {}).get("paused_count") == 1
+
+
 def test_runtime_and_settings_runtime_are_safe(client, auth):
     body = client.get("/api/settings/runtime", headers=auth).json()
     assert body["platform"]["environment"] == "test"

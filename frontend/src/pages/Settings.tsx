@@ -359,7 +359,7 @@ export default function Settings(){
                 )}
               </h3>
               <p className="text-xs mono text-zinc-500 mt-1 max-w-3xl leading-relaxed">
-                Job discovery, the funding radar and application prep run on a cadence instead of on a click. Auto mode only decides <em>when to queue</em>: the queue, its retries, the AI-outage pause and your plan limits are exactly the ones a manual run goes through — and nothing is ever submitted to an employer without you.
+                Job discovery, the funding radar and application prep run on a cadence instead of on a click. Auto mode only decides <em>when to queue</em>: the queue, its retries, the AI-outage pause and your plan limits are exactly the ones a manual run goes through — and nothing is ever submitted to an employer without you. Retries count <em>failures</em>: a run parked by an AI outage and resumed spends none of them.
               </p>
             </div>
             <label className={`shrink-0 flex items-center gap-2 text-sm p-3 rounded-xl border ${canAuto ? 'bg-white dark:bg-zinc-900 cursor-pointer' : 'bg-zinc-50 dark:bg-zinc-800'}`} title={canAuto ? 'Starts work on the cadence below' : (data.automation?.locked_reason || 'Locked on your plan')}>

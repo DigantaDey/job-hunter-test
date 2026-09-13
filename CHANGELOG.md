@@ -4,6 +4,139 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.2] — 2026-09-13
+
+**Queue fix: `attempts` counts failures, not claims.** The durable queue
+incremented `PipelineJob.attempts` when a worker *claimed* an item
+(`job_queue.claim` / `claim_item`), while `fail()` decided retry-vs-dead-letter
+by comparing that counter against `max_attempts`. But `pause()` (transient AI
+outage → item parked in `paused`) deliberately consumes no attempt, and the
+watchdog's `drain_paused` re-queues the item — which is then claimed again and
+incremented again. So every pause → resume cycle spent failure budget without
+the work ever failing. Both consequences were reproduced: (a) an item with
+`max_attempts=3` and **zero** handler failures was claimed five times across
+three outage cycles, and (b) it then dead-lettered on its *first* real failure.
+In a live outage drill a job was dead-lettered at `attempts=6, max_attempts=3`.
+
+Backend semantics, the UI copy that explains them, and the tests. No new
+environment variables, no schema change, no migration — the counter's *meaning*
+changed, not its type or its column.
+
+### Fixed
+
+- **`claim()` and `claim_item()` no longer increment `attempts`.** Claiming
+  takes a lease (`status='processing'`, `locked_by`, `lease_expires_at`) and
+  nothing else. Being handed to a worker is not a failure, so a claim that ends
+  in a pause, a crash or a deploy costs the item no budget.
+- **`fail()` increments first, then applies the budget.** `attempts` grows by
+  one and *then* the check runs: `attempts >= max_attempts` → `dead`, otherwise
+  re-queue with backoff exactly as before. `max_attempts=3` now means three
+  recorded failures, and the third one is the one that dead-letters — N
+  consecutive real failures still dead-letter on the Nth, and a dead item is
+  never claimable again.
+- **The backoff schedule is unchanged.** It is keyed on the failure just
+  recorded, so the progression a caller sees is identical to before (first
+  failure → `AI_BACKOFF_BASE ** 1 * 5` s, second → `** 2 * 5` s, capped at
+  600 s). Previously the claim supplied that exponent; now the failure does.
+  Only pause/resume cycles — which were the bug — behave differently.
+- **`POST /api/ops/queue/retry-dead` resets *both* budgets.** It cleared
+  `attempts` but left `payload.paused_count` at `AI_PAUSE_MAX + 1`, so an item
+  that had dead-lettered on the *pause* cap was re-queued with its outage budget
+  already spent and died again on its very next pause — the operator's retry
+  looked like a no-op. Same confusion, same fix: the two counters are separate
+  and a manual retry starts both from zero.
+- **Queues UI: "gave up after N attempts" was the claim count.** A `dead` row
+  now says *why* it gave up, from the counter that actually decided it —
+  "gave up after 2 of 3 failed attempts", "gave up after 12 AI-outage pauses —
+  it never failed", or both when both apply. Under the old copy a
+  pause-capped job read "gave up after 0 attempts" (or, before this release,
+  after attempts it had never failed).
+- **Copy that explains "attempts" now says *failure* attempts.** Labels are
+  unchanged; only the explanations are: the `failed` / `paused` / `dead` chip
+  hints on Queues ("parking costs no failure attempt"), the dead-row tooltip
+  ("Attempts counts handler failures only — being claimed, or parked by an AI
+  outage, costs nothing"), the Auto-mode card in Settings ("Retries count
+  *failures*: a run parked by an AI outage and resumed spends none of them")
+  and the auto-run `paused` note in `frontend/src/lib/automation.ts`.
+- **The contract is written down where it is implemented.** The
+  `app.services.job_queue` module docstring now has a "Retry accounting"
+  section: `attempts` = handler failures, incremented only by `fail()`;
+  `paused_count` / `AI_PAUSE_MAX` is the separate outage budget; claims, pauses
+  and lease expiries touch neither. `claim()`, `claim_item()`, `fail()`,
+  `pause()`, `recover_stalled()` and `enqueue()` docstrings say the same at the
+  point of use, and `WORKER_MAX_ATTEMPTS` is documented as a *failure* budget in
+  `.env.example` and `app/core/config.py`.
+
+### Unchanged, deliberately
+
+- **`pause()` still consumes no attempt**, and its own safety valve is intact:
+  `payload.paused_count`, capped at `AI_PAUSE_MAX = 12`, dead-letters an item
+  that sits out too many outages — independently of `attempts`, in both
+  directions (an outage never spends failure budget, a failure never spends
+  pause budget).
+- **`recover_stalled()` keeps its rule**: a stalled item whose *failure* count
+  has reached `max_attempts` is dead-lettered on lease expiry, otherwise it is
+  re-queued. It never increments `attempts` itself. With the counter now honest
+  this branch is reached only by rows whose budget was really spent — including
+  pre-v2.2.2 rows whose counter was inflated by claims, which must not be
+  resurrected into an endless crash loop. *Trade-off, stated plainly:* an item
+  whose handler hard-crashes the worker (so `fail()` is never called) is now
+  re-queued on every lease expiry rather than dead-lettered after
+  `max_attempts` crashes. That is the point of the fix — a crash is not a
+  failure of the work — and the loop is slow and observable rather than silent:
+  each cycle waits out `WORKER_LEASE_SECONDS` and lands in
+  `jobhunter_queue_recovered_total` / `jobhunter_worker_task_crashes_total`,
+  while the pause path keeps its own independent cap.
+- **No new environment variables.** `WORKER_MAX_ATTEMPTS` keeps its name and its
+  default (3); only its documented meaning is now precise.
+
+### Tests
+
+New hermetic suite `backend/tests/test_queue_attempts_semantics.py` (9 tests,
+`job_queue` level — no provider, no network, no worker loop; `claim`,
+`claim_item`, `pause`, `drain_paused`, `fail` and `recover_stalled` are called
+directly). It is red against the old code and green against the new:
+
+- an item with `max_attempts=3` survives **five** pause/resume cycles with zero
+  failures (`attempts` stays 0, 5 claims) and its first real failure still
+  returns `retrying`;
+- a second variant proves the whole budget survives the outage: 4 pauses, then
+  failures 1 and 2 retry and failure 3 dead-letters;
+- N consecutive real failures → `dead` on the Nth, `attempts == N`, and neither
+  `claim()` nor `claim_item()` will pick the row up again;
+- lease expiry on a stalled item: failures below the cap → re-queued with the
+  counter untouched (repeatedly — a crash loop with no failures never loses
+  budget); failures at/over the cap → `dead` with `finished_at` and
+  `error="lease expired"`;
+- the pause budget still dead-letters on its own: 13 pauses on an item with
+  `max_attempts=50` and `attempts == 0` → `dead` with "paused 12 times during AI
+  outages";
+- a non-retryable failure is still dead on the first failure (and now records
+  `attempts == 1`);
+- `POST /api/ops/queue/retry-dead` re-queues a failure-dead and a pause-dead
+  item with both counters at zero, and the pause-dead one can sit out another
+  outage afterwards (`test_ops_health_and_privacy.py`).
+
+Three existing assertions pinned the old claim-count semantics and were
+adjusted — **only** those, and only the numbers, never the outcome under test:
+
+- `test_queue_and_worker.py::test_claim_is_exclusive_and_priority_ordered` —
+  `first.attempts == 1` → `== 0` (a claim is not a failure).
+- `test_queue_and_worker.py::test_failure_retries_with_backoff_then_dead_letters`
+  — after the second claim of a `max_attempts=2` item, `attempts == 2` → `== 1`
+  (one recorded failure; the claim adds nothing). The test still ends with the
+  second failure dead-lettering the item, now also asserting `attempts == 2`.
+- `test_ai_pause_resume.py::test_queued_job_paused_on_outage_then_recovers_without_duplicates`
+  — `item.attempts == 1` ("the claim consumed the attempt; the pause must not")
+  → `== 0` ("neither the claim nor the pause may consume a failure attempt").
+  Its module docstring records the same clarification.
+
+Every other retry/dead-letter expectation in the suite was already written
+against failures and passes untouched: 425 backend tests green (415 before this
+change — 9 new queue-semantics tests plus the `retry-dead` one), `ruff` clean,
+`mypy` delta zero (767 pre-existing errors before and after), frontend
+`tsc --noEmit` and `vite build` clean.
+
 ## [2.2.1] — 2026-09-13
 
 **Frontend finishing pass over the v2.1–v2.2 surfaces.** The three backend

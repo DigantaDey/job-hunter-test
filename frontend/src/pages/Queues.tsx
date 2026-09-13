@@ -6,14 +6,40 @@ import { Layers, Bot, Search, Send, Clock, CheckCircle, AlertTriangle, Pause, Pl
 const STATUS_CHIPS = ['queued','processing','done','failed','needs_input','paused','dead'] as const
 type ChipStatus = typeof STATUS_CHIPS[number]
 
+/**
+ * Hover copy per status.
+ *
+ * v2.2.2 — "attempts" means *failure* attempts everywhere in this file: the
+ * backend counts a handler failure, never a claim. Being picked up by a worker
+ * (or parked by an AI outage and resumed) costs an item nothing, so the hints
+ * say "failed attempts" instead of implying every run spends the budget.
+ */
 const STATUS_HINTS: Record<ChipStatus, string> = {
   queued: 'Waiting for a worker slot',
   processing: 'Running right now',
   done: 'Finished',
-  failed: 'Failed — will be retried until max attempts, then marked dead',
+  failed: 'Failed — retried until its failure attempts run out, then marked dead',
   needs_input: 'Waiting on your answers (User Input Needed queue below)',
-  paused: 'AI outage — parked, resumes automatically when the provider is back',
-  dead: 'Exhausted its retries — nothing more will happen without a manual retry',
+  paused: 'AI outage — parked, resumes automatically when the provider is back (parking costs no failure attempt)',
+  dead: 'Out of failure attempts, or out of AI-outage pauses — nothing more will happen without a manual retry',
+}
+
+/**
+ * Why a `dead` row gave up — the two budgets are separate.
+ *
+ * `attempts` counts *handler failures* against `max_attempts`; an item can also
+ * be dead-lettered by the AI-outage pause cap (`payload.paused_count`, 12) with
+ * zero failures. v2.2.2: the old "gave up after N attempts" read the claim
+ * counter, so an outage-parked job reported attempts it had never failed and a
+ * pause-capped job read "gave up after 0 attempts".
+ */
+function deadReason(j: any): string {
+  const failures = Number(j?.attempts ?? 0)
+  const cap = Number(j?.max_attempts ?? 0)
+  const pauses = Number(j?.payload?.paused_count ?? 0)
+  if (failures === 0 && pauses > 0) return `gave up after ${pauses} AI-outage pauses — it never failed`
+  const spent = cap > 0 ? `${failures} of ${cap} failed attempts` : `${failures} failed attempt${failures === 1 ? '' : 's'}`
+  return pauses > 0 ? `gave up after ${spent} and ${pauses} AI-outage pause${pauses === 1 ? '' : 's'}` : `gave up after ${spent}`
 }
 
 /** Amber for a non-zero paused count, grey for dead, neutral otherwise. */
@@ -72,7 +98,9 @@ export default function Queues(){
             </div>
             {/* All seven durable statuses the backend counts (queue_stats). `paused`
                 is the v2.1 headline state: an AI outage parks the work and it
-                resumes on its own; `dead` is a job that exhausted its retries. */}
+                resumes on its own (parking costs no failure attempt — v2.2.2);
+                `dead` is a job that ran out of *failure* attempts, or out of
+                AI-outage pauses. */}
             <div className="grid grid-cols-4 sm:grid-cols-7 gap-1 mt-3 text-center">
               {STATUS_CHIPS.map(k=> {
                 const n = stats[p.id]?.[k] ?? 0
@@ -146,7 +174,7 @@ export default function Queues(){
                   <span className={`text-xs mono px-2 py-1 rounded-full h-fit ${j.status==='paused'?'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-200': j.status==='dead'?'bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200':'bg-zinc-100 dark:bg-zinc-800'}`}>{j.status}</span>
                   {/* v2.1: amber must never be a mystery — say what happens next. */}
                   {j.status==='paused' && <span className="text-[11px] mono text-amber-700 dark:text-amber-300 text-right">AI outage — will resume automatically</span>}
-                  {j.status==='dead' && <span className="text-[11px] mono text-zinc-500 text-right">gave up after {j.attempts ?? j.max_attempts} attempts</span>}
+                  {j.status==='dead' && <span className="text-[11px] mono text-zinc-500 text-right" title="Attempts counts handler failures only — being claimed, or parked by an AI outage, costs nothing.">{deadReason(j)}</span>}
                 </div>
               </div>
             ))}
