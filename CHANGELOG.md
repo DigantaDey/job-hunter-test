@@ -4,6 +4,176 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.4] — 2026-09-13
+
+**Discovery: an empty board says why it is empty.** In a live environment without
+internet — or with sources misconfigured — a discovery run legitimately finds
+nothing, and the run's internal report has always tracked per-source status. But
+the product surfaced only "no fresh jobs", so a user could not tell *no sources
+enabled* from *every source failed* from *nothing fresh in the window* — three
+situations with three different fixes (configure a source, retry after an outage,
+widen the window). The opt-in demo pool (`INCLUDE_DEMO_POOL`, off by default in
+every environment) was another silent contributor to empty boards whose absence
+was never explained.
+
+Emptiness is now explainable: the run classifies itself once, at run time, a new
+read endpoint serves that verdict, and the Jobs page's existing empty state
+renders it. **Reporting only** — no change to fetching, scoring, quotas, dedupe,
+the demo-pool default, the queue, the schema (the report rides in the existing
+`payload.result` JSON) or the environment surface.
+
+### Added
+
+- **`why_empty` in the discovery report** — exactly one of
+  `no_sources_configured` (nothing was attempted: `report["sources"]["requested"]`
+  is empty, which covers both a deliberately empty source selection and
+  `live_enabled` off, where the fan-out never runs), `all_sources_failed` (one or
+  more sources were requested and **every** one of them is in `errors` — an
+  outage, not a quiet market) or `no_fresh_postings` (the fan-out kept something,
+  i.e. at least one source in `ok`, and nothing survived the freshness window and
+  the dedupe against the board). It is set **only** when the run added zero jobs;
+  a run that found jobs has no `why_empty` key at all — not `null`, not `""` — so
+  an absent key is the claim "this run found jobs". The vocabulary is a constant
+  triple (`WHY_NO_SOURCES_CONFIGURED` / `WHY_ALL_SOURCES_FAILED` /
+  `WHY_NO_FRESH_POSTINGS` in `app.services.discovery`), classified in
+  `discover_for_user` and never re-derived by a caller, so the queue row, the run's
+  log line and the API cannot disagree. There is deliberately no fourth reason for
+  "candidates were found but all were already on the board": such a run adds
+  nothing *because* the board already has those jobs, so the board is not empty.
+  With the demo pool enabled a run always finds jobs, so `why_empty` can never be
+  set in that case — pinned by a test.
+- **A `summary` block in the same report** —
+  `{"configured_sources", "failed_sources", "needs_credentials",
+  "demo_pool_enabled", "freshness_window_hours", "fetched", "fresh"}`, every value
+  derived from the same per-source report the classification reads (`requested`,
+  `errors`, `total`) plus two facts of the run, so the verdict and its accounting
+  can never tell different stories. `needs_credentials` is the registry's own
+  `unconfigured_source_ids()`, which is what separates "these sources need keys"
+  from "the network is down". Pinned decision: `summary` rides on **every** report
+  (a successful run's fetched/fresh counts are useful to an operator too); only
+  `why_empty` is conditional.
+- **`GET /api/jobs/discovery/last-run`** (jobs router, `CurrentUser` + tenant
+  scoping exactly like the rest of the jobs API) — the newest *completed* run for
+  this user: `pipeline == "discovery"`, `status == "done"`, `payload.result` a
+  dict. A dead/failed/paused run has no report and must not produce a banner
+  state, and a report-less `done` row is skipped rather than allowed to shadow an
+  older completed run. Optional `?persona_id=` filters on the queue item's
+  payload **in Python**: JSON subscripting is unreliable across the two supported
+  backends (SQLite's `json_extract` vs a PostgreSQL *text* comparison), so a
+  SQL-side filter would match on one and silently match nothing on the other — a
+  test asserts the emitted SQL contains no `persona_id`, no `json_extract` and no
+  `->`. Response: `{"at", "added", "why_empty"?, "summary"?, "ai_rescore"?}`
+  (`ai_rescore` passed through for operator transparency), 404 with the standard
+  not-found shape when the user has no completed run. Only the summary blocks are
+  served — never the full report, which embeds the run's job rows.
+- **The empty-board banner in the SPA** — `components/EmptyBoardBanner.tsx`,
+  rendered from the Jobs page's existing empty branch (no new modal, no new page).
+  Five states in priority order: last-run 404 → "No discovery run yet" + the
+  existing Discover-now CTA; `no_sources_configured` → "No job sources are
+  enabled" + a link to the Settings source configuration (`/settings#scraping`,
+  a real anchor now) + Discover-now; `all_sources_failed` → "All sources failed on
+  the last run" + one chip per source (id + truncated error, full text in the
+  chip's `title`) + Settings link + retry; `no_fresh_postings` → "Sources are
+  healthy, but nothing fresh in the window" + the window in hours + retry;
+  fallback (a run exists with no `why_empty` and the board is empty anyway) →
+  "Last run found N job(s) on \<date\>; your board is empty" + Discover-now, so the
+  UI never renders a reason-less empty state. While the read is in flight — or if
+  it fails for any reason other than 404 — the page keeps its previous plain copy
+  rather than claiming a reason it has not read. The banner also surfaces
+  `needs_credentials` and says when the demo pool is off, so nothing is fabricated
+  to fill the board.
+- **`hooks/useDiscoveryLastRun.ts`** — the thin read: a 404 is an *answer*
+  ("no completed run"), any other failure leaves the state unknown, and the
+  persona the board is filtered by is forwarded as `?persona_id=`. It is only
+  called while the board is empty, so a full board never pays for it.
+- **Frontend component tests, and the runner they need.** The SPA had no test
+  infrastructure at all, so `vitest` + `@testing-library/react` + `jsdom` are
+  added as devDependencies with `npm run test` and a standalone
+  `frontend/vitest.config.ts` (`vite.config.ts` stays free of test-only
+  dependencies, so `npm run build` — including the production image build — never
+  needs vitest). 20 tests: all five banner states including the fallback and its
+  pluralisation, the not-known-yet state, the failed-source chips and their
+  truncation, `needs_credentials`, the demo-pool note, the CTA wiring, the
+  formatting helpers, and the hook (200 / 404 / 500 / persona forwarding /
+  disabled).
+- **`backend/tests/test_discovery_empty_board.py`** (28 tests, hermetic — the
+  repo's faked source fan-out and adapters, the deterministic AI stand-in, no
+  network): the three classifications plus `live_enabled` off; `why_empty` absent
+  (not null) when jobs were added, including in the persisted JSON; the demo pool
+  never producing a reason; the `summary` block matching the source report key for
+  key; `needs_credentials` coming from the registry helper; the endpoint's 404,
+  its non-completed-run filter, newest-run selection, tenant isolation, the
+  payload-level persona filter and its Python-side SQL, a dead run not shadowing a
+  completed one, never serving the full report, and an end-to-end
+  trigger → worker → `payload.result` → endpoint pass; and the empty-source-list
+  fix at every layer.
+
+### Changed
+
+- **`discover_for_user` returns *the* run report.** The function built two dicts:
+  `report` carried `started_at`, `keywords`, `demo_pool` and `freshness_relaxed`
+  and was then dropped, while a separate `summary` was persisted. The returned
+  report is now that one dict, so the persisted result also carries when the run
+  started (what the endpoint serves as `at`), the keywords it ran with, whether the
+  demo pool contributed and whether the window was backfilled. Existing keys
+  (`scanned`, `fresh`, `inserted`, `sources`, `elapsed_seconds`, `ai_rescore`,
+  `jobs`) are unchanged, so every existing reader — `handle_discovery`'s persona
+  signal, the auto-mode notification, `GET /api/pipelines/jobs` (which strips
+  `payload.result`) — behaves as before.
+- **The run's log line carries the verdict**: `discovery: N scanned, M inserted in
+  X.Xs (ai_rescore …) why_empty=no_fresh_postings`, with the same key under
+  `extra_fields` for JSON logs. An empty board is now diagnosable from the log
+  alone, without opening the queue row.
+- **`fetch_all`'s report always carries `total`** (the "nothing was attempted"
+  early return used to omit it), so a reader of `summary.fetched` never has to
+  special-case that run.
+
+### Fixed
+
+- **An explicitly-empty source list was silently upgraded to "all built-in
+  sources"** — a related bug found while making emptiness explainable, fixed here
+  because it made `no_sources_configured` unreachable. Two `or` fallbacks swallowed
+  the difference between *unset* and *explicitly empty*:
+  `handle_discovery` did `payload.get("sources") or config["sources"]` and
+  `fetch_all` did `sources or available_source_ids()`, so a user who had
+  deliberately saved zero sources in `scraping.sources` still got every available
+  adapter fetched — and the response of `POST /api/jobs/discover` claimed sources
+  the caller had just refused. The config layer clearly intended the distinction
+  (`discovery_sources_config` checks `if sources is None`, not `if not sources`).
+  **Decision: option (a) — the whole chain now respects an explicit `[]`.**
+  `None`/absent → the defaults; `[]` → nothing attempted → `no_sources_configured`.
+  `POST /api/jobs/discover` keeps an explicit `[]` in both the queued payload and
+  its response, `handlers._payload_sources` is the one place the queue payload's
+  key is interpreted (absent/`None` → config, list including empty → verbatim,
+  comma-separated string → parsed, anything else → config rather than
+  "everything"), and `fetch_all` resolves `None` to the available adapters and
+  `[]` to no fan-out at all. Reachability is documented and pinned: the Settings
+  page renders `scraping.sources` as read-only chips, so today an explicit `[]` is
+  written through `PUT /api/settings` or a `sources: []` discovery request, while
+  the switch a user *can* flip in the UI is `live_enabled` — which skips the
+  fan-out and lands in the same reason.
+- **The run's own clock was computed and thrown away** (see Changed): `started_at`
+  never reached the persisted report, so nothing downstream could say *when* a run
+  happened. The banner's "Last run found N jobs on \<date\>" and the endpoint's `at`
+  both read it now, with the queue row's `finished_at` as the fallback for reports
+  written by an older version.
+
+### Unchanged, deliberately
+
+- **No behaviour change in fetching, scoring, quotas, dedupe or the queue**, no
+  schema change and no migration (the report lives in the existing JSON), no new
+  entitlement, and **no new environment variable** — `.env.example` is untouched.
+- **`unconfigured_source_ids()` is wired into `summary.needs_credentials` as-is**,
+  and with today's adapter set it always returns `[]`: every key-gated adapter
+  (Adzuna, Jooble, USAJOBS) reports `available() == False` when its credentials are
+  missing *and* `configured() == available()`, so nothing is ever
+  "available but unconfigured". The key is honest either way and starts carrying
+  weight the moment an adapter separates the two; the tests pin the wiring, not the
+  (currently empty) content.
+- **The full report is still persisted per run** in `payload.result` and grows with
+  every run (it embeds the run's job rows). The new endpoint deliberately serves
+  only the summary blocks; the storage question is noted in the PR and left alone.
+
 ## [2.2.3] — 2026-09-13
 
 **Discovery: queued runs get the real AI verdict for the top slice (tier-gated).**

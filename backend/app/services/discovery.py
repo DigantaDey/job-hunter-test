@@ -13,6 +13,16 @@ only when the user has ``can_use_advanced_matching``, so a free-tier run makes
 zero AI calls and stays fully preliminary — the same gate
 ``GET /api/jobs/{job_id}/intelligence`` enforces per job. Every run reports what
 happened in its ``ai_rescore`` block, so a board full of estimates says why.
+
+An *empty* board is reported the same way (v2.2.4): a run that adds nothing says
+which of the three honest reasons it was — no sources were attempted, every
+source that was attempted failed, or the sources were healthy and simply had
+nothing inside the freshness window — plus a ``summary`` block with the counts
+behind that verdict. ``discover_for_user`` is the single source of truth for
+both: the endpoint that serves them
+(``GET /api/jobs/discovery/last-run``) only reads the stored report, so the
+queue row, the log line and the UI can never disagree about why a board is
+empty. Reporting only — no fetching, scoring or quota behaviour changes.
 """
 from __future__ import annotations
 
@@ -48,6 +58,22 @@ FORM_DETECT_TOP = 8
 AI_RESCORE_NO_PROFILE = "no_profile"
 AI_RESCORE_PLAN_FREE = "plan_free"
 
+#: The only three reasons a discovery run can add nothing to the board,
+#: reported verbatim as the run's ``why_empty``. Like the ``ai_rescore``
+#: reasons above they are a vocabulary, not free text: "no fresh jobs" used to
+#: be the whole story, and a user could not tell a configuration problem (fix
+#: it in Settings) from a source outage (retry) from a quiet market (widen the
+#: window). Exactly one of these is set, and only when the run added zero jobs
+#: — a run that found jobs has no ``why_empty`` key at all (not ``null``, not
+#: ``""``), so an absent key is meaningful.
+#:
+#: There is deliberately no fourth reason for "candidates were found but every
+#: one was already on the board": such a run adds nothing *because* the board
+#: already has those jobs, so the board is not empty and no banner is rendered.
+WHY_NO_SOURCES_CONFIGURED = "no_sources_configured"
+WHY_ALL_SOURCES_FAILED = "all_sources_failed"
+WHY_NO_FRESH_POSTINGS = "no_fresh_postings"
+
 
 def _demo_pool_enabled() -> bool:
     """
@@ -59,6 +85,59 @@ def _demo_pool_enabled() -> bool:
     fabricated postings into real results.
     """
     return bool(settings.include_demo_pool)
+
+
+def _classify_empty_run(source_report: Dict[str, Any]) -> str:
+    """Which of the three honest reasons this run added nothing to the board.
+
+    Reads only the per-source report :func:`app.services.sources.fetch_all`
+    returns — ``{"requested": [...], "ok": {...}, "errors": {...}, "total": n}``
+    — so the classification is a fact about the run, never a guess:
+
+    * nothing was *attempted* (``requested`` empty — no sources configured, or
+      ``live_enabled`` off, which skips the fan-out entirely) →
+      :data:`WHY_NO_SOURCES_CONFIGURED`;
+    * sources were attempted and **every** one of them is in ``errors``
+      (individual source failures never raise; they land there) →
+      :data:`WHY_ALL_SOURCES_FAILED` — an outage, not a quiet market;
+    * otherwise the fan-out produced something to keep (at least one source in
+      ``ok``) and nothing survived the freshness window and the dedupe against
+      the board → :data:`WHY_NO_FRESH_POSTINGS`.
+
+    The last branch is the default on purpose: a partial report (a source in
+    neither ``ok`` nor ``errors``, which ``fetch_all`` cannot produce but a
+    hand-built one could) must still yield exactly one reason rather than no
+    reason at all, and "the sources ran and nothing was fresh" is the honest
+    reading of it.
+    """
+    requested = [str(source_id) for source_id in (source_report.get("requested") or [])]
+    errors = source_report.get("errors") or {}
+    if not requested:
+        return WHY_NO_SOURCES_CONFIGURED
+    if all(source_id in errors for source_id in requested):
+        return WHY_ALL_SOURCES_FAILED
+    return WHY_NO_FRESH_POSTINGS
+
+
+def _run_summary(source_report: Dict[str, Any], *, freshness_hours: int, fresh_count: int) -> Dict[str, Any]:
+    """The counts behind :func:`_classify_empty_run`'s verdict.
+
+    Every value is derived from the same per-source report the classification
+    reads (plus two facts of this run), so the two can never tell different
+    stories. ``needs_credentials`` is the registry's own
+    :func:`~app.services.sources.unconfigured_source_ids` — available adapters
+    whose credentials the operator never provided — which is what separates
+    "these sources need keys" from "the network is down".
+    """
+    return {
+        "configured_sources": [str(source_id) for source_id in (source_report.get("requested") or [])],
+        "failed_sources": {str(source_id): str(error) for source_id, error in (source_report.get("errors") or {}).items()},
+        "needs_credentials": list(source_registry.unconfigured_source_ids()),
+        "demo_pool_enabled": _demo_pool_enabled(),
+        "freshness_window_hours": int(freshness_hours),
+        "fetched": int(source_report.get("total") or 0),
+        "fresh": int(fresh_count),
+    }
 
 
 async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[str, Any]], use_ai: bool,
@@ -133,6 +212,18 @@ async def discover_for_user(
     reported verbatim in the run's ``ai_rescore`` block so an operator can tell
     a plan gate apart from a missing resume. It is only read when no profile was
     passed.
+
+    ``source_ids`` follows the same None-vs-empty contract as
+    :func:`app.services.sources.fetch_all`: ``None`` means "whatever the caller
+    resolved for this user" (which ``fetch_all`` reads as every available
+    adapter), an explicit ``[]`` means *fetch nothing* — a user who deliberately
+    disabled every source must not be silently upgraded to all of them.
+
+    Returns the run report: ``started_at``, ``keywords``, ``sources`` (the
+    per-source report), ``scanned`` / ``fresh`` / ``inserted`` /
+    ``elapsed_seconds``, ``ai_rescore``, ``summary``, ``jobs``, plus
+    ``demo_pool`` / ``freshness_relaxed`` when they apply and ``why_empty`` when
+    — and only when — the run added zero jobs.
     """
 
     profile_data = profile or {}
@@ -306,27 +397,41 @@ async def discover_for_user(
         # insert lost a uniqueness race created nothing to score.
         "scored": sum(1 for job in created if str(job.score_source or "") == "ai"),
     }
-    summary = {
-        "scanned": len(unique),
-        "fresh": len(fresh),
-        "inserted": len(created),
-        "sources": source_report,
-        "elapsed_seconds": round(elapsed, 2),
-        "ai_rescore": ai_rescore,
-        "jobs": [
-            {"id": job.id, "title": job.title, "company": job.company, "source": job.source,
-             "score": job.score, "location": job.location, "url": job.url}
-            for job in created
-        ],
-    }
+    # The returned report *is* the run report built at the top of this function
+    # (v2.2.4). It used to be two dicts: ``report`` carried ``started_at``,
+    # ``keywords``, ``demo_pool`` and ``freshness_relaxed`` and was then dropped
+    # on the floor, while a separate ``summary`` was persisted — so nothing
+    # downstream could say *when* a run happened, that the demo pool had
+    # contributed to it, or that the freshness window had been backfilled.
+    report["scanned"] = len(unique)
+    report["fresh"] = len(fresh)
+    report["inserted"] = len(created)
+    report["elapsed_seconds"] = round(elapsed, 2)
+    report["ai_rescore"] = ai_rescore
+    # Why the board gained nothing (v2.2.4). Classified here, once, from the
+    # per-source report above — the endpoint only reads it back. ``summary`` is
+    # always present (it is the accounting behind the verdict, useful on a
+    # successful run too); ``why_empty`` is present *only* when this run added
+    # zero jobs, so an absent key means "this run found jobs".
+    report["summary"] = _run_summary(source_report, freshness_hours=freshness_hours, fresh_count=len(fresh))
+    why_empty = _classify_empty_run(source_report) if not created else None
+    if why_empty:
+        report["why_empty"] = why_empty
+    report["jobs"] = [
+        {"id": job.id, "title": job.title, "company": job.company, "source": job.source,
+         "score": job.score, "location": job.location, "url": job.url}
+        for job in created
+    ]
     log.info(
-        "discovery: %s scanned, %s inserted in %.1fs (ai_rescore enabled=%s skipped=%s scored=%s)",
-        summary["scanned"], summary["inserted"], elapsed,
+        "discovery: %s scanned, %s inserted in %.1fs (ai_rescore enabled=%s skipped=%s scored=%s)%s",
+        report["scanned"], report["inserted"], elapsed,
         ai_rescore["enabled"], ai_rescore["skipped"] or "-", ai_rescore["scored"],
-        extra={"extra_fields": {"user_id": user.id, **{k: summary[k] for k in ("scanned", "fresh", "inserted")},
-                                "ai_rescore": ai_rescore}},
+        f" why_empty={why_empty}" if why_empty else "",
+        extra={"extra_fields": {"user_id": user.id, **{k: report[k] for k in ("scanned", "fresh", "inserted")},
+                                "ai_rescore": ai_rescore,
+                                **({"why_empty": why_empty} if why_empty else {})}},
     )
-    return summary
+    return report
 
 
 def discovery_sources_config(db: Session, user_id: int) -> Dict[str, Any]:

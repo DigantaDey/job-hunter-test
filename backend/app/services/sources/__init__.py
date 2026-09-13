@@ -83,10 +83,29 @@ async def fetch_all(
     Fan out across sources concurrently. Individual source failures degrade
     gracefully and are reported (never raised) so discovery always returns
     whatever succeeded.
+
+    ``sources`` distinguishes *unset* from *empty*, and the distinction is the
+    caller's meaning, not this function's to reinterpret:
+
+    * ``None`` — the caller has no opinion, so every available adapter is
+      fetched (the historical default);
+    * ``[]`` — the caller deliberately selected no sources, so **nothing** is
+      fetched and the report says ``requested: []``.
+
+    The old ``sources or available_source_ids()`` collapsed the two, so a user
+    who had saved an explicitly empty source list still got every available
+    adapter fetched — and discovery could then never report
+    ``no_sources_configured`` honestly. The report's ``requested`` list is what
+    :func:`app.services.discovery._classify_empty_run` reads, so swallowing the
+    distinction here would have made an empty board look like a quiet market.
     """
-    requested = [s for s in (sources or available_source_ids()) if s in ADAPTERS]
-    report: Dict[str, Any] = {"requested": requested, "ok": {}, "errors": {}, "skipped": {}}
+    selected = available_source_ids() if sources is None else sources
+    requested = [s for s in selected if s in ADAPTERS]
+    report: Dict[str, Any] = {"requested": requested, "ok": {}, "errors": {}, "skipped": {}, "total": 0}
     if not requested:
+        # Same shape as the fan-out below (``total`` included) so a reader — the
+        # discovery report's ``summary.fetched`` — never has to special-case the
+        # "nothing was attempted" run.
         return [], report
 
     per_source_limit = max(4, min(25, limit // max(1, len(requested)) + 5))

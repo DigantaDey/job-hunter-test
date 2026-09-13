@@ -282,7 +282,9 @@ export default function Settings(){
           </div>
         </div>
 
-        <div className="card p-5">
+        {/* Anchor for the empty-board banner's "Settings → Sources" link: the
+            source configuration is the fix for `no_sources_configured`. */}
+        <div className="card p-5" id="scraping">
           <h3 className="font-medium flex items-center gap-2"><Search className="w-4 h-4"/> Scraping</h3>
           <div className="mt-3 space-y-3">
             <div>

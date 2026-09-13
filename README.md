@@ -120,6 +120,11 @@ of them, plus the guardrailed AI verdict for the top 12 on Pro (a free-tier run 
 and stays on the labelled estimate; every row carries its `score_source` and the run reports
 `ai_rescore`) — classified by company size and persisted with its source, salary and remote flags.
 Sources that need a key report *why* they are unavailable instead of silently returning nothing.
+A run that adds nothing to the board reports *why* it was empty — `no_sources_configured` (nothing
+was attempted), `all_sources_failed` (an outage, with the per-source errors) or `no_fresh_postings`
+(healthy sources, nothing inside the freshness window) — plus a `summary` of the counts behind that
+verdict; `GET /api/jobs/discovery/last-run` serves it and the Jobs page renders it, so an empty board
+is never a reason-less "no fresh jobs".
 
 **Applications** — a job's apply flow detects the portal (Greenhouse/Lever/Workday/custom), detects
 required fields from the real HTML, maps them from your profile, and either:
@@ -158,7 +163,7 @@ are available in Chrome and Apple Passwords CSV formats.
 | Auth | `GET /api/auth/status`, `POST /api/auth/{bootstrap,register,login,refresh,logout}`, `GET /api/auth/me`, `POST /api/auth/password`, `GET/POST/DELETE /api/auth/api-keys` |
 | Account | `GET /api/account/{disclosures,consent,audit,export,runtime,billing-usage}`, `POST /api/account/consent`, `DELETE /api/account?confirm=<email>` |
 | Resumes | `POST /api/resume/upload`, `GET /api/profile/current`, `POST /api/resumes/generate`, `POST /api/resumes/{id}/{approve,reject}`, `GET /api/resumes/{id}/{preview,diff,download}`, `POST /api/resumes/{id}/polish`, `PUT /api/resumes/{id}/tags` |
-| Jobs | `POST /api/jobs/discover`, `GET /api/jobs`, `POST /api/jobs/{id}/{apply,input,mark-applied,retry,skip}`, `GET /api/user-input-queue`, `POST /api/classify/company`, `GET /api/pipelines/{stats,jobs}` |
+| Jobs | `POST /api/jobs/discover`, `GET /api/jobs/discovery/last-run`, `GET /api/jobs`, `POST /api/jobs/{id}/{apply,input,mark-applied,retry,skip}`, `GET /api/user-input-queue`, `POST /api/classify/company`, `GET /api/pipelines/{stats,jobs}` |
 | Vault | `GET/POST/DELETE /api/vault`, `GET /api/vault/{id}/reveal`, `GET /api/vault/export/{chrome,apple}` |
 | Email | `POST /api/emails/generate`, `GET /api/emails`, `POST /api/emails/{id}/{approve,send,check}`, `GET /api/emails/{id}/events`, `GET/POST/DELETE /api/emails/suppressions` |
 | Funding | `GET /api/funding/{companies,providers,context}`, `POST /api/funding/refresh`, `POST /api/funding/{name}/process` |

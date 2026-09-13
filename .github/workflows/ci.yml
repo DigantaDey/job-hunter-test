@@ -108,7 +108,7 @@ jobs:
           python -m alembic current
 
   frontend:
-    name: Frontend typecheck & build
+    name: Frontend tests, typecheck & build
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -122,6 +122,8 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
       - run: npx tsc --noEmit
+      # Component tests (vitest + jsdom, hermetic — the API client is mocked).
+      - run: npm test
       - run: npm run build
       - name: Fail if the SPA build is empty
         run: test -s dist/index.html
