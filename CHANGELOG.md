@@ -50,7 +50,8 @@ new environment variable, and no new entitlement or quota.
   `extra_fields.ai_rescore` for JSON logs. `GET /api/pipelines/jobs` strips
   `payload.result` (unchanged), so the row and the log are where it is read.
 - **`backend/tests/test_discovery_ai_rescore.py`** (12 tests, hermetic — the
-  repo's scripted local provider, a faked source fan-out, no network): the Pro
+  repo's scripted local provider on the wire paths, the deterministic stand-in
+  where no wire is involved, a faked source fan-out, no network): the Pro
   top slice and its report; a free run that completes with **zero** wire calls;
   no-profile and empty-profile; a mid-slice outage that pauses, persists nothing
   and then completes exactly once after the watchdog drains; the v2.2.2 failure
