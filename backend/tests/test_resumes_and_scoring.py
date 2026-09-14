@@ -6,6 +6,7 @@ import os
 import pytest
 
 from app.models.models import Job, Resume, User
+from tests.conftest import generate_resume_now
 from app.services.resume_service import diff_text, fact_guard_check, render_profile_text, resume_text
 from app.services.scoring import jd_similarity, preliminary_score, tokenize
 
@@ -111,10 +112,8 @@ def test_upload_rejects_wrong_type_and_bad_content(client, auth):
 
 def test_generate_approve_and_download_resume(client, auth, db, uploaded_resume):
     job = _job(db)
-    generated = client.post(f"/api/resumes/generate?job_id={job.id}", headers=auth)
-    assert generated.status_code == 200, generated.text
-    body = generated.json()
-    assert body["status"] == "pending"
+    body = generate_resume_now(client, auth, job.id)
+    assert body["status"] == "generated" and body["resume_status"] == "pending"
     assert body["fact_guard"]["passed"] is True
     resume_id = body["resume_id"]
 
@@ -135,7 +134,7 @@ def test_generate_approve_and_download_resume(client, auth, db, uploaded_resume)
 
 def test_generated_resume_is_not_usable_until_approved(client, auth, db, uploaded_resume):
     job = _job(db)
-    resume_id = client.post(f"/api/resumes/generate?job_id={job.id}", headers=auth).json()["resume_id"]
+    resume_id = generate_resume_now(client, auth, job.id)["resume_id"]
     # The approval gate must not auto-approve generated resumes.
     row = db.query(Resume).filter(Resume.id == resume_id).first()
     assert row.status == "pending"
@@ -146,7 +145,7 @@ def test_generated_resume_is_not_usable_until_approved(client, auth, db, uploade
 
 def test_resume_diff_and_polish_upload(client, auth, db, uploaded_resume):
     job = _job(db)
-    resume_id = client.post(f"/api/resumes/generate?job_id={job.id}", headers=auth).json()["resume_id"]
+    resume_id = generate_resume_now(client, auth, job.id)["resume_id"]
 
     diff = client.get(f"/api/resumes/{resume_id}/diff", headers=auth).json()
     assert diff["against_id"] != resume_id
@@ -200,7 +199,15 @@ async def test_resume_reuse_decision_prefers_similar_jd(client, auth, db, upload
     first = _job(db, "Python FastAPI PostgreSQL payments backend engineer kubernetes")
     second = _job(db, "Python FastAPI PostgreSQL payments backend engineer kubernetes docker")
 
-    generated = client.post(f"/api/resumes/generate?job_id={first.id}", headers=auth).json()["resume_id"]
+    from app.services.handlers import handle_ai
+    from app.services.job_queue import claim_item, complete
+
+    # Inside an async test: run the queued item on this loop rather than via the helper.
+    receipt = client.post(f"/api/resumes/generate?job_id={first.id}", headers=auth).json()
+    item = claim_item(db, receipt["pipeline_job_id"])
+    outcome = await handle_ai(db, item)
+    complete(db, item, result=outcome)
+    generated = outcome["resume_id"]
     client.post(f"/api/resumes/{generated}/approve", headers=auth)
 
     chosen_id, decision = await choose_resume(db, profile.user_id, profile, second, "auto")

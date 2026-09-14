@@ -4,6 +4,71 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.8] — 2026-09-14
+
+**Every AI trigger is now page-agnostic and live.** Starting Auto-apply on a job,
+navigating to Funding Radar and coming back — or pressing F5 — used to lose the
+"Status: preparing • resume: master" line, because it lived in the page's React
+state and the trigger endpoints ran the work inside the request. Now every
+trigger only *enqueues* a durable `pipeline_jobs` row and returns a receipt; the
+pages derive what they show from that row, polled once for the whole app.
+
+### Added
+
+- **Queue-only triggers.** `POST /jobs/{id}/apply`, `POST /jobs/discover`,
+  `POST /resumes/generate`, `POST /emails/generate` and `POST /funding/refresh`
+  all answer `{queued: true, pipeline_job_id, duplicate, queue_status, …}` and
+  never run the AI in the request. A second click while a row is live returns
+  the *existing* row's id (`duplicate: true`) instead of a second run. Tenant
+  scope is unchanged — every row is read and written under the caller's tenant.
+- **`GET /api/queues/ai`** — one tenant-scoped read for the live layer:
+  `counts {queued, processing, paused, needs_input}`, the in-flight `items`,
+  the last 30 minutes of outcomes (`recent`, each with the handler's `result`),
+  and `processing_now`. `GET /api/pipelines/jobs?status=a,b` accepts a
+  comma-separated status list; `GET /api/pipelines/jobs/{id}` returns one row;
+  `GET /api/emails/{id}` returns one bucket card.
+- **Live layer in the frontend.** `hooks/useAIQueue.ts` polls the read every
+  4 s, pauses on `visibilitychange`, coalesces overlapping refreshes and keeps
+  the last snapshot when a read fails. `context/AIWorkContext.tsx` is mounted
+  in `Layout` and shares one poll with every page; `lib/aiWork.ts` derives
+  Queued → Preparing → Applying → Applied / Prepared / Needs input (and the
+  resume, discovery, email and funding equivalents) from a row.
+- **Header chip on every route** ("N queued • M processing • K paused — AI
+  paused, will resume") with a dropdown of the in-flight rows and links to
+  Queues and Queues → User Input Needed (`/queues#user-input`).
+- **Re-attach after F5.** Trigger receipts are stored in `sessionStorage`
+  (`jh.aiwork.tracked`, 6 h TTL); on reload the pages find the row by id and
+  keep following it — and, failing that, the newest row for the same job.
+- Jobs, Funding, Resumes, Emails, Dashboard and Queues subscribe to the context:
+  a status line under each trigger button, the trigger disabled while its row
+  is live, the Dashboard's "Running / Open queues" counters and an "AI work in
+  flight" list from the live snapshot, and Queues with a "Processing now" card
+  plus a visibility-aware 3 s poll. The Resumes preview (including a fact-guard
+  rejection) is derived from the row's `result`.
+- Tests: `backend/tests/test_live_ai_queue.py` (tenant scope, processing_now,
+  comma statuses, needs_input fields, duplicate ids, prepare-mode without a
+  browser), `frontend/src/lib/__tests__/aiWork.test.ts` and
+  `frontend/src/hooks/__tests__/useAIQueue.test.tsx` (interval, hidden-tab
+  pause, stale, coalescing).
+
+### Fixed
+
+- A `needs_input` application row lost the handler's prepared plan: the
+  missing fields, the resume decision and the input-request id were dropped
+  when the row was parked. They are kept in `result`, so the page can name the
+  fields and link straight to the User Input Needed queue.
+- Discover and Funding re-scan returned no `pipeline_job_id` on the duplicate
+  path, so a second click could not attach to the run already in progress.
+- `GET /api/emails/{id}` was shadowed by earlier literal routes.
+- Guardrail and fact-guard rejections of a generated resume are recorded as a
+  `done` row with `result.status == "rejected"`, not a queue failure that would
+  be retried.
+- Jobs → resume choice radios were hidden with `display:none` and could not be
+  reached by keyboard; they are now `sr-only` with a visible focus ring.
+- Focus/target-size fixes inline: logout button, queue filter chips, job list
+  rows, Funding focus input, Resumes job select, Queues input forms — all with
+  `focus:ring` and `min-h-[44px]`; no hover-only controls remain on these pages.
+
 ## [2.2.7] — 2026-09-14
 
 **AI scoring: "unlimited" is now a real setting, and it is the default.** A Pro+

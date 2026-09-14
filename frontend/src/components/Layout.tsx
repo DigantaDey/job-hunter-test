@@ -7,6 +7,8 @@ import { useAuth } from '../context/AuthContext'
 import { creditLabel } from '../lib/credits'
 import { ErrorBoundary } from './ErrorBoundary'
 import { AIStatusBanner } from './AIBanner'
+import { AIWorkProvider } from '../context/AIWorkContext'
+import { AIWorkChip } from './AIWorkChip'
 
 const nav = [
   {to:'/', label:'Dashboard', icon: LayoutDashboard},
@@ -79,6 +81,7 @@ export default function Layout() {
     } finally { setResuming(false) }
   }
   return (
+    <AIWorkProvider>
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex">
       {/* sidebar */}
       <aside className="w-[260px] shrink-0 hidden lg:flex flex-col border-r bg-white dark:bg-zinc-900 dark:border-zinc-800 sticky top-0 h-screen">
@@ -115,7 +118,7 @@ export default function Layout() {
           {user && (
             <div className="mt-3 flex items-center gap-2 text-[11px] mono text-zinc-500 dark:text-zinc-400">
               <span className="truncate flex-1" title={user.email}>{user.email}</span>
-              <button onClick={()=>void logout()} title="Sign out" className="p-1 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800">
+              <button onClick={()=>void logout()} title="Sign out" aria-label="Sign out" className="p-2 min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-blue-500">
                 <LogOut className="w-3.5 h-3.5"/>
               </button>
             </div>
@@ -131,6 +134,7 @@ export default function Layout() {
           <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-600 to-violet-600 flex items-center justify-center text-white font-bold text-xs">JH</div>
           <div className="font-semibold text-sm">JobHunter</div>
           <div className="ml-auto flex items-center gap-2">
+            <AIWorkChip />
             <Circle className={`w-2.5 h-2.5 ${ai?.online ? 'fill-emerald-500 text-emerald-500' : 'fill-red-500 text-red-500'}`} />
             <span className="text-xs">{ai?.online ? 'AI online' : 'AI offline'}</span>
           </div>
@@ -139,7 +143,13 @@ export default function Layout() {
         <div className="lg:hidden border-b dark:border-zinc-800 bg-white dark:bg-zinc-900 px-2 py-2 flex gap-1 overflow-auto">
           {nav.map(n=> <NavLink key={n.to} to={n.to} className={({isActive})=> `px-3 py-1.5 rounded-full text-xs whitespace-nowrap border ${isActive?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`}>{n.label}</NavLink>)}
         </div>
-        <main className="flex-1 p-4 lg:p-6 max-w-[1600px] w-full mx-auto">
+        {/* Live AI work header (v2.2.8): the chip is above every route so a run
+            started on Jobs is still visible on Funding Radar — and after F5,
+            because it reads the durable queue rows, never component state. */}
+        <div className="hidden lg:flex sticky top-0 z-30 bg-zinc-50/80 dark:bg-zinc-950/80 backdrop-blur px-6 py-2 items-center justify-end gap-2 min-h-[52px]">
+          <AIWorkChip />
+        </div>
+        <main className="flex-1 p-4 lg:p-6 lg:pt-2 max-w-[1600px] w-full mx-auto">
           <AIStatusBanner status={ai} resuming={resuming} onResume={()=>void resumeNow()} />
           <ErrorBoundary scope="route" resetKey={loc.pathname}>
             <Outlet />
@@ -150,5 +160,6 @@ export default function Layout() {
         </footer>
       </div>
     </div>
+    </AIWorkProvider>
   )
 }

@@ -248,6 +248,17 @@ async def handle_application(db: Session, item: PipelineJob) -> Dict[str, Any]:
     if prepared.get("status") == "needs_input":
         return {"status": "needs_input", **prepared}
 
+    # ``mode`` (v2.2.8): the interactive Auto-apply button queues the whole
+    # flow now — it used to prepare synchronously and only queue when a real
+    # submission was allowed. A deployment without browser automation
+    # (AUTOFILL_ENABLED=false, the default) must therefore be able to queue a
+    # *prepare-only* run: running ``execute_application`` there would record
+    # "autofill unavailable" and flip the job to ``failed`` for a step nobody
+    # asked for. Absent/``execute`` keeps the historical behaviour (the auto
+    # scheduler and the input re-queue depend on it).
+    if str(payload.get("mode") or "execute") == "prepare":
+        return {**prepared, "status": prepared.get("status") or job.status, "mode": "prepare"}
+
     result = await execute_application(db, user, job, answers=payload.get("answers") or {})
     return {**prepared, **result}
 
@@ -265,20 +276,53 @@ async def handle_email(db: Session, item: PipelineJob) -> Dict[str, Any]:
         return send_email(db, user, email_row, otp=payload.get("otp"), allow_real=payload.get("allow_real", True))
 
     if payload.get("company"):
-        drafted = await draft_email(
-            db, user,
-            company=payload["company"],
-            job=db.query(Job).filter(Job.id == payload["job_id"]).first() if payload.get("job_id") else None,
-            founder=bool(payload.get("founder")),
-            department=payload.get("department", "engineering"),
-            extra_context=payload.get("context", ""),
+        job = (
+            db.query(Job).filter(Job.id == payload["job_id"], Job.user_id == user.id).first()
+            if payload.get("job_id") else None
         )
+        recipient = payload.get("recipient") if isinstance(payload.get("recipient"), dict) else None
+        try:
+            drafted = await draft_email(
+                db, user,
+                company=payload["company"],
+                job=job,
+                founder=bool(payload.get("founder")),
+                department=payload.get("department", "engineering"),
+                recipient=recipient,
+                extra_context=payload.get("context", ""),
+                persona_id=payload.get("persona_id"),
+            )
+        except ValueError as exc:
+            # A missing profile/name/recipient is the user's to fix, not a
+            # retry candidate: finish the row with the reason so the page can
+            # say exactly why nothing landed in the bucket.
+            reason = str(exc)
+            return {"status": "rejected", "code": reason, "message": DRAFT_REJECTIONS.get(reason, reason)}
         email_row = drafted["email"]
+        from app.core.entitlements import increment_usage as _charge
+
+        for meter in ("outreach_per_month", "contact_discovery_per_month"):
+            try:
+                _charge(db, int(user.id), meter, 1)
+            except Exception as exc:  # noqa: BLE001 - never lose the draft over the ledger
+                log.warning("could not charge %s for item %s: %s", meter, item.id, exc)
+        summary = {
+            "email_id": email_row.id, "to": email_row.to_email, "company": email_row.company,
+            "job_id": email_row.job_id, "subject": email_row.subject,
+            "ai_used": bool(drafted.get("ai", {}).get("ai_used")),
+            "fact_guard": (drafted.get("ai") or {}).get("fact_guard"),
+        }
         if bool(get_setting(db, user.id, "general", "auto_approve_email", False)):
             email_row.status = "queued"
             db.commit()
-            return send_email(db, user, email_row, allow_real=True)
-        return {"status": "pending_approval", "email_id": email_row.id, "to": email_row.to_email}
+            return {**summary, **send_email(db, user, email_row, allow_real=True)}
+        if payload.get("queue"):
+            from app.services.job_queue import enqueue
+
+            enqueue(db, user_id=int(user.id), pipeline="email",
+                    payload={"send": True, "email_id": email_row.id}, priority=4,
+                    dedupe_key=f"email:{email_row.id}")
+        return {"status": "pending_approval", **summary}
 
     return {"status": "noop"}
 
@@ -349,10 +393,114 @@ async def handle_funding(db: Session, item: PipelineJob) -> Dict[str, Any]:
             "reason": report.get("reason"), "provider_report": report, **sync}
 
 
+#: ``draft_email`` raises ``ValueError(code)`` for the user-fixable cases; the
+#: router used to translate them into a 400 — the queued path reports them as
+#: the item's result instead (same words, so the UI copy does not fork).
+DRAFT_REJECTIONS = {
+    "profile_missing": "Upload your resume first so outreach can be personalised",
+    "profile_name_missing": ("Your profile has no name, so the email cannot be signed. "
+                             "Re-upload your master resume with AI online, or add your name to the profile."),
+    "no_recipient": "No contact could be found — provide recipient_email explicitly",
+    "suppressed": "That recipient is on your suppression list",
+}
+
+
+async def handle_generate_resume(db: Session, item: PipelineJob, user: User) -> Dict[str, Any]:
+    """Queued tailored-resume generation (v2.2.8) — the fact guard included.
+
+    Exactly the work ``POST /api/resumes/generate`` used to do inline, minus
+    the request/response: generate → fact guard → render + save (``pending``)
+    → tag → persona signal → charge the meter. Nothing half-made is ever
+    saved. A guardrail or fact-guard rejection is a *result* (``status:
+    rejected``), not a failure: retrying the same prompt would not make the
+    model stop inventing employers, and the user has to see the violations.
+    """
+    from app.api.deps import get_owned_profile
+    from app.services import persona as persona_service
+    from app.services.ai_guardrails import GuardrailError
+    from app.services.job_queue import enqueue
+    from app.services.resume_generator import generate_tailored_profile
+    from app.services.resume_service import build_and_save_resume, fact_guard_check
+
+    payload = item.payload or {}
+    job = db.query(Job).filter(Job.id == payload.get("job_id"), Job.user_id == user.id).first()
+    if not job:
+        raise RuntimeError("job_missing")
+    profile = get_owned_profile(db, int(user.id))
+    if not profile:
+        return {"status": "rejected", "code": "profile_missing", "message": "Upload a master resume first"}
+    if not (job.description or "").strip():
+        return {"status": "rejected", "code": "no_description",
+                "message": "This job has no description — paste the JD into the job first"}
+
+    persona = persona_service.get_persona(db, int(user.id), payload.get("persona_id")) or \
+        persona_service.ensure_default_persona(db, int(user.id))
+    persona_context = persona_service.memory_summary(persona) if persona else {}
+    strict = bool(payload.get("strict_skeleton") or get_setting(db, int(user.id), "general", "strict_skeleton", False))
+
+    try:
+        tailored = await generate_tailored_profile(
+            profile.data or {}, job.description or "", profile.layout or {}, strict,
+            db=db, user_id=int(user.id),
+            persona={"name": persona.name if persona else "", "target_role": persona.target_role if persona else "",
+                     "observed_skills": list((persona_context.get("observed_skills") or {}).keys())[:12],
+                     "observed_titles": list((persona_context.get("observed_titles") or {}).keys())[:8]}
+            if persona else None,
+        )
+    except GuardrailError as exc:
+        return {"status": "rejected", **exc.payload(), "job_id": job.id}
+    guard = fact_guard_check(profile.data or {}, tailored.get("tailored_profile") or {})
+    if not guard["passed"]:
+        return {"status": "rejected", "code": "fact_guard_failed", "job_id": job.id,
+                "message": "The tailored resume contained facts not present in your profile.",
+                "violations": guard["violations"], "fact_guard": guard,
+                "issues": [{"code": "fact_guard", "field": v.get("kind"), "message": f"{v.get('kind')}: {v.get('value')}"}
+                           for v in guard["violations"]]}
+
+    resume = build_and_save_resume(db, user_id=int(user.id), profile=profile, job=job, tailored=tailored,
+                                   strict_skeleton=strict, status="pending",
+                                   persona_id=persona.id if persona else None)
+    from app.core import audit
+
+    audit.audit(db, "resume.generated", user=user, target=resume.filename,
+                detail={"job_id": job.id, "resume_id": resume.id, "fact_guard": guard,
+                        "guardrail": (tailored.get("guardrail") or {}).get("passed"),
+                        "persona_id": resume.persona_id, "pipeline_job_id": int(item.id)})
+    enqueue(db, user_id=int(user.id), pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id},
+            priority=4, dedupe_key=f"tag_resume:{resume.id}")
+    persona_service.record_signal(db, int(user.id), resume.persona_id, "resume_generated",
+                                  {"title": job.title, "company": job.company,
+                                   "keywords": tailored.get("tags") or []})
+    from app.core.entitlements import increment_usage
+
+    try:
+        increment_usage(db, int(user.id), "tailored_resumes_per_month", 1)
+    except Exception as exc:  # noqa: BLE001 - never lose the resume over the ledger
+        log.warning("could not charge tailored_resumes_per_month for item %s: %s", item.id, exc)
+
+    return {
+        "status": "generated",
+        "job_id": job.id,
+        "resume_id": resume.id,
+        "resume_status": resume.status,
+        "tags": resume.tags,
+        "display_name": resume.display_name,
+        "fact_guard": guard,
+        "guardrail": tailored.get("guardrail", {}),
+        "reasoning": tailored.get("reasoning", ""),
+        "files": {"docx": f"/api/resumes/{resume.id}/download?format=docx",
+                  "pdf": f"/api/resumes/{resume.id}/download?format=pdf"},
+    }
+
+
 async def handle_ai(db: Session, item: PipelineJob) -> Dict[str, Any]:
-    """Generic AI work: currently resume tagging (the queue keeps it observable)."""
+    """Generic AI work: resume tagging and (v2.2.8) tailored-resume generation."""
     user = _user(db, item)
     payload = item.payload or {}
+    if payload.get("task") == "generate_resume":
+        if not user:
+            raise RuntimeError("user_missing")
+        return await handle_generate_resume(db, item, user)
     if payload.get("task") == "tag_resume":
         from app.models.models import Resume
         from app.services.resume_generator import tag_resume

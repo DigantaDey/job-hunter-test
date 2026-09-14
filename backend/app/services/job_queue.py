@@ -368,11 +368,21 @@ def fail(db: Session, item: PipelineJob, error: str, *, retryable: bool = True) 
     return "dead"
 
 
-def needs_input(db: Session, item: PipelineJob, *, reason: str = "") -> None:
+def needs_input(db: Session, item: PipelineJob, *, reason: str = "",
+                result: Optional[Dict[str, Any]] = None) -> None:
+    """Park the item until the user answers.
+
+    ``result`` (v2.2.8) is the handler's return value — the prepared plan with
+    ``missing_fields`` and ``input_request_id``. It is stored like a completed
+    run's result so the live layer can say *which* fields are missing on any
+    route and after a refresh, instead of only "needs input".
+    """
     item.status = "needs_input"
     item.error = reason[:2000]
     item.locked_by = ""
     item.lease_expires_at = None
+    if result is not None:
+        item.payload = {**(item.payload or {}), "result": result}
     db.commit()
 
 
@@ -477,9 +487,134 @@ def ai_queue_view(db: Session, *, user_id: Optional[int] = None) -> Dict[str, An
 
 def recent_items(db: Session, *, user_id: int, pipeline: Optional[str] = None, status: Optional[str] = None,
                  limit: int = 50) -> List[PipelineJob]:
+    """Newest rows for one tenant. ``status`` accepts a comma-separated list."""
     query = db.query(PipelineJob).filter(PipelineJob.user_id == user_id)
     if pipeline:
         query = query.filter(PipelineJob.pipeline == pipeline)
     if status:
-        query = query.filter(PipelineJob.status == status)
+        wanted = [s.strip() for s in str(status).split(",") if s.strip()]
+        if len(wanted) == 1:
+            query = query.filter(PipelineJob.status == wanted[0])
+        elif wanted:
+            query = query.filter(PipelineJob.status.in_(wanted))
     return query.order_by(PipelineJob.created_at.desc()).limit(limit).all()
+
+
+def existing_item(db: Session, *, user_id: int, dedupe_key: str) -> Optional[PipelineJob]:
+    """The tenant's row behind a dedupe key (``None`` when there is none).
+
+    :func:`enqueue` answers ``None`` for "identical work is already in flight",
+    which is the right *queue* answer but leaves the API without the id the UI
+    needs to re-attach to that in-flight row. Routers call this to return the
+    live ``pipeline_job_id`` on the duplicate path too.
+    """
+    if not dedupe_key:
+        return None
+    return (
+        db.query(PipelineJob)
+        .filter(PipelineJob.user_id == user_id, PipelineJob.dedupe_key == dedupe_key)
+        .first()
+    )
+
+
+def enqueue_or_existing(db: Session, **kwargs: Any) -> tuple[Optional[PipelineJob], bool]:
+    """:func:`enqueue`, but always hand back a row.
+
+    Returns ``(item, duplicate)``: ``duplicate`` is ``True`` when the work was
+    already in flight and ``item`` is that in-flight row (or ``None`` when no
+    dedupe key was given, in which case nothing could have been deduped).
+    """
+    item = enqueue(db, **kwargs)
+    if item is not None:
+        return item, False
+    return existing_item(db, user_id=int(kwargs["user_id"]), dedupe_key=str(kwargs.get("dedupe_key") or "")), True
+
+
+#: Rows the live layer treats as "still moving" — every status in which the
+#: worker or the watchdog may still change the row without user action, plus
+#: ``needs_input`` (which needs the user, and must therefore stay visible).
+LIVE_STATUSES = ("queued", "processing", "paused", "needs_input")
+
+#: How long a finished row stays in the live feed so a page that was refreshed
+#: mid-run still sees the *outcome* (done/dead) and can transition instead of
+#: silently losing the status the user was watching.
+RECENT_FINISHED_WINDOW = timedelta(minutes=30)
+
+
+def serialize_item(row: PipelineJob, *, include_result: bool = True) -> Dict[str, Any]:
+    """One ``pipeline_jobs`` row as the UI sees it.
+
+    ``payload.result`` (the handler's return value) is what the pages derive
+    their final state from — ``applied`` / ``ready_to_apply`` / ``needs_input``
+    for an application, ``resume_id`` + download links for a resume, the scan
+    report for funding. Everything the UI needs to render a run *without*
+    re-clicking must be in here, because after an F5 this row is all it has.
+    """
+    payload: Dict[str, Any] = dict(row.payload) if isinstance(row.payload, dict) else {}
+    result = payload.pop("result", None)
+    # Discovery/funding carry large context blobs; the live feed does not need them.
+    for heavy in ("context", "board_tokens"):
+        payload.pop(heavy, None)
+    out: Dict[str, Any] = {
+        "id": row.id,
+        "pipeline": row.pipeline,
+        "task": payload.get("task"),
+        "job_id": row.job_id,
+        "status": row.status,
+        "priority": row.priority,
+        "attempts": row.attempts,
+        "max_attempts": row.max_attempts,
+        "paused_count": int(payload.get("paused_count") or 0),
+        "error": row.error or "",
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "scheduled_at": row.scheduled_at,
+        "finished_at": row.finished_at,
+        "payload": payload,
+    }
+    if include_result:
+        out["result"] = result if isinstance(result, dict) else (None if result is None else {"result": result})
+    return out
+
+
+def live_view(db: Session, *, user_id: int, limit: int = 100) -> Dict[str, Any]:
+    """Everything one tenant's live layer polls: in-flight rows + fresh outcomes.
+
+    * ``items`` — every row in :data:`LIVE_STATUSES`, oldest first (the order
+      the worker will get to them);
+    * ``recent`` — rows finished (``done``/``dead``/``failed``) inside
+      :data:`RECENT_FINISHED_WINDOW`, newest first, so a refreshed page can
+      still show "applied" for a run it launched before the refresh;
+    * ``counts`` — the header chip numbers;
+    * ``processing_now`` — the row a worker is executing right now (or null).
+
+    Tenant-scoped by construction: every query filters on ``user_id``.
+    """
+    base = db.query(PipelineJob).filter(PipelineJob.user_id == user_id)
+    live_rows = (
+        base.filter(PipelineJob.status.in_(list(LIVE_STATUSES)))
+        .order_by(PipelineJob.priority.asc(), PipelineJob.created_at.asc(), PipelineJob.id.asc())
+        .limit(limit)
+        .all()
+    )
+    since = datetime.utcnow() - RECENT_FINISHED_WINDOW
+    recent_rows = (
+        base.filter(
+            PipelineJob.status.in_(["done", "dead", "failed"]),
+            or_(PipelineJob.finished_at >= since, PipelineJob.updated_at >= since),
+        )
+        .order_by(PipelineJob.id.desc())
+        .limit(limit)
+        .all()
+    )
+    counts = dict.fromkeys(LIVE_STATUSES, 0)
+    for row in live_rows:
+        counts[row.status] = counts.get(row.status, 0) + 1
+    processing = next((row for row in live_rows if row.status == "processing"), None)
+    return {
+        "counts": counts,
+        "items": [serialize_item(row) for row in live_rows],
+        "recent": [serialize_item(row) for row in recent_rows],
+        "processing_now": serialize_item(processing) if processing else None,
+        "server_time": datetime.utcnow(),
+    }

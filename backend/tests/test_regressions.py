@@ -6,6 +6,8 @@ security control or a config value that depended on the working directory.
 """
 from __future__ import annotations
 
+from tests.conftest import draft_email_now
+
 import os
 import time
 import urllib.error
@@ -320,7 +322,7 @@ def test_backup_defaults_come_from_settings(monkeypatch, tmp_path):
 # 11. Consent gates live on the routes that act on the outside world
 # --------------------------------------------------------------------------- #
 def test_sending_email_requires_the_outreach_disclosure(client, auth, uploaded_resume):
-    draft = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=auth).json()
+    draft = draft_email_now(client, auth, {"company": "FinCo"})
     email_id = draft["email"]["id"]
 
     denied = client.post(f"/api/emails/{email_id}/send", json={}, headers=auth)

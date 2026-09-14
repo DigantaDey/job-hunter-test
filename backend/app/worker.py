@@ -223,7 +223,7 @@ class Worker:
                     return
             if item.status == "processing":
                 if isinstance(result, dict) and result.get("status") == "needs_input":
-                    needs_input(db, item, reason="waiting for user input")
+                    needs_input(db, item, reason="waiting for user input", result=result)
                 else:
                     # v2.2 auto mode, the quota half: an auto-triggered run
                     # charges the monthly automation budget once, on success.

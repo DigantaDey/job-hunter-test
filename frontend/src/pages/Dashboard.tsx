@@ -4,6 +4,9 @@ import { Briefcase, CheckCircle, AlertTriangle, Clock, Mail, FileText, Vault, Sp
 import { Link } from 'react-router-dom'
 import { fmtRelativeToNow } from '../lib/automation'
 import { creditLabel, usagePercent } from '../lib/credits'
+import { useAIWork } from '../context/AIWorkContext'
+import { StateIcon } from '../components/AIWorkChip'
+import { describeRow, deriveState, toneClasses } from '../lib/aiWork'
 
 export default function Dashboard() {
   const [summary, setSummary] = useState<any>(null)
@@ -11,6 +14,11 @@ export default function Dashboard() {
   const [performance, setPerformance] = useState<any>(null)
   const [profile, setProfile] = useState<any>(null)
   const [billing, setBilling] = useState<any>(null)
+  // Live layer (v2.2.8): the queue counters below come from the polled
+  // snapshot when it is available, so the dashboard's "Running" and "Open
+  // queues" numbers move while work is in flight instead of freezing at the
+  // value fetched on mount.
+  const work = useAIWork()
 
   useEffect(()=>{
     let cancelled = false
@@ -52,10 +60,13 @@ export default function Dashboard() {
   const buckets: Record<string, Record<string, number>> = automation.queues || {}
   const sumStatus = (...keys: string[]) => Object.values(buckets).reduce((n, b) => n + keys.reduce((m, k) => m + (b?.[k] ?? 0), 0), 0)
   const hasBuckets = Object.keys(buckets).length > 0
-  const pipeRunning = hasBuckets ? sumStatus('queued', 'processing') : (automation.running ?? 0)
+  const live = work.snapshot
+  const pipeRunning = live ? live.counts.queued + live.counts.processing : hasBuckets ? sumStatus('queued', 'processing') : (automation.running ?? 0)
   const pipeCompleted = hasBuckets ? sumStatus('done') : (automation.completed ?? 0)
   const pipeFailed = hasBuckets ? sumStatus('failed', 'dead') : (automation.failed ?? 0)
-  const pipePaused = hasBuckets ? sumStatus('paused') : 0
+  const pipePaused = live ? live.counts.paused : hasBuckets ? sumStatus('paused') : 0
+  const needsInputNow = live ? live.counts.needs_input : (automation.needs_input ?? 0)
+  const inFlight = live ? live.items.slice(0, 5) : []
   const autoNextIso: string | null = automation.next_run || null
   const autoNextMs = autoNextIso ? new Date(autoNextIso).getTime() : NaN
   // `next_run: null` is "no next run to promise": the switch is on but blocked
@@ -187,7 +198,24 @@ export default function Dashboard() {
           <div className="card p-5">
             <h3 className="font-medium flex items-center gap-2"><ListChecks className="w-4 h-4"/> Command center</h3>
             <div className="mt-3 grid gap-2">
-              <Link to="/queues" className="p-3 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm flex items-center justify-between">Open queues <span className="text-xs mono bg-white/20 px-2 py-0.5 rounded-full">{pipeRunning} running{pipePaused ? ` • ${pipePaused} paused` : ''}</span></Link>
+              <Link to="/queues" className="p-3 min-h-[44px] rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm flex items-center justify-between focus:outline-none focus:ring-2 focus:ring-blue-500">Open queues <span className="text-xs mono bg-white/20 dark:bg-zinc-900/10 px-2 py-0.5 rounded-full" data-testid="dashboard-queue-counter">{pipeRunning} running{pipePaused ? ` • ${pipePaused} paused` : ''}{needsInputNow ? ` • ${needsInputNow} need input` : ''}</span></Link>
+              {needsInputNow > 0 && (
+                <Link to="/queues#user-input" className="p-3 min-h-[44px] rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950 text-amber-900 dark:text-amber-100 text-sm flex items-center justify-between focus:outline-none focus:ring-2 focus:ring-amber-500">User Input Needed <span className="text-xs mono">{needsInputNow} waiting on you →</span></Link>
+              )}
+              {inFlight.length > 0 && (
+                <div className="rounded-xl border dark:border-zinc-800 p-2 space-y-1" data-testid="dashboard-in-flight">
+                  <div className="text-[11px] mono uppercase text-zinc-500 px-1">AI work in flight — live</div>
+                  {inFlight.map((row)=>{ const st = deriveState(row); return (
+                    <div key={row.id} className={`px-2 py-1.5 rounded-lg border text-[11px] mono flex items-start gap-2 ${toneClasses(st?.tone || 'neutral')}`}>
+                      <StateIcon state={st} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex justify-between gap-2"><span className="font-medium truncate">#{row.id} {describeRow(row)}</span><span className="shrink-0">{st?.label || row.status}</span></div>
+                        {st?.detail && <div className="opacity-80 mt-0.5 line-clamp-1">{st.detail}</div>}
+                      </div>
+                    </div>
+                  )})}
+                </div>
+              )}
               <Link to="/emails" className="p-3 rounded-xl border dark:border-zinc-800 text-sm flex items-center justify-between">Email bucket <Mail className="w-4 h-4 text-zinc-500"/><span className="text-xs mono">{outreach.sent ?? 0} sent • {outreach.pending_approval ?? 0} pending</span></Link>
               <Link to="/vault" className="p-3 rounded-xl border dark:border-zinc-800 text-sm flex items-center justify-between">Vault <Vault className="w-4 h-4 text-zinc-500"/><span className="text-xs mono">{summary.vault ?? 0} creds</span></Link>
               <Link to="/interview" className="p-3 rounded-xl border dark:border-zinc-800 text-sm flex items-center justify-between">Interview Prep <Brain className="w-4 h-4 text-zinc-500"/></Link>

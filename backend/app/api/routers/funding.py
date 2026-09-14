@@ -30,7 +30,7 @@ from app.services.ai_client import is_ai_error
 from app.services.ai_guardrails import describe_ai_error
 from app.services.funding_radar import SCAN_BLOCKED, SCAN_OK, SCAN_PAUSED
 from app.services.funding_sources import normalize_company_name, provider_status
-from app.services.job_queue import enqueue
+from app.services.job_queue import enqueue_or_existing
 from app.services.outreach import draft_email
 from app.services.user_settings import get_setting, set_setting
 
@@ -245,7 +245,7 @@ async def refresh(user: CurrentUser, db: DbSession, payload: dict = Body(default
     provider = (payload or {}).get("provider") or get_setting(db, user.id, "funding", "provider", settings.funding_provider)
     # The dedupe key includes the focus/persona: re-scanning with different
     # input is different work, and the queue constraint is per (user, key).
-    item = enqueue(
+    item, duplicate = enqueue_or_existing(
         db,
         user_id=user.id,
         pipeline="funding",
@@ -256,9 +256,12 @@ async def refresh(user: CurrentUser, db: DbSession, payload: dict = Body(default
         dedupe_key=f"funding:{provider}:{window}:{persona.id if persona else 0}:{hashlib.sha256(extra_context.encode()).hexdigest()[:10]}",
     )
     audit.audit(db, "funding.refresh_queued", user=user, target=provider,
-                detail={"window_days": window, "focus": focus[:200], "queued": item is not None})
-    return {"queued": item is not None, "pipeline_job_id": item.id if item else None,
-            "duplicate": item is None, "provider": provider, "window_days": window,
+                detail={"window_days": window, "focus": focus[:200], "queued": not duplicate,
+                        "pipeline_job_id": item.id if item else None})
+    # v2.2.8: the duplicate path returns the id of the scan already in flight,
+    # so the live layer re-attaches to it instead of showing nothing.
+    return {"queued": not duplicate, "pipeline_job_id": item.id if item else None,
+            "duplicate": duplicate, "provider": provider, "window_days": window,
             "context_source": context.get("source"), "focus_applied": focus,
             "context": context}
 

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import client, { apiError, aiOutage, guardrailFailure, downloadResume, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
 import { AIOutageBanner } from '../components/AIBanner'
+import { useAIWork } from '../context/AIWorkContext'
+import { WorkStatusLine } from '../components/AIWorkChip'
 import { Upload, FileText, Wand2, Tag, Download, Brain, ShieldCheck, Sparkles, Layers, Check, Loader2, AlertTriangle, BadgeCheck, XCircle, Clock, Activity, Timer } from 'lucide-react'
 
 type Guardrail = {
@@ -149,6 +151,29 @@ export default function Resumes(){
   }
   useEffect(()=>{ load() },[])
 
+  /**
+   * The live layer (v2.2.8): generation is queued, and the preview below the
+   * button is *derived* from the queue row's result — resume id, tags,
+   * guardrail report, or the fact-guard rejection — so it survives navigation
+   * and F5 and the header chip shows "generating" on every route. Any
+   * generate_resume row for the picked job is shown (same tab or not).
+   */
+  const work = useAIWork()
+  const jobIdNum = selectedJob ? Number(selectedJob) : null
+  const genRow = jobIdNum ? work.findRow({ key: `resume:${jobIdNum}`, pipeline: 'ai', jobId: jobIdNum, task: 'generate_resume' }) : null
+  const genLive = !!genRow && ['queued','processing','paused'].includes(String(genRow.status))
+  const genResult = genRow?.status === 'done' ? genRow.result : null
+  const derivedPreview = genResult
+    ? (genResult.status === 'rejected'
+        ? { failed: true, error: genResult.message, guardrail: { passed: false, issues: genResult.issues || [], checks: genResult.checks || ['guardrail'], source: 'ai' } }
+        : genResult)
+    : null
+  const shownPreview = derivedPreview || preview
+  const genFinished = genRow && !genLive ? `${genRow.id}:${genRow.status}` : ''
+  useEffect(()=>{ if(genFinished) load() // the new pending row must appear in the list
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[genFinished])
+
   // elapsed timer while uploading
   useEffect(()=>{
     if(!uploading){
@@ -253,9 +278,10 @@ export default function Resumes(){
     if(!selectedJob) return setNotice('Pick a job')
     setGenerating(true); setOutage(null); setGuardrailErr(null); setNotice(''); setPreview(null)
     try{
-      const {data}=await client.post('/api/resumes/generate', null, {params:{job_id: selectedJob, strict_skeleton: strict, persona_id: personaId || undefined}, timeout: AI_REQUEST_TIMEOUT_MS})
-      setPreview(data)
-      load()
+      const {data}=await client.post('/api/resumes/generate', null, {params:{job_id: selectedJob, strict_skeleton: strict, persona_id: personaId || undefined}})
+      // Queued: keep the receipt, the row carries the outcome (fact guard included).
+      if (data.pipeline_job_id) work.track({ id: data.pipeline_job_id, pipeline: 'ai', key: `resume:${selectedJob}` })
+      if (data.duplicate) setNotice('Already generating for this job — showing its live status.')
     }catch(e:any){
       const o = aiOutage(e)
       const g = guardrailFailure(e)
@@ -335,7 +361,7 @@ export default function Resumes(){
           <div className="pt-2 border-t dark:border-zinc-800">
             <h4 className="text-sm font-medium flex items-center gap-2"><Wand2 className="w-4 h-4"/> Generate tailored resume</h4>
             <div className="mt-2 space-y-2">
-              <select value={selectedJob} onChange={e=>setSelectedJob(e.target.value)} className="w-full border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700">
+              <select value={selectedJob} onChange={e=>setSelectedJob(e.target.value)} aria-label="Job to tailor the resume for" className="w-full border rounded-xl px-3 py-2 min-h-[44px] text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500">
                 <option value="">Pick a job…</option>
                 {jobs.map(j=> <option key={j.id} value={j.id}>{j.title} • {j.company} (score {j.score})</option>)}
               </select>
@@ -347,22 +373,24 @@ export default function Resumes(){
               )}
               <label className="flex items-center gap-2 text-xs mono"><input type="checkbox" checked={strict} onChange={e=>setStrict(e.target.checked)}/> Strictly maintain uploaded skeleton</label>
               <label className="flex items-center gap-2 text-xs mono"><input type="checkbox" checked={!strict} onChange={e=>setStrict(!e.target.checked)}/> AI-generated ATS-friendly format</label>
-              <button onClick={generate} disabled={generating} className="w-full py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50">
-                {generating ? <Loader2 className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} Generate with guardrails
+              <button onClick={generate} disabled={generating || genLive} className="w-full min-h-[44px] py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1">
+                {generating || genLive ? <Loader2 className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} {genLive ? 'Generating (fact guard)…' : 'Generate with guardrails'}
               </button>
+              <WorkStatusLine row={genRow} prefix="Tailored resume" testId="resume-generate-status" onDismiss={()=> jobIdNum && work.untrack(`resume:${jobIdNum}`)} />
               <div className="text-[11px] mono text-zinc-500 flex items-start gap-1"><ShieldCheck className="w-3.5 h-3.5 mt-0.5 shrink-0"/> Schema + fact ledger + ATS quality checks. A draft that invents an employer, date or skill is sent back for repair, then rejected — never saved.</div>
-              {preview && (
-                <div className={`rounded-xl p-3 border ${preview.failed ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800' : 'bg-emerald-50 dark:bg-emerald-950 border-emerald-200 dark:border-emerald-800'}`}>
-                  <div className="text-xs mono font-medium text-emerald-800 dark:text-emerald-200">
-                    {preview.failed ? 'Rejected by the guardrail' : `Generated ${preview.display_name || ''}`}
+              {shownPreview && (
+                <div className={`rounded-xl p-3 border ${shownPreview.failed ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800' : 'bg-emerald-50 dark:bg-emerald-950 border-emerald-200 dark:border-emerald-800'}`}>
+                  <div className={`text-xs mono font-medium ${shownPreview.failed ? 'text-red-800 dark:text-red-200' : 'text-emerald-800 dark:text-emerald-200'}`}>
+                    {shownPreview.failed ? 'Rejected by the guardrail' : `Generated ${shownPreview.display_name || ''}`}
                   </div>
-                  {preview.tags && <div className="text-xs mono mt-1">Tags: {preview.tags.join(', ')}</div>}
-                  {preview.reasoning && <div className="text-[11px] mono mt-1 opacity-80">{preview.reasoning}</div>}
-                  <GuardrailPanel report={preview.guardrail || {}} />
-                  {!preview.failed && (
+                  {shownPreview.error && <div className="text-[11px] mono mt-1 text-red-700 dark:text-red-300">{shownPreview.error}</div>}
+                  {shownPreview.tags && <div className="text-xs mono mt-1">Tags: {shownPreview.tags.join(', ')}</div>}
+                  {shownPreview.reasoning && <div className="text-[11px] mono mt-1 opacity-80">{shownPreview.reasoning}</div>}
+                  <GuardrailPanel report={shownPreview.guardrail || {}} />
+                  {!shownPreview.failed && shownPreview.resume_id && (
                     <div className="mt-2 flex gap-2">
-                      <button onClick={()=>download(preview.resume_id,'docx')} className="text-xs px-3 py-1 rounded-full bg-white dark:bg-zinc-900 border inline-flex items-center gap-1"><Download className="w-3 h-3"/> DOCX</button>
-                      <button onClick={()=>download(preview.resume_id,'pdf')} className="text-xs px-3 py-1 rounded-full bg-white dark:bg-zinc-900 border inline-flex items-center gap-1"><Download className="w-3 h-3"/> PDF</button>
+                      <button onClick={()=>download(shownPreview.resume_id,'docx')} className="text-xs px-3 min-h-[44px] rounded-full bg-white dark:bg-zinc-900 border inline-flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-blue-500"><Download className="w-3 h-3"/> DOCX</button>
+                      <button onClick={()=>download(shownPreview.resume_id,'pdf')} className="text-xs px-3 min-h-[44px] rounded-full bg-white dark:bg-zinc-900 border inline-flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-blue-500"><Download className="w-3 h-3"/> PDF</button>
                     </div>
                   )}
                 </div>

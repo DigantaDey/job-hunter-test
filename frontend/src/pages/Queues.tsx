@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react'
 import client, { apiError } from '../api/client'
+import { useAIWork } from '../context/AIWorkContext'
+import { StateIcon } from '../components/AIWorkChip'
+import { describeRow, deriveState, toneClasses } from '../lib/aiWork'
 import { Layers, Bot, Search, Send, Clock, CheckCircle, AlertTriangle, Pause, Play, ArrowRight, UserCheck } from 'lucide-react'
 
 /** The seven statuses `queue_stats` returns per pipeline — rendered in this order. */
@@ -56,15 +59,48 @@ export default function Queues(){
   const [filter, setFilter] = useState('application')
   const [inputError, setInputError] = useState<string | null>(null)
 
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [lastPollAt, setLastPollAt] = useState<number | null>(null)
+  // The global live layer (v2.2.8): `processing_now`/counts across *every*
+  // pipeline, shared with the header chip — so this page and the chip can
+  // never disagree about what is running.
+  const work = useAIWork()
+
   const load = async()=>{
-    const {data}=await client.get('/api/pipelines/stats')
-    setStats(data)
-    const {data: j}=await client.get('/api/pipelines/jobs', {params:{pipeline: filter}})
-    setJobs(j)
-    const {data: iq}=await client.get('/api/user-input-queue')
-    setInputQueue(iq)
+    try{
+      const {data}=await client.get('/api/pipelines/stats')
+      setStats(data)
+      const {data: j}=await client.get('/api/pipelines/jobs', {params:{pipeline: filter}})
+      setJobs(j)
+      const {data: iq}=await client.get('/api/user-input-queue')
+      setInputQueue(iq)
+      setLoadError(null)
+      setLastPollAt(Date.now())
+    }catch(e:any){
+      // Keep the last good view; say the read failed instead of blanking.
+      setLoadError(apiError(e, 'Live update failed'))
+    }
   }
-  useEffect(()=>{ load(); const id=setInterval(load, 3000); return ()=>clearInterval(id)},[filter])
+  // Live (v2.2.8): poll every 3s while the tab is visible; pause when hidden
+  // and re-read immediately when it becomes visible again.
+  useEffect(()=>{
+    let id: ReturnType<typeof setInterval> | null = null
+    const start = ()=>{ if(id) return; load(); id = setInterval(load, 3000) }
+    const stop = ()=>{ if(id) clearInterval(id); id = null }
+    const onVis = ()=>{ document.visibilityState === 'hidden' ? stop() : start() }
+    if(document.visibilityState !== 'hidden') start()
+    document.addEventListener('visibilitychange', onVis)
+    return ()=>{ stop(); document.removeEventListener('visibilitychange', onVis) }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[filter])
+
+  // Deep link from the chip/dashboard: /queues#user-input scrolls to the section.
+  useEffect(()=>{
+    if(window.location.hash === '#user-input'){
+      const el = document.getElementById('user-input')
+      if(el){ el.scrollIntoView({behavior:'smooth', block:'start'}); (el as HTMLElement).focus?.() }
+    }
+  },[stats === null])
 
   const submitInput = async(item:any, values:Record<string, any>)=>{
     // The endpoint expects InputPayload = {answers: {...}}. Posting the bare
@@ -87,7 +123,36 @@ export default function Queues(){
 
   return (
     <div className="space-y-4">
-      <h1 className="text-xl font-semibold tracking-tight flex items-center gap-2"><Layers className="w-5 h-5"/> Pipelines & Queues <span className="text-xs mono font-normal text-zinc-500">three in parallel • FIFO</span></h1>
+      <h1 className="text-xl font-semibold tracking-tight flex items-center gap-2 flex-wrap"><Layers className="w-5 h-5"/> Pipelines & Queues <span className="text-xs mono font-normal text-zinc-500">three in parallel • FIFO</span>
+        <span className="ml-auto text-[11px] mono font-normal text-zinc-500 inline-flex items-center gap-1" aria-live="polite">
+          <span className={`w-2 h-2 rounded-full ${loadError ? 'bg-red-500' : 'bg-emerald-500 animate-pulse'}`} aria-hidden />
+          {loadError ? `live update failed — ${loadError}` : `live • updated ${lastPollAt ? new Date(lastPollAt).toLocaleTimeString() : '…'}`}
+        </span>
+      </h1>
+
+      {/* Processing now — across every pipeline, from the same poll as the header chip. */}
+      <div className="card p-4" data-testid="processing-now">
+        <div className="flex items-center gap-2 text-sm font-medium"><Play className="w-4 h-4"/> Processing now
+          <span className="text-xs mono font-normal text-zinc-500">{work.counts.queued} queued • {work.counts.processing} processing • {work.counts.paused} paused{work.counts.needs_input ? ` • ${work.counts.needs_input} need input` : ''}</span>
+        </div>
+        {work.snapshot?.processing_now ? (()=>{ const row = work.snapshot!.processing_now!; const st = deriveState(row); return (
+          <div className={`mt-2 px-3 py-2 rounded-xl border text-xs mono flex items-start gap-2 ${toneClasses(st?.tone || 'busy')}`}>
+            <StateIcon state={st} />
+            <div className="min-w-0 flex-1">
+              <div className="flex justify-between gap-2"><span className="font-medium">#{row.id} {describeRow(row)} • {row.pipeline}</span><span>{st?.label || row.status}</span></div>
+              {st?.detail && <div className="opacity-80 mt-0.5">{st.detail}</div>}
+            </div>
+          </div>
+        )})() : (
+          <div className="mt-2 text-xs mono text-zinc-500">{work.snapshot ? 'idle — no worker is executing anything right now' : 'reading…'}</div>
+        )}
+        {(work.snapshot?.items || []).filter(r=>r.status!=='processing').slice(0,6).map(row=>{ const st = deriveState(row); return (
+          <div key={row.id} className={`mt-1 px-3 py-1.5 rounded-lg border text-[11px] mono flex items-start gap-2 ${toneClasses(st?.tone || 'neutral')}`}>
+            <StateIcon state={st} />
+            <div className="min-w-0 flex-1 flex justify-between gap-2"><span className="truncate">#{row.id} {describeRow(row)}</span><span className="shrink-0">{st?.label || row.status}</span></div>
+          </div>
+        )})}
+      </div>
 
       <div className="grid lg:grid-cols-3 gap-3">
         {pipelines.map(p=> (
@@ -135,7 +200,7 @@ export default function Queues(){
       </div>
 
       {/* user input needed queue */}
-      <div className="card p-5">
+      <div className="card p-5" id="user-input" tabIndex={-1}>
         <h3 className="font-medium flex items-center gap-2"><UserCheck className="w-4 h-4"/> User Input Needed Queue <span className="text-xs mono font-normal text-zinc-500">remains until you complete • then re-queued to application</span></h3>
         {inputError && <div className="mt-2 text-xs mono p-2 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-900 text-red-700 dark:text-red-300">{inputError}</div>}
         {inputQueue.length===0 ? <div className="py-6 text-center text-sm mono text-zinc-500">No pending inputs. When autofill hits unknown fields, jobs pause here.</div> :
@@ -157,7 +222,7 @@ export default function Queues(){
         <div className="p-3 border-b dark:border-zinc-800 flex items-center gap-2">
           <span className="text-sm font-medium">Pipeline jobs</span>
           <div className="ml-auto flex gap-1">
-            {['discovery','application','ai','email','funding'].map(p=> <button key={p} onClick={()=>setFilter(p)} className={`text-xs px-3 py-1 rounded-full border mono ${filter===p?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800'}`}>{p}</button>)}
+            {['discovery','application','ai','email','funding'].map(p=> <button key={p} onClick={()=>setFilter(p)} aria-pressed={filter===p} className={`text-xs px-3 min-h-[44px] rounded-full border mono focus:outline-none focus:ring-2 focus:ring-blue-500 ${filter===p?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800'}`}>{p}</button>)}
           </div>
         </div>
         <div className="max-h-[50vh] overflow-auto divide-y dark:divide-zinc-800">
@@ -169,6 +234,7 @@ export default function Queues(){
                   <div className="mono text-xs text-zinc-500">#{j.id} • {j.pipeline} • P{j.priority} • {new Date(j.created_at).toLocaleString()}</div>
                   <div className="font-medium mono text-xs mt-1 truncate">{JSON.stringify(j.payload).slice(0,120)}</div>
                   {j.error && <div className="text-xs text-red-600 dark:text-red-400 mt-1">{j.error}</div>}
+                  {(()=>{ const st = deriveState(j); return st && st.phase !== j.status ? <div className="text-[11px] mono text-zinc-500 mt-1">{st.label}{st.detail ? ` — ${st.detail}` : ''}</div> : null })()}
                 </div>
                 <div className="flex flex-col items-end gap-1 shrink-0">
                   <span className={`text-xs mono px-2 py-1 rounded-full h-fit ${j.status==='paused'?'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-200': j.status==='dead'?'bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200':'bg-zinc-100 dark:bg-zinc-800'}`}>{j.status}</span>
@@ -196,11 +262,11 @@ function InputForm({req, onSubmit}: any){
       {req.fields.map((f:any)=> (
         <div key={f.name}>
           <label className="text-xs mono">{f.label} {f.required && <span className="text-red-500">*</span>}</label>
-          {f.type==='select' ? <select value={values[f.name]||''} onChange={e=>setValues({...values,[f.name]:e.target.value})} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"><option value="">Select…</option><option>Yes</option><option>No</option></select>
-            : <input value={values[f.name]||''} onChange={e=>setValues({...values,[f.name]:e.target.value})} placeholder={f.label} className="w-full mt-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"/>}
+          {f.type==='select' ? <select value={values[f.name]||''} onChange={e=>setValues({...values,[f.name]:e.target.value})} className="w-full mt-1 border rounded-xl px-3 py-2 min-h-[44px] text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500"><option value="">Select…</option><option>Yes</option><option>No</option></select>
+            : <input value={values[f.name]||''} onChange={e=>setValues({...values,[f.name]:e.target.value})} placeholder={f.label} className="w-full mt-1 border rounded-xl px-3 py-2 min-h-[44px] text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500"/>}
         </div>
       ))}
-      <button onClick={()=>onSubmit(values)} className="px-4 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm font-medium inline-flex items-center gap-2">Submit & re-queue <ArrowRight className="w-4 h-4"/></button>
+      <button onClick={()=>onSubmit(values)} className="px-4 py-2 min-h-[44px] rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm font-medium inline-flex items-center gap-2 focus:outline-none focus:ring-2 focus:ring-blue-500">Submit & re-queue <ArrowRight className="w-4 h-4"/></button>
     </div>
   )
 }
