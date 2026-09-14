@@ -72,6 +72,12 @@ free/pro keep their caps.
   Mutation-checked: reverting `isUnlimited` to the original truthiness test
   fails 6 of the 12, dropping the feature-flag guard fails 2, and "everything
   is unlimited" fails 5.
+- **Form round-trip test** — `SettingsTokenBudgets.test.tsx` pins `budgetValue`,
+  the function that used to be `Number(x) || 16000` and read an explicit
+  *Unlimited* as "unset": `0` survives both directions, a real ceiling passes
+  through, and only a genuinely empty field falls back to the platform default
+  (so a stray backspace cannot silently switch an account to an unmetered
+  provider budget). Restoring the old one-liner fails 3 of the 5.
 - **Hermetic coverage** — `0` round-trips through `PUT/GET /api/settings` and
   `/api/meta`; a negative value is stored as unlimited, never a 1-token cap; an
   explicit `0` beats a default after it; the plan ceiling resolves 0/16000/16000

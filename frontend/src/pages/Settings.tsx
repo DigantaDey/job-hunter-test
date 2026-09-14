@@ -16,7 +16,7 @@ const WORKFLOWS = ['parse','keyword_extract','scoring','resume_gen','classify','
  * silently restore a ceiling. A genuinely empty field falls back to the
  * platform default rather than switching the account to unlimited by accident.
  */
-function budgetValue(raw: unknown, fallback: number): number {
+export function budgetValue(raw: unknown, fallback: number): number {
   const text = String(raw ?? '').trim()
   if (text === '') return fallback
   const parsed = Number(text)
