@@ -4,6 +4,7 @@ import { LayoutDashboard, Briefcase, FileText, Mail, Vault, Settings, ScrollText
 import { useTheme } from '../hooks/useTheme'
 import client from '../api/client'
 import { useAuth } from '../context/AuthContext'
+import { creditLabel } from '../lib/credits'
 import { ErrorBoundary } from './ErrorBoundary'
 import { AIStatusBanner } from './AIBanner'
 
@@ -25,6 +26,24 @@ const nav = [
   {to:'/account', label:'Account', icon: UserCog},
   {to:'/logs', label:'Error Logs', icon: ScrollText},
 ]
+
+/**
+ * The sidebar plan banner — the readout in the bug report
+ * ("Pro+ • 222757/2000000 credits • Score 57 preliminary + AI pending").
+ *
+ * Exported so the unlimited reading is tested directly: a Pro+ account has
+ * `ai_credits_per_month: 0`, and `0` is *unlimited*, not a spent quota. The
+ * ceiling claim comes from `creditLabel` — the one place that decides.
+ */
+export function PlanCreditBanner({ ent }: { ent: any }) {
+  if (!ent) return null
+  const used = ent.usage?.ai_credits_per_month?.used ?? 0
+  return (
+    <div className="mt-2 text-[11px] mono bg-gradient-to-r from-blue-600 to-violet-600 text-white rounded-full px-3 py-1 text-center">
+      {ent.plan_label} • {creditLabel(used, ent.limits?.ai_credits_per_month)}
+    </div>
+  )
+}
 
 export default function Layout() {
   const {theme, setTheme} = useTheme()
@@ -78,10 +97,7 @@ export default function Layout() {
           {ai && <div className="mt-3 text-[11px] mono text-zinc-500 dark:text-zinc-400 bg-zinc-50 dark:bg-zinc-800 rounded-lg px-2 py-1 flex justify-between">
             <span>RPM {ai.remaining}/{ai.rpm}</span><span>{ai.latency_ms ? `${ai.latency_ms}ms` : ''}</span>
           </div>}
-          {/* Plan banner. A limit of 0 means UNLIMITED (Pro+): the counter is
-              real, the ceiling is not — so it reads "222757 used • Unlimited"
-              instead of "222757/0 credits", which looked like a used-up quota. */}
-          {ent && <div className="mt-2 text-[11px] mono bg-gradient-to-r from-blue-600 to-violet-600 text-white rounded-full px-3 py-1 text-center">{ent.plan_label} • {(ent.limits?.ai_credits_per_month ?? 0) > 0 ? `${ent.usage?.ai_credits_per_month?.used||0}/${ent.limits?.ai_credits_per_month} credits` : `${ent.usage?.ai_credits_per_month?.used||0} credits used • Unlimited`}</div>}
+          <PlanCreditBanner ent={ent} />
         </div>
         <nav className="p-3 space-y-1 flex-1 overflow-auto scrollbar-thin">
           {nav.map(n=> (

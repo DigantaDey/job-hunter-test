@@ -55,6 +55,23 @@ free/pro keep their caps.
 - **Production config validation** — a positive `AI_MAX_OUTPUT_TOKENS` under 64
   (or `AI_MAX_INPUT_TOKENS` under 256) fails the deploy: that is not a cost cap,
   it is a guarantee that every answer truncates. `0` is always valid.
+- **`src/lib/credits.ts`** — the single reading of "this plan has no ceiling"
+  for every credit readout (`isUnlimited`, `entryIsUnlimited`, `creditLabel`,
+  `usagePercent`). The sidebar banner (`PlanCreditBanner`) and the billing
+  usage tile (`UsageCell`) are now exported components built on it, so the
+  sidebar, the billing grid and the dashboard cannot disagree — three of them
+  used to make the decision inline, one of them truthiness-based. A limit the
+  payload did not state is *not* unlimited (claiming so from a hole in the data
+  is as false as claiming "0 left"), and a locked feature flag
+  (`{allowed: false, limit: 0}`) can never earn the badge.
+- **Component tests** — `UnlimitedCredits.test.tsx` renders the real banner and
+  the real usage tile with the payload from the bug report and asserts the
+  rendering, not a copy of the logic: Pro+ shows `222757 credits used •
+  Unlimited` and never `222757/0`, a capped plan still shows `20000/50000
+  credits` + `30000 left` + a 40% meter, and an unlimited tile draws no meter.
+  Mutation-checked: reverting `isUnlimited` to the original truthiness test
+  fails 6 of the 12, dropping the feature-flag guard fails 2, and "everything
+  is unlimited" fails 5.
 - **Hermetic coverage** — `0` round-trips through `PUT/GET /api/settings` and
   `/api/meta`; a negative value is stored as unlimited, never a 1-token cap; an
   explicit `0` beats a default after it; the plan ceiling resolves 0/16000/16000
