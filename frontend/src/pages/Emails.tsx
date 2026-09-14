@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
-import client, { apiError, AI_REQUEST_TIMEOUT_MS } from '../api/client'
+import client, { apiError } from '../api/client'
 import { Mail, Send, Check, Pencil, Search, Building2, User, Clock, AlertTriangle, Loader2, Briefcase, ExternalLink, ShieldCheck, ShieldAlert, XCircle } from 'lucide-react'
 import { aiOutage, type AIOutage } from '../api/client'
 import { AIOutageBanner } from '../components/AIBanner'
+import { useAIWork } from '../context/AIWorkContext'
+import { WorkStatusLine } from '../components/AIWorkChip'
 
 /** A per-email message: a blocked send or a missing disclosure, with an action. */
 type Notice = { id: number; kind: 'err' | 'warn'; text: string; consent?: string }
@@ -21,6 +23,12 @@ export default function Emails(){
   const [openJd, setOpenJd] = useState<number|null>(null)
   const [outage, setOutage] = useState<AIOutage|null>(null)
 
+  // Live layer (v2.2.8): drafting is queued; the line under the button is
+  // derived from the queue row and survives navigation/F5.
+  const work = useAIWork()
+  const draftRow = work.findRow({ key: 'email:draft', pipeline: 'email' })
+  const draftLive = !!draftRow && ['queued','processing','paused'].includes(String(draftRow.status))
+
   const load=async()=>{
     const {data}=await client.get('/api/emails', {params: filter?{status:filter}: {}})
     setEmails(data)
@@ -36,7 +44,8 @@ export default function Emails(){
       // The endpoint takes a JSON body (EmailGenerate), not query params.
       // job_id is what makes the draft about a real posting — the bucket then
       // shows the title, link and JD excerpt next to the message.
-      await client.post('/api/emails/generate', {company: company || (job?.company ?? ''), job_id: jobId ? Number(jobId) : null, department: dept}, { timeout: AI_REQUEST_TIMEOUT_MS })
+      const {data} = await client.post('/api/emails/generate', {company: company || (job?.company ?? ''), job_id: jobId ? Number(jobId) : null, department: dept})
+      if (data.pipeline_job_id) work.track({ id: data.pipeline_job_id, pipeline: 'email', key: 'email:draft' })
       setCompany(''); setJobId(''); setNotice(null); load()
     }catch(e:any){
       const o = aiOutage(e)
@@ -109,13 +118,14 @@ export default function Emails(){
             <option>engineering</option><option>product</option><option>design</option><option>data</option>
           </select>
         </div>
-        <button onClick={generate} disabled={busyId===-1} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium disabled:opacity-50">
-          {busyId===-1 ? 'Drafting…' : 'Find decision maker & draft'}
+        <button onClick={generate} disabled={busyId===-1 || draftLive} className="px-4 py-2 min-h-[44px] rounded-full bg-blue-600 text-white text-sm font-medium disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1">
+          {busyId===-1 || draftLive ? 'Drafting…' : 'Find decision maker & draft'}
         </button>
         <div className="ml-auto flex gap-1">
-          {['','pending_approval','queued','sent','needs_otp','failed'].map(s=> <button key={s} onClick={()=>setFilter(s)} className={`text-xs px-3 py-1 rounded-full border mono ${filter===s?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800'}`}>{s||'all'}</button>)}
+          {['','pending_approval','queued','sent','needs_otp','failed'].map(s=> <button key={s} onClick={()=>setFilter(s)} aria-pressed={filter===s} className={`text-xs px-3 min-h-[44px] rounded-full border mono focus:outline-none focus:ring-2 focus:ring-blue-500 ${filter===s?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-800'}`}>{s||'all'}</button>)}
         </div>
       </div>
+      <WorkStatusLine row={draftRow} prefix="Cold email" testId="email-draft-status" onDismiss={()=>work.untrack('email:draft')} />
 
       {outage && <AIOutageBanner outage={outage} what='no draft was created' onDismiss={()=>setOutage(null)} />}
 

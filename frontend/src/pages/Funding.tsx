@@ -1,5 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import client, { apiError, aiOutage, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
+import { useAIWork } from '../context/AIWorkContext'
+import { WorkStatusLine } from '../components/AIWorkChip'
 import { AIOutageBanner } from '../components/AIBanner'
 import { TrendingUp, ExternalLink, Mail, Briefcase, Loader2, Sparkles, RefreshCw, Calendar, Target, Building2, CheckCircle2, AlertTriangle, ShieldAlert, PauseCircle, Globe } from 'lucide-react'
 import { Link } from 'react-router-dom'
@@ -156,6 +158,22 @@ export default function Funding() {
 
   useEffect(() => { load() }, [load])
 
+  /**
+   * The live layer (v2.2.8): the queued scan's state is derived from its queue
+   * row (through the global context), so "Scan queued → Scanning → N
+   * companies verified" survives navigation and F5, and the header chip shows
+   * it on every route. When the row finishes the radar list is re-read once.
+   */
+  const work = useAIWork()
+  const scanRow = work.findRow({ key: 'funding', pipeline: 'funding' })
+  const scanLive = !!scanRow && ['queued', 'processing', 'paused'].includes(String(scanRow.status))
+  const scanFinished = scanRow && !scanLive ? `${scanRow.id}:${scanRow.status}` : ''
+  useEffect(() => {
+    if (!scanFinished) return
+    load(false).then(() => setRefreshedAt(new Date().toISOString()))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scanFinished])
+
   // Search-provider status (badge): a non-critical read — a failure just
   // leaves the badge unrendered, never the page.
   useEffect(() => {
@@ -174,10 +192,13 @@ export default function Funding() {
       // receipt as a result used to blank the whole radar. Re-read the list
       // instead so the user keeps seeing their current companies.
       const { data } = await client.post('/api/funding/refresh', body)
+      // The receipt's id is tracked (sessionStorage) so the status line and
+      // the header chip re-attach to this exact scan after a refresh.
+      if (data.pipeline_job_id) work.track({ id: data.pipeline_job_id, pipeline: 'funding', key: 'funding' })
       setNotice(
         data.duplicate
-          ? 'A scan is already running — results will appear here shortly.'
-          : `Scan queued${data.focus_applied ? ` with focus "${data.focus_applied}" (saved to your settings)` : ''} — results appear as the worker finishes.`
+          ? 'A scan is already running — its live status is shown below.'
+          : `Scan queued${data.focus_applied ? ` with focus "${data.focus_applied}" (saved to your settings)` : ''} — the status below updates live.`
       )
       setContext(data.context || null)
       setShowContextInput(false)
@@ -221,14 +242,15 @@ export default function Funding() {
           <span className="text-xs mono font-normal text-zinc-500">Seed → Series D • fresh ≤{windowDays}d • AI-ranked</span>
         </h1>
         <div className="flex flex-wrap gap-2 chips-wrap">
-          <button onClick={() => setShowContextInput(v => !v)} className="px-3 py-2 rounded-full border dark:border-zinc-700 text-xs inline-flex items-center gap-1.5 bg-white dark:bg-zinc-800 min-h-[44px]">
+          <button onClick={() => setShowContextInput(v => !v)} aria-expanded={showContextInput} className="px-3 py-2 rounded-full border dark:border-zinc-700 text-xs inline-flex items-center gap-1.5 bg-white dark:bg-zinc-800 min-h-[44px] focus:outline-none focus:ring-2 focus:ring-blue-500">
             <Target className="w-3.5 h-3.5" /> Add focus
           </button>
-          <button onClick={rescan} disabled={scanning} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50 min-h-[44px]">
-            {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} AI re-scan
+          <button onClick={rescan} disabled={scanning || scanLive} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50 min-h-[44px] focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1">
+            {scanning || scanLive ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} {scanLive ? 'Scanning…' : 'AI re-scan'}
           </button>
         </div>
       </div>
+      <WorkStatusLine row={scanRow} prefix="Funding re-scan" testId="funding-scan-status" onDismiss={() => work.untrack('funding')} />
 
       {/* AI context panel */}
       <div className="card p-4 bg-gradient-to-br from-blue-50 to-violet-50 dark:from-blue-950/30 dark:to-violet-950/30 border-blue-200 dark:border-blue-900">
@@ -287,10 +309,10 @@ export default function Funding() {
               value={contextInput}
               onChange={e => setContextInput(e.target.value)}
               placeholder="Extra focus beyond your resume — e.g. 'AI infra, fintech in India'"
-              className="flex-1 border rounded-xl px-3 py-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"
+              className="flex-1 border rounded-xl px-3 py-2 min-h-[44px] text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
-            <button onClick={rescan} disabled={scanning} className="px-4 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm font-medium disabled:opacity-50">
-              {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Apply & re-scan'}
+            <button onClick={rescan} disabled={scanning || scanLive} className="px-4 py-2 min-h-[44px] rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm font-medium disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500">
+              {scanning || scanLive ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Apply & re-scan'}
             </button>
           </div>
         )}

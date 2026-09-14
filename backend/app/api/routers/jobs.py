@@ -18,12 +18,12 @@ from app.core.logging import get_logger
 from app.models.models import FundingCompany, Job, JobEvent, PipelineJob, Profile, UserInputRequest
 from app.schemas.schemas import JobDetail
 from app.services import persona as persona_service
-from app.services.apply_flow import mark_applied, prepare_application
+from app.services.apply_flow import mark_applied
 from app.services.classifier import ai_company_size
 from app.services.company_normalize import normalize_company_name
 from app.services.discovery import discovery_sources_config
 from app.services.events import record_job_event
-from app.services.job_queue import enqueue, queue_stats
+from app.services.job_queue import enqueue, enqueue_or_existing, queue_stats
 from app.services.user_settings import get_setting
 
 router = APIRouter(tags=["jobs"])
@@ -374,7 +374,7 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
     # sources the caller had just asked it not to.
     sources = list(payload.sources) if payload.sources is not None else list(config["sources"])
 
-    item = enqueue(
+    item, duplicate = enqueue_or_existing(
         db,
         user_id=user.id,
         pipeline="discovery",
@@ -390,10 +390,13 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
         priority=3,
         dedupe_key=f"discovery:{persona.id if persona else 0}:{','.join(keywords[:5])}:{freshness}",
     )
+    # ``pipeline_job_id`` is set on the duplicate path too (v2.2.8): the live
+    # layer re-attaches to the run that is already in flight instead of
+    # showing nothing because the click was a no-op.
     return {
-        "queued": item is not None,
+        "queued": not duplicate,
         "pipeline_job_id": item.id if item else None,
-        "duplicate": item is None,
+        "duplicate": duplicate,
         "keywords": keywords[:20],
         "freshness_hours": freshness,
         "sources": sources,
@@ -408,6 +411,7 @@ class ApplyRequest(BaseModel):
     resume_choice: str = Field(default="auto", pattern="^(auto|master|generated|selected)$")
     resume_id: Optional[int] = None
     answers: Dict[str, Any] = Field(default_factory=dict)
+    #: Kept for API compatibility — since v2.2.8 every apply is queued.
     queue_only: bool = False
 
 
@@ -419,72 +423,85 @@ async def apply_job(
     user: CurrentUser,
     db: DbSession,
 ):
-    """Prepare (and, when allowed, queue) an application — with entitlement checks."""
+    """Queue an application run — with entitlement checks.
+
+    v2.2.8: this endpoint *always* answers ``{queued, pipeline_job_id}`` now.
+    It used to run Prepare inline (resume choice, form detection, autofill
+    plan, vault credential) and hand the outcome back in the response, which
+    is exactly the "Status: preparing • resume: master" line that vanished the
+    moment the user navigated or pressed F5 — the state lived in one React
+    component and nowhere the UI could read it back. The same work now runs
+    as a durable ``application`` item; the row (``GET /api/queues/ai``,
+    ``GET /api/pipelines/jobs/{id}``) carries ``result`` with the prepared
+    plan (``resume_decision``, ``credential_created``, ``missing_fields`` …) or
+    the execution outcome, so every page can render Queued → Preparing →
+    Applying → Applied / Needs input from it, on any route, after any refresh.
+
+    ``mode`` decides how far the worker goes: ``prepare`` (default) stops after
+    the plan — that is all a deployment without browser automation can do;
+    ``execute`` additionally runs the autofill, and is chosen only when the
+    user has enabled auto-submit *and* given the automation disclosure — the
+    same gate the inline path enforced.
+    """
     enforce(db, user.id, "can_run_automation")
     enforce(db, user.id, "applications_per_month")
     enforce(db, user.id, "automation_runs_per_month")
 
     job = _job_or_404(db, user.id, job_id)
     if job.status in ("applied",):
-        return {"status": "applied", "message": "Already applied", "job_id": job.id}
+        return {"status": "applied", "queued": False, "pipeline_job_id": None,
+                "message": "Already applied", "job_id": job.id}
 
     profile = db.query(Profile).filter(Profile.user_id == user.id).first()
     if not profile:
         raise HTTPException(400, {"code": "profile_missing", "message": "Upload a master resume first"})
 
-    if payload.queue_only:
-        increment_usage(db, user.id, "automation_runs_per_month", 1)
-        item = enqueue(
-            db,
-            user_id=user.id,
-            pipeline="application",
-            job_id=job.id,
-            payload={"resume_choice": payload.resume_choice, "resume_id": payload.resume_id, "answers": payload.answers},
-            priority=1,
-            dedupe_key=f"apply:{job.id}",
-        )
-        job.status = "queued"
-        db.commit()
-        record_job_event(db, user_id=user.id, job_id=job.id, stage="queued", status="info", message="Application queued for processing")
-        return {"status": "queued", "pipeline_job_id": item.id if item else None, "duplicate": item is None}
-
-    try:
-        result = await prepare_application(db, user, job, resume_choice=payload.resume_choice, resume_id=payload.resume_id, answers=payload.answers)
-    except ValueError as exc:
-        raise HTTPException(400, {"code": str(exc), "message": "Cannot prepare this application yet"}) from exc
-
-    if result["status"] == "needs_input":
-        return {
-            **result,
-            "status": "needs_input",
-            "vault_created": result.get("credential_created", False),
-            "message": "Some required fields need your input before the application can be submitted",
-        }
-
-    if settings.autofill_enabled and not settings.autofill_dry_run and bool(get_setting(db, user.id, "application", "allow_auto_submit", False)):
+    mode = "prepare"
+    if (settings.autofill_enabled and not settings.autofill_dry_run
+            and bool(get_setting(db, user.id, "application", "allow_auto_submit", False))):
         require_consent("automation")(user)
         enforce(db, user.id, "can_use_autofill")
-        increment_usage(db, user.id, "automation_runs_per_month", 1)
-        item = enqueue(
-            db,
-            user_id=user.id,
-            pipeline="application",
-            job_id=job.id,
-            payload={"resume_choice": payload.resume_choice, "resume_id": payload.resume_id, "answers": payload.answers},
-            priority=1,
-            dedupe_key=f"apply:{job.id}",
-        )
-        result.update({"status": "queued", "pipeline_job_id": item.id if item else None})
+        mode = "execute"
 
-    audit.audit(
+    dedupe_key = f"apply:{job.id}"
+    item, duplicate = enqueue_or_existing(
         db,
-        "job.applied",
-        user=user,
-        target=f"{job.company}:{job.title}",
-        detail={"job_id": job.id, "status": result["status"], "resume_decision": result["resume_decision"]},
-        request=request,
+        user_id=user.id,
+        pipeline="application",
+        job_id=job.id,
+        payload={"resume_choice": payload.resume_choice, "resume_id": payload.resume_id,
+                 "answers": payload.answers, "mode": mode},
+        priority=1,
+        dedupe_key=dedupe_key,
     )
-    return result
+    if not duplicate:
+        increment_usage(db, user.id, "automation_runs_per_month", 1)
+        job.status = "queued"
+        job.error = ""
+        db.commit()
+        record_job_event(db, user_id=user.id, job_id=job.id, stage="queued", status="info",
+                         message=f"Application queued for processing ({mode})",
+                         meta={"pipeline_job_id": item.id if item else None, "resume_choice": payload.resume_choice})
+        audit.audit(
+            db,
+            "job.apply_queued",
+            user=user,
+            target=f"{job.company}:{job.title}",
+            detail={"job_id": job.id, "mode": mode, "resume_choice": payload.resume_choice,
+                    "pipeline_job_id": item.id if item else None},
+            request=request,
+        )
+    return {
+        "status": "queued",
+        "queued": not duplicate,
+        "duplicate": duplicate,
+        "pipeline_job_id": item.id if item else None,
+        "queue_status": item.status if item else None,
+        "job_id": job.id,
+        "mode": mode,
+        "message": ("An application run for this job is already in flight — showing its live status."
+                    if duplicate else "Application queued — the status below updates live and survives a refresh."),
+    }
 
 
 def _requeue_application(db: Session, user_id: int, job: Job, answers: Dict[str, Any]) -> Optional[PipelineJob]:
@@ -496,7 +513,7 @@ def _requeue_application(db: Session, user_id: int, job: Job, answers: Dict[str,
         .first()
     )
     if existing is None:
-        return enqueue(db, user_id=user_id, pipeline="application", job_id=job.id, payload={"resume_choice": "auto", "answers": answers}, priority=1, dedupe_key=dedupe_key)
+        return enqueue(db, user_id=user_id, pipeline="application", job_id=job.id, payload={"resume_choice": "auto", "answers": answers, "mode": "prepare"}, priority=1, dedupe_key=dedupe_key)
     if existing.status == "needs_input":
         existing.payload = {**(existing.payload or {}), "resume_choice": "auto", "answers": answers}
         existing.status = "queued"
@@ -631,26 +648,40 @@ def pipelines(user: CurrentUser, db: DbSession):
 
 @router.get("/pipelines/jobs")
 def pipeline_items(user: CurrentUser, db: DbSession, pipeline: Optional[str] = None, status_filter: Optional[str] = Query(None, alias="status"), limit: int = 50):
-    from app.services.job_queue import recent_items
+    """Recent queue rows for this tenant. ``status`` may be a comma list
+    (``queued,processing,paused``) so the live layer needs a single read."""
+    from app.services.job_queue import recent_items, serialize_item
 
     rows = recent_items(db, user_id=user.id, pipeline=pipeline, status=status_filter, limit=min(200, limit))
-    return [
-        {
-            "id": r.id,
-            "pipeline": r.pipeline,
-            "job_id": r.job_id,
-            "status": r.status,
-            "priority": r.priority,
-            "attempts": r.attempts,
-            "max_attempts": r.max_attempts,
-            "error": r.error,
-            "created_at": r.created_at,
-            "updated_at": r.updated_at,
-            "scheduled_at": r.scheduled_at,
-            "payload": {k: v for k, v in (r.payload or {}).items() if k != "result"},
-        }
-        for r in rows
-    ]
+    return [serialize_item(r, include_result=False) for r in rows]
+
+
+@router.get("/queues/ai")
+def ai_queue_live(user: CurrentUser, db: DbSession, limit: int = Query(100, ge=1, le=200)):
+    """The live layer's single poll (v2.2.8).
+
+    Every AI trigger in the product — Discover jobs, Auto-apply, Generate
+    resume, Draft email, Funding re-scan — answers ``{queued, pipeline_job_id}``
+    and the work runs in the durable queue. This is where the UI reads the
+    state of that work back, on every route and after a hard refresh: in-flight
+    rows, the outcomes of the last half hour (with each handler's ``result``),
+    the header-chip counts and whatever a worker is executing right now.
+    Tenant-scoped: the caller only ever sees their own rows.
+    """
+    from app.services.job_queue import live_view
+
+    return live_view(db, user_id=int(user.id), limit=limit)
+
+
+@router.get("/pipelines/jobs/{item_id}")
+def pipeline_item(item_id: int, user: CurrentUser, db: DbSession):
+    """One queue row — how a page re-attaches to the id it stored before an F5."""
+    from app.services.job_queue import serialize_item
+
+    row = db.query(PipelineJob).filter(PipelineJob.id == item_id, PipelineJob.user_id == user.id).first()
+    if not row:
+        raise HTTPException(404, "Queue item not found")
+    return serialize_item(row)
 
 
 @router.get("/company/{company_name}/intel")

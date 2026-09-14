@@ -1,6 +1,8 @@
 """Settings validation, secret handling and outreach compliance gates."""
 from __future__ import annotations
 
+from tests.conftest import draft_email_now
+
 from app.core.security import decrypt_secret
 from app.models.models import Email, SettingsModel
 
@@ -107,10 +109,9 @@ def test_consent_is_recorded_with_timestamps(client, auth):
 
 
 def test_email_draft_never_sends_without_explicit_enablement(client, full_consent, uploaded_resume, db):
-    draft = client.post("/api/emails/generate", json={"company": "FinCo", "founder": True}, headers=full_consent)
-    assert draft.status_code == 200, draft.text
-    email_id = draft.json()["email"]["id"]
-    assert draft.json()["email"]["status"] == "pending_approval"
+    draft = draft_email_now(client, full_consent, {"company": "FinCo", "founder": True})
+    email_id = draft["email"]["id"]
+    assert draft["email"]["status"] == "pending_approval"
 
     report = client.post(f"/api/emails/{email_id}/check", headers=full_consent).json()
     assert "smtp_not_configured" in report["blockers"]
@@ -119,11 +120,11 @@ def test_email_draft_never_sends_without_explicit_enablement(client, full_consen
     send = client.post(f"/api/emails/{email_id}/send", json={}, headers=full_consent).json()
     assert send["sent"] is False
     assert send["blocked"] is True
-    assert client.get(f"/api/emails/{email_id}", headers=full_consent) is not None
+    assert client.get(f"/api/emails/{email_id}", headers=full_consent).status_code == 200
 
 
 def test_outreach_consent_blocks_send(client, auth, uploaded_resume, db):
-    draft = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=auth).json()
+    draft = draft_email_now(client, auth, {"company": "FinCo"})
     email_id = draft["email"]["id"]
     report = client.post(f"/api/emails/{email_id}/check", headers=auth).json()
     assert "outreach_consent_missing" in report["blockers"]
@@ -141,7 +142,7 @@ def test_outreach_consent_blocks_send(client, auth, uploaded_resume, db):
 
 def test_send_succeeds_the_consent_gate_once_accepted(client, auth, uploaded_resume, db):
     """After accepting the disclosure the gate passes (dry run still blocks the send)."""
-    draft = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=auth).json()
+    draft = draft_email_now(client, auth, {"company": "FinCo"})
     email_id = draft["email"]["id"]
     assert client.post("/api/account/consent", json={"outreach": True}, headers=auth).status_code == 200
     result = client.post(f"/api/emails/{email_id}/send", json={}, headers=auth)
@@ -160,7 +161,7 @@ def test_dry_run_reports_no_transmission(client, full_consent, uploaded_resume, 
     monkeypatch.setattr(settings, "email_sending_enabled", True)
     monkeypatch.setattr(settings, "email_dry_run", True)
 
-    email_id = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=full_consent).json()["email"]["id"]
+    email_id = draft_email_now(client, full_consent, {"company": "FinCo"})["email"]["id"]
     result = client.post(f"/api/emails/{email_id}/send", json={}, headers=full_consent).json()
     assert result["dry_run"] is True
     assert result["sent"] is False
@@ -176,14 +177,14 @@ def test_real_send_requires_compliance_configuration(client, full_consent, uploa
     monkeypatch.setattr(settings, "email_dry_run", False)
     monkeypatch.setattr(settings, "email_postal_address", "")
 
-    email_id = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=full_consent).json()["email"]["id"]
+    email_id = draft_email_now(client, full_consent, {"company": "FinCo"})["email"]["id"]
     report = client.post(f"/api/emails/{email_id}/check", headers=full_consent).json()
     assert "postal_address_missing" in report["blockers"]
     assert client.post(f"/api/emails/{email_id}/send", json={}, headers=full_consent).json()["sent"] is False
 
 
 def test_suppression_list_blocks_and_can_be_removed(client, full_consent, uploaded_resume, db):
-    draft = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=full_consent).json()
+    draft = draft_email_now(client, full_consent, {"company": "FinCo"})
     email_id, recipient = draft["email"]["id"], draft["email"]["to"]
 
     added = client.post("/api/emails/suppressions", json={"email": recipient}, headers=full_consent)
@@ -201,7 +202,7 @@ def test_suppression_list_blocks_and_can_be_removed(client, full_consent, upload
 
 
 def test_unsubscribe_token_suppresses_recipient(client, full_consent, uploaded_resume, db):
-    draft = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=full_consent).json()
+    draft = draft_email_now(client, full_consent, {"company": "FinCo"})
     email_id = draft["email"]["id"]
     row = db.query(Email).filter(Email.id == email_id).first()
 
@@ -214,7 +215,7 @@ def test_unsubscribe_token_suppresses_recipient(client, full_consent, uploaded_r
 
 
 def test_open_pixel_records_events(client, full_consent, uploaded_resume, db):
-    email_id = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=full_consent).json()["email"]["id"]
+    email_id = draft_email_now(client, full_consent, {"company": "FinCo"})["email"]["id"]
     row = db.query(Email).filter(Email.id == email_id).first()
     pixel = client.get(f"/api/track/open/{row.tracking_token}.png")
     assert pixel.status_code == 200
@@ -226,7 +227,7 @@ def test_open_pixel_records_events(client, full_consent, uploaded_resume, db):
 
 
 def test_webhook_bounce_suppresses(client, full_consent, uploaded_resume, db):
-    draft = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=full_consent).json()
+    draft = draft_email_now(client, full_consent, {"company": "FinCo"})
     recipient = draft["email"]["to"]
     response = client.post("/api/track/events", json={"event": "hard_bounce", "email": recipient})
     assert response.status_code == 200

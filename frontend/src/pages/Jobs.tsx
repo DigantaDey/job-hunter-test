@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
-import client, { apiError, aiOutage, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
+import client, { apiError, aiOutage, downloadResume, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
 import { AIOutageBanner } from '../components/AIBanner'
 import { EmptyBoardBanner } from '../components/EmptyBoardBanner'
 import { useDiscoveryLastRun } from '../hooks/useDiscoveryLastRun'
+import { useAIWork } from '../context/AIWorkContext'
+import { WorkStatusLine } from '../components/AIWorkChip'
 import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader2, Wand2, CheckCircle, AlertCircle, Eye, Brain, Target, MapPin, DollarSign, GraduationCap, Zap, TrendingUp, FileText } from 'lucide-react'
 
 /**
@@ -36,7 +38,41 @@ export default function Jobs(){
   const [discoverMsg, setDiscoverMsg] = useState('')
   const [generating, setGenerating] = useState(false)
   const [generateMsg, setGenerateMsg] = useState('')
-  const [generatedLinks, setGeneratedLinks] = useState<any>(null)
+
+  /**
+   * The live layer (v2.2.8). Every AI trigger on this page — Discover,
+   * Auto-apply, Generate resume, Cold email — is *queued*; the status shown
+   * below each button is derived from the durable queue row, read through the
+   * global context. That is what makes "Status: preparing • resume: master"
+   * survive navigation and F5: the receipt's `pipeline_job_id` goes to
+   * sessionStorage (`track`), the poll finds the row, and the row is the
+   * state. Nothing on this page owns a status string any more.
+   */
+  const work = useAIWork()
+  const applyRow = selected ? work.findRow({ key: `apply:${selected.id}`, pipeline: 'application', jobId: selected.id }) : null
+  const resumeRow = selected ? work.findRow({ key: `resume:${selected.id}`, pipeline: 'ai', jobId: selected.id, task: 'generate_resume' }) : null
+  const emailRow = selected ? work.findRow({ key: `email:${selected.id}`, pipeline: 'email', jobId: selected.id }) : null
+  const discoverRow = work.findRow({ key: 'discover', pipeline: 'discovery' })
+  const applyLive = !!applyRow && ['queued', 'processing', 'paused'].includes(String(applyRow.status))
+  const resumeLive = !!resumeRow && ['queued', 'processing', 'paused'].includes(String(resumeRow.status))
+  const discoverLive = !!discoverRow && ['queued', 'processing', 'paused'].includes(String(discoverRow.status))
+  const generatedLinks = resumeRow?.status === 'done' && resumeRow.result?.files ? resumeRow.result.files : null
+
+  // When a run the user is watching finishes, refresh the job row/list once so
+  // the board's own status column (queued → preparing → applied) catches up.
+  const applyFinished = applyRow && !applyLive ? `${applyRow.id}:${applyRow.status}` : ''
+  useEffect(()=>{
+    if(!applyFinished || !selected) return
+    load()
+    client.get(`/api/jobs/${selected.id}`).then(r=>setSelected((prev:any)=> prev && prev.id===r.data.id ? r.data : prev)).catch(()=>{})
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[applyFinished])
+  const discoverFinished = discoverRow && !discoverLive ? `${discoverRow.id}:${discoverRow.status}` : ''
+  useEffect(()=>{
+    if(!discoverFinished) return
+    load(); reloadLastRun()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[discoverFinished])
 
   /**
    * The board is not filtered by a track today, so there is no persona to scope
@@ -77,25 +113,22 @@ export default function Jobs(){
   }
 
   const discover = async()=>{
-    setDiscoverBusy(true)
+    setDiscoverBusy(true); setDiscoverMsg('')
     try{
       const {data} = await client.post('/api/jobs/discover', {})
       setDiscoverMsg(`${(data.keywords || []).slice(0, 8).join(' • ')}`)
-      setTimeout(load, 2000)
-      setTimeout(load, 4500)
-      // The queued run's own verdict is what the empty-board banner shows, so it
-      // is re-read once the polls above have had time to pick the jobs up.
-      setTimeout(reloadLastRun, 5000)
+      // The receipt is all we keep: the run's state comes from the queue row.
+      if (data.pipeline_job_id) work.track({ id: data.pipeline_job_id, pipeline: 'discovery', key: 'discover' })
     }catch(e:any){ setDiscoverMsg(apiError(e)) }
     finally{ setDiscoverBusy(false)}
   }
   const generateResume = async()=>{
     if(!selected) return
-    setGenerating(true)
+    setGenerating(true); setGenerateMsg('')
     try{
-      const {data} = await client.post('/api/resumes/generate', null, {params:{job_id: selected.id}, timeout: AI_REQUEST_TIMEOUT_MS})
-      setGenerateMsg('Tailored resume ready')
-      setGeneratedLinks(data.files)
+      const {data} = await client.post('/api/resumes/generate', null, {params:{job_id: selected.id}})
+      if (data.pipeline_job_id) work.track({ id: data.pipeline_job_id, pipeline: 'ai', key: `resume:${selected.id}` })
+      if (data.duplicate) setGenerateMsg('Already generating — showing its live status.')
     }catch(e:any){
       const o = aiOutage(e)
       if (o) setOutage(o)
@@ -108,12 +141,8 @@ export default function Jobs(){
     setBusy(true); setApplyMsg('')
     try{
       const {data}=await client.post(`/api/jobs/${selected.id}/apply`, {resume_choice: resumeChoice})
-      if(data.status==='needs_input'){
-        setApplyMsg('Needs your input — check Queues → User Input Needed')
-      } else {
-        const decision = data.resume_decision ? `• resume: ${data.resume_decision}` : ''
-        setApplyMsg(`Status: ${data.status} ${decision} ${data.vault_created ? '• vault credential created' : ''}`)
-      }
+      if (data.pipeline_job_id) work.track({ id: data.pipeline_job_id, pipeline: 'application', key: `apply:${selected.id}` })
+      else if (data.status === 'applied') setApplyMsg(data.message || 'Already applied')
       load()
       const fresh = await client.get(`/api/jobs/${selected.id}`); setSelected(fresh.data)
     }catch(e:any){ setApplyMsg(apiError(e, 'Apply failed')) }
@@ -125,12 +154,13 @@ export default function Jobs(){
       <div className="flex flex-wrap gap-3 items-center justify-between">
         <h1 className="text-xl font-semibold tracking-tight flex items-center gap-2"><Building2 className="w-5 h-5"/> Job discovery — with intelligence</h1>
         <div className="flex gap-2">
-          <button onClick={discover} disabled={discoverBusy} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50 min-h-[44px]">
-            {discoverBusy ? <Loader2 className="w-4 h-4 animate-spin"/> : <Search className="w-4 h-4"/>} Discover jobs
+          <button onClick={discover} disabled={discoverBusy || discoverLive} className="px-4 py-2 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50 min-h-[44px] focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1">
+            {discoverBusy || discoverLive ? <Loader2 className="w-4 h-4 animate-spin"/> : <Search className="w-4 h-4"/>} {discoverLive ? 'Discovering…' : 'Discover jobs'}
           </button>
         </div>
       </div>
       {discoverMsg && <div className="text-xs mono p-2 rounded-lg bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300">Keywords: {discoverMsg}</div>}
+      <WorkStatusLine row={discoverRow} prefix="Discover jobs" testId="discover-status" onDismiss={()=>work.untrack('discover')} />
       {outage && <AIOutageBanner outage={outage} what="no tailored resume was created" onDismiss={()=>setOutage(null)} />}
 
       <div className="card p-3 flex flex-col sm:flex-row flex-wrap gap-2 items-start sm:items-center chips-wrap">
@@ -176,7 +206,7 @@ export default function Jobs(){
           <div className="max-h-[75vh] overflow-auto divide-y dark:divide-zinc-800">
             {jobs.length===0 ? <EmptyBoardBanner lastRun={lastRunLoading ? undefined : lastRun} busy={discoverBusy} onDiscover={discover}/> :
               jobs.map(j=> (
-              <button key={j.id} onClick={()=>selectJob(j.id)} className={`w-full text-left p-4 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 focus:bg-blue-50 flex gap-3 min-h-[44px] ${selected?.id===j.id ? 'bg-blue-50 dark:bg-blue-950/30' : ''}`}>
+              <button key={j.id} onClick={()=>selectJob(j.id)} className={`w-full text-left p-4 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500 flex gap-3 min-h-[44px] ${selected?.id===j.id ? 'bg-blue-50 dark:bg-blue-950/30' : ''}`}>
                 <div className="w-10 h-10 rounded-xl bg-zinc-900 dark:bg-zinc-800 text-white flex items-center justify-center text-xs font-bold shrink-0">{j.company.slice(0,2).toUpperCase()}</div>
                 <div className="min-w-0 flex-1">
                   <div className="text-sm font-medium flex items-center gap-2 truncate">{j.title} <span className="text-[11px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 mono">{j.source}</span> {j.funding && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 border border-violet-200 mono">💰 funded</span>}</div>
@@ -282,13 +312,15 @@ export default function Jobs(){
               <div className="border-t dark:border-zinc-800 pt-4 space-y-3">
                 <div className="text-xs mono font-medium flex items-center gap-2"><Wand2 className="w-3.5 h-3.5"/> Application — Prepare → Review → Confirm → Execute</div>
                 <div className="grid grid-cols-3 gap-2">
-                  <label className={`text-xs p-2 rounded-xl border cursor-pointer text-center ${resumeChoice==='auto'?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-900 dark:border-zinc-700'}`}><input type="radio" name="resumeChoice" value="auto" checked={resumeChoice==='auto'} onChange={()=>setResumeChoice('auto')} className="hidden"/>Auto (AI decides)</label>
-                  <label className={`text-xs p-2 rounded-xl border cursor-pointer text-center ${resumeChoice==='master'?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-900 dark:border-zinc-700'}`}><input type="radio" name="resumeChoice" value="master" checked={resumeChoice==='master'} onChange={()=>setResumeChoice('master')} className="hidden"/>Master</label>
-                  <label className={`text-xs p-2 rounded-xl border cursor-pointer text-center ${resumeChoice==='generated'?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-900 dark:border-zinc-700'}`}><input type="radio" name="resumeChoice" value="generated" checked={resumeChoice==='generated'} onChange={()=>setResumeChoice('generated')} className="hidden"/>Generated</label>
+                  <label className={`text-xs p-2 min-h-[44px] flex items-center justify-center rounded-xl border cursor-pointer text-center focus-within:ring-2 focus-within:ring-blue-500 ${resumeChoice==='auto'?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-900 dark:border-zinc-700'}`}><input type="radio" name="resumeChoice" value="auto" checked={resumeChoice==='auto'} onChange={()=>setResumeChoice('auto')} className="sr-only"/>Auto (AI decides)</label>
+                  <label className={`text-xs p-2 min-h-[44px] flex items-center justify-center rounded-xl border cursor-pointer text-center focus-within:ring-2 focus-within:ring-blue-500 ${resumeChoice==='master'?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-900 dark:border-zinc-700'}`}><input type="radio" name="resumeChoice" value="master" checked={resumeChoice==='master'} onChange={()=>setResumeChoice('master')} className="sr-only"/>Master</label>
+                  <label className={`text-xs p-2 min-h-[44px] flex items-center justify-center rounded-xl border cursor-pointer text-center focus-within:ring-2 focus-within:ring-blue-500 ${resumeChoice==='generated'?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-900 dark:border-zinc-700'}`}><input type="radio" name="resumeChoice" value="generated" checked={resumeChoice==='generated'} onChange={()=>setResumeChoice('generated')} className="sr-only"/>Generated</label>
                 </div>
-                <button onClick={apply} disabled={busy} className="w-full py-2.5 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50">
-                  {busy ? <Loader2 className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} {selected.status==='needs_input' ? 'Re-queue application' : 'Auto-apply (vault + autofill)'}
+                <button onClick={apply} disabled={busy || applyLive} className="w-full min-h-[44px] py-2.5 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1">
+                  {busy || applyLive ? <Loader2 className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} {applyLive ? 'Application in progress…' : selected.status==='needs_input' ? 'Re-queue application' : 'Auto-apply (vault + autofill)'}
                 </button>
+                {/* Derived from the queue row — Queued → Preparing → Applying → Applied / Needs input — survives navigation and F5. */}
+                <WorkStatusLine row={applyRow} prefix="Auto-apply" testId="apply-status" onDismiss={()=>work.untrack(`apply:${selected.id}`)} />
                 {applyMsg && <div className="text-xs mono p-2 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200 flex gap-2"><AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5"/>{applyMsg}</div>}
                 <div className="text-[11px] mono text-zinc-500 leading-relaxed">
                   Prepare → Review → Confirm → Execute. For Workday/Lever: auto-creates vault credential. Unknown fields → User Input Needed queue. Never silently fails.
@@ -297,27 +329,29 @@ export default function Jobs(){
 
               {selected.error && <div className="text-xs mono p-2 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300">{selected.error}</div>}
               <div className="space-y-2 text-xs mono">
-                <button onClick={generateResume} disabled={generating} className="w-full py-2 rounded-full border dark:border-zinc-700 flex items-center justify-center gap-1 disabled:opacity-50">{generating ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <Wand2 className="w-3.5 h-3.5"/>} Generate tailored resume (fact guard)</button>
+                <button onClick={generateResume} disabled={generating || resumeLive} className="w-full min-h-[44px] py-2 rounded-full border dark:border-zinc-700 flex items-center justify-center gap-1 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500">{generating || resumeLive ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : <Wand2 className="w-3.5 h-3.5"/>} {resumeLive ? 'Generating (fact guard)…' : 'Generate tailored resume (fact guard)'}</button>
+                <WorkStatusLine row={resumeRow} prefix="Tailored resume" testId="resume-status" onDismiss={()=>work.untrack(`resume:${selected.id}`)} />
                 {generateMsg && <div className="text-[11px] text-zinc-500">{generateMsg}</div>}
                 {generatedLinks && (
                   <div className="flex gap-2">
-                    <a href={generatedLinks.docx} className="flex-1 py-1.5 rounded-full border dark:border-zinc-700 text-center">Download .docx</a>
-                    <a href={generatedLinks.pdf} className="flex-1 py-1.5 rounded-full border dark:border-zinc-700 text-center">Download .pdf</a>
+                    <button type="button" onClick={()=>void downloadResume(resumeRow!.result!.resume_id, 'docx')} className="flex-1 min-h-[44px] py-1.5 rounded-full border dark:border-zinc-700 text-center focus:outline-none focus:ring-2 focus:ring-blue-500">Download .docx</button>
+                    <button type="button" onClick={()=>void downloadResume(resumeRow!.result!.resume_id, 'pdf')} className="flex-1 min-h-[44px] py-1.5 rounded-full border dark:border-zinc-700 text-center focus:outline-none focus:ring-2 focus:ring-blue-500">Download .pdf</button>
                   </div>
                 )}
                 <button onClick={async()=>{
                   setApplyMsg('')
                   try{
-                    await client.post('/api/emails/generate', {company: selected.company, job_id: selected.id}, { timeout: AI_REQUEST_TIMEOUT_MS })
-                    setApplyMsg('Email drafted → check the Email Bucket')
+                    const {data} = await client.post('/api/emails/generate', {company: selected.company, job_id: selected.id})
+                    if (data.pipeline_job_id) work.track({ id: data.pipeline_job_id, pipeline: 'email', key: `email:${selected.id}` })
                   }catch(e:any){ setApplyMsg(apiError(e, 'Could not draft the email')) }
-                }} className="w-full py-2 rounded-full border dark:border-zinc-700">Cold email</button>
+                }} disabled={!!emailRow && ['queued','processing','paused'].includes(String(emailRow.status))} className="w-full min-h-[44px] py-2 rounded-full border dark:border-zinc-700 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500">Cold email</button>
+                <WorkStatusLine row={emailRow} prefix="Cold email" testId="email-status" onDismiss={()=>work.untrack(`email:${selected.id}`)} />
                 <button onClick={async()=>{
                   try{
                     const {data} = await client.post('/api/interview/generate', {job_id: selected.id, count: 8}, { timeout: AI_REQUEST_TIMEOUT_MS })
                     setApplyMsg(`Interview prep generated: ${data.questions.length} questions → Interview Prep page`)
                   }catch(e:any){ setApplyMsg(apiError(e)) }
-                }} className="w-full py-2 rounded-full border dark:border-zinc-700 flex items-center justify-center gap-1"><FileText className="w-3.5 h-3.5"/> Interview prep</button>
+                }} className="w-full min-h-[44px] py-2 rounded-full border dark:border-zinc-700 flex items-center justify-center gap-1 focus:outline-none focus:ring-2 focus:ring-blue-500"><FileText className="w-3.5 h-3.5"/> Interview prep</button>
               </div>
             </div>
           )}

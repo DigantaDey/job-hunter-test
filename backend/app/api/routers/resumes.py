@@ -25,11 +25,9 @@ from app.core.security import constant_time_equals
 from app.models.models import Job, Profile, Resume
 from app.schemas.schemas import ProfileOut, ResumeOut
 from app.services import persona as persona_service
-from app.services.job_queue import enqueue
-from app.services.resume_generator import generate_tailored_profile
+from app.services.job_queue import enqueue, enqueue_or_existing
 from app.services.resume_parser import ai_extract_profile, extract_layout, extract_text
 from app.services.resume_service import (
-    build_and_save_resume,
     create_polished_resume,
     diff_text,
     download_filename,
@@ -444,11 +442,19 @@ async def generate_resume(
     persona_id: Optional[int] = None,
 ):
     """
-    Generate a tailored resume for a job (starts ``pending`` until approved).
+    Queue a tailored resume for a job (v2.2.8) — the fact guard runs in the worker.
 
-    AI is required. If the model is offline the caller gets a 503 explaining
-    exactly why; if the model's draft cannot be made accurate the caller gets a
-    422 listing the guardrail violations. Nothing half-made is ever saved.
+    Answers ``{queued, pipeline_job_id}``. The generation used to run inline
+    for up to ten minutes and the "Tailored resume ready" line lived in one
+    component's state, so navigating away or refreshing lost both the wait
+    and the outcome. It now runs as a durable ``ai`` item
+    (``task=generate_resume``): the row carries the result — ``resume_id``,
+    download links, the guardrail report, or ``status: rejected`` with the
+    fact-guard violations — so Resume Studio and the job drawer can render
+    it on any route and after any refresh. Nothing half-made is ever saved.
+
+    The cheap, user-fixable checks stay synchronous (no profile, no JD,
+    entitlements) because a click should hear about those immediately.
     """
     enforce(db, user.id, "can_generate_resume")
     enforce(db, user.id, "tailored_resumes_per_month")
@@ -463,50 +469,33 @@ async def generate_resume(
         raise HTTPException(422, "This job has no description — paste the JD into the job first")
 
     persona = persona_service.get_persona(db, user.id, persona_id) or persona_service.ensure_default_persona(db, user.id)
-    persona_context = persona_service.memory_summary(persona) if persona else {}
     strict = bool(strict_skeleton or get_setting(db, user.id, "general", "strict_skeleton", False))
-
-    tailored = await generate_tailored_profile(
-        profile.data or {}, job.description or "", profile.layout or {}, strict,
-        db=db, user_id=user.id,
-        persona={"name": persona.name if persona else "", "target_role": persona.target_role if persona else "",
-                 "observed_skills": list((persona_context.get("observed_skills") or {}).keys())[:12],
-                 "observed_titles": list((persona_context.get("observed_titles") or {}).keys())[:8]}
-        if persona else None,
+    item, duplicate = enqueue_or_existing(
+        db,
+        user_id=user.id,
+        pipeline="ai",
+        job_id=job.id,
+        payload={"task": "generate_resume", "job_id": job.id, "strict_skeleton": strict,
+                 "persona_id": persona.id if persona else None},
+        priority=2,
+        dedupe_key=f"generate_resume:{job.id}:{persona.id if persona else 0}:{int(strict)}",
     )
-    guard = fact_guard_check(profile.data or {}, tailored.get("tailored_profile") or {})
-    if not guard["passed"]:
-        raise HTTPException(422, {"code": "fact_guard_failed",
-                                  "message": "The tailored resume contained facts not present in your profile.",
-                                  "violations": guard["violations"]})
-
-    resume = build_and_save_resume(db, user_id=user.id, profile=profile, job=job, tailored=tailored,
-                                   strict_skeleton=strict, status="pending",
-                                   persona_id=persona.id if persona else None)
-
-    audit.audit(db, "resume.generated", user=user, target=resume.filename,
-                detail={"job_id": job.id, "resume_id": resume.id, "fact_guard": guard,
-                        "guardrail": (tailored.get("guardrail") or {}).get("passed"),
-                        "persona_id": resume.persona_id}, request=request)
-    enqueue(db, user_id=user.id, pipeline="ai", payload={"task": "tag_resume", "resume_id": resume.id},
-            priority=4, dedupe_key=f"tag_resume:{resume.id}")
-    persona_service.record_signal(db, user.id, resume.persona_id, "resume_generated",
-                                  {"title": job.title, "company": job.company,
-                                   "keywords": tailored.get("tags") or []})
-
-    increment_usage(db, user.id, "tailored_resumes_per_month", 1)
-
+    if not duplicate:
+        audit.audit(db, "resume.generate_queued", user=user, target=f"job:{job.id}",
+                    detail={"job_id": job.id, "persona_id": persona.id if persona else None,
+                            "strict_skeleton": strict, "pipeline_job_id": item.id if item else None},
+                    request=request)
     return {
-        "resume_id": resume.id,
-        "status": resume.status,
-        "tags": resume.tags,
-        "display_name": resume.display_name,
-        "fact_guard": guard,
-        "guardrail": tailored.get("guardrail", {}),
-        "reasoning": tailored.get("reasoning", ""),
-        "tailored": resume.profile_snapshot,
-        "files": {"docx": f"/api/resumes/{resume.id}/download?format=docx",
-                  "pdf": f"/api/resumes/{resume.id}/download?format=pdf"},
+        "status": "queued",
+        "queued": not duplicate,
+        "duplicate": duplicate,
+        "pipeline_job_id": item.id if item else None,
+        "queue_status": item.status if item else None,
+        "job_id": job.id,
+        "persona_id": persona.id if persona else None,
+        "message": ("A tailored resume for this job is already being generated — showing its live status."
+                    if duplicate else "Tailored resume queued — the fact guard runs in the worker; "
+                    "the result appears here (and in Resume Studio) when it is done."),
     }
 
 

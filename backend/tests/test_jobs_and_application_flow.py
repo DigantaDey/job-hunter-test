@@ -1,9 +1,35 @@
-"""Discovery queueing, application preparation, user-input gate and timeline."""
+"""Discovery queueing, application preparation, user-input gate and timeline.
+
+v2.2.8: ``POST /api/jobs/{id}/apply`` is queue-only — it answers
+``{queued, pipeline_job_id}`` and the prepare/execute work runs in the worker.
+The helpers below run exactly what the worker runs and then read the outcome
+back the way the SPA does (``GET /api/pipelines/jobs/{id}`` → ``result``), so
+these tests cover the page-agnostic contract rather than a synchronous one.
+"""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 
 from app.models.models import Job, JobEvent, PipelineJob, User, UserInputRequest
+from app.worker import Worker
+
+
+def _run(item_id: int, pipeline: str = "application") -> None:
+    """Execute a queued item the way the worker does (claim → handler → finish)."""
+    asyncio.run(Worker(pipelines=[pipeline])._run_item(item_id, pipeline))
+
+
+def _apply(client, auth, job_id: int, body=None) -> dict:
+    """Click Auto-apply, run the queued item, return the row the UI polls."""
+    response = client.post(f"/api/jobs/{job_id}/apply", json=body or {}, headers=auth)
+    assert response.status_code == 200, response.text
+    receipt = response.json()
+    assert receipt["status"] == "queued" and receipt["pipeline_job_id"], receipt
+    _run(receipt["pipeline_job_id"])
+    row = client.get(f"/api/pipelines/jobs/{receipt['pipeline_job_id']}", headers=auth)
+    assert row.status_code == 200, row.text
+    return row.json()
 
 
 def _job(db, **overrides) -> Job:
@@ -70,16 +96,47 @@ def test_discovery_uses_ai_context_keywords(client, auth, uploaded_resume):
     assert context["source"] in ("heuristic", "ai")
 
 
+def test_apply_is_queued_and_the_receipt_reattaches(client, auth, db, uploaded_resume):
+    """The click answers a receipt; the same id is what the live layer re-reads.
+
+    A second click while the run is in flight is a *duplicate* that still hands
+    back the in-flight id — the UI must be able to re-attach, not show nothing.
+    """
+    job = _job(db)
+    first = client.post(f"/api/jobs/{job.id}/apply", json={"resume_choice": "master"}, headers=auth).json()
+    assert first["queued"] is True and first["status"] == "queued" and first["pipeline_job_id"]
+    assert first["mode"] == "prepare"  # no browser automation in tests → prepare only
+    db.refresh(job)
+    assert job.status == "queued"
+
+    again = client.post(f"/api/jobs/{job.id}/apply", json={"resume_choice": "master"}, headers=auth).json()
+    assert again["duplicate"] is True and again["pipeline_job_id"] == first["pipeline_job_id"]
+
+    live = client.get("/api/queues/ai", headers=auth).json()
+    assert live["counts"]["queued"] >= 1
+    assert any(i["id"] == first["pipeline_job_id"] and i["pipeline"] == "application" for i in live["items"])
+
+    # Tenant scope: the row is not readable by anyone else.
+    assert client.get(f"/api/pipelines/jobs/{first['pipeline_job_id']}", headers=auth).status_code == 200
+
+
 def test_application_preparation_creates_vault_credential(client, auth, db, uploaded_resume):
     job = _job(db)
-    response = client.post(f"/api/jobs/{job.id}/apply", json={"resume_choice": "master"}, headers=auth)
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["status"] in ("preparing", "queued")
+    row = _apply(client, auth, job.id, {"resume_choice": "master"})
+    assert row["status"] == "done", row
+    body = row["result"]
+    assert body["status"] == "preparing"
     assert body["resume_decision"] == "master"
     assert body["credential_created"] is True
     assert body["portal_type"] == "lever"
     assert body["fields_mapped"] == 3
+    db.refresh(job)
+    assert job.status == "preparing"
+
+    # The finished row stays in the live feed's ``recent`` list so a page
+    # refreshed after the run still sees the outcome.
+    live = client.get("/api/queues/ai", headers=auth).json()
+    assert any(r["id"] == row["id"] and r["result"]["resume_decision"] == "master" for r in live["recent"])
 
     vault = client.get("/api/vault", headers=auth).json()
     assert [entry["domain"] for entry in vault] == ["jobs.lever.co"]
@@ -99,7 +156,9 @@ def test_application_requires_user_input_then_completes(client, auth, db, upload
              "options": [], "profile_key": "salaryExpectation"},
         ]}})
 
-    prepared = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth).json()
+    row = _apply(client, auth, job.id)
+    assert row["status"] == "needs_input"
+    prepared = row["result"]
     assert prepared["status"] == "needs_input"
     assert [f["name"] for f in prepared["missing_fields"]] == ["salary_expectation"]
 
@@ -140,19 +199,24 @@ async def test_user_answers_survive_the_requeue_round_trip(client, auth, db, upl
              "options": [], "profile_key": "salaryExpectation"},
         ]}})
 
-    prepared = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth).json()
+    from app.services.handlers import handle_application
+    from app.services.job_queue import claim_item, needs_input
+
+    receipt = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth).json()
+    first_item = claim_item(db, receipt["pipeline_job_id"])
+    prepared = await handle_application(db, first_item)
     assert prepared["status"] == "needs_input"
     assert [f["name"] for f in prepared["missing_fields"]] == ["salary_expectation"]
+    needs_input(db, first_item, reason="waiting for user input")
 
     submitted = client.post(f"/api/jobs/{job.id}/input",
                             json={"answers": {"salary_expectation": "120000"}}, headers=auth)
     assert submitted.status_code == 200, submitted.text
+    db.expire_all()
     item = db.query(PipelineJob).filter(PipelineJob.id == submitted.json()["pipeline_job_id"]).one()
     assert item.payload["answers"] == {"salary_expectation": "120000"}
 
     # Run exactly what the worker runs for the re-queued item.
-    from app.services.handlers import handle_application
-
     result = await handle_application(db, item)
     assert result.get("status") != "needs_input", \
         f"re-run ignored the user's answer, still missing: {result.get('missing_fields')}"
@@ -188,16 +252,11 @@ async def test_parked_item_is_requeued_with_fresh_answers(client, auth, db, uplo
              "options": [], "profile_key": "salaryExpectation"},
         ]}})
 
-    prepared = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth).json()
-    assert prepared["status"] == "needs_input"
+    receipt = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth).json()
+    item = db.query(PipelineJob).filter(PipelineJob.id == receipt["pipeline_job_id"]).one()
 
-    # First answer round: the item is enqueued, then (simulating a stale or
-    # interrupted run) the worker processes it *without* the answer and parks
-    # it in needs_input.
-    submitted = client.post(f"/api/jobs/{job.id}/input",
-                            json={"answers": {"salary_expectation": "120000"}}, headers=auth)
-    assert submitted.status_code == 200, submitted.text
-    item = db.query(PipelineJob).filter(PipelineJob.id == submitted.json()["pipeline_job_id"]).one()
+    # First round: (simulating a stale or interrupted run) the worker
+    # processes the item *without* an answer and parks it in needs_input.
     item.payload = {"resume_choice": "auto", "answers": {}}  # stale payload
     db.commit()
     claimed = claim_item(db, item.id)
@@ -233,8 +292,9 @@ def test_needs_input_is_not_duplicated_on_repeat_apply(client, auth, db, uploade
     job = _job(db, extra={"forms": {"portal_type": "custom", "detection_source": "html", "fields": [
         {"name": "salary_expectation", "label": "Expected salary", "type": "text", "required": True,
          "options": [], "profile_key": "salaryExpectation"}]}})
-    first = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth).json()
-    second = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=auth).json()
+    first = _apply(client, auth, job.id)["result"]
+    # The parked row is re-run (user-driven re-runs reuse the dedupe row).
+    second = _apply(client, auth, job.id)["result"]
     assert first["input_request_id"] == second["input_request_id"]
     assert db.query(UserInputRequest).filter(UserInputRequest.job_id == job.id).count() == 1
 
@@ -302,9 +362,8 @@ def test_pipeline_stats_and_jobs_endpoints(client, auth, db, uploaded_resume):
 def test_application_consent_gate_is_recorded(client, full_consent, db, uploaded_resume):
     """With consent + automation disabled we prepare, never silently submit."""
     job = _job(db)
-    response = client.post(f"/api/jobs/{job.id}/apply", json={}, headers=full_consent)
-    assert response.status_code == 200
-    assert response.json()["status"] in ("preparing", "needs_input", "queued")
+    row = _apply(client, full_consent, job.id)
+    assert row["result"]["status"] in ("preparing", "needs_input")
     db.refresh(job)
     assert job.status != "applied"
 

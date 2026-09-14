@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 from app.models.models import Email, Job, Profile, Resume
 from app.services.job_queue import enqueue
 from app.services.outreach import is_role_mailbox
+from tests.conftest import draft_email_now, generate_resume_now
 
 
 # --------------------------------------------------------------------------- #
@@ -126,13 +127,8 @@ def test_download_filename_is_professional_not_resume_id_hash(client: TestClient
 
 def test_generated_resume_carries_the_guardrail_verdict(client: TestClient, auth: Dict[str, str], db,
                                                         uploaded_resume, seeded_job):
-    generated = client.post(
-        "/api/resumes/generate",
-        params={"job_id": seeded_job.id},
-        headers=auth,
-    )
-    assert generated.status_code == 200, generated.text
-    payload = generated.json()
+    payload = generate_resume_now(client, auth, seeded_job.id)
+    assert payload["status"] == "generated", payload
 
     guardrail = payload["guardrail"]
     assert guardrail["passed"] is True
@@ -170,10 +166,11 @@ def test_hallucinated_resume_is_rejected_and_never_saved(client: TestClient, aut
 
     monkeypatch.setattr(ai_client, "chat_completion", lying_model)
 
-    response = client.post("/api/resumes/generate", params={"job_id": seeded_job.id}, headers=auth)
-    assert response.status_code == 422, response.text
-    body = response.json()
-    assert body["code"] == "guardrail_failed"
+    # The queued run finishes as a *rejection* (done, result.status=rejected) —
+    # not a failure to retry: the model would invent the employer again.
+    body = generate_resume_now(client, auth, seeded_job.id)
+    assert body["_row"]["status"] == "done"
+    assert body["status"] == "rejected" and body["code"] == "guardrail_failed", body
     codes = {issue["code"] for issue in body["issues"]}
     assert "fabricated_employer" in codes, codes
 
@@ -340,8 +337,8 @@ def test_suggestions_offer_more_than_one_track(client: TestClient, auth: Dict[st
 # --------------------------------------------------------------------------- #
 def test_draft_references_the_job_and_the_bucket_shows_the_jd(client: TestClient, auth: Dict[str, str],
                                                               uploaded_resume, seeded_job, db):
-    generated = client.post("/api/emails/generate", json={"company": "FinCo", "job_id": seeded_job.id}, headers=auth)
-    assert generated.status_code == 200, generated.text
+    generated = draft_email_now(client, auth, {"company": "FinCo", "job_id": seeded_job.id})
+    assert generated["email"], generated
 
     row = db.query(Email).order_by(Email.id.desc()).first()
     assert row is not None
@@ -381,12 +378,10 @@ def test_generic_role_mailbox_is_flagged_not_passed_off_as_real(client: TestClie
     assert is_role_mailbox("hr@wirelane.com") is True
     assert is_role_mailbox("diganta@wirelane.com") is False
 
-    generated = client.post("/api/emails/generate",
-                            json={"company": "Wirelane", "department": "engineering",
-                                  "recipient_email": "engineering@wirelane.com",
-                                  "recipient_name": "Engineering Team"},
-                            headers=auth)
-    assert generated.status_code == 200, generated.text
+    generated = draft_email_now(client, auth, {"company": "Wirelane", "department": "engineering",
+                                               "recipient_email": "engineering@wirelane.com",
+                                               "recipient_name": "Engineering Team"})
+    assert generated["email"], generated
     row = db.query(Email).order_by(Email.id.desc()).first()
     assert row.verified is False
 
@@ -397,8 +392,8 @@ def test_generic_role_mailbox_is_flagged_not_passed_off_as_real(client: TestClie
 
 
 def test_email_without_a_job_is_marked_as_unattached(client: TestClient, auth: Dict[str, str], uploaded_resume, db):
-    generated = client.post("/api/emails/generate", json={"company": "FinCo"}, headers=auth)
-    assert generated.status_code == 200, generated.text
+    generated = draft_email_now(client, auth, {"company": "FinCo"})
+    assert generated["email"], generated
     card = client.get("/api/emails", headers=auth).json()[0]
     assert card["job"] is None
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Annotated, Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -12,17 +13,19 @@ from app.core import audit
 from app.core.auth import require_consent
 from app.core.entitlements import enforce, increment_usage
 from app.core.logging import get_logger
-from app.models.models import Email, EmailEvent, EmailOptOut, Job, User
+from app.models.models import Email, EmailEvent, EmailOptOut, Job, Profile, User
 from app.services import persona as persona_service
-from app.services.job_queue import enqueue
+from app.services.handlers import DRAFT_REJECTIONS
+from app.services.job_queue import enqueue_or_existing
 from app.services.outreach import (
     compliance_report,
-    draft_email,
     is_role_mailbox,
+    is_suppressed,
     send_email,
     suppress,
     tracking_urls,
 )
+from app.services.user_settings import get_setting
 
 router = APIRouter(prefix="/emails", tags=["emails"])
 log = get_logger("app.emails")
@@ -117,7 +120,15 @@ class EmailGenerate(BaseModel):
 
 @router.post("/generate")
 async def create_email(payload: EmailGenerate, request: Request, user: CurrentUser, db: DbSession):
-    """Draft outreach (never sends) and put it in the approval bucket."""
+    """Queue an outreach draft (never sends) for the approval bucket.
+
+    v2.2.8: answers ``{queued, pipeline_job_id}`` — the draft is written by the
+    ``email`` pipeline and the row's ``result`` carries ``email_id``/``to`` (or
+    ``status: rejected`` with the reason), so the bucket and the job drawer can
+    show it on any route and after a refresh. The user-fixable preconditions
+    (no profile, unsigned profile, suppressed recipient) are still checked
+    here so a click fails fast with the same 400 as before.
+    """
     enforce(db, user.id, "can_send_outreach")
     enforce(db, user.id, "outreach_per_month")
     enforce(db, user.id, "contact_discovery_per_month")
@@ -128,39 +139,53 @@ async def create_email(payload: EmailGenerate, request: Request, user: CurrentUs
         if not job:
             raise HTTPException(404, "Job not found")
 
+    profile = get_setting(db, user.id, "application", "profile_snapshot", {}) or {}
+    if not profile:
+        profile_row = db.query(Profile).filter(Profile.user_id == user.id).first()
+        profile = (profile_row.data if profile_row else {}) or {}
+    if not profile:
+        raise HTTPException(400, {"code": "profile_missing", "message": DRAFT_REJECTIONS["profile_missing"]})
+    if not str(profile.get("name") or "").strip():
+        raise HTTPException(400, {"code": "profile_name_missing", "message": DRAFT_REJECTIONS["profile_name_missing"]})
+    if payload.recipient_email and is_suppressed(db, user.id, payload.recipient_email.strip().lower()):
+        raise HTTPException(400, {"code": "suppressed", "message": DRAFT_REJECTIONS["suppressed"]})
+
     recipient = None
     if payload.recipient_email:
-        recipient = {"name": payload.recipient_name or "", "email": payload.recipient_email, "title": "", "confidence": 1.0, "source": "manual", "verified": False}
+        recipient = {"name": payload.recipient_name or "", "email": payload.recipient_email, "title": "",
+                     "confidence": 1.0, "source": "manual", "verified": False}
 
     persona = persona_service.get_persona(db, user.id, payload.persona_id or (job.persona_id if job else None))
-    try:
-        result = await draft_email(db, user, company=payload.company, job=job, founder=payload.founder,
-                                   department=payload.department, recipient=recipient,
-                                   extra_context=payload.context,
-                                   persona_id=persona.id if persona else None)
-    except ValueError as exc:
-        reason = str(exc)
-        messages = {
-            "profile_missing": "Upload your resume first so outreach can be personalised",
-            "profile_name_missing": ("Your profile has no name, so the email cannot be signed. "
-                                     "Re-upload your master resume with AI online, or add your name to the profile."),
-            "no_recipient": "No contact could be found — provide recipient_email explicitly",
-            "suppressed": "That recipient is on your suppression list",
-        }
-        raise HTTPException(400, {"code": reason, "message": messages.get(reason, reason)}) from exc
-    email_row: Email = result["email"]
-    if payload.queue:
-        enqueue(db, user_id=user.id, pipeline="email", payload={"send": True, "email_id": email_row.id}, priority=4, dedupe_key=f"email:{email_row.id}")
-    audit.audit(db, "email.generated", user=user, target=email_row.to_email, detail={"company": payload.company, "source": email_row.source, "confidence": email_row.confidence}, request=request)
-    increment_usage(db, user.id, "outreach_per_month", 1)
-    increment_usage(db, user.id, "contact_discovery_per_month", 1)
+    fingerprint = hashlib.sha256(
+        f"{payload.company.strip().lower()}|{payload.department}|{int(payload.founder)}|"
+        f"{(payload.recipient_email or '').lower()}|{payload.context.strip()}".encode()
+    ).hexdigest()[:12]
+    item, duplicate = enqueue_or_existing(
+        db,
+        user_id=user.id,
+        pipeline="email",
+        job_id=job.id if job else None,
+        payload={"company": payload.company, "job_id": job.id if job else None, "founder": payload.founder,
+                 "department": payload.department, "context": payload.context, "recipient": recipient,
+                 "persona_id": persona.id if persona else None, "queue": bool(payload.queue)},
+        priority=4,
+        dedupe_key=f"draft:{job.id if job else 0}:{fingerprint}",
+    )
+    if not duplicate:
+        audit.audit(db, "email.generate_queued", user=user, target=payload.company,
+                    detail={"company": payload.company, "job_id": job.id if job else None,
+                            "pipeline_job_id": item.id if item else None}, request=request)
     return {
-        "email": _bucket_row(email_row, jobs={job.id: job} if job else {}),
-        "decision_maker": result["decision"],
-        "contact": {**result["contact"], "role_mailbox": is_role_mailbox(email_row.to_email),
-                    "verified": bool(email_row.verified)},
-        "ai": {"used": result["ai"].get("ai_used"), "fact_guard": result["ai"].get("fact_guard")},
+        "status": "queued",
+        "queued": not duplicate,
+        "duplicate": duplicate,
+        "pipeline_job_id": item.id if item else None,
+        "queue_status": item.status if item else None,
+        "company": payload.company,
+        "job_id": job.id if job else None,
         "persona": persona_service.to_dict(persona, include_memory=False) if persona else None,
+        "message": ("A draft for this company is already being written — showing its live status."
+                    if duplicate else "Draft queued — it lands in the approval bucket when the writer is done."),
     }
 
 
@@ -257,3 +282,19 @@ def remove_suppression(suppression_id: int, user: CurrentUser, db: DbSession):
     db.commit()
     audit.audit(db, "email.unsubscribed", user=user, target=row.email, detail={"removed": True})
     return {"ok": True}
+
+
+@router.get("/{email_id}")
+def get_email(email_id: int, user: CurrentUser, db: DbSession):
+    """One approval-bucket card — how the SPA fetches a draft the queue just wrote.
+
+    Declared last on purpose: ``/{email_id}`` would otherwise shadow the
+    literal ``/suppressions`` and ``/contacts`` routes above it.
+    """
+    row = _email_or_404(db, user.id, email_id)
+    jobs: Dict[int, Job] = {}
+    if row.job_id:
+        job = db.query(Job).filter(Job.id == row.job_id, Job.user_id == user.id).first()
+        if job:
+            jobs[job.id] = job
+    return _bucket_row(row, jobs=jobs)

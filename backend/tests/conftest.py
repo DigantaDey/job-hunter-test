@@ -689,3 +689,61 @@ def seeded_job(db, owner_tokens=None):
     db.commit()
     db.refresh(job)
     return job
+
+
+# --------------------------------------------------------------------------- #
+# v2.2.8 — queued AI triggers
+#
+# ``POST /api/resumes/generate`` and ``POST /api/emails/generate`` answer
+# ``{queued, pipeline_job_id}`` and the work runs in the durable queue. These
+# helpers do what the SPA does — click, let the worker run the item, read the
+# row back — so tests can keep asserting on the *outcome* in one call.
+# --------------------------------------------------------------------------- #
+def run_queue_item(item_id: int, pipeline: str) -> None:
+    """Execute one queued item exactly the way the worker does."""
+    import asyncio
+
+    from app.worker import Worker
+
+    asyncio.run(Worker(pipelines=[pipeline])._run_item(item_id, pipeline))
+
+
+def queued_result(client: TestClient, headers: Dict[str, str], receipt: Dict[str, Any], pipeline: str) -> Dict[str, Any]:
+    """Run the queued item behind ``receipt`` and return the finished row (with ``result``)."""
+    assert receipt.get("pipeline_job_id"), receipt
+    run_queue_item(int(receipt["pipeline_job_id"]), pipeline)
+    row = client.get(f"/api/pipelines/jobs/{receipt['pipeline_job_id']}", headers=headers)
+    assert row.status_code == 200, row.text
+    return row.json()
+
+
+def generate_resume_now(client: TestClient, headers: Dict[str, str], job_id: int, **params: Any) -> Dict[str, Any]:
+    """Click "Generate tailored resume", run the worker, return the handler's result.
+
+    The result is the old synchronous response (``resume_id``, ``fact_guard``,
+    ``guardrail``, ``files`` …) or ``{"status": "rejected", ...}``.
+    """
+    response = client.post("/api/resumes/generate", params={"job_id": job_id, **params}, headers=headers)
+    assert response.status_code == 200, response.text
+    row = queued_result(client, headers, response.json(), "ai")
+    result = row.get("result") or {}
+    result.setdefault("status", row["status"])
+    result["_row"] = row
+    return result
+
+
+def draft_email_now(client: TestClient, headers: Dict[str, str], body: Dict[str, Any]) -> Dict[str, Any]:
+    """Click "Cold email", run the worker, return the bucket card for the draft.
+
+    Mirrors the old synchronous response: ``{"email": <bucket row>, ...}``;
+    a rejected draft returns ``{"email": None, "rejected": <result>}``.
+    """
+    response = client.post("/api/emails/generate", json=body, headers=headers)
+    assert response.status_code == 200, response.text
+    row = queued_result(client, headers, response.json(), "email")
+    result = row.get("result") or {}
+    if not result.get("email_id"):
+        return {"email": None, "rejected": result, "_row": row}
+    card = client.get(f"/api/emails/{result['email_id']}", headers=headers)
+    assert card.status_code == 200, card.text
+    return {"email": card.json(), "result": result, "_row": row}
