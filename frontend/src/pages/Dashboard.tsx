@@ -3,6 +3,7 @@ import client from '../api/client'
 import { Briefcase, CheckCircle, AlertTriangle, Clock, Mail, FileText, Vault, Sparkles, TrendingUp, ArrowRight, Activity, Search, ListChecks, Zap, BarChart3, Target, Brain, DollarSign, Bell } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { fmtRelativeToNow } from '../lib/automation'
+import { creditLabel, usagePercent } from '../lib/credits'
 
 export default function Dashboard() {
   const [summary, setSummary] = useState<any>(null)
@@ -36,6 +37,11 @@ export default function Dashboard() {
   const ent = summary.entitlements
   const plan = ent?.plan || 'free'
   const aiUsage = summary.ai_usage || {}
+  // The AI-credit ceiling, resolved once so every readout on this page agrees.
+  // `0` = UNLIMITED (Pro+): `creditLabel` says so in words and `usagePercent`
+  // returns null, so no meter is drawn against a fake 0 (or invented 50000).
+  const aiCreditLimit = aiUsage.limit ?? ent?.limits?.ai_credits_per_month
+  const aiCreditPercent = usagePercent(aiUsage.credits_used, aiCreditLimit)
   const apps = summary.applications || {}
   const outreach = summary.outreach || {}
   const automation = summary.automation || {}
@@ -106,8 +112,10 @@ export default function Dashboard() {
                 </Link>
               )}
               <div className="mt-3 space-y-2 text-[11px] mono">
-                <div className="flex justify-between"><span>AI credits</span><span>{aiUsage.credits_used ?? 0}/{aiUsage.limit ?? ent?.limits?.ai_credits_per_month ?? 50000}</span></div>
-                <div className="w-full bg-white/10 rounded-full h-1.5 overflow-hidden"><div className="bg-blue-500 h-1.5 rounded-full" style={{width: `${Math.min(100, ((aiUsage.credits_used||0)/(aiUsage.limit||50000))*100)}%`}} /></div>
+                <div className="flex justify-between"><span>AI credits</span><span>{creditLabel(aiUsage.credits_used, aiCreditLimit)}</span></div>
+                {aiCreditPercent !== null && (
+                  <div className="w-full bg-white/10 rounded-full h-1.5 overflow-hidden"><div className="bg-blue-500 h-1.5 rounded-full" style={{width: `${aiCreditPercent}%`}} /></div>
+                )}
                 <div className="flex justify-between"><span>Outreach</span><span>{outreach.sent ?? 0}/{ent?.limits?.outreach_per_month ?? 10}</span></div>
                 <div className="flex justify-between"><span>Automation</span><span>{ent?.usage?.automation_runs_per_month?.used ?? 0}/{ent?.limits?.automation_runs_per_month ?? 5}</span></div>
                 {/* v2.2 — auto mode. Both fields come from the scheduler's own
@@ -191,7 +199,7 @@ export default function Dashboard() {
             <h3 className="font-medium flex items-center gap-2"><DollarSign className="w-4 h-4"/> Billing & Usage</h3>
             <div className="mt-2 text-xs mono space-y-1">
               <div className="flex justify-between"><span>Plan</span><span className="font-medium">{ent?.plan_label || 'Free'}</span></div>
-              <div className="flex justify-between"><span>AI tokens</span><span>{aiUsage.credits_used ?? 0}/{aiUsage.limit ?? 50000}</span></div>
+              <div className="flex justify-between"><span>AI tokens</span><span>{creditLabel(aiUsage.credits_used, aiCreditLimit)}</span></div>
               <div className="flex justify-between"><span>Cost this month</span><span>${aiUsage.cost_usd ?? 0}</span></div>
               <div className="flex justify-between"><span>Automation</span><span>{ent?.usage?.automation_runs_per_month?.used ?? 0}/{ent?.limits?.automation_runs_per_month ?? 5}</span></div>
             </div>

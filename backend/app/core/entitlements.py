@@ -42,6 +42,12 @@ PLANS: Dict[str, Dict[str, Any]] = {
             "ai_operations_per_month": 50,
             "ai_operations_per_day": 15,
             "ai_credits_per_month": 50000,  # tokens
+            #: Per-request output-token ceiling. A *cap*, not a quota: the
+            #: gateway clamps every outgoing ``max_tokens`` (and the automatic
+            #: escalation on truncation) to it. Free stays capped so a free
+            #: account cannot make the platform's provider bill unbounded
+            #: reasoning traces; ``0`` (unlimited) is what the paid tiers get.
+            "ai_max_output_tokens": 16000,
             "resume_parses_per_month": 5,
             "job_analysis_per_month": 50,
             "advanced_matching": False,
@@ -101,6 +107,8 @@ PLANS: Dict[str, Dict[str, Any]] = {
             "ai_operations_per_month": 500,
             "ai_operations_per_day": 100,
             "ai_credits_per_month": 500000,
+            #: Capped like free (see the note there); raise to 0 to unclamp.
+            "ai_max_output_tokens": 16000,
             "resume_parses_per_month": 50,
             "job_analysis_per_month": 500,
             "advanced_matching": True,
@@ -152,7 +160,15 @@ PLANS: Dict[str, Dict[str, Any]] = {
             "funding_companies_per_month": 1000,
             "ai_operations_per_month": 2000,
             "ai_operations_per_day": 500,
-            "ai_credits_per_month": 2000000,
+            #: **0 = unlimited.** Pro+ is the tier whose whole promise is "the
+            #: model decides, not our cap": a 2M-token monthly quota still
+            #: counted them down and the 16000-token output ceiling truncated
+            #: long job descriptions into a `truncated_response` fallback
+            #: ("Score 57 preliminary + AI pending"). Unlimited credits + an
+            #: unclamped output budget mean the AI verdict is the verdict.
+            "ai_credits_per_month": 0,
+            #: 0 = no clamp — the provider's own per-model maximum applies.
+            "ai_max_output_tokens": 0,
             "resume_parses_per_month": 200,
             "job_analysis_per_month": 2000,
             "advanced_matching": True,
@@ -218,6 +234,31 @@ UPGRADE_HINTS = {
 }
 
 
+def is_unlimited(limit: Any) -> bool:
+    """``0`` or ``None`` means **unlimited** for every plan limit.
+
+    The single predicate behind "this tier has no cap" — used by
+    :func:`limit_for`, :func:`check_limit`, :func:`entitlements_snapshot` and
+    the UI's *Unlimited* badge, so a plan can never disagree with itself about
+    whether a limit exists. Booleans are never unlimited: they are
+    feature flags, and ``False`` must stay a block.
+    """
+    if isinstance(limit, bool):
+        return False  # feature flag: False must stay a block
+    if limit is None:
+        return True  # a blanked-out plan entry means "no cap", not a TypeError
+    try:
+        return int(limit) <= 0
+    except (TypeError, ValueError):
+        return True  # unparseable → fail open; a typo must not brick a tier
+
+
+#: Plan limits that are *caps*, not consumable quotas. They belong in
+#: ``limits`` (what the tier allows) but not in ``usage`` (what the user has
+#: spent) — otherwise the billing grid renders a ceiling as "0 used".
+NON_CONSUMABLE_LIMITS = frozenset({"ai_max_output_tokens"})
+
+
 def current_period() -> str:
     return datetime.utcnow().strftime("%Y-%m")
 
@@ -271,9 +312,23 @@ def can(db: Session, user_id: int, capability: str) -> bool:
 
 
 def limit_for(db: Session, user_id: int, limit_key: str) -> int:
+    """The plan's numeric limit. ``0`` = unlimited (see :func:`is_unlimited`).
+
+    ``None`` is accepted as another spelling of unlimited rather than blowing
+    up on ``int(None)`` — a plan entry an operator blanks out means "no cap",
+    not "TypeError at billing time".
+    """
     plan = get_user_plan(db, user_id)
     cfg = get_plan_config(plan)
-    return int(cfg["limits"].get(limit_key, 0))
+    raw = cfg["limits"].get(limit_key, 0)
+    if isinstance(raw, bool):
+        return int(raw)  # feature flag: 1 when on, 0 when off
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
 
 
 def usage_for(db: Session, user_id: int, capability_or_limit: str, period: Optional[str] = None) -> Tuple[int, int]:
@@ -297,8 +352,15 @@ def usage_for(db: Session, user_id: int, capability_or_limit: str, period: Optio
 
 
 def check_limit(db: Session, user_id: int, limit_key: str) -> Tuple[bool, int, int, str]:
+    """``(allowed, used, limit, hint)``.
+
+    A limit of ``0``/``None`` is **unlimited** — always allowed, never a block,
+    and the returned limit stays ``0`` so callers (and the UI) can render it as
+    *Unlimited* instead of "0 remaining". Boolean limits are feature flags: the
+    flag itself decides.
+    """
     used, lim = usage_for(db, user_id, limit_key)
-    if lim == 0:
+    if lim <= 0:
         plan = get_user_plan(db, user_id)
         cfg = get_plan_config(plan)
         raw = cfg["limits"].get(limit_key)
@@ -306,9 +368,9 @@ def check_limit(db: Session, user_id: int, limit_key: str) -> Tuple[bool, int, i
             allowed = bool(raw)
             hint = UPGRADE_HINTS.get(limit_key, "Upgrade to unlock this feature")
             return allowed, used, 1 if allowed else 0, hint
-        if raw == 0:
-            return True, used, 0, ""
-    allowed = used < lim if lim > 0 else True
+        # 0 / None / anything non-numeric: unlimited, never a block.
+        return True, used, 0, ""
+    allowed = used < lim
     hint = UPGRADE_HINTS.get(limit_key, "") if not allowed else ""
     return allowed, used, lim, hint
 
@@ -406,13 +468,22 @@ def entitlements_snapshot(db: Session, user_id: int) -> Dict[str, Any]:
     cfg = get_plan_config(plan)
     sub = get_subscription(db, user_id)
     period = current_period()
-    usage = {}
+    # ``remaining`` is None for an unlimited limit, hence the Any value type.
+    usage: Dict[str, Dict[str, Any]] = {}
     for key in cfg["limits"].keys():
+        if key in NON_CONSUMABLE_LIMITS:
+            continue  # a cap, not a quota — see the constant
         used, lim = usage_for(db, user_id, key, period=period)
         if isinstance(cfg["limits"][key], bool):
             usage[key] = {"allowed": bool(cfg["limits"][key]), "used": 0, "limit": 1 if cfg["limits"][key] else 0}
+        elif is_unlimited(cfg["limits"][key]):
+            # Unlimited: the counter still moves (billing/observability), but
+            # there is no ceiling to run out of — and no invented "999999
+            # remaining" that a UI would render as a real number.
+            usage[key] = {"used": used, "limit": 0, "remaining": None, "unlimited": True}
         else:
-            usage[key] = {"used": used, "limit": lim, "remaining": max(0, lim - used) if lim else 999999}
+            usage[key] = {"used": used, "limit": lim, "remaining": max(0, lim - used),
+                          "unlimited": False}
     return {
         "plan": plan,
         "plan_label": cfg["label"],

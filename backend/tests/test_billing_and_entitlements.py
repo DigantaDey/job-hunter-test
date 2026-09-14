@@ -51,8 +51,60 @@ def test_plans_have_required_limits():
     for plan_key in ["free", "pro", "pro_plus"]:
         cfg = get_plan_config(plan_key)
         assert cfg["limits"]["jobs_discovered_per_month"] > 0
-        assert cfg["limits"]["ai_credits_per_month"] > 0
         assert cfg["limits"]["tailored_resumes_per_month"] > 0
+        # AI credits: free/pro are metered; Pro+ is UNLIMITED (``0``), which is
+        # a deliberate plan promise rather than a missing value — see
+        # ``test_pro_plus_is_unlimited``.
+        assert cfg["limits"]["ai_credits_per_month"] >= 0
+
+
+def test_pro_plus_is_unlimited():
+    """Pro+ has no AI ceiling: unlimited credits and an unclamped output budget.
+
+    ``0`` is the encoding of "unlimited" and every layer must read it that way
+    — a limit that blocks would put a paying Pro+ user back on the preliminary
+    keyword score the moment their meter hit 0.
+    """
+    from app.core.entitlements import is_unlimited
+
+    pro_plus = get_plan_config("pro_plus")["limits"]
+    assert pro_plus["ai_credits_per_month"] == 0
+    assert pro_plus["ai_max_output_tokens"] == 0
+    assert is_unlimited(0) and is_unlimited(None)
+    assert not is_unlimited(16000) and not is_unlimited(True) and not is_unlimited(False)
+
+    # Free and Pro keep real caps (a free account must not be able to make the
+    # platform's provider bill unbounded reasoning traces).
+    assert get_plan_config("free")["limits"]["ai_max_output_tokens"] == 16000
+    assert get_plan_config("pro")["limits"]["ai_max_output_tokens"] == 16000
+    assert get_plan_config("free")["limits"]["ai_credits_per_month"] > 0
+    assert get_plan_config("pro")["limits"]["ai_credits_per_month"] > 0
+
+
+def test_unlimited_credit_limit_never_blocks(db):
+    """An unlimited limit is never a block, however high the counter climbs."""
+    user = make_user(db)
+    db.add(Subscription(user_id=user.id, plan="pro_plus", status="active", provider="manual",
+                        current_period_start=datetime.now(timezone.utc)))
+    db.commit()
+
+    # Far past what the old 2,000,000-token Pro+ ceiling allowed.
+    increment_usage(db, user.id, "ai_credits_per_month", 9_000_000)
+
+    allowed, used, limit, hint = check_limit(db, user.id, "ai_credits_per_month")
+    assert allowed is True, (used, limit, hint)
+    assert limit == 0, limit
+    assert hint == ""
+    enforce(db, user.id, "ai_credits_per_month")  # must not raise
+
+    snapshot = entitlements_snapshot(db, user.id)
+    assert snapshot["usage"]["ai_credits_per_month"] == {
+        "used": 9_000_000, "limit": 0, "remaining": None, "unlimited": True,
+    }
+    # The output cap is a *cap*, not a quota: it is published in ``limits`` (so
+    # the UI can badge it) but never rendered as "0 used" in the usage grid.
+    assert snapshot["limits"]["ai_max_output_tokens"] == 0
+    assert "ai_max_output_tokens" not in snapshot["usage"]
 
 
 def test_free_more_restricted_than_pro():

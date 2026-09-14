@@ -63,6 +63,40 @@ LIVE_SOURCES = (
 #: explicitly rate limited by their terms. Disabled unless keys are provided.
 CREDENTIALED_SOURCES = ("adzuna", "jooble", "usajobs", "linkedin", "naukri", "indeed", "instahyre")
 
+# --------------------------------------------------------------------------- #
+# AI token budgets — the semantics shared by the env settings, the per-user
+# Settings → AI API fields and the gateway's clamp.
+# --------------------------------------------------------------------------- #
+#: ``0`` means **unlimited** for both budgets: no client-side clamp, the
+#: provider's own per-model maximum applies. Every layer that reads a token
+#: budget must treat ``0`` (and ``None``) this way — a ``value or default``
+#: chain silently converts "unlimited" back into a cap.
+AI_TOKEN_UNLIMITED = 0
+#: Smallest *explicit* ceiling that can still produce a usable answer. Below
+#: this a model cannot even emit a small JSON object, so a positive value under
+#: the floor is a configuration mistake rather than a policy choice.
+AI_MIN_OUTPUT_TOKENS = 64
+AI_MIN_INPUT_TOKENS = 256
+
+
+def ai_token_budget(value: Any) -> int:
+    """Normalise a token budget: ``0``/``None``/negative → :data:`AI_TOKEN_UNLIMITED`.
+
+    The one place that decides what an odd value means, so env, the per-user
+    setting and the gateway can never disagree:
+
+    * ``0``, ``None``, ``""`` or a negative number → ``0`` (unlimited). A
+      negative value is a typo for "off", not for "1 token";
+    * anything else → that positive integer.
+    """
+    if value is None:
+        return AI_TOKEN_UNLIMITED
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return AI_TOKEN_UNLIMITED
+    return parsed if parsed > 0 else AI_TOKEN_UNLIMITED
+
 
 def _maybe_json(value: str) -> Any:
     """
@@ -122,7 +156,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.2.6"
+    version: str = "2.2.7"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -242,16 +276,26 @@ class Settings(BaseSettings):
     ai_backoff_base: float = 1.5
     ai_daily_token_budget: int = 0
     # Per-user OUTPUT-token ceiling (the per-request default for users who have
-    # not set their own in Settings → AI API). Every outgoing ``max_tokens`` is
-    # clamped to the resolved ceiling, and the gateway's automatic escalation on
-    # truncation (PR #29) can never exceed it. Kept at the hard escalation
-    # ceiling so out-of-the-box behaviour is unchanged for operators.
-    ai_max_output_tokens: int = 16000
+    # not set their own in Settings → AI API). **0 = unlimited**: the gateway
+    # sends the task's own starting budget, never clamps it, and the automatic
+    # escalation on truncation is free to grow past any shipped ceiling — the
+    # provider's own per-model maximum is the only limit. A positive value
+    # clamps every outgoing ``max_tokens`` *and* the escalation to it.
+    #
+    # Why 0 is the shipped default: a fixed 16000-token ceiling was the direct
+    # cause of ``truncated_response`` on long job descriptions with reasoning
+    # models (the thinking phase eats the budget before the JSON starts), which
+    # the product then honestly reported as "AI pending" next to a preliminary
+    # keyword score — a fallback, never a verdict. Unlimited is the right
+    # default for a paid model; operators who want a cost cap set a number.
+    ai_max_output_tokens: int = 0
     # Per-user INPUT-token ceiling (per-request default). The gateway derives a
     # character budget (≈4 chars/token) from it and caps every prompt part —
     # the old hardcoded slices (jd[:2000], json.dumps(profile)[:5000], …) all
-    # obey it now.
-    ai_max_input_tokens: int = 12000
+    # obey it now. **0 = unlimited**: nothing is truncated client-side, so a
+    # long JD reaches the model whole (the provider still enforces its own
+    # context window, and reports it as a 400 the gateway surfaces honestly).
+    ai_max_input_tokens: int = 0
     # How often the AI-availability watchdog re-probes the provider and drains
     # work that was paused during a transient outage (seconds).
     ai_watchdog_interval_seconds: float = 15.0
@@ -496,6 +540,18 @@ class Settings(BaseSettings):
             return path
         return os.path.abspath(os.path.join(BACKEND_DIR, path))
 
+    @field_validator("ai_max_output_tokens", "ai_max_input_tokens", mode="before")
+    @classmethod
+    def _normalize_ai_token_budget(cls, value: Any) -> int:
+        """``0`` = unlimited (provider default); a negative value means the same.
+
+        A budget the operator meant to switch off must never come back as a
+        tiny cap: ``AI_MAX_OUTPUT_TOKENS=-1`` used to mean "clamp every answer
+        to 1 token", i.e. every AI call truncated. Negative now normalises to
+        unlimited, the same as ``0`` and an unset value.
+        """
+        return ai_token_budget(value)
+
     @model_validator(mode="after")
     def _reject_unsafe_production(self) -> "Settings":
         """Constructing a production Settings with unsafe values fails loudly."""
@@ -554,6 +610,16 @@ class Settings(BaseSettings):
             and self.smtp_configured
             and self.compliance_ready_for_sending
         )
+
+    @property
+    def ai_output_unlimited(self) -> bool:
+        """True when ``AI_MAX_OUTPUT_TOKENS=0`` — the provider decides the cap."""
+        return self.ai_max_output_tokens <= 0
+
+    @property
+    def ai_input_unlimited(self) -> bool:
+        """True when ``AI_MAX_INPUT_TOKENS=0`` — prompts are never client-truncated."""
+        return self.ai_max_input_tokens <= 0
 
     @property
     def ai_enabled(self) -> bool:
@@ -674,6 +740,20 @@ class Settings(BaseSettings):
                 )
         if self.autofill_allow_submit and not self.autofill_enabled:
             problems.append("AUTOFILL_ALLOW_SUBMIT requires AUTOFILL_ENABLED=true")
+        # A token budget of 0 is *unlimited* and always valid. A positive value
+        # under the floor is not a cost cap, it is a self-inflicted outage: no
+        # model can answer a rubric/profile request in 20 output tokens, so
+        # every call would come back `truncated_response`. Fail the deploy.
+        if 0 < self.ai_max_output_tokens < AI_MIN_OUTPUT_TOKENS:
+            problems.append(
+                f"AI_MAX_OUTPUT_TOKENS must be 0 (unlimited — the provider's own maximum) or at least "
+                f"{AI_MIN_OUTPUT_TOKENS} tokens, got {self.ai_max_output_tokens}"
+            )
+        if 0 < self.ai_max_input_tokens < AI_MIN_INPUT_TOKENS:
+            problems.append(
+                f"AI_MAX_INPUT_TOKENS must be 0 (unlimited — no client-side prompt truncation) or at least "
+                f"{AI_MIN_INPUT_TOKENS} tokens, got {self.ai_max_input_tokens}"
+            )
         if self.metrics_enabled and not (self.metrics_token or "").strip():
             problems.append(
                 "METRICS_TOKEN must be set when METRICS_ENABLED=true (/api/metrics is otherwise "
@@ -703,6 +783,13 @@ class Settings(BaseSettings):
             "live_scraping_enabled": self.live_scraping_enabled,
             "ai_model": self.ai_model,
             "ai_configured": self.ai_enabled,
+            # The platform-wide token ceilings (0 = unlimited → the provider's
+            # own maximum). Secret-free, and what Settings → AI API shows as
+            # the default before a user sets their own per-user budget.
+            "ai_max_output_tokens": self.ai_max_output_tokens,
+            "ai_max_input_tokens": self.ai_max_input_tokens,
+            "ai_output_unlimited": self.ai_output_unlimited,
+            "ai_input_unlimited": self.ai_input_unlimited,
             "email_sending_enabled": self.email_sending_enabled,
             "email_dry_run": self.email_dry_run,
             "email_configured": self.smtp_configured,
@@ -774,6 +861,10 @@ __all__ = [
     "REQUIRED_CONSENTS",
     "FUNDING_SEARCH_PROVIDERS",
     "resolve_funding_search_provider",
+    "AI_TOKEN_UNLIMITED",
+    "AI_MIN_OUTPUT_TOKENS",
+    "AI_MIN_INPUT_TOKENS",
+    "ai_token_budget",
     "BACKEND_DIR",
     "REPO_DIR",
 ]

@@ -1,6 +1,39 @@
 import { useEffect, useState } from 'react'
 import client, { apiError } from '../api/client'
 import { Crown, Zap, Sparkles, BarChart3, CreditCard, AlertTriangle, Check } from 'lucide-react'
+import { entryIsUnlimited, usagePercent, type UsageEntry } from '../lib/credits'
+
+/**
+ * One tile of the "Usage this month" grid.
+ *
+ * Exported so the unlimited reading is tested directly. `limit: 0` is
+ * **unlimited** (Pro+), and the server backs it with `remaining: null` +
+ * `unlimited: true` — never an invented "999999 left". A capped tile keeps its
+ * "N left" and its meter; an unlimited one gets a badge and no meter, because a
+ * meter drawn against 0 is a lie in either direction.
+ */
+export function UsageCell({ label, value }: { label: string; value: UsageEntry }) {
+  const unlimited = entryIsUnlimited(value)
+  const percent = usagePercent(value?.used, value?.limit)
+  return (
+    <div className="bg-zinc-50 dark:bg-zinc-800 rounded-xl p-3">
+      <div className="text-[11px] mono uppercase text-zinc-500">{label.replace(/_/g, ' ')}</div>
+      <div className="mt-1 flex items-center justify-between">
+        <span className="text-sm font-medium mono">
+          {unlimited || percent === null ? `${value?.used ?? 0} used` : `${value?.used ?? 0}/${value?.limit}`}
+        </span>
+        {unlimited
+          ? <span className="text-[11px] mono font-medium text-violet-600 dark:text-violet-300 px-2 py-0.5 rounded-full bg-violet-100 dark:bg-violet-950" title="No ceiling on this plan">Unlimited</span>
+          : <span className="text-[11px] mono text-zinc-500">{value?.remaining ?? 0} left</span>}
+      </div>
+      {percent !== null && (
+        <div className="mt-2 w-full bg-zinc-200 dark:bg-zinc-700 rounded-full h-1">
+          <div className="bg-blue-600 h-1 rounded-full" style={{ width: `${percent}%` }} />
+        </div>
+      )}
+    </div>
+  )
+}
 
 export default function Billing() {
   const [sub, setSub] = useState<any>(null)
@@ -62,14 +95,7 @@ export default function Billing() {
           <h3 className="font-medium flex items-center gap-2"><BarChart3 className="w-4 h-4"/> Usage this month ({ent.period})</h3>
           <div className="mt-3 grid grid-cols-2 gap-3">
             {ent.usage && Object.entries(ent.usage).slice(0,12).map(([k,v]: any)=>(
-              <div key={k} className="bg-zinc-50 dark:bg-zinc-800 rounded-xl p-3">
-                <div className="text-[11px] mono uppercase text-zinc-500">{k.replace(/_/g,' ')}</div>
-                <div className="mt-1 flex items-center justify-between">
-                  <span className="text-sm font-medium mono">{v.used}/{v.limit || '∞'}</span>
-                  <span className="text-[11px] mono text-zinc-500">{v.remaining ?? 0} left</span>
-                </div>
-                {v.limit>0 && <div className="mt-2 w-full bg-zinc-200 dark:bg-zinc-700 rounded-full h-1"><div className="bg-blue-600 h-1 rounded-full" style={{width: `${Math.min(100, (v.used/v.limit)*100)}%`}}/></div>}
-              </div>
+              <UsageCell key={k} label={k} value={v} />
             ))}
           </div>
         </div>

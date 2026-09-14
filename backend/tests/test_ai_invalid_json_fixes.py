@@ -414,11 +414,27 @@ def test_lenient_json_extraction_variants():
 
 
 def test_max_output_tokens_default_is_large_enough_for_a_resume():
-    """1200 truncated every large resume parse — the floor must fit a full
-    profile JSON (roles, bullets, education, projects…)."""
-    from app.core.config import settings
+    """A large resume parse must fit: 1200 truncated every one of them.
 
-    assert settings.ai_max_output_tokens >= 4000
+    The shipped default is now ``0`` = **unlimited** (no clamp — the provider's
+    own per-model maximum, and the escalation on truncation is free to grow),
+    which fits any profile by construction. An operator who sets an explicit
+    ceiling instead must still be given the old floor of 4000, and the parse
+    task's own starting budget carries it either way.
+    """
+    from app.core.config import settings
+    from app.services.resume_parser import PARSE_OUTPUT_TOKENS
+
+    assert settings.ai_max_output_tokens == 0 or settings.ai_max_output_tokens >= 4000, \
+        "an explicit AI_MAX_OUTPUT_TOKENS below 4000 truncates every large resume parse"
+    assert PARSE_OUTPUT_TOKENS >= 4000
+    # …and an unlimited ceiling must not clamp that starting budget down.
+    from app.services.ai_client import escalation_ceiling, resolve_output_ceiling
+
+    assert resolve_output_ceiling(0) == 0
+    assert resolve_output_ceiling(0, 16000) == 0, "an explicit 0 is unlimited, not 'unset'"
+    assert escalation_ceiling(0) > 16000, \
+        "unlimited must let the escalation grow past the old shipped ceiling"
 
 
 # --------------------------------------------------------------------------- #

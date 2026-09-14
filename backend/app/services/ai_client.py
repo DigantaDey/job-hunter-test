@@ -26,8 +26,12 @@ Guarantees (in order of importance):
 7. **User-controlled token budgets.** The per-user ``ai.max_input_tokens`` /
    ``ai.max_output_tokens`` settings (owner + paid tiers; fixed safe defaults on
    free) are the single source of truth for prompt truncation and the output
-   ceiling: the gateway clamps every outgoing ``max_tokens`` to the resolved
-   ceiling and the automatic escalation on truncation can never exceed it.
+   ceiling. **``0`` means unlimited** (the shipped default): the gateway sends
+   the task's own starting budget, clamps nothing, truncates no prompt part, and
+   lets the escalation on truncation grow to the provider's own maximum — which
+   is what keeps a long job description on a reasoning model from coming back
+   ``truncated_response``. A positive ceiling still clamps every outgoing
+   ``max_tokens`` *and* the escalation to it.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from app.core.config import settings
+from app.core.config import ai_token_budget, settings
 from app.core.logging import get_logger, user_id_var
 from app.core.metrics import inc, observe, set_gauge
 from app.core.rate_limiter import rate_limiter
@@ -437,6 +441,14 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
         except Exception as exc:
             log.warning("could not read workflow override for user %s/%s: %s", user_id, workflow, exc)
 
+    # The plan's output ceiling is a tenant-level cap, applied last so it can
+    # only ever tighten the resolved budget: Pro+ (0) is genuinely unlimited,
+    # free/pro keep their cap whatever the operator's env says.
+    plan_cap = plan_output_ceiling(db, user_id)
+    resolved_output = _first_budget((user_max_output_tokens,), settings.ai_max_output_tokens)
+    if plan_cap > 0:
+        resolved_output = plan_cap if resolved_output <= 0 else min(resolved_output, plan_cap)
+
     return {
         "base_url": (base_url or "").strip().rstrip("/"),
         "api_key": (api_key or "").strip(),
@@ -445,9 +457,36 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
         "key_error": key_error,
         "timeout": user_timeout,
         "max_retries": user_max_retries,
-        "max_input_tokens": user_max_input_tokens,
-        "max_output_tokens": user_max_output_tokens,
+        "max_input_tokens": _first_budget((user_max_input_tokens,), settings.ai_max_input_tokens),
+        "max_output_tokens": resolved_output,
+        "plan_max_output_tokens": plan_cap,
     }
+
+
+def plan_output_ceiling(db, user_id: int) -> int:
+    """The plan's per-request output ceiling (``0`` = unlimited).
+
+    The monetisation boundary for token budgets: Pro+ has no ceiling, free/pro
+    keep one — which is why a free account still gets ``truncated_response`` on
+    a long job description while Pro+ gets the real AI verdict.
+
+    The operator's own account is exempt: their setting/env value *is* the
+    platform default, and clamping it to the free plan would put the operator
+    straight back on the truncated-response bug ``AI_MAX_OUTPUT_TOKENS=0``
+    exists to fix. A failed plan lookup also fails open — an entitlement read
+    must never be the reason AI is unavailable.
+    """
+    try:
+        from app.core.entitlements import limit_for
+        from app.models.models import User
+
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is not None and user.role == "owner":
+            return 0  # unlimited — the operator decides
+        return limit_for(db, int(user_id), "ai_max_output_tokens")
+    except Exception as exc:
+        log.warning("plan output ceiling could not be resolved for user %s: %s", user_id, exc)
+        return 0
 
 
 def _ambient_user_id() -> Optional[int]:
@@ -520,6 +559,45 @@ def breaker_snapshot() -> Dict[str, Dict[str, Any]]:
     return {k: v.state() for k, v in _breakers.items()}
 
 
+def _first_budget(values: Tuple[Any, ...], fallback: Any) -> int:
+    """First value that is actually set — **``0`` counts as set** (it means
+    unlimited, so a ``value or default`` chain would silently re-introduce a
+    cap the operator switched off). Unset/``None``/unparseable → ``fallback``.
+    """
+    for value in values:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        return ai_token_budget(value)
+    return ai_token_budget(fallback)
+
+
+def resolve_output_ceiling(*values: Any) -> int:
+    """The effective OUTPUT-token ceiling for a call. ``0`` = **unlimited**.
+
+    Resolution is "first value that is set" (an explicit ``0`` wins over
+    anything after it), so a user who chose *Unlimited* in Settings → AI API is
+    never clamped by the env default, and vice versa.
+    """
+    return _first_budget(values, settings.ai_max_output_tokens)
+
+
+def resolve_input_budget(*values: Any) -> int:
+    """The effective INPUT-token budget for a call. ``0`` = **unlimited**."""
+    return _first_budget(values, settings.ai_max_input_tokens)
+
+
+def escalation_ceiling(output_ceiling: int) -> int:
+    """Highest value the automatic ``max_tokens`` escalation may reach.
+
+    A user ceiling is a hard stop (the escalation can never exceed it). With an
+    unlimited ceiling the escalation is still bounded — by
+    :data:`_MAX_OUTPUT_TOKENS_HARD_STOP`, past every shipping model's maximum
+    completion — so "unlimited" can never turn a retry loop into an unbounded
+    bill.
+    """
+    return output_ceiling if output_ceiling > 0 else _MAX_OUTPUT_TOKENS_HARD_STOP
+
+
 def input_budget_chars(db=None, user_id: Optional[int] = None,
                        ai_config: Optional[Dict[str, Any]] = None) -> int:
     """Character budget for ONE dynamic prompt part, from the user's input budget.
@@ -528,6 +606,12 @@ def input_budget_chars(db=None, user_id: Optional[int] = None,
     resume text…) with this instead of hardcoded slices; the gateway then caps
     the *total* prompt the same way, so the user's ``ai.max_input_tokens`` is
     the single source of truth end to end.
+
+    ``0`` (unlimited — the shipped default) means **no client-side cap**: every
+    caller passes the value straight to :func:`fit_prompt_part`, which treats
+    ``0`` as "do not truncate", so a long job description reaches the model
+    whole. It used to collapse to the 1000-char floor, which truncated every
+    document on the unlimited path.
     """
     raw: Any = None
     if isinstance(ai_config, dict):
@@ -539,10 +623,10 @@ def input_budget_chars(db=None, user_id: Optional[int] = None,
             raw = None
     if raw is None:
         raw = settings.ai_max_input_tokens
-    try:
-        return max(1000, int(raw) * CHARS_PER_TOKEN)
-    except (TypeError, ValueError):
-        return max(1000, settings.ai_max_input_tokens * CHARS_PER_TOKEN)
+    budget = ai_token_budget(raw)
+    if budget <= 0:
+        return 0  # unlimited — fit_prompt_part truncates nothing
+    return max(1000, budget * CHARS_PER_TOKEN)
 
 
 def fit_prompt_part(text: str, budget_chars: int, *, label: str = "") -> Tuple[str, bool]:
@@ -684,10 +768,16 @@ _INVISIBLES_TABLE = str.maketrans("", "", "\ufeff\u200b\u200c\u200d\u2060")
 #: How many opening-bracket positions to probe when salvaging the model's last
 #: JSON draft out of a reasoning trace.
 _MAX_JSON_SALVAGE_TRIES = 32
-#: Hard upper bound for automatic max_tokens escalation (reasoning models can
-#: need thousands of tokens of thinking before the JSON is even started). The
-#: user's configured output ceiling is always clamped to this value as well.
-_MAX_OUTPUT_TOKENS_CEILING = 16000
+#: Hard safety stop for the automatic ``max_tokens`` escalation when the
+#: resolved output ceiling is UNLIMITED (``0`` = provider default).
+#:
+#: "Unlimited" means *we* do not clamp — it does not mean the retry loop may
+#: bill an unbounded budget: the escalation still stops here, which is past
+#: every shipping model's maximum completion (8k–100k), so a runaway retry can
+#: never ask a provider for millions of output tokens. A user who sets an
+#: explicit ceiling gets that ceiling instead (and the escalation can never
+#: exceed it).
+_MAX_OUTPUT_TOKENS_HARD_STOP = 128000
 #: Starting output budget when a task does not state its own (per-call
 #: ``max_tokens`` argument is the task's own starting budget; this is the
 #: fallback — matching the legacy AI_MAX_OUTPUT_TOKENS default so out-of-the-box
@@ -888,7 +978,8 @@ def _invalid_json_error(content: str, finish_reason: Optional[str], current_max_
             return AIClientError(
                 f"truncated_response: the model spent all {current_max_tokens} output tokens before writing "
                 "an answer (finish_reason=length — a reasoning model's thinking phase consumed the budget). "
-                "Raise AI_MAX_OUTPUT_TOKENS or use a model that does not burn the budget on reasoning",
+                "Set Max output tokens to 0 (unlimited — the provider's own maximum) in Settings → AI API "
+                "or AI_MAX_OUTPUT_TOKENS=0, or use a model that does not burn the budget on reasoning",
                 reason=REASON_TRUNCATED, retryable=True)
         return AIClientError(
             f"empty_response: the model returned an empty answer (finish_reason={finish_reason or 'unknown'}) "
@@ -897,7 +988,8 @@ def _invalid_json_error(content: str, finish_reason: Optional[str], current_max_
     if finish_reason == "length":
         return AIClientError(
             f"truncated_response: the JSON was cut off at max_tokens={current_max_tokens} "
-            "(finish_reason=length) — raise AI_MAX_OUTPUT_TOKENS or use a model with a larger output limit",
+            "(finish_reason=length) — raise the output ceiling (Settings → AI API → Max output tokens, "
+            "or AI_MAX_OUTPUT_TOKENS; 0 = unlimited) or use a model with a larger output limit",
             reason=REASON_TRUNCATED, retryable=True)
     return AIClientError(
         f"invalid_json: model did not return valid JSON (preview: {content[:300]!r})",
@@ -1011,8 +1103,14 @@ async def chat_completion(
                 "key_error": cfg.get("key_error"),
                 "timeout": cfg.get("timeout"),
                 "max_retries": cfg.get("max_retries"),
-                "max_input_tokens": ai_config.get("max_input_tokens") or cfg.get("max_input_tokens") or settings.ai_max_input_tokens,
-                "max_output_tokens": ai_config.get("max_output_tokens") or cfg.get("max_output_tokens") or settings.ai_max_output_tokens,
+                # ``0`` is a *setting* (unlimited), not a missing value — the
+                # merge must be first-one-set, never ``a or b``.
+                "max_input_tokens": _first_budget(
+                    (ai_config.get("max_input_tokens"), cfg.get("max_input_tokens")),
+                    settings.ai_max_input_tokens),
+                "max_output_tokens": _first_budget(
+                    (ai_config.get("max_output_tokens"), cfg.get("max_output_tokens")),
+                    settings.ai_max_output_tokens),
             }
         if not cfg["api_key"]:
             if cfg.get("key_error"):
@@ -1052,16 +1150,17 @@ async def chat_completion(
 
         # ------------------------------------------------------------------ #
         # User token budgets — the single source of truth (Settings → AI API)
+        #
+        # ``0`` on either budget means UNLIMITED: no clamp, no client-side
+        # prompt truncation, and the escalation on truncation may grow past any
+        # shipped ceiling (bounded only by ``escalation_ceiling``). An explicit
+        # ``0`` always wins over a default after it — a ``value or default``
+        # chain would silently re-introduce the cap the user switched off.
         # ------------------------------------------------------------------ #
-        try:
-            output_ceiling = min(max(64, int(cfg.get("max_output_tokens") or settings.ai_max_output_tokens)),
-                                 _MAX_OUTPUT_TOKENS_CEILING)
-        except (TypeError, ValueError):
-            output_ceiling = _MAX_OUTPUT_TOKENS_CEILING
-        try:
-            input_budget_chars = max(1000, int(cfg.get("max_input_tokens") or settings.ai_max_input_tokens) * CHARS_PER_TOKEN)
-        except (TypeError, ValueError):
-            input_budget_chars = max(1000, settings.ai_max_input_tokens * CHARS_PER_TOKEN)
+        output_ceiling = resolve_output_ceiling(cfg.get("max_output_tokens"))
+        escalation_stop = escalation_ceiling(output_ceiling)
+        resolved_input = resolve_input_budget(cfg.get("max_input_tokens"))
+        input_budget_chars = 0 if resolved_input <= 0 else max(1000, resolved_input * CHARS_PER_TOKEN)
         input_truncated = False
 
         messages: List[Dict[str, str]] = []
@@ -1083,13 +1182,19 @@ async def chat_completion(
         json_mode_active = json_mode
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        # Output budget: the task's starting budget (per call) clamped to the
-        # user's configured ceiling. The ceiling is the single source of truth
-        # — the automatic escalation below can never exceed it either.
-        current_max_tokens = min(max(1, int(max_tokens or _DEFAULT_OUTPUT_START)), output_ceiling)
-        if max_tokens and int(max_tokens) > output_ceiling:
+        # Output budget: the task's own starting budget (per call), clamped to
+        # the user's configured ceiling *when there is one*. With an unlimited
+        # ceiling nothing is clamped — the task's budget goes out as asked and
+        # the automatic escalation below may grow past any shipped default.
+        try:
+            starting_budget = max(1, int(max_tokens or _DEFAULT_OUTPUT_START))
+        except (TypeError, ValueError):
+            starting_budget = _DEFAULT_OUTPUT_START
+        if output_ceiling > 0 and starting_budget > output_ceiling:
             log.warning("AI %s: max_tokens=%d clamped to the user's output ceiling %d",
-                        workflow, int(max_tokens), output_ceiling)
+                        workflow, starting_budget, output_ceiling)
+            starting_budget = output_ceiling
+        current_max_tokens = starting_budget
         max_tokens_key = "max_tokens"
         payload[max_tokens_key] = current_max_tokens
 
@@ -1351,9 +1456,13 @@ async def chat_completion(
 
             if action == "raise_max_tokens_big" or action == "raise_max_tokens":
                 factor, floor = (4, 4000) if action == "raise_max_tokens_big" else (2, 2400)
-                # PR #29 escalation is preserved — but the user's configured
-                # output ceiling is the hard stop: it can never be exceeded.
-                new_max = min(max(current_max_tokens * factor, floor), output_ceiling)
+                # PR #29 escalation is preserved. A user who set an explicit
+                # output ceiling gets it as the hard stop; a user with an
+                # UNLIMITED ceiling is no longer pinned at the shipped default
+                # (which is exactly what made long job descriptions + reasoning
+                # models come back `truncated_response` forever) — the growth
+                # stops at the safety bound in ``escalation_ceiling`` instead.
+                new_max = min(max(current_max_tokens * factor, floor), escalation_stop)
                 if new_max > current_max_tokens:
                     what = "the thinking phase used the whole budget" if not content.strip() \
                         else "the JSON was cut off"
@@ -1362,7 +1471,9 @@ async def chat_completion(
                     current_max_tokens = new_max
                     payload[max_tokens_key] = new_max
                     continue
-                action = None  # already at the user's ceiling — retrying cannot help
+                # Already at the effective stop (the user's ceiling, or the
+                # safety bound when it is unlimited) — retrying cannot help.
+                action = None
             elif action == "drop_response_format":
                 log.warning("AI %s: model returned an empty answer with response_format=json_object "
                             "— retrying without it", workflow)
@@ -1416,7 +1527,13 @@ async def chat_completion(
                 latency_ms=latency_ms,
                 meta={"attempts": attempt, "timeout_seconds": effective_timeout,
                       "input_truncated": input_truncated, "max_tokens": current_max_tokens,
-                      "output_ceiling": output_ceiling},
+                      # ``output_ceiling: 0`` means unlimited (no clamp was
+                      # applied) — kept as a number so the ledger stays
+                      # queryable, with the flag spelled out beside it.
+                      "output_ceiling": output_ceiling,
+                      "output_unlimited": output_ceiling <= 0,
+                      "escalation_ceiling": escalation_stop,
+                      "input_unlimited": resolved_input <= 0},
             )
 
         if not json_mode:
