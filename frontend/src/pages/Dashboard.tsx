@@ -36,6 +36,10 @@ export default function Dashboard() {
   const ent = summary.entitlements
   const plan = ent?.plan || 'free'
   const aiUsage = summary.ai_usage || {}
+  // 0 = UNLIMITED on this plan (Pro+). Resolved once from the plan's own limit
+  // so every "AI credits" readout on this page agrees — and so the meter is
+  // never drawn against a 0 (or an invented 50000) ceiling.
+  const aiCreditLimit = Number(aiUsage.limit ?? ent?.limits?.ai_credits_per_month ?? 0) || 0
   const apps = summary.applications || {}
   const outreach = summary.outreach || {}
   const automation = summary.automation || {}
@@ -106,8 +110,15 @@ export default function Dashboard() {
                 </Link>
               )}
               <div className="mt-3 space-y-2 text-[11px] mono">
-                <div className="flex justify-between"><span>AI credits</span><span>{aiUsage.credits_used ?? 0}/{aiUsage.limit ?? ent?.limits?.ai_credits_per_month ?? 50000}</span></div>
-                <div className="w-full bg-white/10 rounded-full h-1.5 overflow-hidden"><div className="bg-blue-500 h-1.5 rounded-full" style={{width: `${Math.min(100, ((aiUsage.credits_used||0)/(aiUsage.limit||50000))*100)}%`}} /></div>
+                {/* AI credits. A limit of 0 means UNLIMITED on this plan (Pro+):
+                    the meter is hidden rather than drawn against a fake 0/50000
+                    ceiling, and the number reads as usage, not headroom. */}
+                {aiCreditLimit > 0
+                  ? <>
+                      <div className="flex justify-between"><span>AI credits</span><span>{aiUsage.credits_used ?? 0}/{aiCreditLimit}</span></div>
+                      <div className="w-full bg-white/10 rounded-full h-1.5 overflow-hidden"><div className="bg-blue-500 h-1.5 rounded-full" style={{width: `${Math.min(100, ((aiUsage.credits_used||0)/aiCreditLimit)*100)}%`}} /></div>
+                    </>
+                  : <div className="flex justify-between"><span>AI credits</span><span>{aiUsage.credits_used ?? 0} used • <span className="text-violet-300 font-medium">Unlimited</span></span></div>}
                 <div className="flex justify-between"><span>Outreach</span><span>{outreach.sent ?? 0}/{ent?.limits?.outreach_per_month ?? 10}</span></div>
                 <div className="flex justify-between"><span>Automation</span><span>{ent?.usage?.automation_runs_per_month?.used ?? 0}/{ent?.limits?.automation_runs_per_month ?? 5}</span></div>
                 {/* v2.2 — auto mode. Both fields come from the scheduler's own
@@ -191,7 +202,7 @@ export default function Dashboard() {
             <h3 className="font-medium flex items-center gap-2"><DollarSign className="w-4 h-4"/> Billing & Usage</h3>
             <div className="mt-2 text-xs mono space-y-1">
               <div className="flex justify-between"><span>Plan</span><span className="font-medium">{ent?.plan_label || 'Free'}</span></div>
-              <div className="flex justify-between"><span>AI tokens</span><span>{aiUsage.credits_used ?? 0}/{aiUsage.limit ?? 50000}</span></div>
+              <div className="flex justify-between"><span>AI tokens</span><span>{aiCreditLimit > 0 ? `${aiUsage.credits_used ?? 0}/${aiCreditLimit}` : `${aiUsage.credits_used ?? 0} used • Unlimited`}</span></div>
               <div className="flex justify-between"><span>Cost this month</span><span>${aiUsage.cost_usd ?? 0}</span></div>
               <div className="flex justify-between"><span>Automation</span><span>{ent?.usage?.automation_runs_per_month?.used ?? 0}/{ent?.limits?.automation_runs_per_month ?? 5}</span></div>
             </div>

@@ -4,6 +4,92 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.7] — 2026-09-14
+
+**AI scoring: "unlimited" is now a real setting, and it is the default.** A Pro+
+user with 222,757 of 2,000,000 credits left — nowhere near any quota — got
+"Score 57 preliminary + AI pending" on a long job description. The AI never
+answered: every outgoing `max_tokens` was clamped to a hard-coded 16000 ceiling
+that neither the operator nor the user had chosen, the automatic escalation on
+truncation was pinned at that same value, and the honest outcome was
+`truncated_response`. The preliminary keyword score beside an "AI pending" badge
+is a *fallback*, not a verdict, and a paying Pro+ account should never be served
+one because of our cap. `AI_MAX_OUTPUT_TOKENS` / `AI_MAX_INPUT_TOKENS` and the
+per-user `ai.max_output_tokens` / `ai.max_input_tokens` settings now take **`0` =
+unlimited** (no clamp — the provider's own per-model maximum), and `0` is the
+shipped default. Pro+ gets unlimited AI credits and an unclamped output budget;
+free/pro keep their caps.
+
+### Added
+
+- **`0` = unlimited token budgets.** `AI_MAX_OUTPUT_TOKENS=0` /
+  `AI_MAX_INPUT_TOKENS=0` (both new defaults) mean "do not clamp": the gateway
+  sends each task's own starting budget, truncates no prompt part, and lets the
+  escalation on truncation grow to the provider's maximum — bounded only by a
+  new 128,000-token safety stop so a runaway retry loop can never bill a
+  multi-million-token request. A positive value still clamps every outgoing
+  `max_tokens` *and* the escalation, exactly as before.
+- **`ai_max_output_tokens` plan limit** — the per-request output ceiling is now
+  a real entitlement (`free`/`pro` 16000, `pro_plus` 0 = unlimited) and is
+  applied in `resolve_config_for_user` as a tenant-level cap: it can only
+  tighten the resolved budget, so "free still truncates" stays true now that the
+  *default* is unlimited. The operator's own account is exempt — their
+  setting/env value is the platform default, and clamping it to the free plan
+  would put the operator straight back on this bug.
+- **Pro+ is unlimited on AI credits** (`ai_credits_per_month: 0`). `is_unlimited()`
+  is the single predicate behind it (`0`/`None` → unlimited, booleans never),
+  used by `limit_for`, `check_limit` and `entitlements_snapshot`, so a plan can
+  never disagree with itself about whether a limit exists.
+- **Unlimited surfaces in the API and the UI.** `/api/meta` and
+  `public_settings()` publish `ai_max_output_tokens` / `ai_max_input_tokens`
+  plus `ai_output_unlimited` / `ai_input_unlimited`; `GET /api/settings` adds
+  `max_output_tokens_unlimited`, `max_input_tokens_unlimited` and the platform
+  defaults. Settings → AI API accepts `0` in both fields, badges them
+  **Unlimited**, explains "0 = provider default (unlimited)", and round-trips
+  `0` instead of snapping back to a ceiling. The plan banner, Billing usage grid
+  and Dashboard read `limit 0` as *Unlimited* rather than "222757/0 credits" or
+  a meter drawn against a fake ceiling.
+- **Ledger provenance** — a successful call now records `output_unlimited`,
+  `escalation_ceiling` and `input_unlimited` beside `max_tokens` /
+  `output_ceiling`, so "was this call clamped?" is answerable from the record.
+- **Production config validation** — a positive `AI_MAX_OUTPUT_TOKENS` under 64
+  (or `AI_MAX_INPUT_TOKENS` under 256) fails the deploy: that is not a cost cap,
+  it is a guarantee that every answer truncates. `0` is always valid.
+- **Hermetic coverage** — `0` round-trips through `PUT/GET /api/settings` and
+  `/api/meta`; a negative value is stored as unlimited, never a 1-token cap; an
+  explicit `0` beats a default after it; the plan ceiling resolves 0/16000/16000
+  for Pro+/pro/free; an unlimited ceiling lets the escalation grow
+  4000 → 16000 → 32000 on the wire; an unlimited input budget sends a 6k-char
+  resume whole with `input_truncated: false`; the reported bug end to end
+  (Pro+ + a 44k-char JD + a model that thinks three times →
+  1200 → 4800 → 19200 → 76800 → `score_source="ai"`); and the capped half of the
+  contract (free, same JD, same provider → `truncated_response` →
+  explicitly labelled preliminary).
+
+### Fixed
+
+- **`value or default` read "unlimited" as "unset"** in four places —
+  `chat_completion`'s explicit-config merge, `get_user_ai_config`,
+  `input_budget_chars` and the Settings form's prefill/save. A user who chose
+  *Unlimited* silently got the platform ceiling back on the next read, and every
+  save re-applied it. All four are first-value-set now (`0` counts as set).
+- **An unlimited input budget collapsed to the 1000-char floor.**
+  `input_budget_chars` computed `max(1000, 0 * 4)`, so switching the budget off
+  would have shredded every prompt on the one path that is meant to be free of
+  clamps. It returns `0` (= no cap for `fit_prompt_part`) instead.
+- **`limit_for` raised `TypeError` on a `None` plan limit** (`int(None)`);
+  `None` is now another spelling of unlimited, and an unparseable value fails
+  open rather than bricking the tier at billing time.
+- **`entitlements_snapshot` invented `remaining: 999999`** for an unlimited
+  limit — a number the Billing grid then rendered as real headroom. Unlimited
+  keys report `remaining: null` + `unlimited: true`.
+- `ai_max_output_tokens` is excluded from the per-key usage snapshot
+  (`NON_CONSUMABLE_LIMITS`): it is a *cap*, not a quota, and the billing grid
+  used to render every cap as "0 used".
+- `truncated_response` now tells the user what actually fixes it — set Max
+  output tokens to `0` (unlimited) in Settings → AI API or `AI_MAX_OUTPUT_TOKENS=0`
+  — instead of only pointing at a raised ceiling.
+
 ## [2.2.6] — 2026-09-13
 
 **Funding radar: scan through a search engine when one is configured.** With

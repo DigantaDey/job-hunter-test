@@ -7,6 +7,23 @@ import { AUTO_BLOCKERS, AUTO_WORKFLOW_LABELS, autoStateCopy, fmtCadence, fmtWhen
 
 const WORKFLOWS = ['parse','keyword_extract','scoring','resume_gen','classify','email_gen','form_detect','funding_scan','tagging','interview','company_intel']
 
+/**
+ * Read a token-budget field back out of the form.
+ *
+ * **0 is a value, not an empty field** — it means *unlimited* (no clamp, the
+ * provider's own per-model maximum), so it must survive the form round-trip.
+ * `Number(x) || 16000` used to read a user's explicit "Unlimited" as unset and
+ * silently restore a ceiling. A genuinely empty field falls back to the
+ * platform default rather than switching the account to unlimited by accident.
+ */
+function budgetValue(raw: unknown, fallback: number): number {
+  const text = String(raw ?? '').trim()
+  if (text === '') return fallback
+  const parsed = Number(text)
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback
+  return Math.trunc(parsed)
+}
+
 /** How often the Auto-mode card re-reads its schedule/history while it is on screen. */
 const AUTOMATION_POLL_MS = 30_000
 
@@ -16,7 +33,8 @@ export default function Settings(){
   const [saving, setSaving]=useState(false)
   const [msg, setMsg]=useState('')
   const [showKey, setShowKey]=useState(false)
-  const [aiForm, setAiForm]=useState({base_url:'', model:'', api_key:'', rpm:60, timeout:300, max_input_tokens:12000, max_output_tokens:16000})
+  // max_input_tokens / max_output_tokens: 0 = unlimited (provider default).
+  const [aiForm, setAiForm]=useState({base_url:'', model:'', api_key:'', rpm:60, timeout:300, max_input_tokens:0, max_output_tokens:0})
   const [aiStatus, setAiStatus]=useState<any>(null)
   const [aiSaving, setAiSaving]=useState(false)
   const [extracted, setExtracted]=useState<any>(null)
@@ -68,8 +86,10 @@ export default function Settings(){
         api_key: '',
         rpm: data.ai.rpm || status?.user_config?.rpm || 60,
         timeout: data.ai.timeout || 300,
-        max_input_tokens: data.ai.max_input_tokens || 12000,
-        max_output_tokens: data.ai.max_output_tokens || 16000
+        // 0 round-trips as 0 — it means unlimited, not "unset" (the old
+        // `|| 12000` showed a cap the user had switched off).
+        max_input_tokens: budgetValue(data.ai.max_input_tokens, data.ai.platform_max_input_tokens ?? 0),
+        max_output_tokens: budgetValue(data.ai.max_output_tokens, data.ai.platform_max_output_tokens ?? 0)
       })
     }
   }
@@ -113,8 +133,10 @@ export default function Settings(){
           model: aiForm.model,
           rpm: Number(aiForm.rpm)||60,
           timeout: timeoutSecs,
-          max_input_tokens: Number(aiForm.max_input_tokens) || 12000,
-          max_output_tokens: Number(aiForm.max_output_tokens) || 16000,
+          // 0 = unlimited (provider default) and is sent as 0 — the previous
+          // `|| 16000` turned "unlimited" back into a ceiling on every save.
+          max_input_tokens: budgetValue(aiForm.max_input_tokens, data?.ai?.platform_max_input_tokens ?? 0),
+          max_output_tokens: budgetValue(aiForm.max_output_tokens, data?.ai?.platform_max_output_tokens ?? 0),
         }
       }
       if(aiForm.api_key && aiForm.api_key.trim()){
@@ -226,21 +248,25 @@ export default function Settings(){
               <div className="text-[11px] mono text-zinc-500">Timeout: how long to wait for the model per request (5–1800s). Reasoning models on large tasks need minutes — raise this if slow models time out.</div>
               <div className="mt-2 grid grid-cols-2 gap-2">
                 <div>
-                  <label className="text-xs mono">Max input tokens</label>
-                  <input type="number" min={256} max={200000} value={aiForm.max_input_tokens} disabled={!data.ai?.token_limits_editable} onChange={e=>setAiForm({...aiForm, max_input_tokens: Number(e.target.value)})} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700 disabled:opacity-50"/>
+                  <label className="text-xs mono flex items-center gap-1.5">Max input tokens
+                    {aiForm.max_input_tokens === 0 && <span className="text-[10px] font-medium text-violet-600 dark:text-violet-300 px-1.5 py-0.5 rounded-full bg-violet-100 dark:bg-violet-950">Unlimited</span>}
+                  </label>
+                  <input type="number" min={0} max={200000} value={aiForm.max_input_tokens} disabled={!data.ai?.token_limits_editable} onChange={e=>setAiForm({...aiForm, max_input_tokens: e.target.value===''? '' : Number(e.target.value)} as any)} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700 disabled:opacity-50"/>
                   <div className="text-[11px] mono text-zinc-500 mt-1">
                     {data.ai?.token_limits_editable
-                      ? 'Cap on prompt length (resume + JD + context) sent to the model, in tokens (256–200000). Larger prompts are clamped and the truncation is flagged in the record.'
-                      : 'Locked on the free tier — upgrade to edit. Default 12000.'}
+                      ? <>0 = provider default (unlimited) — the job description reaches the model whole, nothing is truncated client-side. A number (256–200000) caps prompt length (resume + JD + context); larger prompts are clamped and the truncation is flagged in the record.</>
+                      : 'Locked on the free tier — upgrade to edit. 0 = unlimited.'}
                   </div>
                 </div>
                 <div>
-                  <label className="text-xs mono">Max output tokens</label>
-                  <input type="number" min={64} max={16000} value={aiForm.max_output_tokens} disabled={!data.ai?.token_limits_editable} onChange={e=>setAiForm({...aiForm, max_output_tokens: Number(e.target.value)})} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700 disabled:opacity-50"/>
+                  <label className="text-xs mono flex items-center gap-1.5">Max output tokens
+                    {aiForm.max_output_tokens === 0 && <span className="text-[10px] font-medium text-violet-600 dark:text-violet-300 px-1.5 py-0.5 rounded-full bg-violet-100 dark:bg-violet-950" title="No cap: the provider's own per-model maximum applies, and the automatic escalation on truncation is free to grow">Unlimited</span>}
+                  </label>
+                  <input type="number" min={0} max={16000} value={aiForm.max_output_tokens} disabled={!data.ai?.token_limits_editable} onChange={e=>setAiForm({...aiForm, max_output_tokens: e.target.value===''? '' : Number(e.target.value)} as any)} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700 disabled:opacity-50"/>
                   <div className="text-[11px] mono text-zinc-500 mt-1">
                     {data.ai?.token_limits_editable
-                      ? 'Cap on how much the model may generate per request, in tokens (64–16000). A failed attempt that is retried can never exceed this.'
-                      : 'Locked on the free tier — upgrade to edit. Default 16000.'}
+                      ? <>0 = provider default (unlimited) — no clamp, so long job descriptions on reasoning models no longer come back truncated. A number (64–16000) caps how much the model may generate per request; a retry can never exceed it.</>
+                      : 'Locked on the free tier — upgrade to edit. 0 = unlimited.'}
                   </div>
                 </div>
               </div>

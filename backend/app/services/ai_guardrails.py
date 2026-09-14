@@ -95,7 +95,7 @@ DIAGNOSIS: Dict[str, Tuple[str, str]] = {
     ),
     "truncated_response": (
         "The model's answer was cut off before the JSON completed.",
-        "The output-token limit is too small for this document — raise AI_MAX_OUTPUT_TOKENS (Settings → AI API) or use a model with a larger output limit. Reasoning models also burn tokens on 'thinking' before the JSON starts.",
+        "The output-token ceiling is too small for this document — set Max output tokens to 0 (unlimited, the provider's own maximum) in Settings → AI API or AI_MAX_OUTPUT_TOKENS=0, or use a model with a larger output limit. Reasoning models also burn tokens on 'thinking' before the JSON starts.",
     ),
     "content_filter": (
         "The provider blocked the answer with its content filter.",

@@ -17,7 +17,13 @@ from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
+from app.core.config import (
+    AI_MIN_INPUT_TOKENS,
+    AI_MIN_OUTPUT_TOKENS,
+    AI_TOKEN_UNLIMITED,
+    ai_token_budget,
+    settings,
+)
 from app.core.logging import get_logger
 from app.core.security import decrypt_secret, encrypt_secret
 from app.models.models import SettingsModel, User
@@ -147,6 +153,20 @@ WRITABLE_KEYS: Dict[str, set] = {
 }
 
 
+def _budget_or(value: Any, fallback: Any) -> int:
+    """A token budget: ``value`` when it is set, else ``fallback``.
+
+    **``0`` counts as set** — it means unlimited (provider default). The old
+    ``value or fallback`` idiom read an explicit *Unlimited* as "unset" and
+    quietly restored the platform ceiling, which is how a Pro+ user with
+    unlimited AI kept hitting a 16000-token wall and getting
+    ``truncated_response`` on long job descriptions.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ai_token_budget(fallback)
+    return ai_token_budget(value)
+
+
 def coerce_bool(value: Any) -> Any:
     """Strict-ish boolean coercion for settings values: ``None`` when the value
     is not a boolean at all.
@@ -196,9 +216,14 @@ def validate_openai_compatible(base_url: str, model: str, api_key: str = "") -> 
 
 #: Validation ranges for the per-user token budgets (sane, model-aware lower
 #: and upper bounds — see the over-context decision in the CHANGELOG).
+#:
+#: ``0`` is always accepted for both and means **unlimited**: no clamp, the
+#: provider's own per-model maximum applies (the shipped default, and what Pro+
+#: gets). A *positive* value must sit inside the range — a ceiling under the
+#: floor is not a cost cap, it is a guarantee that every answer truncates.
 TOKEN_LIMIT_RANGES = {
-    "max_input_tokens": (256, 200000),
-    "max_output_tokens": (64, 16000),
+    "max_input_tokens": (AI_MIN_INPUT_TOKENS, 200000),
+    "max_output_tokens": (AI_MIN_OUTPUT_TOKENS, 16000),
 }
 
 
@@ -396,8 +421,11 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
         "rpm": get_setting(db, user_id, "ai", "rpm", settings.ai_rpm),
         "max_retries": get_setting(db, user_id, "ai", "max_retries", settings.ai_max_retries),
         "timeout": get_setting(db, user_id, "ai", "timeout", settings.ai_timeout),
-        "max_input_tokens": max_input_tokens or settings.ai_max_input_tokens,
-        "max_output_tokens": max_output_tokens or settings.ai_max_output_tokens,
+        # ``0`` = unlimited, so these must be first-value-set, never
+        # ``value or default`` — that silently turned an explicit "unlimited"
+        # back into the env ceiling.
+        "max_input_tokens": _budget_or(max_input_tokens, settings.ai_max_input_tokens),
+        "max_output_tokens": _budget_or(max_output_tokens, settings.ai_max_output_tokens),
     }
 
 
@@ -425,6 +453,15 @@ def grouped(db: Session, user: User, *, reveal_secrets: bool = False) -> Dict[st
         bucket[row.key] = row.value
 
     result["ai"]["api_key_set"] = bool(ai_key or settings.ai_api_key)
+    # ``0`` on a token budget means unlimited (no clamp — the provider's own
+    # maximum). Spelled out for the UI so it can render an "Unlimited" badge
+    # instead of a bare 0, and so the platform default is visible next to it.
+    result["ai"]["max_output_tokens"] = ai_token_budget(result["ai"].get("max_output_tokens"))
+    result["ai"]["max_input_tokens"] = ai_token_budget(result["ai"].get("max_input_tokens"))
+    result["ai"]["max_output_tokens_unlimited"] = result["ai"]["max_output_tokens"] <= 0
+    result["ai"]["max_input_tokens_unlimited"] = result["ai"]["max_input_tokens"] <= 0
+    result["ai"]["platform_max_output_tokens"] = settings.ai_max_output_tokens
+    result["ai"]["platform_max_input_tokens"] = settings.ai_max_input_tokens
     if ai_key:
         result["ai"]["api_key_masked"] = "***"
     if ai_key_error:
@@ -584,15 +621,23 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
                 # Sane ranges; over-context behaviour is clamping-with-warning
                 # (the gateway truncates/clamps and flags it — it never
                 # rejects a save just because a model's window is smaller).
+                #
+                # ``0`` is the escape hatch, not an out-of-range value: it means
+                # unlimited (no clamp — the provider's own maximum). A negative
+                # value is a typo for "off" and is stored as 0 rather than
+                # becoming a 1-token cap that truncates every answer.
                 lo, hi = TOKEN_LIMIT_RANGES[key]
                 try:
                     value = int(value)
                 except (TypeError, ValueError) as exc:
                     raise HTTPException(400, f"'{category}.{key}' must be an integer number of tokens") from exc
-                if not lo <= value <= hi:
+                if value < 0:
+                    value = AI_TOKEN_UNLIMITED
+                elif value != AI_TOKEN_UNLIMITED and not lo <= value <= hi:
                     raise HTTPException(
                         400,
-                        f"'{category}.{key}' must be between {lo} and {hi} tokens",
+                        f"'{category}.{key}' must be 0 (unlimited — the provider's own maximum) "
+                        f"or between {lo} and {hi} tokens",
                     )
             # Hygiene for AI connection fields: paste artifacts (trailing
             # whitespace/newlines) and masked placeholders are the two classic

@@ -65,8 +65,11 @@ export default function Billing() {
               <div key={k} className="bg-zinc-50 dark:bg-zinc-800 rounded-xl p-3">
                 <div className="text-[11px] mono uppercase text-zinc-500">{k.replace(/_/g,' ')}</div>
                 <div className="mt-1 flex items-center justify-between">
-                  <span className="text-sm font-medium mono">{v.used}/{v.limit || '∞'}</span>
-                  <span className="text-[11px] mono text-zinc-500">{v.remaining ?? 0} left</span>
+                  <span className="text-sm font-medium mono">{v.limit > 0 ? `${v.used}/${v.limit}` : `${v.used} used`}</span>
+                  {/* 0 (or an explicit unlimited flag) = no ceiling on this plan. */}
+                  {v.limit > 0
+                    ? <span className="text-[11px] mono text-zinc-500">{v.remaining ?? 0} left</span>
+                    : <span className="text-[11px] mono font-medium text-violet-600 dark:text-violet-300 px-2 py-0.5 rounded-full bg-violet-100 dark:bg-violet-950" title="No ceiling on this plan">Unlimited</span>}
                 </div>
                 {v.limit>0 && <div className="mt-2 w-full bg-zinc-200 dark:bg-zinc-700 rounded-full h-1"><div className="bg-blue-600 h-1 rounded-full" style={{width: `${Math.min(100, (v.used/v.limit)*100)}%`}}/></div>}
               </div>

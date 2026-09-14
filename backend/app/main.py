@@ -259,6 +259,13 @@ def create_app() -> FastAPI:
             "version": settings.version,
             "environment": settings.environment,
             "uptime_seconds": round(time.time() - STARTED_AT, 1),
+            # The platform-wide AI token ceilings, secret-free. ``0`` means
+            # unlimited (the provider's own per-model maximum) — the UI reads
+            # it to render "Unlimited" instead of a number.
+            "ai_max_output_tokens": settings.ai_max_output_tokens,
+            "ai_max_input_tokens": settings.ai_max_input_tokens,
+            "ai_output_unlimited": settings.ai_output_unlimited,
+            "ai_input_unlimited": settings.ai_input_unlimited,
             "features": [
                 "multi_user_auth_rbac", "tenant_isolation", "per_user_vault_encryption",
                 "ai_keyword_extraction", "ai_scoring_calibrated", "ai_email_drafting",
