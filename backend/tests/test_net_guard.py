@@ -162,3 +162,93 @@ async def test_transport_guard_checks_redirect_hops():
     )
     assert allowed == "response"
     assert seen == ["https://93.184.216.34/board"]
+
+
+# --------------------------------------------------------------------------- #
+# Reusable pre-flight: one policy, answer-instead-of-exception
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_preflight_answers_instead_of_raising(monkeypatch):
+    """Callers that must decline *before* expensive work (a browser) get a verdict."""
+    monkeypatch.setattr(net_guard, "_resolve", _metadata_resolver)
+
+    verdict = await net_guard.preflight("https://sneaky.example.com/")
+    assert verdict.allowed is False
+    assert verdict.code == "unsafe_address"
+    assert verdict.host == "sneaky.example.com"
+    assert verdict.port == 443
+    assert verdict.addresses == ("169.254.169.254",)
+    with pytest.raises(OutboundURLBlocked):
+        verdict.raise_if_blocked()
+
+
+@pytest.mark.asyncio
+async def test_preflight_describes_an_allowed_url(monkeypatch):
+    monkeypatch.setattr(net_guard, "_resolve", _public_resolver)
+
+    verdict = await net_guard.preflight("https://boards.greenhouse.io/v1/boards/acme")
+    assert verdict.allowed is True
+    assert verdict.scheme == "https"
+    assert verdict.host == "boards.greenhouse.io"
+    assert verdict.port == 443
+    assert verdict.dns_checked is True
+    assert verdict.addresses == ("93.184.216.34",)
+
+
+@pytest.mark.asyncio
+async def test_the_navigation_policy_is_stricter_than_the_http_policy(monkeypatch):
+    """``OUTBOUND_ALLOW_PRIVATE`` reaches the HTTP client and nothing else."""
+    monkeypatch.setattr(settings, "outbound_allow_private", True, raising=False)
+    monkeypatch.setattr(net_guard, "_resolve", _private_resolver)
+
+    await net_guard.check_url("http://10.0.0.5/internal-jobs")  # HTTP: the flag allows it
+    verdict = await net_guard.preflight_navigation("http://10.0.0.5/internal-jobs")
+    assert verdict.allowed is False
+    assert verdict.navigation is True
+
+    with pytest.raises(OutboundURLBlocked):
+        await net_guard.check_navigation_url("http://127.0.0.1:8000/")
+
+
+@pytest.mark.asyncio
+async def test_navigation_hard_blocks_survive_the_allow_list(monkeypatch):
+    """Metadata, loopback and link-local are absolute for a browser; RFC1918 is not."""
+    monkeypatch.setattr(settings, "outbound_allowed_hosts",
+                        ["169.254.169.254", "127.0.0.1", "metadata.google.internal", "redis.local"],
+                        raising=False)
+    for url in ("http://169.254.169.254/latest/meta-data/", "http://127.0.0.1:8000/",
+                "http://metadata.google.internal/computeMetadata/v1/", "http://redis.local/"):
+        verdict = await net_guard.preflight_navigation(url)
+        assert verdict.allowed is False, url
+
+    monkeypatch.setattr(settings, "outbound_allowed_hosts", ["10.10.0.5"], raising=False)
+    verdict = await net_guard.preflight_navigation("http://10.10.0.5/apply")
+    assert verdict.allowed is True
+    assert verdict.allowlisted is True
+
+
+def test_host_matching_is_subdomain_aware():
+    assert net_guard.host_matches("jobs.lever.co", "jobs.lever.co")
+    assert net_guard.host_matches("sub.jobs.lever.co", "jobs.lever.co")
+    assert not net_guard.host_matches("jobs.lever.co.evil.net", "jobs.lever.co")
+    assert not net_guard.host_matches("notjobs.lever.co", "jobs.lever.co")
+
+
+def test_registrable_domain_tells_an_ats_redirect_from_a_new_organisation():
+    assert net_guard.registrable_domain("careers.jobs.lever.co") == "lever.co"
+    assert net_guard.registrable_domain("boards.greenhouse.co.uk") == "greenhouse.co.uk"
+    assert net_guard.same_registrable_domain("boards.greenhouse.io", "job-boards.greenhouse.io")
+    assert not net_guard.same_registrable_domain("jobs.lever.co", "evil.example.net")
+    assert not net_guard.same_registrable_domain("jobs.lever.co", "jobs.lever.co.evil.net")
+
+
+@pytest.mark.asyncio
+async def test_dns_cache_stays_bounded(monkeypatch):
+    """A sweep over thousands of hosts must not grow the verdict cache forever."""
+    monkeypatch.setattr(net_guard, "_resolve", _public_resolver)
+    for index in range(settings.dns_cache_max_entries + 200):
+        await net_guard.preflight(f"https://sweep-{index}.example.com/")
+
+    stats = net_guard.dns_cache_stats()
+    assert stats["entries"] <= stats["max_entries"] == settings.dns_cache_max_entries
+    assert stats["evictions"] >= 200

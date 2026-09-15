@@ -253,6 +253,19 @@ async def prepare_application(
     return result
 
 
+def company_domains(job: Job) -> List[str]:
+    """
+    The job's *independent* company metadata, for the autofill domain policy.
+
+    The posting URL is deliberately not part of this: it is the value a feed
+    supplies, so it cannot also be the evidence that the URL is trustworthy.
+    """
+    info = job.company_info or {}
+    extra = job.extra or {}
+    candidates = [info.get("website"), extra.get("company_website")]
+    return [str(value).strip() for value in candidates if value]
+
+
 async def execute_application(
     db: Session,
     user: User,
@@ -274,8 +287,11 @@ async def execute_application(
         if entry:
             from app.core.security import decrypt_secret
 
+            # ``domain`` travels with the credential so the browser can refuse to
+            # type it on any host that is not the domain it was issued for.
             credential = {"username": entry.username,
-                          "password": decrypt_secret(entry.password_enc, f"user:{user.id}:vault")}
+                          "password": decrypt_secret(entry.password_enc, f"user:{user.id}:vault"),
+                          "domain": domain}
 
     if not plan:
         prepared = await prepare_application(db, user, job, answers=answers)
@@ -293,6 +309,8 @@ async def execute_application(
         credential=credential,
         allow_submit=submit,
         screenshot_path=screenshot if settings.autofill_enabled else None,
+        # Independent company metadata: restricts where the browser may act.
+        expected_domains=company_domains(job),
     )
 
     extra["autofill_result"] = result

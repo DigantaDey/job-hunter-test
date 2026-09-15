@@ -63,6 +63,25 @@ authenticated user. Tenancy isolation is covered by tests (`tests/test_auth_and_
   address check for an air-gapped install. Fetches still honour `RESPECT_ROBOTS_TXT`, are
   rate-limited per host, use short timeouts and never send credentials. Treat `FUNDING_IMPORT_URL`
   and ATS board tokens as operator-trusted configuration.
+* The **browser** is an outbound client too, and a more dangerous one: it renders, follows
+  redirects and can be typed into. `execute_autofill` therefore runs the same policy as a
+  **pre-flight** (`net_guard.preflight_navigation`) before Playwright is even launched, in a
+  stricter shape: loopback, link-local (`169.254.0.0/16`, the cloud-metadata range) and metadata
+  hostnames are refused **even when allow-listed**, and `OUTBOUND_ALLOW_PRIVATE` does not apply to
+  navigation at all (a private range is reachable by a browser only when that exact host is in
+  `OUTBOUND_ALLOWED_HOSTS`). A refused posting URL is recorded as `status="blocked"` on the job —
+  never as an application.
+* Autofill is additionally **domain-restricted**. The domains a run may act on come from the job's
+  *own* metadata (its ATS portal domain, or the company website on record) — never from the posting
+  URL, which is the attacker-supplied value. A posting on a host that metadata does not name is
+  refused; a redirect off the posting's own organisation stops the run. **Vault credentials are
+  typed only when the page's live host is one of those domains *and* the domain the credential was
+  issued for** — including for `password` fields in the form plan, not just the login form. A
+  mismatch is reported in the run result (`login.reason`) instead of silently filling.
+* Autofill failures are diagnosable without leaking anything: every selector decision is logged at
+  `DEBUG` and echoed in the result's `diagnostics` (field name, selector, outcome) — values, and
+  passwords in particular, are never logged. `tests/test_autofill_navigation_policy.py` pins all of
+  this, including that no secret reaches a log line.
 * Residual risk: DNS is resolved by the guard and again by the HTTP client, so a hostile resolver
   could answer differently the second time (DNS rebinding). The window is narrow and the default
   (`OUTBOUND_ALLOW_PRIVATE=false`) means a rebinding answer is refused on the next hop; keep the
@@ -91,6 +110,14 @@ fact that a deletion happened). Users can read their own trail at `GET /api/acco
 * Automation is dry-run by default and requires two explicit opt-ins plus a recorded consent:
   `POST /api/jobs/{id}/apply` enforces the `automation` disclosure (403 `consent_required`) on the
   branch that would really submit; dry-run preparation stays available without it.
+* The worker is a long-lived process that sweeps thousands of *distinct* URLs and hosts, so every
+  in-process cache it keeps is a **bounded LRU** (`app/core/lru.py`), not a dict that only grows:
+  the outbound GET cache (`HTTP_CACHE_MAX_ENTRIES`, default 128 — storing status + headers + parsed
+  body, never the raw `httpx.Response`, and never a body over `HTTP_CACHE_MAX_BODY_BYTES`), the
+  per-host politeness state (`HTTP_HOST_STATE_MAX_ENTRIES`, where a lock a coroutine is holding is
+  pinned rather than evicted) and the SSRF guard's DNS verdicts (`DNS_CACHE_MAX_ENTRIES`). Entries,
+  evictions and hits are on `GET /api/ops/status` under `outbound`, so a cache that stops behaving
+  is visible before it becomes an incident.
 
 ## 7. Known risks & accepted trade-offs
 
