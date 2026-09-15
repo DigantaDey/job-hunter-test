@@ -202,7 +202,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.2.12"
+    version: str = "2.2.14"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -224,6 +224,15 @@ class Settings(BaseSettings):
     password_min_length: int = 10
     max_login_attempts: int = 8
     login_lockout_seconds: int = 900
+    #: The pre-auth login-failure window lives in this process, is keyed on the
+    #: caller-supplied email address, and therefore has to be *bounded* and
+    #: *tunable* rather than hardcoded: a hardcoded 8/300s cannot be tightened
+    #: on an install that is being sprayed, and the key count below is the cap
+    #: that stops a spray of distinct addresses from growing the map (or, in the
+    #: old implementation, from wiping everybody's lockout by crossing a
+    #: threshold and calling ``clear()``). See ``app/api/routers/auth.py``.
+    login_throttle_window_seconds: int = 300
+    login_throttle_max_keys: int = 4096
 
     cors_origins: List[str] = Field(default_factory=list)
     allowed_hosts: List[str] = Field(default_factory=list)
@@ -434,6 +443,12 @@ class Settings(BaseSettings):
     http_host_state_max_entries: int = 512
     #: DNS verdicts in the SSRF guard.
     dns_cache_max_entries: int = 512
+    #: Derived per-scope Fernet keys (``app.core.security._key_cache``). One
+    #: entry per user vault scope, so this is bounded like the rest — and it
+    #: carries a TTL so that rotating ``VAULT_KEY`` on a running process stops
+    #: serving the *old* derived key within that many seconds instead of never.
+    key_cache_max_entries: int = 1024
+    key_cache_ttl_seconds: int = 3600
 
     greenhouse_board_tokens: List[str] = Field(default_factory=list)
     lever_board_tokens: List[str] = Field(default_factory=list)
@@ -484,6 +499,13 @@ class Settings(BaseSettings):
     clearbit_api_key: str = ""
     apollo_api_key: str = ""
     contact_verify_mx: bool = True
+    #: The MX probe is a blocking resolver call, so it runs on a worker thread
+    #: and is capped twice: this is the resolver's own ``lifetime`` *and* the
+    #: await's ceiling, and the limiter below is how many of those may be in
+    #: flight at once (a discovery sweep verifying a dozen contacts must not
+    #: monopolise the thread pool the rest of the app runs on).
+    contact_mx_timeout_seconds: float = 5.0
+    contact_mx_max_concurrent: int = 8
     contact_max_candidates: int = 5
 
     # ------------------------------------------------------------------ #

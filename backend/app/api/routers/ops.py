@@ -15,7 +15,7 @@ from app.core.config import settings
 from app.core.entitlements import entitlements_snapshot
 from app.core.logging import get_logger
 from app.core.rate_limiter import rate_limiter
-from app.core.security import constant_time_equals
+from app.core.security import constant_time_equals, key_cache_stats
 from app.db import check_db_health, migration_state
 from app.metrics_server import TEXT_CONTENT_TYPE
 from app.models.models import (
@@ -330,6 +330,10 @@ async def ops_status(request: Request, user: CurrentUser, db: DbSession):
             },
             "workers": int(settings.web_concurrency or 1),
         },
+        # Derived per-scope vault keys. One entry per user vault, so this is a
+        # bounded LRU like the rest — and ``expirations``/``evictions`` rising is
+        # what makes a key-rotation staleness window visible instead of silent.
+        "key_cache": key_cache_stats(),
     }
 
 

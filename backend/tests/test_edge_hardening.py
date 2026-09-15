@@ -280,7 +280,7 @@ def test_login_throttle_is_bounded_and_cannot_be_wiped():
     # And a flood that fits inside the cap costs *its own* entries only: the
     # lockout established before it still holds afterwards.
     attempts.clear()
-    for _ in range(auth_router._MAX_ATTEMPTS):
+    for _ in range(auth_router._max_attempts()):
         auth_router._throttle("owner@example.com")
     for index in range(1_000):
         auth_router._throttle(f"flood{index}@example.com")

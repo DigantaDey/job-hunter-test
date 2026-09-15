@@ -35,6 +35,7 @@ import hmac
 import ipaddress
 import json
 import math
+import re
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -305,12 +306,37 @@ def path_label(scope: Mapping[str, Any], raw_path: str) -> str:
 # --------------------------------------------------------------------------- #
 # Request context / access log
 # --------------------------------------------------------------------------- #
+#: Characters a caller-supplied correlation id may keep. Everything else —
+#: crucially CR/LF and the other control characters — is replaced, because this
+#: value is echoed back in a response header, written into every log line for
+#: the request, and stored on every audit row. A raw newline there is both a log
+#: injection and a response-splitting primitive.
+_REQUEST_ID_ALLOWED = re.compile(r"[^A-Za-z0-9._:+\-]")
+
+
+def sanitize_request_id(raw: str, *, limit: int = 64) -> str:
+    """
+    Reduce a client-supplied ``x-request-id`` to something safe to reflect.
+
+    Disallowed characters become ``_`` rather than being dropped, so the id still
+    has the caller's shape (and two different hostile values do not collapse onto
+    each other). Returns ``""`` for input that held nothing usable, which the
+    caller treats as "generate our own".
+    """
+    cleaned = _REQUEST_ID_ALLOWED.sub("_", raw or "")[:limit]
+    # An id that was nothing but illegal characters carries no correlation
+    # value, so the caller generates its own rather than echoing "__".
+    return cleaned if cleaned.strip("_") else ""
+
+
 class RequestContextMiddleware(BaseHTTPMiddleware):
     """Attach an id to every request, log it, and count it."""
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         incoming = request.headers.get("x-request-id", "")
-        request_id = incoming[:64] if incoming else uuid.uuid4().hex[:16]
+        request_id = sanitize_request_id(incoming) if incoming else ""
+        if not request_id:
+            request_id = uuid.uuid4().hex[:16]
         token = request_id_var.set(request_id)
         request.state.request_id = request_id
 

@@ -28,14 +28,38 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 # Brute-force protection: per-email attempt window (in-process; a shared store is
 # the next step for multi-replica deployments).
-_MAX_ATTEMPTS = 8
-_WINDOW_SECONDS = 300
+#:
 #: Bounded on purpose: the email is caller-supplied and this runs *before*
 #: authentication, so the old plain dict with ``if len(...) > 2000: clear()`` let
 #: an attacker both grow it with random addresses and wipe everybody's lockout
 #: state by crossing the threshold. An LRU with a TTL evicts the oldest window
 #: instead — one noisy address costs its own entry, never anyone else's.
-_attempts = BoundedTTLMap(name="auth.login_attempts", max_entries=4096, default_ttl=_WINDOW_SECONDS)
+#:
+#: The threshold and the window are read from ``settings`` on every call
+#: (``MAX_LOGIN_ATTEMPTS`` / ``LOGIN_THROTTLE_WINDOW_SECONDS``) rather than
+#: frozen here, so an install that is being sprayed can tighten them without a
+#: code change. Only the key cap is read at import time, because that is the
+#: shape of the map itself.
+#:
+#: ``evictable`` pins a window that has reached the threshold: that entry *is*
+#: an active lockout, so letting a flood of one-attempt addresses push it out
+#: would reintroduce the original bug at a larger spray size. Partial windows
+#: stay evictable, the pinned ones still expire on their TTL, and any resulting
+#: overflow is reported as ``over_capacity`` on ``/api/ops/status``.
+_attempts = BoundedTTLMap(name="auth.login_attempts",
+                          max_entries=settings.login_throttle_max_keys,
+                          default_ttl=settings.login_throttle_window_seconds,
+                          evictable=lambda window: len(window or []) < _max_attempts())
+
+
+def _max_attempts() -> int:
+    """Configured failure threshold for the window (never below 1)."""
+    return max(1, int(settings.max_login_attempts or 1))
+
+
+def _window_seconds() -> int:
+    """Configured sliding window, in seconds (never below 1)."""
+    return max(1, int(settings.login_throttle_window_seconds or 1))
 
 
 class Credentials(BaseModel):
@@ -86,21 +110,32 @@ class ApiKeyCreate(BaseModel):
 
 
 def _throttle(email: str) -> None:
+    """
+    Record a failed-login attempt for *email* and 429 once the window is full.
+
+    The entry is re-put on every call, which is what keeps both the LRU recency
+    and the per-entry TTL honest: an idle address expires on its own, and an
+    address still being sprayed stays in the map until it is evicted for room —
+    never by wiping its neighbours.
+    """
     now = time.time()
+    window_seconds = _window_seconds()
     key = email.lower()
-    window = [t for t in (_attempts.get(key) or []) if now - t < _WINDOW_SECONDS]
-    if len(window) >= _MAX_ATTEMPTS:
-        retry = int(_WINDOW_SECONDS - (now - window[0]))
+    window = [t for t in (_attempts.get(key) or []) if now - t < window_seconds]
+    if len(window) >= _max_attempts():
+        retry = int(window_seconds - (now - window[0]))
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
                             detail={"code": "too_many_attempts", "retry_after": max(1, retry)},
                             headers={"Retry-After": str(max(1, retry))})
     window.append(now)
-    _attempts.put(key, window)
+    _attempts.put(key, window, ttl=window_seconds)
 
 
 def login_throttle_state() -> Dict[str, Any]:
     """Bounded-login-throttle counters for ops (never the emails or timestamps)."""
-    return _attempts.stats()
+    return {**_attempts.stats(),
+            "max_attempts": _max_attempts(),
+            "window_seconds": _window_seconds()}
 
 
 @router.get("/status")

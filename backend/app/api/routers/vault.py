@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from typing import Any, Dict, List
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 from app.api.deps import CurrentUser, DbSession
 from app.core import audit
 from app.core.entitlements import enforce
+from app.core.logging import get_logger
 from app.models.models import VaultEntry
 from app.schemas.schemas import VaultOut
 from app.services.vault import (
+    VaultDecryptionError,
+    VaultExport,
     delete_all_vault,
     delete_entry,
     export_apple_csv,
@@ -20,7 +25,35 @@ from app.services.vault import (
     save_vault_entry,
 )
 
+log = get_logger("app.vault.api")
+
 router = APIRouter(prefix="/vault", tags=["vault"])
+
+#: Response header carrying how many entries had to be left out of a CSV
+#: because their ciphertext could not be decrypted. A download cannot render an
+#: error, so this (and the audit row) is how a silently short export says so.
+UNDECRYPTABLE_HEADER = "X-Vault-Undecryptable"
+
+
+def _undecryptable_headers(result: VaultExport) -> Dict[str, str]:
+    return {UNDECRYPTABLE_HEADER: str(len(result.undecryptable))}
+
+
+def _audit_export(
+    db: DbSession, user: Any, request: Request, flavour: str, entries: List[VaultEntry], result: VaultExport
+) -> None:
+    """Record an export, including the entries that could not be read."""
+    detail: Dict[str, Any] = {"entries": len(entries), "written": len(entries) - len(result.undecryptable)}
+    if result.undecryptable:
+        detail["undecryptable"] = list(result.undecryptable)
+        log.error(
+            "vault %s export omitted %s entr%s that cannot be decrypted with the configured "
+            "VAULT_KEY (entry ids: %s)",
+            flavour, len(result.undecryptable),
+            "y" if len(result.undecryptable) == 1 else "ies",
+            ", ".join(str(i) for i in result.undecryptable),
+        )
+    audit.audit(db, "vault.exported", user=user, target=flavour, detail=detail, request=request)
 
 
 @router.get("", response_model=list[VaultOut])
@@ -48,28 +81,51 @@ def reveal(entry_id: int, request: Request, user: CurrentUser, db: DbSession):
     if not entry:
         raise HTTPException(404, "Entry not found")
     audit.audit(db, "vault.viewed", user=user, target=entry.domain, detail={"entry_id": entry.id, "revealed": True}, request=request)
-    return {"id": entry.id, "domain": entry.domain, "username": entry.username, "password": reveal_password(entry)}
+    try:
+        password = reveal_password(entry, db=db)
+    except VaultDecryptionError as exc:
+        # A 500, not an empty password: the entry exists and belongs to the
+        # caller, so this is the server failing to read its own data (almost
+        # always a rotated VAULT_KEY). Saying so is the difference between an
+        # operator seeing the breakage and a user re-typing every credential.
+        audit.audit(db, "vault.reveal_failed", user=user, target=entry.domain,
+                    detail={"entry_id": entry.id, "reason": exc.reason}, request=request)
+        raise HTTPException(
+            500,
+            detail={
+                "code": "vault_entry_undecryptable",
+                "entry_id": entry.id,
+                "message": ("This credential cannot be decrypted with the server's current "
+                            "VAULT_KEY. It was likely encrypted under a previous key; restore "
+                            "that key or re-enter the credential."),
+            },
+        ) from exc
+    return {"id": entry.id, "domain": entry.domain, "username": entry.username, "password": password}
 
 
 @router.get("/export/chrome")
 def export_chrome(request: Request, user: CurrentUser, db: DbSession):
     entries = list_vault_entries(db, user.id)
-    audit.audit(db, "vault.exported", user=user, target="chrome", detail={"entries": len(entries)}, request=request)
+    result = export_chrome_csv(entries)
+    _audit_export(db, user, request, "chrome", entries, result)
     return PlainTextResponse(
-        export_chrome_csv(entries),
+        result.text,
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=jobhunter_chrome_passwords.csv", "Cache-Control": "no-store"},
+        headers={"Content-Disposition": "attachment; filename=jobhunter_chrome_passwords.csv",
+                 "Cache-Control": "no-store", **_undecryptable_headers(result)},
     )
 
 
 @router.get("/export/apple")
 def export_apple(request: Request, user: CurrentUser, db: DbSession):
     entries = list_vault_entries(db, user.id)
-    audit.audit(db, "vault.exported", user=user, target="apple", detail={"entries": len(entries)}, request=request)
+    result = export_apple_csv(entries)
+    _audit_export(db, user, request, "apple", entries, result)
     return PlainTextResponse(
-        export_apple_csv(entries),
+        result.text,
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=jobhunter_apple_passwords.csv", "Cache-Control": "no-store"},
+        headers={"Content-Disposition": "attachment; filename=jobhunter_apple_passwords.csv",
+                 "Cache-Control": "no-store", **_undecryptable_headers(result)},
     )
 
 

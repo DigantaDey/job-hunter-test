@@ -4,6 +4,75 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.14] — 2026-09-15
+
+**Long-lived process state stops being attacker-resettable, the daily cap stops
+moving with the server's timezone, and a broken vault key now fails loudly.**
+Five independent defects, all of which degraded quietly: the pre-auth login
+window still had a hardcoded 8/300s threshold and an unbounded derived-key
+cache next to it; the outreach daily cap measured "today" with `date.today()`,
+so it drifted with `TZ` and across DST and disagreed between workers; the MX
+probe ran the blocking resolver *on* the event loop, freezing the worker for up
+to five seconds per contact; the text log formatter interpolated the
+caller-supplied `x-request-id` header raw, so a newline in it forged log
+records; and the vault's opportunistic re-key was never committed — while a
+ciphertext that no longer decrypted was swallowed into an empty password.
+
+### Fixed
+
+- **A login spray can no longer reset other users' lockouts, and the threshold
+  is configuration.** The window is a bounded LRU (`LOGIN_THROTTLE_MAX_KEYS`)
+  whose *full* windows are pinned via `evictable`, so a flood of one-attempt
+  addresses costs its own entries at any spray size instead of pushing an active
+  lockout out; partial windows stay evictable, pinned ones still expire on their
+  TTL, and any overflow is reported as `over_capacity`. `MAX_LOGIN_ATTEMPTS` and
+  `LOGIN_THROTTLE_WINDOW_SECONDS` are read per call rather than frozen at
+  import, so an install being sprayed can tighten them without a code change,
+  and the live values are reported on `GET /api/ops/status` under
+  `edge.login_throttle`.
+- **`security._key_cache` is bounded and expires.** It is keyed on the vault
+  scope, which embeds the user id, so the plain dict grew for the whole process
+  lifetime. It is now a `BoundedTTLMap` (`KEY_CACHE_MAX_ENTRIES`,
+  `KEY_CACHE_TTL_SECONDS`), surfaced as `key_cache` on `GET /api/ops/status`,
+  with `clear_key_cache()` for an explicit post-rotation flush — the TTL is what
+  stops a rotated `VAULT_KEY` from being shadowed by a stale derivation forever.
+- **The daily outreach cap is a UTC timestamp range.** `sent_today()` now
+  applies `sent_at >= start AND sent_at < end` over the UTC calendar day
+  (`utc_day_bounds`), matching the naive-UTC column `send_email` writes. The old
+  `date.today()` midnight moved with the process timezone and jumped on a DST
+  change, so the same 24 hours could be charged to two different days — granting
+  a second full budget early, or blocking sends long after the budget had rolled
+  over. `/api/account/billing-usage` reads the same helper, so "today" means one
+  thing everywhere.
+- **The MX probe no longer blocks the event loop.** `dns.resolver.resolve` runs
+  on a worker thread (`resolve_mx`), bounded by `CONTACT_MX_TIMEOUT_SECONDS` and
+  a `CONTACT_MX_MAX_CONCURRENT` limiter, with the thread *abandoned* rather than
+  awaited when the budget elapses. Async callers use `verify_email_async()`;
+  the sync `verify_email()` still probes MX from a script but declines inside a
+  running loop, reporting `mx: "skipped_event_loop"` instead of freezing every
+  other task on the worker. An unfinished lookup is still `mx_ok: null` —
+  unknown, never invalid.
+- **A forged `x-request-id` can no longer mint log records.** The header is
+  reduced to a safe character set at the edge (`sanitize_request_id`) before it
+  is echoed, logged or stored on an audit row — a raw CR/LF there was also a
+  response-splitting primitive — and `sanitize_log_value` escapes C0/C1
+  controls and the Unicode line terminators on every value the text formatter
+  interpolates, escaping rather than deleting so an attack stays visible in the
+  log. The traceback block is indented so a newline inside an exception message
+  cannot start a line at column 0. JSON mode was already safe.
+- **The vault re-key is committed, and an undecryptable entry is an error.**
+  `reveal_password()` now persists its opportunistic re-encryption itself
+  (best-effort, logged either way), so an entry upgraded off the legacy global
+  key stays upgraded — previously the mutation died with the request and the
+  entry became unreadable the moment `VAULT_KEY` was rotated. A ciphertext that
+  matches no key raises `VaultDecryptionError` and logs at ERROR instead of
+  returning `""`: `GET /api/vault/{id}/reveal` answers `500` with
+  `code: "vault_entry_undecryptable"` plus a `vault.reveal_failed` audit row;
+  both CSV exports *omit* the entry (never a blank password a browser importer
+  would store) and report the count in `X-Vault-Undecryptable` and on the audit
+  row; the GDPR export emits `"password": null` with
+  `"password_error": "undecryptable"`.
+
 ## [2.2.13] — 2026-09-15
 
 **The funding radar's company name stops being a URL, and one scan costs one
