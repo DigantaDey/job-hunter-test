@@ -233,7 +233,10 @@ def sync_funding_db(db: Session, user_id: int, companies: List[Dict[str, Any]],
     # the normalised name so casing differences collapse onto the same row.
     existing: Dict[str, FundingCompany] = {}
     for stored in db.query(FundingCompany).filter(FundingCompany.user_id == user_id).all():
-        existing.setdefault(normalize_company_name(stored.name), stored)
+        # ``name_normalized`` is the stored identity (and the UNIQUE key); fall
+        # back to normalising the display name for rows written before the
+        # column existed.
+        existing.setdefault(stored.name_normalized or normalize_company_name(stored.name), stored)
 
     added = updated = 0
     for company in companies:
@@ -244,7 +247,8 @@ def sync_funding_db(db: Session, user_id: int, companies: List[Dict[str, Any]],
         row = existing.get(key)
         raised_at = company.get("raised_at") or None
         if row is None:
-            row = FundingCompany(user_id=user_id, name=name[:200], discovered_at=now)
+            row = FundingCompany(user_id=user_id, name=name[:200], name_normalized=key,
+                                 discovered_at=now)
             db.add(row)
             existing[key] = row
             added += 1
@@ -310,6 +314,64 @@ def prune_funding_db(db: Session, user_id: int, window_days: int) -> int:
         db.commit()
         inc("jobhunter_funding_pruned_total", value=int(deleted))
     return int(deleted or 0)
+
+
+#: The meter a funding scan is billed to. One scan = one unit, wherever the
+#: scan ran.
+FUNDING_SCAN_METER = "funding_companies_per_month"
+
+
+def funding_scan_charged(report: Optional[Dict[str, Any]]) -> bool:
+    """Is this scan outcome billable? Only a scan that actually succeeded is.
+
+    ``paused``/``blocked`` (AI outage) and ``scan_failed`` (every provider
+    failed) are outages, not work the user asked for and got — they cost
+    nothing, which is what makes the sync and the queued path cost the same.
+    """
+    return str((report or {}).get("scan_status") or "") == SCAN_OK
+
+
+def charge_funding_scan(db: Session, user_id: int, report: Optional[Dict[str, Any]]) -> int:
+    """The single charge point for a funding scan (sync **and** queued).
+
+    Brief 5's convention: charge where the work actually happened, exactly
+    once, and never for a failure. Before this, the interactive radar billed
+    ``len(companies)`` per scan while the queued path billed at *trigger* time
+    (and never refunded a failed job), so the same scan cost anywhere between
+    nothing and twenty units depending on which button produced it.
+
+    Returns the number of units charged (0 or 1). Never raises: the ledger must
+    not be able to lose a scan that already ran.
+    """
+    if not funding_scan_charged(report):
+        return 0
+    from app.core.entitlements import increment_usage
+
+    try:
+        increment_usage(db, int(user_id), FUNDING_SCAN_METER, 1)
+    except Exception as exc:  # noqa: BLE001 - never lose the scan over the ledger
+        log.warning("could not charge %s for user %s: %s", FUNDING_SCAN_METER, user_id, exc)
+        return 0
+    return 1
+
+
+def find_funding_company(db: Session, user_id: int, company_name: str) -> Optional[FundingCompany]:
+    """Look a radar row up by its stored normalised key (one indexed query).
+
+    The key is the same one the sync dedupes on, so a name that differs only in
+    casing, surrounding or repeated whitespace finds the row — and ``%``/``_``
+    are plain characters, not wildcards (the old ``ilike`` made any row of the
+    user matchable from the URL).
+    """
+    key = normalize_company_name(company_name)
+    if not key:
+        return None
+    return (
+        db.query(FundingCompany)
+        .filter(FundingCompany.user_id == int(user_id), FundingCompany.name_normalized == key)
+        .order_by(FundingCompany.id)
+        .first()
+    )
 
 
 def refresh_funding_has_open_positions(db: Session, user_id: int) -> int:
@@ -390,7 +452,7 @@ def persist_funding_scan(
         existing: Dict[str, FundingCompany] = {}
         link_lookup: Dict[str, FundingCompany] = {}
         for row in db.query(FundingCompany).filter(FundingCompany.user_id == int(user_id)).all():
-            fk = funding_sources.normalize_company_name(row.name)
+            fk = row.name_normalized or funding_sources.normalize_company_name(row.name)
             if fk and fk not in existing:
                 existing[fk] = row
             lk = normalize_link_name(row.name)
@@ -608,4 +670,8 @@ __all__ = [
     "list_funding_companies",
     "normalize_company_name",
     "normalize_stage",
+    "FUNDING_SCAN_METER",
+    "charge_funding_scan",
+    "funding_scan_charged",
+    "find_funding_company",
 ]

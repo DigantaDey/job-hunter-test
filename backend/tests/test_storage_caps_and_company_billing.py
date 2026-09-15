@@ -260,7 +260,7 @@ def test_funding_tracked_job_blocked_when_board_at_jobs_max(client, auth, db, up
                                                     "url": "https://fundco.example.com/jobs/1"}]}))
     db.commit()
 
-    response = client.post("/api/funding/FundCo/process", headers=auth)
+    response = client.post("/api/funding/companies/process", json={"company": "FundCo"}, headers=auth)
     assert response.status_code == 429, response.text
     assert response.json()["detail"]["limit"] == "jobs_max"
     db.expire_all()

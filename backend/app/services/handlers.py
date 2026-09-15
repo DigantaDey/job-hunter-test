@@ -376,21 +376,18 @@ async def handle_funding(db: Session, item: PipelineJob) -> Dict[str, Any]:
         funding_radar.persist_funding_scan(db, int(user.id), report, companies if report.get("scan_status") == funding_radar.SCAN_OK else [])
     except Exception as exc:  # noqa: BLE001
         log.warning("funding history persist (queued) failed for user %s: %s", user.id, exc)
+    # The single charge point, shared with the synchronous radar
+    # (``funding_radar.charge_funding_scan``): exactly one unit for a scan that
+    # actually succeeded, nothing for a paused/blocked/failed one. The trigger
+    # (``POST /funding/refresh``) only *checks* the quota — it used to spend it
+    # and never refunded a job that then failed, while the sync path charged
+    # ``len(companies)``, so the same scan cost a different amount in each mode.
+    charged = funding_radar.charge_funding_scan(db, int(user.id), report)
     if _is_auto(item):
-        # Auto runs are held to the same per-action budget the interactive radar
-        # charges (``POST /funding/companies`` counts ``len(companies)`` per scan).
-        # Checking it before enqueueing is only meaningful if the run also pays
-        # for what it took, so a scheduled scan can never be a way around the cap.
-        if report.get("scan_status") == funding_radar.SCAN_OK and companies:
-            from app.core.entitlements import increment_usage
-
-            try:
-                increment_usage(db, int(user.id), "funding_companies_per_month", len(companies))
-            except Exception as exc:  # noqa: BLE001 - never lose the scan over the ledger
-                log.warning("could not charge funding quota for item %s: %s", item.id, exc)
         _notify_auto_funding(db, item, user, started_at)
     return {"scanned": len(companies), "scan_status": report.get("scan_status"),
-            "reason": report.get("reason"), "provider_report": report, **sync}
+            "reason": report.get("reason"), "charged": charged,
+            "provider_report": report, **sync}
 
 
 #: ``draft_email`` raises ``ValueError(code)`` for the user-fixable cases; the

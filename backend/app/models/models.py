@@ -24,6 +24,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 
 from app.db import Base
@@ -461,13 +462,21 @@ class FundingCompany(Base):
 
     __tablename__ = "funding_companies"
     __table_args__ = (
-        UniqueConstraint("user_id", "name", name="uq_funding_user_name"),
+        # Identity is the *normalised* name (v2.2.9): uniqueness used to be on
+        # the raw ``name`` while every dedupe/lookup path already keyed on the
+        # normalised form, so "Acme Inc." and "acme inc." were two rows the
+        # code believed were one.
+        UniqueConstraint("user_id", "name_normalized", name="uq_funding_user_name_norm"),
         Index("ix_funding_user_seen", "user_id", "last_seen_at"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     name = Column(String, nullable=False)
+    #: Dedupe/lookup key — :func:`funding_sources.normalize_company_name`
+    #: (strip + collapse whitespace + casefold). ``name`` keeps the provider's
+    #: display casing.
+    name_normalized = Column(String(200), nullable=False, default="", server_default="", index=True)
     stage = Column(String, default="Undisclosed")  # Seed, Series A-D, Undisclosed
     raised_at = Column(DateTime, default=utcnow)
     website = Column(String, default="")
@@ -698,3 +707,22 @@ class CompanyIntel(Base):
     verified = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+# --------------------------------------------------------------------------- #
+# FundingCompany.name_normalized — kept in sync with ``name`` by the ORM.
+#
+# The normalised name is the row's identity (UNIQUE(user_id, name_normalized)),
+# so it must never depend on a caller remembering to set it. The rules are the
+# ones :func:`app.services.funding_sources.normalize_company_name` applies —
+# duplicated here (three trivial string operations) rather than imported,
+# because the services layer imports the models layer.
+# --------------------------------------------------------------------------- #
+def _funding_name_key(value) -> str:
+    return " ".join(str(value or "").split()).casefold()[:200]
+
+
+@event.listens_for(FundingCompany, "before_insert")
+@event.listens_for(FundingCompany, "before_update")
+def _sync_funding_name_normalized(_mapper, _connection, target: "FundingCompany") -> None:
+    target.name_normalized = _funding_name_key(target.name)
