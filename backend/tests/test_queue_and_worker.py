@@ -124,7 +124,10 @@ def test_recover_stalled_items(db, owner):
     item.lease_expires_at = datetime.utcnow() - timedelta(seconds=5)
     db.commit()
 
-    assert recover_stalled(db) == 1
+    # v2.3: recover_stalled has a safety margin (default 300s) to avoid
+    # cloning a live worker still inside a 300s AI call. For this unit test
+    # we want immediate recovery, so pass safety_margin_seconds=0.
+    assert recover_stalled(db, safety_margin_seconds=0) == 1
     db.refresh(item)
     assert item.status == "queued"
     assert item.locked_by == ""
@@ -367,7 +370,10 @@ async def test_stalled_processing_item_recovered_at_restart_and_completed(db, ow
 
     # "Restart": Worker.start() recovers before serving (as does the API
     # lifespan) — the row is back in the queue.
-    worker = Worker(pipelines=["ai"], poll_interval=0.05)
+    # v2.3: startup recovery uses the same safety margin (300s) to avoid
+    # cloning a live worker on rolling deploy. For this test we set the
+    # worker's safety to 0 so the 30s-expired row is recovered immediately.
+    worker = Worker(pipelines=["ai"], poll_interval=0.05, reaper_safety_seconds=0)
     await worker._recover()
     assert _status_of(db, item.id) == "queued"
 

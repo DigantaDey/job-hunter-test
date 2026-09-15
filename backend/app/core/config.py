@@ -206,6 +206,21 @@ class Settings(BaseSettings):
     #: ``app.services.job_queue`` module docstring.
     worker_max_attempts: int = 3
     worker_max_runtime_seconds: int = 900
+    #: How often each worker loop runs the stall reaper (seconds). The reaper
+    #: calls :func:`job_queue.recover_stalled` on an interval, not only at
+    #: boot, so a hung AI call (lease 120s, AI timeout 300s) does not leave a
+    #: job stuck \"processing\" for the rest of the process lifetime.
+    worker_reaper_interval_seconds: float = 60.0
+    #: Safety margin for the reaper: only re-queue when the lease has been
+    #: expired by more than this many seconds. This prevents cloning a merely
+    #: slow job that is still inside a 300s AI call under a live worker.
+    #: Default is the AI timeout (300s) — a job must be expired by >300s
+    #: before it is considered truly stalled.
+    worker_reaper_safety_seconds: float = 300.0
+    #: How many times a job may be re-claimed due to lease expiry before it is
+    #: moved to the dead-letter. A crash-looping job that never calls fail()
+    #: would otherwise bounce forever.
+    worker_max_reclaims: int = 5
     #: Supervisor: base delay before respawning a worker slot that died with
     #: an exception (seconds). Doubled per consecutive crash of that slot,
     #: capped by ``worker_crash_backoff_max_seconds``. 0 = respawn immediately.
