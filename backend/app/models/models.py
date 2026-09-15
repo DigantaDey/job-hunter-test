@@ -377,6 +377,11 @@ class PipelineJob(Base):
     priority = Column(Integer, default=5)  # 1 highest
     attempts = Column(Integer, default=0)
     max_attempts = Column(Integer, default=3)
+    #: How many times this row has been re-queued because its lease expired
+    #: (crash/restart). Tracked separately from ``attempts`` (handler failures)
+    #: so a crash-looping job can be dead-lettered after N reclaims instead of
+    #: bouncing forever. Incremented atomically in :func:`recover_stalled`.
+    reclaim_count = Column(Integer, default=0, nullable=False)
     dedupe_key = Column(String(300), default="")
     scheduled_at = Column(DateTime, default=utcnow, index=True)
     lease_expires_at = Column(DateTime, nullable=True)

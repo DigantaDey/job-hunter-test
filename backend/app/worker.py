@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import signal
+import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
@@ -72,10 +73,23 @@ class Worker:
     """
 
     def __init__(self, pipelines: Sequence[str] = PIPELINES, concurrency: Optional[int] = None,
-                 poll_interval: Optional[float] = None):
+                 poll_interval: Optional[float] = None,
+                 reaper_interval: Optional[float] = None,
+                 reaper_safety_seconds: Optional[float] = None):
         self.pipelines = [p for p in pipelines if p in HANDLERS]
         self.concurrency = max(1, concurrency or settings.worker_concurrency)
         self.poll_interval = poll_interval or settings.worker_poll_interval
+        self.reaper_interval = (
+            reaper_interval
+            if reaper_interval is not None
+            else float(getattr(settings, "worker_reaper_interval_seconds", 60.0))
+        )
+        self.reaper_safety = (
+            reaper_safety_seconds
+            if reaper_safety_seconds is not None
+            else float(getattr(settings, "worker_reaper_safety_seconds", 300.0))
+        )
+        self._last_reap = time.monotonic()  # start interval from now
         self.running = False
         self.worker_id = worker_id()
         #: slot name (``loop-0..N-1``, ``watchdog``, ``auto-scheduler``) -> live task
@@ -177,7 +191,36 @@ class Worker:
     async def _recover(self) -> None:
         db = SessionLocal()
         try:
-            recover_stalled(db, pipelines=self.pipelines)
+            # Startup recovery uses the same safety margin as the periodic
+            # reaper to avoid cloning a live worker on rolling deploy.
+            recover_stalled(
+                db,
+                pipelines=self.pipelines,
+                safety_margin_seconds=self.reaper_safety,
+            )
+        finally:
+            db.close()
+        # Start the periodic interval from now, after the boot sweep.
+        self._last_reap = time.monotonic()
+
+    def _should_reap(self) -> bool:
+        # Shared across loop slots: first slot to hit the interval reaps.
+        now = time.monotonic()
+        if now - self._last_reap >= self.reaper_interval:
+            self._last_reap = now
+            return True
+        return False
+
+    async def _do_reap(self) -> None:
+        db = SessionLocal()
+        try:
+            recover_stalled(
+                db,
+                pipelines=self.pipelines,
+                safety_margin_seconds=self.reaper_safety,
+            )
+        except Exception as exc:  # pragma: no cover - DB hiccup
+            log.error("reaper failed: %s", exc)
         finally:
             db.close()
 
@@ -247,6 +290,12 @@ class Worker:
 
     async def _loop(self) -> None:
         while self.running:
+            # Periodic lease reaper (v2.3): recover stalled rows without a
+            # process restart. Each loop slot checks the shared timer; the
+            # first slot to hit the interval does the reap (CAS-safe).
+            if self._should_reap():
+                await self._do_reap()
+
             db = SessionLocal()
             try:
                 item = claim(db, pipelines=self.pipelines)

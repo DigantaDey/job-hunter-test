@@ -109,6 +109,7 @@ def enqueue(
             existing.status = "queued"
             existing.priority = max(1, min(9, priority))
             existing.attempts = 0
+            existing.reclaim_count = 0
             existing.max_attempts = max_attempts or settings.worker_max_attempts
             existing.scheduled_at = datetime.utcnow() + timedelta(seconds=max(0, delay_seconds))
             existing.lease_expires_at = None
@@ -386,39 +387,207 @@ def needs_input(db: Session, item: PipelineJob, *, reason: str = "",
     db.commit()
 
 
-def recover_stalled(db: Session, *, pipelines: Optional[Sequence[str]] = None) -> int:
-    """Re-queue items whose lease expired (worker crash / deploy).
+def recover_stalled(
+    db: Session,
+    *,
+    pipelines: Optional[Sequence[str]] = None,
+    safety_margin_seconds: Optional[float] = None,
+    max_reclaims: Optional[int] = None,
+) -> int:
+    """Re-queue items whose lease expired (worker crash / deploy) with CAS safety.
+
+    This is the **periodic lease reaper** (v2.3). Earlier versions ran only at
+    worker startup and did a read-modify-write without a compare-and-set, so:
+
+    * a slow/hung AI call (lease 120s, AI timeout 300s) left the job stuck
+      ``processing`` for the rest of the process lifetime;
+    * on a rolling deploy the new worker's startup sweep could re-queue a row
+      while the original process was still running it — duplicate outreach,
+      duplicate applications, double AI spend.
+
+    The new contract:
+
+    * **Periodic**: called every :data:`worker_reaper_interval_seconds` from
+      each worker's poll loop, not only at boot.
+    * **CAS**: re-claim is a single ``UPDATE ... WHERE id=:id AND
+      status='processing' AND lease_expires_at < cutoff`` — exactly one
+      concurrent reclaimer wins (rowcount check).
+    * **Safety margin**: only re-queue when the lease has been expired by more
+      than the maximum single-job duration (default 300s = AI timeout), so a
+      merely-slow job inside a 300s AI call is not cloned under a live worker.
+    * **Crash-loop guard**: ``reclaim_count`` (how many times the row was
+      re-queued due to lease expiry) is tracked atomically; after N reclaims
+      the row is moved to dead-letter instead of bouncing forever.
+    * **Observability**: per re-claimed job log + metric (id, pipeline, age,
+      claim count).
 
     A stalled item is one nobody ever called :func:`fail` for, so the decision
-    is made on its *failure* count: ``attempts >= max_attempts`` → dead-letter
-    (its budget was already spent by real failures — this is also what stops a
-    row written before v2.2.2, whose counter was inflated by claims, from
-    looping forever), otherwise re-queue and let it run again. Recovering a
-    lease never increments ``attempts`` itself.
+    is made on its *failure* count (``attempts >= max_attempts`` → dead) and
+    on its *reclaim* count (``reclaim_count >= max_reclaims`` → dead).
+    Recovering a lease never increments ``attempts`` itself.
     """
     now = datetime.utcnow()
+    # Safety margin: only consider leases expired by more than this.
+    # Default from settings (300s = ai_timeout) to prevent cloning a live
+    # worker still inside a 300s AI call. Tests that want immediate recovery
+    # pass safety_margin_seconds=0.
+    if safety_margin_seconds is None:
+        safety_margin_seconds = float(
+            getattr(settings, "worker_reaper_safety_seconds", 300.0)
+        )
+    safety_margin_seconds = max(0.0, float(safety_margin_seconds))
+    cutoff = now - timedelta(seconds=safety_margin_seconds)
+
+    if max_reclaims is None:
+        max_reclaims = int(
+            getattr(settings, "worker_max_reclaims", 0)
+            or getattr(settings, "worker_max_attempts", 3)
+        )
+    max_reclaims = max(1, int(max_reclaims))
+
+    # Candidates: processing rows whose lease is None (very old) or expired
+    # beyond the safety margin.
     query = db.query(PipelineJob).filter(
         PipelineJob.status == "processing",
-        or_(PipelineJob.lease_expires_at.is_(None), PipelineJob.lease_expires_at < now),
+        or_(PipelineJob.lease_expires_at.is_(None), PipelineJob.lease_expires_at < cutoff),
     )
     if pipelines:
         query = query.filter(PipelineJob.pipeline.in_(list(pipelines)))
     stalled = query.all()
+
+    recovered = 0
     for item in stalled:
-        if item.attempts >= (item.max_attempts or settings.worker_max_attempts):
-            item.status = "dead"
-            item.finished_at = now
-            item.error = item.error or "lease expired"
+        attempts = int(item.attempts or 0)
+        max_attempts = int(item.max_attempts or settings.worker_max_attempts)
+        reclaim_count = int(getattr(item, "reclaim_count", 0) or 0)
+
+        # Age for observability: how long has the lease been expired?
+        age_seconds = 0.0
+        if item.lease_expires_at:
+            try:
+                age_seconds = (now - item.lease_expires_at).total_seconds()
+            except Exception:
+                age_seconds = safety_margin_seconds
         else:
-            item.status = "queued"
-            item.scheduled_at = now
-        item.locked_by = ""
-        item.lease_expires_at = None
-    if stalled:
+            # No lease timestamp — treat as very old, use updated_at.
+            try:
+                base = item.updated_at or item.created_at or now
+                age_seconds = (now - base).total_seconds()
+            except Exception:
+                age_seconds = safety_margin_seconds
+
+        should_dead = False
+        dead_reason = ""
+        if attempts >= max_attempts:
+            should_dead = True
+            dead_reason = item.error or "lease expired"
+        elif reclaim_count >= max_reclaims:
+            should_dead = True
+            dead_reason = (
+                f"crash-looped {reclaim_count} times, giving up: "
+                f"{item.error or 'lease expired'}"
+            )
+
+        # CAS update: only succeed if row is still processing and lease still expired.
+        # This makes racing reclaimers safe — exactly one wins (rowcount).
+        base_filter = [
+            PipelineJob.id == item.id,
+            PipelineJob.status == "processing",
+            or_(
+                PipelineJob.lease_expires_at.is_(None),
+                PipelineJob.lease_expires_at < cutoff,
+            ),
+        ]
+
+        if should_dead:
+            updated = (
+                db.query(PipelineJob)
+                .filter(*base_filter)
+                .update(
+                    {
+                        PipelineJob.status: "dead",
+                        PipelineJob.finished_at: now,
+                        PipelineJob.error: (dead_reason or "lease expired")[:2000],
+                        PipelineJob.locked_by: "",
+                        PipelineJob.lease_expires_at: None,
+                        PipelineJob.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated:
+                recovered += 1
+                log.warning(
+                    "reclaimed stalled job id=%s pipeline=%s age=%.1fs "
+                    "reclaim_count=%s attempts=%s/%s -> dead (%s)",
+                    item.id,
+                    item.pipeline,
+                    age_seconds,
+                    reclaim_count,
+                    attempts,
+                    max_attempts,
+                    (dead_reason or "lease expired")[:200],
+                )
+                inc("jobhunter_queue_recovered_total", value=1)
+                inc(
+                    "jobhunter_queue_reclaimed_total",
+                    pipeline=item.pipeline,
+                    outcome="dead",
+                )
+                inc("jobhunter_queue_reclaim_total", pipeline=item.pipeline)
+        else:
+            # Re-queue: atomic increment of reclaim_count via SQL expression.
+            # coalesce handles legacy rows where the column is NULL.
+            updated = (
+                db.query(PipelineJob)
+                .filter(*base_filter)
+                .update(
+                    {
+                        PipelineJob.status: "queued",
+                        PipelineJob.scheduled_at: now,
+                        PipelineJob.locked_by: "",
+                        PipelineJob.lease_expires_at: None,
+                        PipelineJob.updated_at: now,
+                        PipelineJob.reclaim_count: func.coalesce(
+                            PipelineJob.reclaim_count, 0
+                        )
+                        + 1,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated:
+                recovered += 1
+                new_count = reclaim_count + 1
+                log.warning(
+                    "reclaimed stalled job id=%s pipeline=%s age=%.1fs "
+                    "reclaim_count=%s attempts=%s/%s -> queued",
+                    item.id,
+                    item.pipeline,
+                    age_seconds,
+                    new_count,
+                    attempts,
+                    max_attempts,
+                )
+                inc("jobhunter_queue_recovered_total", value=1)
+                inc(
+                    "jobhunter_queue_reclaimed_total",
+                    pipeline=item.pipeline,
+                    outcome="requeued",
+                )
+                inc("jobhunter_queue_reclaim_total", pipeline=item.pipeline)
+                # Extra per-job metric for operators
+                set_gauge(
+                    "jobhunter_queue_reclaim_age_seconds",
+                    age_seconds,
+                    job_id=str(item.id),
+                    pipeline=item.pipeline,
+                )
+
+    if recovered:
         db.commit()
-        inc("jobhunter_queue_recovered_total", value=len(stalled))
-        log.warning("recovered %s stalled queue item(s)", len(stalled))
-    return len(stalled)
+        log.warning("recovered %s stalled queue item(s)", recovered)
+    return recovered
 
 
 def queue_stats(db: Session, *, user_id: Optional[int] = None) -> Dict[str, Dict[str, int]]:
@@ -564,6 +733,7 @@ def serialize_item(row: PipelineJob, *, include_result: bool = True) -> Dict[str
         "priority": row.priority,
         "attempts": row.attempts,
         "max_attempts": row.max_attempts,
+        "reclaim_count": int(getattr(row, "reclaim_count", 0) or 0),
         "paused_count": int(payload.get("paused_count") or 0),
         "error": row.error or "",
         "created_at": row.created_at,

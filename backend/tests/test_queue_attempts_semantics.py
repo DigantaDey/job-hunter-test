@@ -52,9 +52,18 @@ def _runnable(db, item: PipelineJob) -> None:
 def _stall(db, item: PipelineJob) -> None:
     """Simulate the worker dying mid-run: the lease expires, the row stays
     ``processing`` and nobody ever called ``fail()``."""
-    item.lease_expires_at = datetime.utcnow() - timedelta(seconds=30)
+    # v2.3: recover_stalled has a 300s safety margin (to avoid cloning a live
+    # worker still inside a 300s AI call). Use 400s so the row is beyond the
+    # margin and is considered truly stalled by default.
+    item.lease_expires_at = datetime.utcnow() - timedelta(seconds=400)
     item.locked_by = "dead-worker-42"
     db.commit()
+
+
+def _recover(db, **kwargs):
+    """Helper that calls recover_stalled with safety_margin=0 for immediate recovery
+    in unit tests that don't want to reason about the margin."""
+    return recover_stalled(db, safety_margin_seconds=0, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -75,7 +84,7 @@ def test_claim_and_claim_item_do_not_increment_attempts(db, owner):
     # Crash → re-queue → claim the *same* row again (claim_item this time):
     # still zero failures, so still zero attempts.
     _stall(db, claimed)
-    assert recover_stalled(db, pipelines=["email"]) == 1
+    assert recover_stalled(db, pipelines=["email"], safety_margin_seconds=0) == 1
     again = claim_item(db, item.id)
     assert again is not None
     assert again.attempts == 0
@@ -211,7 +220,7 @@ def test_stalled_item_with_budget_left_is_requeued(db, owner):
     assert claimed.attempts == 1, "the second claim must not make it 2"
     _stall(db, claimed)
 
-    assert recover_stalled(db, pipelines=["ai"]) == 1
+    assert recover_stalled(db, pipelines=["ai"], safety_margin_seconds=0) == 1
     db.refresh(item)
     assert item.status == "queued", "1 failure of 3 — the budget is not spent"
     assert item.attempts == 1
@@ -223,7 +232,7 @@ def test_stalled_item_with_budget_left_is_requeued(db, owner):
         claimed = claim(db, pipelines=["ai"])
         assert claimed is not None
         _stall(db, claimed)
-        assert recover_stalled(db, pipelines=["ai"]) == 1
+        assert recover_stalled(db, pipelines=["ai"], safety_margin_seconds=0) == 1
         db.refresh(item)
         assert item.status == "queued" and item.attempts == 1
 
@@ -246,7 +255,7 @@ def test_stalled_item_at_the_failure_cap_is_dead_lettered(db, owner):
     db.commit()
     _stall(db, claimed)
 
-    assert recover_stalled(db, pipelines=["ai"]) == 1
+    assert recover_stalled(db, pipelines=["ai"], safety_margin_seconds=0) == 1
     db.refresh(item)
     assert item.status == "dead"
     assert item.finished_at is not None
