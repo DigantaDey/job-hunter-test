@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession, search_context
@@ -71,30 +72,16 @@ def list_jobs(
     if q:
         pattern = f"%{q}%"
         query = query.filter(Job.title.ilike(pattern) | Job.company.ilike(pattern) | Job.location.ilike(pattern))
-    # Company exact normalized filter (prompt B): exact match only, suffix-stripped
+    # Company exact normalized filter (prompt B): exact match only, suffix-stripped.
+    # The normalized identity is a column (``company_name_normalized``, stored at
+    # create/import time, backfilled by migration e5f6a7b8c9d0), so the match
+    # happens in SQL and LIMIT/OFFSET are applied by the database — a Pro+
+    # board of 20k rows is never fetched whole to filter in Python.
     if company is not None and str(company).strip():
         target = normalize_company_name(company)
-        # Need to fetch then filter in Python because SQL can't do suffix stripping
-        rows = query.order_by(Job.score.desc(), Job.discovered_at.desc()).all()
-        rows = [r for r in rows if normalize_company_name(r.company) == target]
-        # apply offset/limit after filtering
-        sliced = rows[offset: offset + limit]
-        out = []
-        for r in sliced:
-            funding_norm = normalize_company_name(r.company)
-            is_funded = bool(funding_norm and funding_norm in funded_norms)
-            d = {
-                "id": r.id, "title": r.title, "company": r.company, "location": r.location, "url": r.url,
-                "source": r.source, "status": r.status, "score": r.score, "company_size": r.company_size,
-                "discovered_at": r.discovered_at, "posted_at": r.posted_at, "applied_at": r.applied_at,
-                "error": r.error,
-                "funding": is_funded,
-                "is_funded": is_funded,
-                "funding_match": is_funded,
-                "has_open_positions": is_funded,
-            }
-            out.append(d)
-        return out
+        if not target:
+            return []
+        query = query.filter(Job.company_name_normalized == target)
     rows = query.order_by(Job.score.desc(), Job.discovered_at.desc()).offset(offset).limit(limit).all()
     out = []
     for r in rows:
@@ -105,10 +92,15 @@ def list_jobs(
             "source": r.source, "status": r.status, "score": r.score, "company_size": r.company_size,
             "discovered_at": r.discovered_at, "posted_at": r.posted_at, "applied_at": r.applied_at,
             "error": r.error,
+            # Funding chip only. The old payload also carried
+            # ``has_open_positions`` set to this same funding flag — a semantic
+            # lie the Jobs UI rendered as an "open roles" chip. A Job row *is*
+            # an open position by definition, so the field had no honest
+            # meaning here and is gone (the real signal lives on the funding
+            # radar's own companies).
             "funding": is_funded,
             "is_funded": is_funded,
             "funding_match": is_funded,
-            "has_open_positions": is_funded,
         }
         out.append(d)
     return out
@@ -337,6 +329,10 @@ async def trigger_discovery(payload: DiscoveryRequest, request: Request, user: C
     """Queue a discovery run — monetized via entitlements."""
     enforce(db, user.id, "jobs_discovered_per_month")
     enforce(db, user.id, "jobs_discovered_per_day")
+    # Storage cap, real: a board at its jobs_max cannot be topped up. The
+    # worker clamps the same way on persist, so concurrent runs can never
+    # overshoot even past this check.
+    enforce(db, user.id, "jobs_max")
 
     # Daily counter incremented at trigger time (to enforce rate); monthly by actual discovered count in discovery.py
     increment_usage(db, user.id, "jobs_discovered_per_day", 1)
@@ -633,17 +629,29 @@ def skip_job(job_id: int, user: CurrentUser, db: DbSession):
 
 @router.get("/user-input-queue")
 def user_input_queue(user: CurrentUser, db: DbSession):
-    rows = db.query(UserInputRequest).filter(UserInputRequest.user_id == user.id, UserInputRequest.status == "pending").order_by(UserInputRequest.created_at.desc()).all()
-    jobs = {j.id: j for j in db.query(Job).filter(Job.user_id == user.id).all()}
+    # One join, not "fetch every job the user has and index it in Python":
+    # the queue carries a handful of pending rows at most, but the old shape
+    # loaded the user's *entire* board (20k rows on Pro+) into a dict on every
+    # poll just to look up three fields per pending row. The LEFT JOIN keeps
+    # pending rows whose job row was deleted (empty title/company/url, as
+    # before) without ever touching the rest of the board.
+    rows = (
+        db.query(UserInputRequest, Job)
+        .outerjoin(Job, and_(Job.id == UserInputRequest.job_id, Job.user_id == user.id))
+        .filter(UserInputRequest.user_id == user.id, UserInputRequest.status == "pending")
+        .order_by(UserInputRequest.created_at.desc())
+        .all()
+    )
     return [
         {
-            "id": row.id,
-            "job_id": row.job_id,
-            "job": {"title": jobs[row.job_id].title if row.job_id in jobs else "", "company": jobs[row.job_id].company if row.job_id in jobs else "", "url": jobs[row.job_id].url if row.job_id in jobs else ""},
-            "fields": row.fields,
-            "created_at": row.created_at,
+            "id": req.id,
+            "job_id": req.job_id,
+            "job": {"title": job.title if job else "", "company": job.company if job else "",
+                    "url": job.url if job else ""},
+            "fields": req.fields,
+            "created_at": req.created_at,
         }
-        for row in rows
+        for req, job in rows
     ]
 
 
@@ -708,13 +716,47 @@ def pipeline_item(item_id: int, user: CurrentUser, db: DbSession):
 
 @router.get("/company/{company_name}/intel")
 async def company_intelligence(company_name: str, user: CurrentUser, db: DbSession, refresh: bool = False):
-    """Company intelligence — deeper research."""
-    enforce(db, user.id, "can_use_company_intel")
-    enforce(db, user.id, "company_intel_per_month")
-    from app.services.company_intel import fetch_company_intel
+    """Company intelligence — deeper research.
 
+    Billing follows the work: the ``company_intel_per_month`` meter (and the
+    AI ledger the model call writes) is spent **only when the model actually
+    builds or refreshes the intel** — cache miss, stale cache, or explicit
+    refresh. A fresh cache read is free work: it answers from the stored row
+    and leaves the counter untouched. The old code did the exact inverse
+    (charged the free cache hit, gave the paid AI run away), so the quota
+    protected nothing that costs money.
+    """
+    # Capability gate only — NOT ``enforce()``: ``enforce`` would also check
+    # the capability's mapped monthly quota, and a user at their limit must
+    # still be able to read research they already paid for (a fresh cache row
+    # is free work). The quota is checked below, immediately before the AI
+    # call it protects.
+    if not can(db, user.id, "can_use_company_intel"):
+        from app.core.entitlements import UPGRADE_HINTS
+
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "upgrade_required",
+                "capability": "can_use_company_intel",
+                "message": UPGRADE_HINTS.get("company_intel_per_month", "Company intel is not available on your plan"),
+            },
+        )
+    from app.services.company_intel import fetch_company_intel, get_cached_intel
+
+    # Free path: a fresh (<30d) cached row answers the read with no AI at all.
+    # ``refresh`` deliberately bypasses it — the user asked for new research.
+    cached = None if refresh else get_cached_intel(db, user.id, company_name)
+    if cached is not None:
+        return cached
+
+    # AI work is about to happen — this is what the monthly quota protects.
+    enforce(db, user.id, "company_intel_per_month")
     data = await fetch_company_intel(company_name, db=db, user_id=user.id, force_refresh=refresh)
-    if not refresh:
+    # ``cached`` re-checked against the outcome, not the intent: a concurrent
+    # request may have filled the cache between the check above and this call,
+    # in which case no AI ran here and nothing is charged.
+    if not data.get("cached"):
         try:
             increment_usage(db, user.id, "company_intel_per_month", 1)
         except Exception:

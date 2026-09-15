@@ -15,11 +15,12 @@ All features remain available in Free tier — limits differentiate.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Type
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.models import Subscription, UsageCounter
+from app.models.models import Job, Resume, Subscription, UsageCounter, VaultEntry
 
 # --------------------------------------------------------------------------- #
 # Plan definitions — single source of truth for limits
@@ -231,6 +232,26 @@ UPGRADE_HINTS = {
     "outreach_per_month": "Outreach limit reached. Upgrade for higher sending limits.",
     "advanced_matching": "Advanced matching is a Pro feature. Upgrade to see detailed breakdown.",
     "advanced_analytics": "Advanced analytics is Pro. Upgrade to see performance insights.",
+    # Storage caps — enforced by *actual row count* (see STORAGE_LIMITS below),
+    # so the hint offers the delete-out option that works on every plan.
+    "resumes_max": "Resume storage is full — delete resumes you no longer need, or upgrade for more storage.",
+    "vault_entries_max": "Credential vault is full — delete unused logins, or upgrade for more storage.",
+    "jobs_max": "Your job board is full — clear jobs you no longer track, or upgrade for more space.",
+}
+
+#: Storage caps: limits that bound how many *rows* a user may hold.
+#:
+#: These are enforced by counting the rows, never by a ``UsageCounter``: a
+#: counter for a storage cap is dead code by construction — nothing ever
+#: incremented the ``resumes_max`` / ``vault_entries_max`` counters and
+#: ``jobs_max`` was not enforced at all, so the ``enforce()`` calls in the
+#: create endpoints never tripped and the free tier stored unlimited rows
+#: while advertising 10/20/500. The row count is the usage: it goes up when a
+#: row is created and down when one is deleted, with no bookkeeping to drift.
+STORAGE_LIMITS: Dict[str, Type[Any]] = {
+    "resumes_max": Resume,
+    "vault_entries_max": VaultEntry,
+    "jobs_max": Job,
 }
 
 
@@ -375,6 +396,36 @@ def check_limit(db: Session, user_id: int, limit_key: str) -> Tuple[bool, int, i
     return allowed, used, lim, hint
 
 
+def storage_count(db: Session, user_id: int, limit_key: str) -> int:
+    """The number of rows the user actually holds for a storage cap.
+
+    One indexed ``COUNT`` per cap — cheap even on a Pro+ board (20k rows).
+    """
+    model = STORAGE_LIMITS.get(limit_key)
+    if model is None:
+        raise ValueError(f"{limit_key!r} is not a storage cap")
+    return int(db.query(func.count(model.id)).filter(model.user_id == user_id).scalar() or 0)
+
+
+def check_storage(db: Session, user_id: int, limit_key: str) -> Tuple[bool, int, int, str]:
+    """``(allowed, used, limit, hint)`` for a storage cap, by real row count.
+
+    Unlike :func:`check_limit` this never consults ``UsageCounter``: the rows
+    *are* the usage, so deleting a file frees a slot the same instant and the
+    number the UI renders as "used" is the number that blocks. A ``0`` limit
+    is unlimited, as everywhere else.
+    """
+    if limit_key not in STORAGE_LIMITS:
+        raise ValueError(f"{limit_key!r} is not a storage cap")
+    lim = limit_for(db, user_id, limit_key)
+    used = storage_count(db, user_id, limit_key)
+    if is_unlimited(lim):
+        return True, used, 0, ""
+    allowed = used < lim
+    hint = UPGRADE_HINTS.get(limit_key, f"Storage limit for {limit_key} reached ({used}/{lim})") if not allowed else ""
+    return allowed, used, lim, hint
+
+
 def increment_usage(db: Session, user_id: int, capability: str, amount: int = 1) -> UsageCounter:
     """Increment usage counter atomically (SELECT FOR UPDATE)."""
     period = current_period()
@@ -448,6 +499,24 @@ def enforce(db: Session, user_id: int, capability_or_limit: str):
                 )
             return
 
+    # Storage caps are enforced by the rows the user actually has, not by a
+    # UsageCounter nothing writes — see STORAGE_LIMITS.
+    if limit_key in STORAGE_LIMITS:
+        allowed, used, lim, hint = check_storage(db, user_id, limit_key)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "limit_exceeded",
+                    "limit": limit_key,
+                    "used": used,
+                    "limit_value": lim,
+                    "message": hint or f"Storage limit for {limit_key} reached ({used}/{lim})",
+                    "upgrade_required": True,
+                },
+            )
+        return
+
     allowed, used, lim, hint = check_limit(db, user_id, limit_key)
     if not allowed:
         raise HTTPException(
@@ -473,6 +542,18 @@ def entitlements_snapshot(db: Session, user_id: int) -> Dict[str, Any]:
     for key in cfg["limits"].keys():
         if key in NON_CONSUMABLE_LIMITS:
             continue  # a cap, not a quota — see the constant
+        if key in STORAGE_LIMITS:
+            # A cap on stored rows: "used" is the real COUNT of the user's
+            # rows, never the (unwritten) UsageCounter — the grid renders
+            # "7/10 resumes" instead of a permanent "0 used".
+            used = storage_count(db, user_id, key)
+            lim = limit_for(db, user_id, key)
+            if is_unlimited(lim):
+                usage[key] = {"used": used, "limit": 0, "remaining": None, "unlimited": True}
+            else:
+                usage[key] = {"used": used, "limit": lim, "remaining": max(0, lim - used),
+                              "unlimited": False}
+            continue
         used, lim = usage_for(db, user_id, key, period=period)
         if isinstance(cfg["limits"][key], bool):
             usage[key] = {"allowed": bool(cfg["limits"][key]), "used": 0, "limit": 1 if cfg["limits"][key] else 0}

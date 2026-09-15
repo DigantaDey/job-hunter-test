@@ -210,7 +210,7 @@ export default function Jobs(){
                 <div className="w-10 h-10 rounded-xl bg-zinc-900 dark:bg-zinc-800 text-white flex items-center justify-center text-xs font-bold shrink-0">{j.company.slice(0,2).toUpperCase()}</div>
                 <div className="min-w-0 flex-1">
                   <div className="text-sm font-medium flex items-center gap-2 truncate">{j.title} <span className="text-[11px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 mono">{j.source}</span> {j.funding && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 border border-violet-200 mono">💰 funded</span>}</div>
-                  <div className="text-xs text-zinc-500 truncate flex flex-wrap gap-1">{j.company} • {j.location} • <span className="mono">{j.company_size}</span> {j.has_open_positions && <span className="text-[10px] px-1 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-700 mono">open roles</span>}</div>
+                  <div className="text-xs text-zinc-500 truncate flex flex-wrap gap-1">{j.company} • {j.location} • <span className="mono">{j.company_size}</span></div>
                   <div className="text-xs mono text-zinc-500 mt-1 line-clamp-1 break-all">{j.url}</div>
                 </div>
                 <div className="shrink-0 flex flex-col items-end gap-1">

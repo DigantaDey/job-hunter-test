@@ -28,6 +28,7 @@ from app.services import funding_radar, funding_search
 from app.services import persona as persona_service
 from app.services.ai_client import is_ai_error
 from app.services.ai_guardrails import describe_ai_error
+from app.services.company_normalize import normalize_company_name as normalize_job_company
 from app.services.funding_radar import SCAN_BLOCKED, SCAN_OK, SCAN_PAUSED
 from app.services.funding_sources import normalize_company_name, provider_status
 from app.services.job_queue import enqueue_or_existing
@@ -381,6 +382,9 @@ async def process_company(company_name: str, request: Request, user: CurrentUser
             return {"action": "apply_flow", "job_id": existing.id, "company": row.name,
                     "positions_source": "provider",
                     "message": "A job for this company is already tracked"}
+        # The tracked job is a real row on the board: it counts against
+        # jobs_max like any discovered one (the cap is real row count).
+        enforce(db, user.id, "jobs_max")
         meta: Dict[str, Any] = dict(row.meta or {})
         job_title = str(position.get("title") or "").strip()[:300]
         url = str(position.get("url") or "").strip() or str(meta.get("careers_url") or "").strip()
@@ -392,6 +396,10 @@ async def process_company(company_name: str, request: Request, user: CurrentUser
             user_id=user.id,
             title=job_title,
             company=row.name,
+            # SQL-side company filter identity — the jobs-side normalizer
+            # (suffix-stripped), the same rules ``GET /api/jobs?company=``
+            # applies to the query.
+            company_name_normalized=normalize_job_company(row.name),
             location=str(position.get("location") or "").strip()[:200],
             description=_funding_job_description(row, position, url),
             url=url[:500],

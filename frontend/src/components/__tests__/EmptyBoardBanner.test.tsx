@@ -1,9 +1,9 @@
 /**
- * The empty-board banner (v2.2.4) — all five states, plus the not-known-yet one.
+ * The empty-board banner (v2.2.4) — all six states, plus the not-known-yet one.
  *
  * The banner renders the backend's verdict (`GET /api/jobs/discovery/last-run`)
  * and derives nothing, so these tests drive it with the exact payloads the
- * endpoint serves. The fifth state matters as much as the other four: a
+ * endpoint serves. The fallback state matters as much as the others: a
  * completed run with no `why_empty` on a board that is empty anyway must still
  * say something true, because the UI must never render a reason-less empty
  * state.
@@ -55,8 +55,8 @@ describe('emptyBoardState', () => {
     expect(emptyBoardState(null)).toBe('no_run')
   })
 
-  it('passes the three reported reasons through', () => {
-    for (const why of ['no_sources_configured', 'all_sources_failed', 'no_fresh_postings']) {
+  it('passes the four reported reasons through', () => {
+    for (const why of ['no_sources_configured', 'all_sources_failed', 'no_fresh_postings', 'jobs_cap_reached']) {
       expect(emptyBoardState({ added: 0, why_empty: why })).toBe(why)
     }
   })
@@ -143,6 +143,28 @@ describe('the five banner states', () => {
     expect(screen.getByTestId('freshness-window').textContent).toBe('168-hour')
     expect(screen.getByTestId('empty-board-cta').textContent).toContain('Retry discovery')
     expect(screen.queryByTestId('failed-source-chips')).toBeNull()
+  })
+
+  it('4b. jobs_cap_reached → the storage-limit message + upgrade link, no outage accounting', () => {
+    // The worker's early-return report: a zero-job run by design (board at its
+    // jobs_max), so it carries the zero summary the banner must not render as
+    // "sources attempted".
+    renderBanner({
+      at: '2026-09-12T09:30:00',
+      added: 0,
+      why_empty: 'jobs_cap_reached',
+      summary: { ...SUMMARY, configured_sources: [], fetched: 0, fresh: 0 },
+    })
+    expect(screen.getByTestId('empty-board-banner').dataset.state).toBe('jobs_cap_reached')
+    expect(screen.getByTestId('empty-board-headline').textContent).toBe('Your job board is at its storage limit')
+    expect(screen.getByText(/delete jobs you no longer track, or upgrade/i)).toBeTruthy()
+    // The fix is an upgrade, so the banner links to pricing — and, unlike a
+    // real outage, there is no "sources attempted" accounting to read as one.
+    const upgrade = screen.getByRole('link', { name: /Upgrade for a bigger board/i })
+    expect(upgrade.getAttribute('href')).toBe('/pricing')
+    expect(screen.getByTestId('last-run-accounting').textContent).not.toContain('source(s) attempted')
+    // Not a retryable outage: no retry CTA.
+    expect(screen.getByTestId('empty-board-cta').textContent).toBe('Discover jobs now')
   })
 
   it('5. fallback → a run that found jobs, on a board that is empty anyway', () => {
