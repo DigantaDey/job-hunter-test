@@ -127,12 +127,13 @@ async def draft_email(
     always show which job a draft was written for.
     """
     company_name = company if isinstance(company, str) else getattr(company, "name", "") or ""
-    profile = get_setting(db, user.id, "application", "profile_snapshot", {}) or {}
-    if not profile:
-        from app.models.models import Profile  # local import avoids a cycle at module load
+    # The profile lives in the Profile table — there is no settings-based
+    # snapshot to read first (the old `application.profile_snapshot` fallback
+    # was never writable and therefore always empty).
+    from app.models.models import Profile  # local import avoids a cycle at module load
 
-        profile_row = db.query(Profile).filter(Profile.user_id == user.id).first()
-        profile = (profile_row.data if profile_row else {}) or {}
+    profile_row = db.query(Profile).filter(Profile.user_id == user.id).first()
+    profile = (profile_row.data if profile_row else {}) or {}
     if not profile:
         raise ValueError("profile_missing")
     if not str(profile.get("name") or "").strip():

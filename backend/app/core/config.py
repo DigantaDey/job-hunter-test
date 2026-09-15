@@ -156,7 +156,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.2.8"
+    version: str = "2.2.9"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"

@@ -4,6 +4,64 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.9] — 2026-09-15
+
+**Auto-apply's Execute phase is alive, and discovery no longer burns a batch
+over one bad row.** The consent/execute pipeline had three silent breaks: no
+caller ever passed `allow_submit=True`, so even a fully consented,
+queue-approved run always finished as a dry run; re-queuing after a
+"needs input" answer demoted the run to `prepare`; and the discovery batch
+rolled back *entirely* when one insert conflicted — after the per-job AI
+scoring had already been paid for. All three are fixed, with e2e coverage
+(stub AI, mocked Playwright).
+
+### Fixed
+
+- **Execute intent is threaded end-to-end.** `POST /jobs/{id}/apply` already
+  queued `mode: "execute"` when the user has auto-submit on and accepted the
+  automation disclosure; now `handle_application` honours it — it passes
+  `allow_submit=True` into `execute_application` for every execute-mode item
+  (the handler's absent-mode default, which the auto scheduler relies on, is
+  execute). The consent chain is what actually gates submission: the live
+  per-user `allow_auto_submit` setting **and** `AUTOFILL_ALLOW_SUBMIT` **and**
+  a non-dry-run deployment must all hold at execution time, so an intent
+  queued before a consent was revoked (or a flag flipped) still runs — as a
+  dry run, never a submit. With the chain green, a confirmed application now
+  fills the form and submits it (`status: applied`), instead of always
+  parking at `ready_to_apply`.
+- **Re-queue preserves the mode.** `_requeue_application` (the
+  "answer the input queue" path) no longer re-enqueues as `prepare`: the
+  re-queued item keeps its original `mode` (`execute` stays `execute`,
+  explicitly — absent mode means execute, the handler's default). When the
+  live row is gone, the intent is recovered from the job's most recent
+  application item; a job with no history defaults to `prepare`. An
+  execute-mode run that paused for a missing field now completes as execute
+  after the answer.
+- **Discovery: one bad row no longer discards the batch.** Inserts commit
+  per row (skip-and-continue): a uniqueness conflict on one candidate is
+  recorded in the run report's `insert_errors` (title/company/dedupe_key/
+  reason) and the rest of the batch persists — the AI spend for the batch is
+  kept. The run's log line reports `insert_errors=N` when it happens.
+- **Discovery: dropped a dead sort.** The candidate list was sorted by
+  `score` before scoring ever ran — a constant-key no-op (the following
+  newest-first sort then reordered everything again). Only the real ordering
+  (newest first) remains.
+- **Removed the dead `application.profile_snapshot` settings key.** The
+  outreach paths read it as a "fallback" profile that was never writable and
+  therefore always empty, then fell back to the real `Profile` table anyway.
+  They now read the `Profile` table directly; the settings surface is
+  unchanged (the key was never in the writable schema).
+
+### Tests
+
+- New end-to-end suite (`tests/test_autofill_execute_pipeline.py`, stub AI +
+  mocked Playwright): a consented execute run with `AUTOFILL_ALLOW_SUBMIT`
+  reaches `execute_autofill` with `dry_run=False` and submits (job →
+  `applied`); without live consent the same queued intent stays a dry run
+  (job → `ready_to_apply`, no submit click); an execute job re-queued after
+  an input answer resumes as execute and submits; a discovery batch with one
+  failing insert still persists the good jobs and reports the failure.
+
 ## [2.2.8] — 2026-09-14
 
 **Every AI trigger is now page-agnostic and live.** Starting Auto-apply on a job,
