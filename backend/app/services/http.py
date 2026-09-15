@@ -19,9 +19,12 @@ nothing here may be an unbounded dict:
 * ``_host_state`` (per-host politeness lock + last-call timestamp) is a bounded
   LRU too, and an entry whose lock a coroutine currently holds is never evicted
   — the politeness guarantee cannot be lost to make room for a cache entry;
-* the SSRF guard's DNS cache is bounded in :mod:`app.services.net_guard`.
+* the SSRF guard's DNS cache is bounded in :mod:`app.services.net_guard`;
+* the ``host`` label on this module's metrics is collapsed to a bounded set by
+  :func:`_host_label` — a label value is a permanent series in the in-process
+  registry, and the hosts a sweep touches are pulled out of job feeds.
 
-Counters for all three are on ``GET /api/ops/status``.
+Counters for the three caches are on ``GET /api/ops/status``.
 """
 from __future__ import annotations
 
@@ -29,7 +32,7 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, FrozenSet, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -38,7 +41,12 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.lru import BoundedTTLMap
 from app.core.metrics import inc, observe
-from app.services.net_guard import OutboundURLBlocked, check_url, install_transport_guard
+from app.services.net_guard import (
+    OutboundURLBlocked,
+    check_url,
+    install_transport_guard,
+    registrable_domain,
+)
 
 log = get_logger("app.http")
 
@@ -119,6 +127,70 @@ _cache: BoundedTTLMap = _bounded("http.cache", settings.http_cache_max_entries)
 #: host -> _HostState. Hard-capped LRU that skips entries whose lock is held.
 _host_state: BoundedTTLMap = _bounded("http.host_state", settings.http_host_state_max_entries,
                                       evictable=_not_held)
+
+
+# --------------------------------------------------------------------------- #
+# Bounded ``host`` metric label
+# --------------------------------------------------------------------------- #
+#: Organisation-level domains of the APIs this product calls *on purpose*: the
+#: job-board adapters, the funding/contact providers. Kept next to the metrics
+#: because it exists only to bound a label — it is **not** a policy list (the
+#: SSRF allow-list is ``OUTBOUND_ALLOWED_HOSTS``, enforced by ``net_guard``), and
+#: an entry drifting out of date costs a ``host="other"`` series, never a
+#: security decision.
+SOURCE_API_DOMAINS: FrozenSet[str] = frozenset({
+    "adzuna.com", "apollo.io", "arbeitnow.com", "ashbyhq.com", "clearbit.com",
+    "crunchbase.com", "greenhouse.io", "himalayas.app", "hunter.io", "jobicy.com",
+    "jooble.org", "lever.co", "myworkdaysite.com", "remoteok.com", "remotive.com",
+    "sec.gov", "smartrecruiters.com", "tavily.com", "themuse.com", "tracxn.io",
+    "usajobs.gov", "weworkremotely.com", "workable.com",
+})
+
+_intended_domains_cache: Dict[Tuple[Any, ...], FrozenSet[str]] = {}
+
+
+def _intended_host_domains() -> FrozenSet[str]:
+    """Every domain this deployment is *configured* to talk to (bounded set)."""
+    key = (tuple(settings.outbound_allowed_hosts), settings.ai_base_url, settings.public_base_url,
+           settings.funding_import_url, settings.email_unsubscribe_base_url)
+    cached = _intended_domains_cache.get(key)
+    if cached is None:
+        domains = set(SOURCE_API_DOMAINS)
+        for entry in list(key[0]) + [str(value or "") for value in key[1:]]:
+            text = str(entry or "").strip().lower()
+            if not text:
+                continue
+            if "://" in text:  # a configured endpoint URL rather than a host name
+                text = urlparse(text).netloc.split("@")[-1]
+            domain = registrable_domain(text.split(":")[0])
+            if domain:
+                domains.add(domain)
+        cached = frozenset(domains)
+        if len(_intended_domains_cache) > 4:  # settings can be reloaded/patched
+            _intended_domains_cache.clear()
+        _intended_domains_cache[key] = cached
+    return cached
+
+
+def _host_label(host: str) -> str:
+    """
+    The ``host`` label for outbound metrics: a bounded set, never a raw host.
+
+    A label value is a permanent series in the in-process registry, and the hosts
+    this client fetches are not a bounded set: discovery and company-intel pull
+    arbitrary company websites, ATS portals and redirect targets straight out of
+    job feeds. Labelled raw, every one of them created a series that nothing ever
+    evicted. So only the domains this deployment intends to talk to (the built-in
+    provider APIs above, plus whatever ``OUTBOUND_ALLOWED_HOSTS`` / the AI and
+    funding endpoints name) keep their own series, collapsed to their
+    organisation-level domain (``boards-api.greenhouse.io`` → ``greenhouse.io``);
+    everything else is counted as ``other``.
+
+    Per-source detail is not lost: ``jobhunter_source_fetch_total{source=…}`` is
+    labelled by the adapter, which is a bounded set by construction.
+    """
+    domain = registrable_domain((host or "").strip().lower().split("@")[-1])
+    return domain if domain and domain in _intended_host_domains() else "other"
 
 
 async def get_client() -> httpx.AsyncClient:
@@ -238,19 +310,23 @@ async def request(
     callers use (``status_code``, ``headers``, ``json()``, ``text``).
     """
     host = urlparse(url).netloc
+    # Metric labels are permanent series, so the host is collapsed to a bounded
+    # set (see _host_label); the raw host stays in the log lines and in the
+    # per-host politeness state below.
+    label = _host_label(host)
     cache_key = f"{method}:{url}:{sorted((params or {}).items())}"
 
     # Fail fast (and auditably) on URLs that must never leave the process.
     try:
         await check_url(url)
     except OutboundURLBlocked as exc:
-        inc("jobhunter_http_blocked_total", reason="url_policy", host=host)
+        inc("jobhunter_http_blocked_total", reason="url_policy", host=label)
         log.warning("outbound request blocked: %s", exc.reason)
         raise
     if method.upper() == "GET" and cache_seconds > 0:
         cached = _cache.get(cache_key)
         if cached is not None:
-            inc("jobhunter_http_cache_hits_total", host=host)
+            inc("jobhunter_http_cache_hits_total", host=label)
             log.debug("http cache hit for %s (%s)", url, cached)
             return cached
 
@@ -259,7 +335,7 @@ async def request(
         from app.services.robots import can_fetch
 
         if not await can_fetch(url):
-            inc("jobhunter_http_blocked_total", reason="robots_txt", host=host)
+            inc("jobhunter_http_blocked_total", reason="robots_txt", host=label)
             raise PermissionError(f"robots.txt disallows fetching {url}")
 
     max_attempts = (settings.ai_max_retries if retries is None else retries) + 1
@@ -277,15 +353,15 @@ async def request(
                 )
             except httpx.HTTPError as exc:
                 last_error = exc
-                inc("jobhunter_http_errors_total", host=host, kind=type(exc).__name__)
+                inc("jobhunter_http_errors_total", host=label, kind=type(exc).__name__)
                 if attempt >= max_attempts:
                     raise
                 await asyncio.sleep(min(8.0, settings.ai_backoff_base ** attempt) * (0.7 + random.random() * 0.6))
                 continue
             finally:
-                observe("jobhunter_http_duration_seconds", time.perf_counter() - started, host=host)
+                observe("jobhunter_http_duration_seconds", time.perf_counter() - started, host=label)
 
-        inc("jobhunter_http_requests_total", host=host, status=str(response.status_code))
+        inc("jobhunter_http_requests_total", host=label, status=str(response.status_code))
 
         if response.status_code == 429 or 500 <= response.status_code < 600:
             if attempt >= max_attempts:

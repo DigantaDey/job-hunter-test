@@ -8,6 +8,7 @@ from fastapi import Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.core.auth import CurrentUser, get_current_user, require_consent  # noqa: F401  (re-export)
+from app.core.middleware import resolve_client_ip
 from app.db import get_db
 from app.models.models import Job, Profile
 
@@ -73,10 +74,16 @@ def get_owned_profile(db: Session, user_id: int) -> Optional[Profile]:
 
 
 def client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else ""
+    """
+    The client IP this request is attributed to (audit rows, login failures).
+
+    Delegated to :func:`app.core.middleware.resolve_client_ip`, which believes
+    ``X-Forwarded-For`` only from a configured proxy and then takes the rightmost
+    hop that is not itself a proxy. Taking the *leftmost* entry unconditionally —
+    what this used to do — let any direct client pick the address written into
+    the audit trail and used for per-IP throttling.
+    """
+    return resolve_client_ip(request.scope)
 
 
 __all__ = [

@@ -12,10 +12,11 @@ settings for outbound email, and (by default) SQLite as the primary database.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from functools import lru_cache
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -136,6 +137,51 @@ def _csv_lower(value: Any) -> List[str]:
     return [v.lower() for v in _csv(value)]
 
 
+#: Values that mean "trust everybody" in a peer allow-list — the one shape of
+#: ``TRUSTED_PROXIES`` / ``FORWARDED_ALLOW_IPS`` that turns the client IP (and
+#: with it rate limits, login-failure attribution and audit rows) into
+#: attacker-chosen input.
+_TRUST_EVERYTHING = {"*", "any", "all"}
+
+
+def _proxy_trust_entry_problem(setting: str, entry: str) -> Optional[str]:
+    """One sentence saying why a peer allow-list entry is unsafe, or ``None``."""
+    text = (entry or "").strip()
+    if not text:
+        return None
+    if text.lower() in _TRUST_EVERYTHING:
+        return f"{setting} entry '{text}' trusts every peer — any client can then spoof X-Forwarded-For"
+    try:
+        network = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        return f"{setting} entry '{text}' is not an IP address or CIDR"
+    if network.prefixlen == 0:
+        return f"{setting} entry '{text}' covers the whole address space — list the proxy's own CIDR instead"
+    return None
+
+
+def proxy_trust_problems(trusted_proxies: Sequence[str], forwarded_allow_ips: str) -> List[str]:
+    """
+    Fatal mistakes in the client-IP trust boundary.
+
+    Both settings answer the same question — "which peers may tell us who the
+    real client is?" — for two different layers (the app's own resolver and
+    uvicorn's ``--proxy-headers``), so both are checked the same way: a wildcard,
+    an all-covering CIDR or a value that is not an address at all means the
+    deployment has handed ``X-Forwarded-For`` back to whoever is connecting.
+    """
+    problems: List[str] = []
+    for entry in trusted_proxies or ():
+        problem = _proxy_trust_entry_problem("TRUSTED_PROXIES", str(entry))
+        if problem:
+            problems.append(problem)
+    for entry in _csv(forwarded_allow_ips):
+        problem = _proxy_trust_entry_problem("FORWARDED_ALLOW_IPS", entry)
+        if problem:
+            problems.append(problem)
+    return problems
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=os.path.join(REPO_DIR, ".env"),
@@ -156,7 +202,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.2.11"
+    version: str = "2.2.12"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -181,7 +227,24 @@ class Settings(BaseSettings):
 
     cors_origins: List[str] = Field(default_factory=list)
     allowed_hosts: List[str] = Field(default_factory=list)
+    #: Peer addresses/CIDRs allowed to speak for someone else, i.e. the reverse
+    #: proxies in front of this process. ``X-Forwarded-For`` is only believed
+    #: when the *peer* is on this list, and then only up to the rightmost hop
+    #: that is not itself a proxy (see ``app.core.middleware.resolve_client_ip``).
+    #: Empty (the default) trusts nobody: the peer address is the client, which
+    #: is correct for a deployment with no proxy and *fail-closed* for one with a
+    #: proxy nobody configured — every client would collapse onto the proxy's
+    #: address rather than being able to spoof one.
+    #: Comma separated, addresses or CIDRs: ``10.0.0.0/8,172.16.5.4``.
     trusted_proxies: List[str] = Field(default_factory=list)
+    #: Mirror of uvicorn's ``--forwarded-allow-ips`` (the shipped image's CMD
+    #: reads this environment variable). Uvicorn resolves ``X-Forwarded-For``
+    #: itself before the app sees the request; keep this and ``TRUSTED_PROXIES``
+    #: pointing at the same proxy, or one of the two layers will attribute
+    #: requests to the proxy's address. ``*`` — trust every peer — is refused in
+    #: production: it lets any direct client choose the IP that rate limits,
+    #: login-failure attribution and audit rows are keyed on.
+    forwarded_allow_ips: str = "127.0.0.1"
 
     # ------------------------------------------------------------------ #
     # Database
@@ -197,6 +260,16 @@ class Settings(BaseSettings):
     # Workers / queue
     # ------------------------------------------------------------------ #
     run_worker_in_api: bool = True
+    #: uvicorn worker processes in the shipped image (the Dockerfile CMD reads
+    #: ``WEB_CONCURRENCY``). **1 is the supported default**: the API process also
+    #: holds the in-process pipeline worker and every per-process budget — rate
+    #: limits, AI token buckets and daily budgets, per-user workflow overrides,
+    #: the metrics registry. ``N`` workers means ``N`` copies of each, so limits
+    #: are effectively multiplied by ``N`` and a setting saved through the API
+    #: reaches one worker in ``N``. Scale with the standalone worker container
+    #: (and more API replicas behind a load balancer) instead — see
+    #: ``docs/DEPLOYMENT.md`` §6.
+    web_concurrency: int = 1
     worker_concurrency: int = 2
     worker_poll_interval: float = 1.0
     worker_lease_seconds: int = 120
@@ -257,6 +330,13 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     api_rate_limit_per_minute: int = 600
     auth_rate_limit_per_minute: int = 20
+    #: Hard cap on distinct rate-limit buckets kept in memory. The limiter runs
+    #: before authentication, so the key set is attacker-influenced; the cap
+    #: makes it a bounded LRU instead of a memory-DoS primitive (each new key
+    #: past the cap evicts the least recently used one). Raise it only if
+    #: ``evictions`` on ``GET /api/ops/status`` climbs while legitimate users are
+    #: being throttled.
+    rate_limit_max_keys: int = 8192
 
     # ------------------------------------------------------------------ #
     # Files
@@ -448,6 +528,14 @@ class Settings(BaseSettings):
     #: compose file, for container networking — says otherwise.
     metrics_port: int = 0
     metrics_host: str = "127.0.0.1"
+    #: Hard cap on distinct label combinations (series) kept per metric name.
+    #: The registry is an in-process dict and a series is permanent once created,
+    #: so a caller that labels on request-controlled data (a ``Host`` header, a
+    #: raw path, an outbound host from a feed) would grow it forever. Callers are
+    #: required to use bounded label values; this cap is the backstop that turns
+    #: a mistake into evicted series (counted on ``GET /api/ops/status``) instead
+    #: of an OOM.
+    metrics_max_series_per_metric: int = 512
 
     # ------------------------------------------------------------------ #
     # Backups
@@ -852,17 +940,63 @@ class Settings(BaseSettings):
             )
         if not self.public_base_url or "localhost" in self.public_base_url:
             problems.append("PUBLIC_BASE_URL must be the public https URL of this deployment")
+        # The client-IP trust boundary decides who rate limits, login-failure
+        # attribution and audit rows blame. A wildcard hands that choice to any
+        # client that can open a socket, so it fails the deploy like a weak
+        # SECRET_KEY does.
+        problems.extend(proxy_trust_problems(self.trusted_proxies, self.forwarded_allow_ips))
         if problems:
             raise ValueError("Unsafe production configuration:\n  - " + "\n  - ".join(problems))
 
     def warnings(self) -> List[str]:
         """Non-fatal configuration smells — logged once at startup."""
         warnings: List[str] = list(self.billing_webhook_problems())
+        warnings.extend(self.scaling_warnings())
         if self.environment in PRODUCTION_ENVIRONMENTS:
             return warnings
         warnings.extend(self.secret_problems())
         if self.cors_origins and "*" in self.cors_origins:
             warnings.append("CORS_ORIGINS contains '*' — fine for development, never for production")
+        return warnings
+
+    def scaling_warnings(self) -> List[str]:
+        """
+        In-process state that a second worker (or replica) silently multiplies.
+
+        The app keeps its budgets in process memory: the rate limiter, the AI
+        token bucket and daily token budget, per-user workflow overrides loaded
+        at boot, and the metrics registry. ``WEB_CONCURRENCY=N`` therefore means
+        ``N`` independent copies — per-user limits are effectively ``N`` times
+        what they say, and an override saved through the settings API reaches the
+        one worker that served the request. Said loudly at startup rather than
+        discovered as "the limit doesn't work".
+        """
+        warnings: List[str] = []
+        try:
+            workers = int(self.web_concurrency)
+        except (TypeError, ValueError):
+            workers = 1
+        if workers > 1:
+            warnings.append(
+                f"WEB_CONCURRENCY={workers} runs {workers} API processes, and every in-process budget is "
+                f"per process: rate limits and AI token/daily budgets are effectively x{workers}, a per-user "
+                "AI override saved through the API reaches one worker, and /metrics covers whichever worker "
+                "won the port. Use the standalone worker container (and more API replicas behind a load "
+                "balancer) to scale — see docs/DEPLOYMENT.md §6."
+            )
+        if self.run_worker_in_api and workers > 1:
+            warnings.append(
+                f"RUN_WORKER_IN_API=true with WEB_CONCURRENCY={workers} starts {workers} copies of the "
+                "pipeline worker in one deployment; set RUN_WORKER_IN_API=false and run `python -m app.worker`."
+            )
+        # Note on the proxy trust boundary: TRUSTED_PROXIES (the app's resolver)
+        # and FORWARDED_ALLOW_IPS (uvicorn's --proxy-headers) are two ways to say
+        # the same thing and either one is sufficient, so a "they disagree"
+        # warning would be noise. A *missing* boundary cannot be detected from
+        # configuration alone — it shows up at runtime as X-Forwarded-For arriving
+        # from a peer nobody configured, which ``app.core.middleware`` counts
+        # (``jobhunter_edge_forwarded_for_total{reason="untrusted_peer"}``) and
+        # warns about once a minute.
         return warnings
 
     def public_settings(self) -> Dict[str, Any]:

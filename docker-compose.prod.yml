@@ -38,6 +38,23 @@ services:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-jobhunter}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jobhunter}
       ENVIRONMENT: production
       RUN_WORKER_IN_API: "false"
+      # One API process. Every budget the app enforces is in-process state — the
+      # rate limiter, AI token buckets and daily budgets, per-user AI overrides,
+      # the metrics registry — so WEB_CONCURRENCY=N would silently multiply each
+      # per-user limit by N and make a setting saved through the API reach one
+      # worker in N. Scale by adding replicas of this service behind a load
+      # balancer (and workers below), not by raising this. docs/DEPLOYMENT.md §6.
+      WEB_CONCURRENCY: "${WEB_CONCURRENCY:-1}"
+      # Client-IP trust boundary: name the proxy that sets X-Forwarded-For, or
+      # leave the loopback default and forwarded headers are ignored (the peer
+      # address is the client). Set both to the same value — uvicorn's
+      # --proxy-headers reads FORWARDED_ALLOW_IPS, the app's own resolver (rate
+      # limits, audit IPs) reads TRUSTED_PROXIES. '*' is refused in production.
+      #   proxy on the docker host:  172.17.0.1 (or your gateway)
+      #   proxy in this network:     172.18.0.0/16
+      #   cloud LB:                  its subnet, e.g. 10.0.0.0/8
+      FORWARDED_ALLOW_IPS: "${FORWARDED_ALLOW_IPS:-127.0.0.1}"
+      TRUSTED_PROXIES: "${TRUSTED_PROXIES:-}"
       AUTO_MIGRATE: "true"
       # Metrics on their own port, reachable only inside this compose network
       # (0.0.0.0 inside the container, never published to the host).

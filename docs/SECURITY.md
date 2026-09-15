@@ -41,9 +41,25 @@ authenticated user. Tenancy isolation is covered by tests (`tests/test_auth_and_
 * `TrustedHostMiddleware` is enabled whenever `ALLOWED_HOSTS` is set (required in production).
 * Security headers on every response: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy`, `Permissions-Policy`, `Cross-Origin-Opener-Policy`, CSP, and HSTS in production.
-* Request bodies over `MAX_UPLOAD_MB` (+ overhead) are rejected with 413 before parsing.
-* Rate limiting: sliding window keyed by API key → bearer token → client IP (600 req/min reads,
-  ~200 writes by default, per credential); `429` carries `Retry-After`.
+* Request bodies over `MAX_UPLOAD_MB` (+ overhead) are rejected with 413 — on the declared
+  `Content-Length` **and** by counting bytes as they stream in, so a `Transfer-Encoding: chunked`
+  request cannot bypass the cap. The 413 is written once, and any later response from the handler is
+  dropped rather than appended.
+* Rate limiting: sliding window, `429` with `Retry-After`, keyed on a **verified identity** — a
+  signature-verified access token → `u:<hmac(user id)>` (one budget per user, wherever they connect
+  from), an API key → `k:<hmac(key)>` *plus* the client-IP bucket (the key cannot be verified
+  without a DB read, so the IP budget is what stops a junk-key flood) — and on the **resolved client
+  IP** for everything else. Keys are HMAC fingerprints, never a slice of a raw header, and the log is
+  a hard-capped LRU (`RATE_LIMIT_MAX_KEYS`, 8192) with a periodic sweep: it runs *before*
+  authentication, so 10 000 requests with 10 000 unique `Authorization` values cost one bucket, not
+  10 000 dict entries (`tests/test_edge_hardening.py`).
+* The client IP is only taken from `X-Forwarded-For` when the connecting peer is in `TRUSTED_PROXIES`
+  (and uvicorn's own resolver is restricted the same way by `FORWARDED_ALLOW_IPS`, which defaults to
+  loopback rather than `*`), and then only up to the **rightmost hop that is not itself a proxy** —
+  so a direct client cannot choose the address that rate limits, login-failure attribution and
+  `audit_logs.ip` are keyed on. A refused header is counted
+  (`jobhunter_edge_forwarded_for_total{reason="untrusted_peer"}`) and warned about; `*`/`0.0.0.0/0`
+  in either setting fails production startup. See `docs/DEPLOYMENT.md` §3.1.
 * Every response echoes `X-Request-ID`; request ids appear in logs and audit rows.
 * TLS itself is terminated by your proxy — see `docs/DEPLOYMENT.md` §3.
 
@@ -118,6 +134,12 @@ fact that a deletion happened). Users can read their own trail at `GET /api/acco
   pinned rather than evicted) and the SSRF guard's DNS verdicts (`DNS_CACHE_MAX_ENTRIES`). Entries,
   evictions and hits are on `GET /api/ops/status` under `outbound`, so a cache that stops behaving
   is visible before it becomes an incident.
+* The same rule covers the *edge*, whose keys are attacker-chosen by definition: the rate limiter's
+  hit log (`RATE_LIMIT_MAX_KEYS`), the login-throttle windows (4 096 entries, TTL'd — a flood of
+  random addresses used to wipe everybody's lockout state), the unmatched-path metric labels (64
+  shapes, then `other`) and the metrics registry itself (`METRICS_MAX_SERIES_PER_METRIC` series per
+  metric, least-recently-updated evicted first). All four report their shape under `edge` on
+  `GET /api/ops/status`.
 
 ## 7. Known risks & accepted trade-offs
 
@@ -126,7 +148,7 @@ fact that a deletion happened). Users can read their own trail at `GET /api/acco
 | Automating applications may violate a portal's ToS | disclosed in the consent text, off by default, dry-run default; the operator decides |
 | AI provider sees resume/JD text | use a provider you trust or leave `AI_API_KEY` empty (heuristics still work) |
 | Open tracking pixels are inaccurate (Gmail prefetch) | documented as directional, not proof of reading |
-| In-process rate limiter is per-instance | documented; use a shared limiter if you scale horizontally |
+| In-process rate limiter is per-instance | documented; `WEB_CONCURRENCY` ships at 1 and raising it warns at startup (budgets multiply per process). Use a shared limiter if you scale horizontally |
 | Single-node file storage | back up the volumes; object storage is a future item |
 
 ## 8. Reporting a vulnerability

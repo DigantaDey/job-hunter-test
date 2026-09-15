@@ -25,6 +25,8 @@ for before calling the deployment production-grade.
 | 13 | Billing provider configured | `BILLING_PROVIDER=stripe|razorpay|manual`, `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`; the webhook secret is mandatory — without it the billing webhook routes refuse every event (400; 503 in production) rather than skipping verification; webhooks idempotent via `billing_events` unique constraint |
 | 14 | AI credit ceilings configured per plan | plan limits (`ai_credits_per_month`) live in `app/core/entitlements.py`; monitor `ai_credit_ledger` |
 | 15 | Pricing page public | `/pricing` should be reachable without auth for SEO; `/billing` behind auth |
+| 16 | Proxy trust boundary set **iff** a proxy is in front | `TRUSTED_PROXIES` + `FORWARDED_ALLOW_IPS` = the proxy's address/CIDR (§3.1). Never `*`/`0.0.0.0/0` — production refuses to start; without it any client can choose the IP that rate limits and audit rows are keyed on |
+| 17 | `WEB_CONCURRENCY=1` unless you read §6 | every in-process budget (rate limits, AI token/daily budgets, per-user AI overrides, metrics) is per process; N workers multiply them by N |
 
 The application fails fast at startup with a readable list of the problems above (see
 `Settings.validate_runtime()`); it never silently degrades into an insecure mode.
@@ -85,8 +87,48 @@ server {
 }
 ```
 
-Caddy/Traefik equivalents work unchanged; the app respects `X-Forwarded-*` (uvicorn is started with
-`--proxy-headers`).
+Caddy/Traefik equivalents work unchanged — but **the app only believes `X-Forwarded-*` from a proxy
+you name** (next section). With the shipped defaults it ignores the header entirely and uses the
+address of the socket that connected.
+
+### 3.1 Client IP trust boundary (read this before you put a proxy in front)
+
+`X-Forwarded-For` is a claim made by whoever hands the app a request. Two settings decide which
+claims are believed, and both are **empty/loopback by default**:
+
+| Setting | Read by | Default | Effect |
+|---|---|---|---|
+| `FORWARDED_ALLOW_IPS` | uvicorn (`--proxy-headers`, in the image CMD) | `127.0.0.1` | rewrites `scope["client"]` from the header when the peer matches |
+| `TRUSTED_PROXIES` | the app (`app.core.middleware.resolve_client_ip`) | *(empty)* | same question, answered in-process: rate-limit keys, login-failure attribution, `audit_logs.ip` |
+
+Either one is sufficient; set both to the same value so the two layers cannot disagree. The
+resolution rule is the standard one: walk the header **from the right** and take the first hop that
+is not itself a trusted proxy — everything left of that was written by the client or by an upstream
+it chose. A wildcard (`*`) or an all-covering CIDR (`0.0.0.0/0`) hands that choice back to any
+client that can open a socket, which is why **production refuses to start with one**
+(`Settings.validate_for_runtime`).
+
+Pick the row that matches your topology:
+
+| Topology | `FORWARDED_ALLOW_IPS` / `TRUSTED_PROXIES` |
+|---|---|
+| No proxy (`docker run -p 8000:8000`, bare uvicorn) | leave the defaults — the peer address *is* the client |
+| nginx/Caddy on the docker host, port published | the docker gateway, usually `172.17.0.1` (`docker network inspect bridge`) |
+| Proxy container in the compose network | that network's subnet, e.g. `172.18.0.0/16` |
+| Cloud load balancer / ingress | the LB's subnet (e.g. `10.0.0.0/8`, or the provider's published ranges) |
+| Proxy chain (LB → nginx → app) | list **every** hop; the rightmost non-listed address wins |
+
+If you get this wrong the failure is *fail-closed*, not spoofable: every request is attributed to the
+proxy's address, so all clients share one rate-limit bucket and audit rows all show the proxy. The
+app says so rather than staying quiet — `jobhunter_edge_forwarded_for_total{reason="untrusted_peer"}`
+increments and one warning per minute is logged:
+
+```
+ignoring X-Forwarded-For (203.0.113.7) from untrusted peer 172.18.0.1 — if that peer is your reverse
+proxy, list it in TRUSTED_PROXIES (and/or FORWARDED_ALLOW_IPS ...)
+```
+
+`GET /api/ops/status` reports the effective boundary under `edge.client_ip`.
 
 ---
 
@@ -147,13 +189,64 @@ sidecar cannot see it.
 * Bare metal / systemd: leave `METRICS_HOST=127.0.0.1` and scrape through localhost (or an SSH
   tunnel); only set `0.0.0.0` on a network you control.
 * `METRICS_TOKEN` is still checked on this port — set the same token in the scrape config.
-* With `WEB_CONCURRENCY > 1` only the worker that wins the bind serves the port, so the series
-  cover one worker. Scale with the standalone worker container (each container exposes its own
-  metrics) rather than by raising `WEB_CONCURRENCY`.
 
 Suggested alerts: readiness failing for 2 minutes, `jobhunter_pipeline_jobs_total{status="dead"}`,
 queue age > 10 minutes, `jobhunter_ai_requests_total{status="breaker_open"}` rising, 5xx rate, disk
-usage on the uploads/generated volumes.
+usage on the uploads/generated volumes, `jobhunter_edge_forwarded_for_total{reason="untrusted_peer"}`
+rising (proxy trust boundary not configured — §3.1), and `edge.registry.evicted` on
+`GET /api/ops/status` rising (something is labelling metrics on unbounded data).
+
+### Metric cardinality
+
+The registry is in-process and a label value is a **permanent series**, so every label comes from a
+bounded set — this is a memory property, not a tidiness one:
+
+| Metric | Labels | Why it is bounded |
+|---|---|---|
+| `jobhunter_http_requests_total` | `method`, `path`, `status` | `path` is the **route template** (`/api/jobs/{job_id}`), resolved after routing. No `host` label: the `Host` header is caller-chosen. Unmatched URLs go through a 64-entry admission list and then count as `other` |
+| `jobhunter_http_request_duration_seconds` | `method`, `path` | same |
+| `jobhunter_http_*` (outbound client) | `host`, `status`/`kind`/`reason` | `host` is collapsed to the organisation-level domain of endpoints this deployment *intends* to call (`SOURCE_API_DOMAINS` + `OUTBOUND_ALLOWED_HOSTS` + the AI/funding endpoints); every host pulled out of a job feed counts as `other`. Per-source detail lives on `jobhunter_source_fetch_total{source=…}` |
+| `jobhunter_rate_limited_total` | `path` | bounded as above |
+| `jobhunter_edge_forwarded_for_total` | `reason` | four fixed reasons |
+
+As a backstop, each metric name keeps at most `METRICS_MAX_SERIES_PER_METRIC` (512) series and evicts
+the least recently updated one beyond that; `edge.registry` on `GET /api/ops/status` reports series
+and evictions per metric. If you add a metric, label it from an enum, a route template or a config
+value — never from a header, a raw path, a URL or an exception message.
+
+### Workers, replicas and in-process state
+
+`WEB_CONCURRENCY` (the image CMD passes it to `uvicorn --workers`) **defaults to 1** and
+`docker-compose.prod.yml` pins it there. That is the least-surprising default for a self-hosted
+product, because the app's budgets live in process memory:
+
+| In-process state | What `WEB_CONCURRENCY=4` does to it |
+|---|---|
+| Rate limiter (`RateLimitMiddleware`) | each worker keeps its own hit log → the per-user/per-IP budget is effectively ×4 |
+| AI token bucket (`app.core.rate_limiter`) and daily token budget | ×4 → the provider sees four times the intended RPM/spend |
+| Per-user AI workflow overrides loaded at boot | an override saved through `PUT /api/settings` reaches the one worker that served the request; the other three keep the old value until they restart |
+| Login-throttle windows (`/api/auth/login`) | ×4 attempts before a lockout |
+| Metrics registry | only the worker that wins the `METRICS_PORT` bind serves it, so series cover one worker |
+| Pipeline worker (`RUN_WORKER_IN_API=true`) | N copies of every pipeline claiming the same queue |
+
+The app logs a warning naming these at startup when `WEB_CONCURRENCY > 1`
+(`Settings.scaling_warnings()`), and `GET /api/ops/status` reports `edge.workers`.
+
+Scale horizontally instead — it is the topology this product is built for:
+
+```bash
+# pipeline throughput: more worker containers (no API, no duplicated budgets)
+docker compose -f docker-compose.prod.yml up -d --scale worker=3
+
+# API throughput: more API replicas behind the load balancer, each with
+# WEB_CONCURRENCY=1 and RUN_WORKER_IN_API=false
+docker compose -f docker-compose.prod.yml up -d --scale api=3
+```
+
+Multiple *replicas* have the same in-process property as multiple workers (they are separate
+processes). If you need limits that hold across replicas, put a shared limiter in front (the
+load balancer's own rate limiting, or a Redis-backed middleware) — the per-user AI budgets then
+belong in the database, which is a deliberate change rather than a configuration flag.
 
 ---
 
@@ -182,4 +275,9 @@ startup log prints the app version, environment, database driver and migration s
 | `/api/metrics` returns 404 `metrics_moved` | `METRICS_PORT` is set — scrape `http://<host>:9464/metrics` instead |
 | Nothing answers on the metrics port | `METRICS_ENABLED=true`, and (in a container) `METRICS_HOST=0.0.0.0`; a second worker that lost the bind logs a warning and stays quiet |
 | Queue not draining | worker container not running (`RUN_WORKER_IN_API=false` on the API) |
-| Upload rejected with 413 | file larger than `MAX_UPLOAD_MB`, or the proxy's `client_max_body_size` |
+| Upload rejected with 413 | file larger than `MAX_UPLOAD_MB`, or the proxy's `client_max_body_size`. The app answers 413 both on the declared `Content-Length` **and** while streaming (a chunked upload is counted as it arrives), so `{"code":"payload_too_large"}` is the app; an HTML 413 is the proxy |
+| `audit_logs.ip` shows one address for every user | the proxy trust boundary is not configured (§3.1) — set `TRUSTED_PROXIES`/`FORWARDED_ALLOW_IPS` to the proxy's CIDR. Look for `jobhunter_edge_forwarded_for_total{reason="untrusted_peer"}` |
+| Everyone behind one office/NAT gets 429s together | anonymous traffic is limited per client IP by design. Signed-in users are limited per **user** (a verified token), so this only affects pre-auth endpoints — raise `API_RATE_LIMIT_PER_MINUTE` or terminate TLS closer to the client |
+| 429s that do not match `API_RATE_LIMIT_PER_MINUTE` | `WEB_CONCURRENCY > 1` or several replicas: each process keeps its own limiter (§6). Also check `edge.rate_limiter.evictions` on `GET /api/ops/status` — if it climbs with real traffic, raise `RATE_LIMIT_MAX_KEYS` |
+| Startup refuses with "… trusts every peer" | `TRUSTED_PROXIES`/`FORWARDED_ALLOW_IPS` contains `*` or `0.0.0.0/0`; list the proxy's actual address/CIDR instead (§3.1) |
+| A metric you expect is missing from `/metrics` | series caps: each metric keeps `METRICS_MAX_SERIES_PER_METRIC` label combinations and evicts the least recently updated beyond that — check `edge.registry` on `GET /api/ops/status` |

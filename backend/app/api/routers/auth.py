@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -12,6 +12,7 @@ from app.api.deps import CurrentUser, DbSession, client_ip
 from app.core import audit
 from app.core.auth import issue_session_tokens
 from app.core.config import settings
+from app.core.lru import BoundedTTLMap
 from app.core.security import (
     api_key_prefix,
     hash_password,
@@ -27,9 +28,14 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 # Brute-force protection: per-email attempt window (in-process; a shared store is
 # the next step for multi-replica deployments).
-_attempts: Dict[str, List[float]] = {}
 _MAX_ATTEMPTS = 8
 _WINDOW_SECONDS = 300
+#: Bounded on purpose: the email is caller-supplied and this runs *before*
+#: authentication, so the old plain dict with ``if len(...) > 2000: clear()`` let
+#: an attacker both grow it with random addresses and wipe everybody's lockout
+#: state by crossing the threshold. An LRU with a TTL evicts the oldest window
+#: instead — one noisy address costs its own entry, never anyone else's.
+_attempts = BoundedTTLMap(name="auth.login_attempts", max_entries=4096, default_ttl=_WINDOW_SECONDS)
 
 
 class Credentials(BaseModel):
@@ -81,16 +87,20 @@ class ApiKeyCreate(BaseModel):
 
 def _throttle(email: str) -> None:
     now = time.time()
-    window = [t for t in _attempts.get(email.lower(), []) if now - t < _WINDOW_SECONDS]
+    key = email.lower()
+    window = [t for t in (_attempts.get(key) or []) if now - t < _WINDOW_SECONDS]
     if len(window) >= _MAX_ATTEMPTS:
         retry = int(_WINDOW_SECONDS - (now - window[0]))
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
                             detail={"code": "too_many_attempts", "retry_after": max(1, retry)},
                             headers={"Retry-After": str(max(1, retry))})
     window.append(now)
-    _attempts[email.lower()] = window
-    if len(_attempts) > 2000:
-        _attempts.clear()
+    _attempts.put(key, window)
+
+
+def login_throttle_state() -> Dict[str, Any]:
+    """Bounded-login-throttle counters for ops (never the emails or timestamps)."""
+    return _attempts.stats()
 
 
 @router.get("/status")
@@ -168,7 +178,7 @@ def login(payload: Credentials, request: Request, db: DbSession):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
     if not user.is_active:
         raise HTTPException(403, "Account disabled")
-    _attempts.pop(email, None)
+    _attempts.pop(email, None)  # a successful login clears its own window
     audit.audit(db, "auth.login", user=user, request=request, ip=client_ip(request))
     return issue_session_tokens(db, user, user_agent=request.headers.get("user-agent", ""))
 

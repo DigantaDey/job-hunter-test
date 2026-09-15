@@ -12,29 +12,54 @@ Two calling styles are supported, both in use in the codebase::
 
 ``inc(name, value=N, ...)`` counts by ``N`` (default 1) — the ``value`` keyword is
 reserved for the increment so callers can do ``inc("rows_total", value=len(rows))``.
+
+Cardinality
+-----------
+A label combination is a *series*, and in an in-process registry a series is
+permanent once created. Label values therefore have to come from a bounded set —
+route templates rather than raw paths, outcome codes rather than exception text,
+registrable domains rather than arbitrary hosts — because the alternative is a
+caller-controlled key growing this module until the process is OOM-killed (a
+``Host`` header, or the host of every URL pulled out of a job feed, is exactly
+such a key).
+
+Every metric is additionally capped at ``METRICS_MAX_SERIES_PER_METRIC`` series:
+past the cap the least recently updated series is evicted, so a mistake costs
+observability (and shows up as ``evictions`` on ``GET /api/ops/status``) rather
+than memory. The cap is a backstop, not a licence to label on request data.
 """
 from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import OrderedDict, defaultdict
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from app.core.config import settings
 
 DEFAULT_BUCKETS: Sequence[float] = (
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 )
 
+SeriesKey = Tuple[Tuple[str, str], ...]
+
 _LOCK = threading.Lock()
-_COUNTERS: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float] = defaultdict(float)
-_GAUGES: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float] = {}
-_HISTOGRAMS: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], Dict[str, object]] = {}
+_COUNTERS: Dict[Tuple[str, SeriesKey], float] = defaultdict(float)
+_GAUGES: Dict[Tuple[str, SeriesKey], float] = {}
+_HISTOGRAMS: Dict[Tuple[str, SeriesKey], Dict[str, object]] = {}
+#: metric name -> its series in least-recently-updated order (the eviction queue).
+_RECENCY: Dict[str, "OrderedDict[SeriesKey, None]"] = {}
+#: metric name -> series dropped because the cap was reached.
+_EVICTED: Dict[str, int] = defaultdict(int)
 _HELP: Dict[str, str] = {
     "jobhunter_info": "Build and environment information.",
     "jobhunter_http_requests_total": "HTTP requests handled, by method, path template and status.",
     "jobhunter_http_request_duration_seconds": "HTTP request latency in seconds.",
     "jobhunter_http_requests_in_progress": "HTTP requests currently being served.",
     "jobhunter_http_errors_total": "Unhandled/validation failures.",
+    "jobhunter_http_payload_too_large_total": "Requests rejected by the body-size cap, by how it was caught.",
     "jobhunter_rate_limited_total": "Requests rejected by the rate limiter.",
+    "jobhunter_edge_forwarded_for_total": "X-Forwarded-For headers seen, by whether the peer was trusted.",
     "jobhunter_jobs_discovered_total": "Jobs persisted from discovery runs.",
     "jobhunter_source_fetch_total": "Job-board adapter fetches that returned a result.",
     "jobhunter_source_results_total": "Postings returned per source.",
@@ -53,8 +78,33 @@ _HELP: Dict[str, str] = {
 # --------------------------------------------------------------------------- #
 # Core API
 # --------------------------------------------------------------------------- #
-def _key(name: str, labels: Optional[Dict[str, str]]) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
+def _key(name: str, labels: Optional[Dict[str, str]]) -> Tuple[str, SeriesKey]:
     return name, tuple(sorted((str(k), str(v)) for k, v in (labels or {}).items()))
+
+
+def _series_cap() -> int:
+    return max(16, int(settings.metrics_max_series_per_metric or 512))
+
+
+def _touch(name: str, labels: SeriesKey, store: Dict[Any, Any]) -> None:
+    """
+    Mark a series as just-updated and enforce the per-metric series cap.
+
+    Called under :data:`_LOCK` by every writer. Eviction is LRU by *update*
+    time: the series that has not been touched for the longest is the one nobody
+    is looking at, which is also the shape a cardinality mistake produces
+    (thousands of one-shot label values, each touched once).
+    """
+    recent = _RECENCY.get(name)
+    if recent is None:
+        recent = _RECENCY[name] = OrderedDict()
+    recent[labels] = None
+    recent.move_to_end(labels)
+    cap = _series_cap()
+    while len(recent) > cap:
+        stale, _unused = recent.popitem(last=False)
+        if store.pop((name, stale), None) is not None:
+            _EVICTED[name] += 1
 
 
 def _render_labels(labels: Optional[Dict[str, str]]) -> str:
@@ -79,7 +129,9 @@ def counter(name: str, labels: Optional[Dict[str, str]] = None, value: float = 1
     extra, amount = _split(kw)
     merged.update(extra)
     with _LOCK:
-        _COUNTERS[_key(name, merged)] += float(amount if amount is not None else value)
+        key, series = _key(name, merged)
+        _COUNTERS[(key, series)] += float(amount if amount is not None else value)
+        _touch(key, series, _COUNTERS)
 
 
 def inc(name: str, value: float = 1.0, **labels: object) -> None:
@@ -91,7 +143,9 @@ def gauge(name: str, value: float, labels: Optional[Dict[str, str]] = None, **kw
     merged = dict(labels or {})
     merged.update(_split(kw)[0])
     with _LOCK:
-        _GAUGES[_key(name, merged)] = float(value)
+        key, series = _key(name, merged)
+        _GAUGES[(key, series)] = float(value)
+        _touch(key, series, _GAUGES)
 
 
 def set_gauge(name: str, value: float, **labels: object) -> None:
@@ -103,10 +157,12 @@ def observe(name: str, value: float, labels: Optional[Dict[str, str]] = None,
     merged = dict(labels or {})
     merged.update(_split(kw)[0])
     with _LOCK:
+        key, series = _key(name, merged)
         entry = _HISTOGRAMS.setdefault(
-            _key(name, merged),
+            (key, series),
             {"count": 0, "sum": 0.0, "buckets": dict.fromkeys(buckets, 0), "bounds": tuple(buckets)},
         )
+        _touch(key, series, _HISTOGRAMS)
         entry["count"] = int(entry["count"]) + 1  # type: ignore[arg-type]
         entry["sum"] = float(entry["sum"]) + float(value)  # type: ignore[arg-type]
         bucket_counts = entry["buckets"]  # type: ignore[assignment]
@@ -209,6 +265,41 @@ def reset() -> None:
         _COUNTERS.clear()
         _GAUGES.clear()
         _HISTOGRAMS.clear()
+        _RECENCY.clear()
+        _EVICTED.clear()
+
+
+def series_count(name: Optional[str] = None) -> int:
+    """Live series across the registry, or for one metric name."""
+    with _LOCK:
+        if name is None:
+            return sum(len(series) for series in _RECENCY.values())
+        return len(_RECENCY.get(name) or ())
+
+
+def stats() -> Dict[str, Any]:
+    """
+    Registry shape for ops: series per metric, and what the cap has evicted.
+
+    ``series`` growing toward ``max_series_per_metric`` with a rising ``evicted``
+    means some caller is labelling on unbounded data (a host header, a raw path) —
+    visible before it becomes an incident.
+    """
+    cap = _series_cap()
+    with _LOCK:
+        per_metric = {
+            metric: {"series": len(series), "evicted": int(_EVICTED.get(metric, 0))}
+            for metric, series in sorted(_RECENCY.items())
+        }
+        total = sum(entry["series"] for entry in per_metric.values())
+        evicted = sum(entry["evicted"] for entry in per_metric.values())
+    return {
+        "series": total,
+        "evicted": evicted,
+        "max_series_per_metric": cap,
+        "metrics": len(per_metric),
+        "by_metric": per_metric,
+    }
 
 
 def _format(value: object) -> str:

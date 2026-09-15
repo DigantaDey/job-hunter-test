@@ -54,9 +54,23 @@ EXPOSE 9464
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health/live', timeout=4).status == 200 else 1)"
 
-# WEB_CONCURRENCY controls uvicorn workers. It defaults to 1 because each API
-# process also runs the in-process pipeline worker (RUN_WORKER_IN_API): N
-# workers means N copies of every pipeline. To scale, run the standalone worker
-# container (docker-compose.prod.yml) with RUN_WORKER_IN_API=false and only then
-# raise this.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*' --workers ${WEB_CONCURRENCY:-1}"]
+# WEB_CONCURRENCY controls uvicorn workers and defaults to 1 for two reasons:
+# each API process also runs the in-process pipeline worker (RUN_WORKER_IN_API),
+# and every budget the app enforces is per process — the rate limiter, AI token
+# buckets and daily budgets, per-user AI overrides, the metrics registry — so N
+# workers silently multiplies them by N. To scale, run the standalone worker
+# container (docker-compose.prod.yml) with RUN_WORKER_IN_API=false and add API
+# replicas behind a load balancer; see docs/DEPLOYMENT.md §6.
+#
+# FORWARDED_ALLOW_IPS is uvicorn's --proxy-headers trust boundary and defaults to
+# loopback, i.e. X-Forwarded-For is ignored unless you name the proxy that sets
+# it. It used to be '*', which let any direct client pick the address the app
+# attributes the request to — per-IP rate limits, login-failure attribution and
+# the `ip` column of audit rows. Set it to the reverse proxy's address or CIDR
+# (and to the same value in TRUSTED_PROXIES, which the app's own resolver reads):
+#
+#   same host, nginx -> published port:  FORWARDED_ALLOW_IPS=<docker gateway, e.g. 172.17.0.1>
+#   proxy in the compose network:        FORWARDED_ALLOW_IPS=172.18.0.0/16
+#   cloud load balancer:                 FORWARDED_ALLOW_IPS=<LB subnet, e.g. 10.0.0.0/8>
+#   no proxy at all:                     leave the default (peer address is the client)
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=\"${FORWARDED_ALLOW_IPS:-127.0.0.1}\" --workers ${WEB_CONCURRENCY:-1}"]
