@@ -496,6 +496,11 @@ def _ambient_user_id() -> Optional[int]:
     ``LogContext`` sets it per queue item, so AI calls made deep inside
     pipelines (which historically had no user context) can still resolve the
     *user's* configured key instead of falling back to env-only config.
+
+    The value is an ``int`` at every writer site and ``ContextFilter`` coerces
+    it, so the ``int()`` below is belt-and-braces rather than a repair: it keeps
+    a future caller that binds a numeric string from silently losing the user's
+    key, and it still returns ``None`` for anything that is not a number.
     """
     raw = user_id_var.get()
     if raw is None or raw == "":
