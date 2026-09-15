@@ -495,6 +495,14 @@ class Settings(BaseSettings):
         used to become ``unknown_provider`` and silently kill the radar."""
         return (value or "").strip().lower()
 
+    @field_validator("billing_provider")
+    @classmethod
+    def _normalize_billing_provider(cls, value: str) -> str:
+        """Same footgun as the funding provider: ``BILLING_PROVIDER=STRIPE`` used
+        to fall through to the manual provider, silently disabling real webhooks
+        while leaving the (dev-mode) manual endpoint as the billing path."""
+        return (value or "manual").strip().lower()
+
     @field_validator("environment")
     @classmethod
     def _normalize_environment(cls, value: str) -> str:
@@ -624,6 +632,52 @@ class Settings(BaseSettings):
     @property
     def ai_enabled(self) -> bool:
         return bool(self.ai_api_key)
+
+    # ------------------------------------------------------------------ #
+    # Billing webhook trust boundary
+    # ------------------------------------------------------------------ #
+    @property
+    def stripe_webhook_secret_configured(self) -> bool:
+        """True when Stripe signature verification is possible for this deploy."""
+        return bool((self.stripe_webhook_secret or "").strip())
+
+    @property
+    def razorpay_webhook_secret_configured(self) -> bool:
+        """True when Razorpay signature verification is possible for this deploy."""
+        return bool((self.razorpay_webhook_secret or "").strip())
+
+    def billing_webhook_problems(self) -> List[str]:
+        """
+        Loud startup validation for the billing webhook trust boundary.
+
+        A selected provider whose webhook secret is empty cannot verify a
+        single signature, and an unverified "apply subscription changes"
+        endpoint is a remote plan forge. Verification is therefore mandatory:
+        ``/api/billing/webhooks/{stripe,razorpay}`` answer
+        ``400 webhook_not_configured`` (and, **in production, refuse to serve
+        with 503** so providers retry instead of silently marking deliveries
+        successful), and ``/api/billing/webhooks/manual`` requires
+        ``EMAIL_WEBHOOK_TOKEN`` in every environment. These problems are
+        logged loudly at startup by ``app.main``; they do not block boot, the
+        routes themselves are the boundary.
+        """
+        problems: List[str] = []
+        provider = (self.billing_provider or "").strip().lower()
+        if provider == "stripe" and not self.stripe_webhook_secret_configured:
+            problems.append(
+                "BILLING_PROVIDER=stripe but STRIPE_WEBHOOK_SECRET is empty — "
+                "POST /api/billing/webhooks/stripe will refuse every event with "
+                "webhook_not_configured (400; 503 in production); set the secret "
+                "to enable payment webhooks"
+            )
+        if provider == "razorpay" and not self.razorpay_webhook_secret_configured:
+            problems.append(
+                "BILLING_PROVIDER=razorpay but RAZORPAY_WEBHOOK_SECRET is empty — "
+                "POST /api/billing/webhooks/razorpay will refuse every event with "
+                "webhook_not_configured (400; 503 in production); set the secret "
+                "to enable payment webhooks"
+            )
+        return problems
 
     @property
     def funding_search_effective(self) -> str:
@@ -766,7 +820,7 @@ class Settings(BaseSettings):
 
     def warnings(self) -> List[str]:
         """Non-fatal configuration smells — logged once at startup."""
-        warnings: List[str] = []
+        warnings: List[str] = list(self.billing_webhook_problems())
         if self.environment in PRODUCTION_ENVIRONMENTS:
             return warnings
         warnings.extend(self.secret_problems())

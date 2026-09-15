@@ -88,6 +88,12 @@ def _load_workflow_overrides() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
+    # Billing webhook trust boundary: a selected payment provider whose
+    # webhook secret is empty cannot verify any signature, so the webhook
+    # routes refuse events (400 — 503 in production). Say it loudly rather
+    # than letting paid plans silently stop provisioning.
+    for problem in settings.billing_webhook_problems():
+        log.error("BILLING WEBHOOK MISCONFIGURATION: %s", problem)
     init_db()
     for path in (settings.upload_dir, settings.generated_dir, settings.screenshot_dir):
         os.makedirs(path, exist_ok=True)
