@@ -31,7 +31,7 @@ from app.services.ai_client import is_ai_error
 from app.services.ai_guardrails import describe_ai_error
 from app.services.company_normalize import normalize_company_name as normalize_job_company
 from app.services.funding_radar import SCAN_BLOCKED, SCAN_OK, SCAN_PAUSED
-from app.services.funding_sources import normalize_company_name, provider_status
+from app.services.funding_sources import provider_status
 from app.services.job_queue import enqueue_or_existing
 from app.services.outreach import draft_email
 from app.services.user_settings import get_setting, set_setting
