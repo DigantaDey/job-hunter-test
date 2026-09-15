@@ -29,6 +29,8 @@ from app.models.models import (
     VaultEntry,
 )
 from app.schemas.schemas import ErrorLogOut
+from app.services import http as http_client
+from app.services import net_guard
 from app.services.ai_client import breaker_snapshot, is_configured, ping
 from app.services.auto_scheduler import brief as auto_scheduler_brief
 from app.services.job_queue import queue_stats, recover_stalled
@@ -296,6 +298,15 @@ async def ops_status(request: Request, user: CurrentUser, db: DbSession):
             "tasks": worker_tasks,
         },
         "metrics": metrics.snapshot(),
+        # Bounded in-process caches (v2.2.11): entries/evictions/hits for the
+        # outbound GET cache, the per-host politeness state and the SSRF guard's
+        # DNS verdicts. A worker that sweeps thousands of distinct URLs must not
+        # grow any of these — ``entries`` sitting at ``max_entries`` with a
+        # rising ``evictions`` is the healthy shape.
+        "outbound": {
+            "http_cache": http_client.cache_stats(),
+            "dns_cache": net_guard.dns_cache_stats(),
+        },
     }
 
 

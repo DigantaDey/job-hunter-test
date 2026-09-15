@@ -73,12 +73,16 @@ def fake_playwright(monkeypatch):
             self.filled = {}
             self.clicks = []
             self.screenshot_path = None
+            # A real page reports where it ended up; the autofill domain gate
+            # reads it (a redirect must not carry credentials with it).
+            self.url = "about:blank"
 
         def set_default_timeout(self, timeout):
             pass
 
         async def goto(self, url, **kwargs):
             self.goto_urls.append(url)
+            self.url = url
 
         def locator(self, selector):
             return FakeLocator(self, selector)
@@ -134,6 +138,16 @@ def fake_playwright(monkeypatch):
     monkeypatch.setattr(settings, "autofill_enabled", True)
     monkeypatch.setattr(settings, "autofill_dry_run", False)
     monkeypatch.setattr(settings, "autofill_allow_submit", True)
+
+    # The autofill pre-flight resolves the posting host, so keep the suite
+    # offline: every host resolves to one public address.
+    from app.services import net_guard
+
+    async def _public_resolver(*_args, **_kwargs):
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(net_guard, "_resolve", _public_resolver)
+    net_guard.clear_dns_cache()
     return page
 
 

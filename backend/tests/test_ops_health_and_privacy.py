@@ -66,6 +66,13 @@ def test_ops_status_reports_components(client, auth):
     assert "queues" in body and "discovery" in body["queues"]
     assert body["workers"]["concurrency"] >= 1
     assert "ai" in body and "rate_limiter" in body["ai"]
+    # The bounded outbound caches are observable: a worker sweeping thousands of
+    # distinct URLs must not grow them, and this is where that is checked.
+    outbound = body["outbound"]
+    assert outbound["http_cache"]["max_entries"] >= 1
+    assert outbound["http_cache"]["entries"] <= outbound["http_cache"]["max_entries"]
+    assert outbound["http_cache"]["host_state"]["entries"] <= outbound["http_cache"]["host_state"]["max_entries"]
+    assert outbound["dns_cache"]["entries"] <= outbound["dns_cache"]["max_entries"]
 
 
 def test_retry_dead_resets_both_budgets(client, auth, db):

@@ -7,19 +7,36 @@ Production rules enforced here:
 * per-host politeness delay + concurrency cap (we never hammer a job board);
 * optional robots.txt compliance before fetching HTML;
 * response caching for idempotent GETs (discovery endpoints are polled).
+
+Memory: this module lives for the whole worker process, and a discovery /
+funding / company-intel sweep touches *thousands of distinct URLs and hosts*, so
+nothing here may be an unbounded dict:
+
+* ``_cache`` is a bounded LRU of :class:`CachedResponse` — the status code, the
+  headers and the parsed body, never the raw ``httpx.Response`` (which pins the
+  request, its stream, its elapsed timing and the client's cookie jar). Bodies
+  over ``HTTP_CACHE_MAX_BODY_BYTES`` are served but not cached;
+* ``_host_state`` (per-host politeness lock + last-call timestamp) is a bounded
+  LRU too, and an entry whose lock a coroutine currently holds is never evicted
+  — the politeness guarantee cannot be lost to make room for a cache entry;
+* the SSRF guard's DNS cache is bounded in :mod:`app.services.net_guard`.
+
+Counters for all three are on ``GET /api/ops/status``.
 """
 from __future__ import annotations
 
 import asyncio
 import random
 import time
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Union
 from urllib.parse import urlparse
 
 import httpx
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.lru import BoundedTTLMap
 from app.core.metrics import inc, observe
 from app.services.net_guard import OutboundURLBlocked, check_url, install_transport_guard
 
@@ -27,10 +44,81 @@ log = get_logger("app.http")
 
 _client: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
-_host_locks: Dict[str, asyncio.Lock] = {}
-_host_last_call: Dict[str, float] = {}
 _semaphore: Optional[asyncio.Semaphore] = None
-_cache: Dict[str, Tuple[float, httpx.Response]] = {}
+
+
+@dataclass(frozen=True)
+class CachedResponse:
+    """
+    What a cache hit actually needs to look like.
+
+    Deliberately *not* an ``httpx.Response``: keeping one alive pins the request
+    object, the decoded stream and the client's cookies for as long as the entry
+    lives, which is exactly the leak this cache used to have. Consumers use
+    ``status_code`` / ``headers`` / ``json()`` / ``text`` — and nothing else.
+    """
+
+    url: str
+    status_code: int
+    headers: httpx.Headers
+    text: str
+    json_body: Any = None
+    is_cache_hit: bool = True
+
+    def json(self) -> Any:
+        if self.json_body is None:
+            raise ValueError(f"cached response for {self.url} has no JSON body "
+                             f"(content-type: {self.headers.get('content-type', 'unknown')})")
+        return self.json_body
+
+    def raise_for_status(self) -> "CachedResponse":
+        return self
+
+    @property
+    def is_success(self) -> bool:
+        return 200 <= self.status_code < 300
+
+    @property
+    def ok(self) -> bool:
+        return self.is_success
+
+    @property
+    def content_type(self) -> str:
+        return self.headers.get("content-type", "")
+
+    def __repr__(self) -> str:  # never log the body
+        return f"<CachedResponse {self.status_code} {self.url} ({len(self.text)} chars, cached)>"
+
+
+@dataclass
+class _HostState:
+    """Per-host politeness state: the serialising lock + the last call time."""
+
+    lock: asyncio.Lock = None  # type: ignore[assignment]
+    last_call: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+
+
+def _not_held(state: Any) -> bool:
+    """A politeness lock a coroutine is holding must never be evicted."""
+    lock = getattr(state, "lock", None)
+    return not (lock is not None and lock.locked())
+
+
+def _bounded(name: str, default_max: int, **kwargs) -> BoundedTTLMap:
+    return BoundedTTLMap(name=name, max_entries=default_max, **kwargs)
+
+
+#: GET-url -> CachedResponse. Hard-capped LRU; TTL comes from the caller's
+#: ``cache_seconds`` at write time.
+_cache: BoundedTTLMap = _bounded("http.cache", settings.http_cache_max_entries)
+
+#: host -> _HostState. Hard-capped LRU that skips entries whose lock is held.
+_host_state: BoundedTTLMap = _bounded("http.host_state", settings.http_host_state_max_entries,
+                                      evictable=_not_held)
 
 
 async def get_client() -> httpx.AsyncClient:
@@ -74,26 +162,55 @@ def _sem() -> asyncio.Semaphore:
     return _semaphore
 
 
+def _host_state_for(host: str) -> _HostState:
+    """
+    Get-or-create the politeness state for *host* (no await between look and
+    insert, so two coroutines cannot each create one).
+
+    The lookup goes through the LRU's ``get`` so a host that is *actively* being
+    fetched is the last candidate for eviction — not the one that happened to be
+    inserted first.
+    """
+    state = _host_state.get(host)
+    if state is None:
+        state = _HostState()
+        _host_state.put(host, state)
+    return state
+
+
 async def _polite_wait(host: str) -> None:
     """Serialise + space out requests to the same host."""
-    lock = _host_locks.setdefault(host, asyncio.Lock())
-    async with lock:
-        last = _host_last_call.get(host, 0.0)
-        gap = settings.per_host_min_interval_seconds - (time.monotonic() - last)
+    state = _host_state_for(host)
+    async with state.lock:
+        gap = settings.per_host_min_interval_seconds - (time.monotonic() - state.last_call)
         if gap > 0:
             await asyncio.sleep(gap)
-        _host_last_call[host] = time.monotonic()
+        state.last_call = time.monotonic()
 
 
-def _cache_get(key: str, ttl: int) -> Optional[httpx.Response]:
-    hit = _cache.get(key)
-    if not hit:
+def _cache_entry(response: httpx.Response, url: str) -> Optional[CachedResponse]:
+    """Detach what consumers need from *response* (or None when it is too big to cache)."""
+    body = response.text
+    size = len(body.encode("utf-8", "replace"))
+    if size > settings.http_cache_max_body_bytes:
+        log.debug("http cache: not caching %s — %d bytes exceeds the %d byte cap",
+                  url, size, settings.http_cache_max_body_bytes)
         return None
-    ts, response = hit
-    if time.time() - ts > ttl:
-        _cache.pop(key, None)
-        return None
-    return response
+    json_body: Any = None
+    if "json" in (response.headers.get("content-type") or "").lower():
+        try:
+            json_body = response.json()
+        except ValueError:
+            json_body = None  # advertised as JSON but unparseable: serve the text
+    return CachedResponse(url=url, status_code=response.status_code,
+                          headers=httpx.Headers(dict(response.headers)), text=body,
+                          json_body=json_body)
+
+
+def cache_stats() -> Dict[str, Any]:
+    """Bounded-cache counters for ops/monitoring (never the cached bodies)."""
+    return {**_cache.stats(), "max_body_bytes": settings.http_cache_max_body_bytes,
+            "host_state": _host_state.stats()}
 
 
 def clear_cache() -> None:
@@ -112,8 +229,14 @@ async def request(
     cache_seconds: int = 0,
     allow_redirects: bool = True,
     respect_robots: Optional[bool] = None,
-) -> httpx.Response:
-    """Perform an HTTP request with retries/backoff, policy checks and politeness controls."""
+) -> Union[httpx.Response, CachedResponse]:
+    """
+    Perform an HTTP request with retries/backoff, policy checks and politeness controls.
+
+    A cache hit returns a :class:`CachedResponse` (status + headers + parsed
+    body) rather than the original ``httpx.Response``; both satisfy the surface
+    callers use (``status_code``, ``headers``, ``json()``, ``text``).
+    """
     host = urlparse(url).netloc
     cache_key = f"{method}:{url}:{sorted((params or {}).items())}"
 
@@ -125,9 +248,10 @@ async def request(
         log.warning("outbound request blocked: %s", exc.reason)
         raise
     if method.upper() == "GET" and cache_seconds > 0:
-        cached = _cache_get(cache_key, cache_seconds)
+        cached = _cache.get(cache_key)
         if cached is not None:
             inc("jobhunter_http_cache_hits_total", host=host)
+            log.debug("http cache hit for %s (%s)", url, cached)
             return cached
 
     should_check_robots = settings.respect_robots_txt if respect_robots is None else respect_robots
@@ -173,7 +297,9 @@ async def request(
             continue
 
         if method.upper() == "GET" and cache_seconds > 0 and response.status_code == 200:
-            _cache[cache_key] = (time.time(), response)
+            entry = _cache_entry(response, url)
+            if entry is not None:
+                _cache.put(cache_key, entry, ttl=cache_seconds)
         return response
 
     raise last_error or RuntimeError("request failed")

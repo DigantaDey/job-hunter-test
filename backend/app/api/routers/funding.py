@@ -423,6 +423,11 @@ async def process_company(company_name: str, request: Request, user: CurrentUser
             # not a headcount, and "startup" would be our guess.
             company_info={"stage": row.stage, "industry": row.industry, "source": row.source,
                           "funding_url": meta.get("url", ""), "positions_source": "provider",
+                          # The company's own domain, independent of the posting
+                          # URL above: the autofill domain policy uses it to
+                          # decide where the browser may act (and where a vault
+                          # credential may be typed).
+                          "website": row.website or "",
                           "url_source": url_source},
         )
         db.add(job)

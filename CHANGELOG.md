@@ -4,6 +4,86 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.11] — 2026-09-15
+
+**The autofill browser is now behind the SSRF guard, the worker's caches are
+bounded, and autofill failures say what they tried.** Three defects in the
+long-lived worker: `page.goto(job.url)` navigated to whatever URL a feed or an
+import supplied — never checked against `net_guard`, so the headless browser
+would load `169.254.169.254` (cloud credentials), `127.0.0.1:<port>` (anything
+else in the container) or any RFC1918 host, and `_attempt_login` then typed the
+user's vault password into whatever password-looking field that host rendered;
+`http._cache` stored whole `httpx.Response` objects keyed by GET-url and evicted
+an entry only when the *same* URL was seen again, so a discovery/funding/
+company-intel sweep grew it (and the per-host politeness maps, and the DNS
+verdict cache) for the whole process lifetime; and a failed autofill reported
+"0 fields filled" with no record of which selector matched.
+
+### Fixed
+
+- **Browser navigation is policy-checked before it happens.**
+  `net_guard`'s deny-first policy is now a reusable pre-flight
+  (`preflight` → `URLVerdict`, with `check_url` / `check_navigation_url` as
+  thin raising wrappers, so the rules cannot drift). `execute_autofill` runs
+  `preflight_navigation` before Playwright is even launched, in a stricter
+  shape: loopback, link-local (`169.254.0.0/16`) and metadata hostnames are
+  refused **even when allow-listed**, and `OUTBOUND_ALLOW_PRIVATE` does not
+  reach navigation (a private range is navigable only when that exact host is
+  in `OUTBOUND_ALLOWED_HOSTS`). A refused URL is recorded on the job as
+  `status="blocked"` with the reason — never as an application.
+- **Autofill is restricted to the job's own domains.** The domains a run may
+  act on come from the job's metadata — its ATS portal domain
+  (`form_detector.VAULT_DOMAINS`) or the company website on record
+  (`job.company_info.website`, now populated for funding-radar jobs) — and
+  never from the posting URL, which is the attacker-supplied value. A posting
+  on a host that metadata does not name is refused; a login-requiring form on
+  a foreign host is refused before navigation; a redirect off the posting's
+  own organisation stops the run.
+- **Vault credentials only go to the domain they were issued for.** Injection
+  now requires the page's *live* host to be the application domain **and** the
+  credential's own vault domain (`login.reason` reports which check failed).
+  The same gate covers `password` fields in the form plan — the fill loop was
+  a second credential path — so no password is typed on an unverified host.
+- **The worker's caches are bounded LRUs** (`app/core/lru.py`): the GET cache
+  holds `HTTP_CACHE_MAX_ENTRIES` (128) detached summaries — status + headers +
+  parsed body, never the raw `httpx.Response` that pinned its request, stream
+  and cookies — and skips bodies over `HTTP_CACHE_MAX_BODY_BYTES`; per-host
+  politeness state is capped at `HTTP_HOST_STATE_MAX_ENTRIES` with an
+  in-use lock pinned rather than evicted (the politeness guarantee cannot be
+  lost to make room); the SSRF guard's DNS verdicts are capped at
+  `DNS_CACHE_MAX_ENTRIES`. Entries/evictions/hits are on `GET /api/ops/status`
+  under `outbound`. Politeness, `Retry-After` handling and backoff are
+  unchanged.
+- **Autofill failures are diagnosable.** Every step logs at `DEBUG` which
+  selector matched (or that none did, with the selectors tried) and the result
+  carries a capped `diagnostics` list plus a `navigation` block (host, landed
+  host, domain policy). Field names and selectors only — values, and passwords
+  in particular, are never logged (pinned by a test that fails on any leak).
+
+### Tests
+
+- New `tests/test_autofill_navigation_policy.py` (46 tests): `goto` is refused
+  for metadata/loopback/link-local/private/internal-port/non-HTTP job URLs with
+  the browser never launched; `OUTBOUND_ALLOW_PRIVATE` does not relax the
+  browser while an allow-listed private host still works; postings outside the
+  company domain, login forms on foreign hosts and off-organisation redirects
+  are refused; credentials are injected on the application domain and withheld
+  on a lookalike host, an unverified custom portal, or a credential issued for
+  another domain; `credential_decision` is pinned as a pure deny-first rule;
+  diagnostics/debug logs name the matched selector and never a secret.
+- New `tests/test_http_cache_bounds.py` (24 tests): the response cache cannot
+  exceed its bound under 4× its cap in distinct URLs and stores no
+  `httpx.Response`; hits are served without touching the wire, expire on their
+  TTL, and oversized/non-200 bodies are not cached; host state is bounded while
+  a held lock survives the sweep; politeness spacing, per-host serialisation,
+  `Retry-After` and exhausted-retry behaviour are unchanged; the DNS cache is
+  bounded and still caches positive *and* negative verdicts.
+- Extended `tests/test_net_guard.py` (pre-flight verdicts, the
+  HTTP-vs-navigation asymmetry, hard blocks surviving the allow-list, host /
+  registrable-domain matching, DNS cache bound) and
+  `tests/test_ops_health_and_privacy.py` (the `outbound` block).
+- Full suite green: 628 tests.
+
 ## [2.2.10] — 2026-09-15
 
 **Storage caps are real, company-intel bills the work it does, and the hot

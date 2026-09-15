@@ -156,7 +156,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.2.9"
+    version: str = "2.2.11"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -313,10 +313,32 @@ class Settings(BaseSettings):
     http_user_agent: str = "JobHunterAI/2.0 (+https://github.com/jobhunter-ai)"
     #: SSRF policy (see app/services/net_guard.py)
     outbound_allowed_hosts: List[str] = Field(default_factory=list)
+    #: Relaxes the private-address check for the **HTTP client only**. Browser
+    #: navigation (autofill) ignores it: a headless Chromium is the one deputy
+    #: that will render an internal service and be fed vault credentials.
     outbound_allow_private: bool = False
     http_timeout: float = 20.0
     http_max_retries: int = 2
     live_scrape_timeout: float = 60.0
+
+    # ------------------------------------------------------------------ #
+    # Bounded in-process caches
+    #
+    # The worker is a long-lived process that sweeps thousands of *distinct*
+    # URLs and hosts per day, so every one of these caches is a hard-capped LRU
+    # (see app/core/lru.py) rather than a dict that only ever grows. Counters
+    # (entries/evictions/hits) are on /api/ops/status.
+    # ------------------------------------------------------------------ #
+    #: Cached GET responses (status + headers + parsed body — never the raw
+    #: httpx.Response, which pins the request, its stream and its cookies).
+    http_cache_max_entries: int = 128
+    #: Bodies larger than this are served but not cached: one 40 MB feed must
+    #: not evict the whole cache (or dominate process memory) by itself.
+    http_cache_max_body_bytes: int = 1_000_000
+    #: Per-host politeness state (lock + last-call timestamp).
+    http_host_state_max_entries: int = 512
+    #: DNS verdicts in the SSRF guard.
+    dns_cache_max_entries: int = 512
 
     greenhouse_board_tokens: List[str] = Field(default_factory=list)
     lever_board_tokens: List[str] = Field(default_factory=list)
