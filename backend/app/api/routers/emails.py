@@ -25,7 +25,6 @@ from app.services.outreach import (
     suppress,
     tracking_urls,
 )
-from app.services.user_settings import get_setting
 
 router = APIRouter(prefix="/emails", tags=["emails"])
 log = get_logger("app.emails")
@@ -139,10 +138,11 @@ async def create_email(payload: EmailGenerate, request: Request, user: CurrentUs
         if not job:
             raise HTTPException(404, "Job not found")
 
-    profile = get_setting(db, user.id, "application", "profile_snapshot", {}) or {}
-    if not profile:
-        profile_row = db.query(Profile).filter(Profile.user_id == user.id).first()
-        profile = (profile_row.data if profile_row else {}) or {}
+    # The profile lives in the Profile table — there is no settings-based
+    # snapshot to read first (the old `application.profile_snapshot` fallback
+    # was never writable and therefore always empty).
+    profile_row = db.query(Profile).filter(Profile.user_id == user.id).first()
+    profile = (profile_row.data if profile_row else {}) or {}
     if not profile:
         raise HTTPException(400, {"code": "profile_missing", "message": DRAFT_REJECTIONS["profile_missing"]})
     if not str(profile.get("name") or "").strip():

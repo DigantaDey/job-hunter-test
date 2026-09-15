@@ -272,7 +272,9 @@ async def discover_for_user(
             fresh.append(posting)
         report["freshness_relaxed"] = True
 
-    fresh.sort(key=lambda p: (p["score"] if "score" in p else 0, p.get("posted_at") or datetime.min), reverse=False)
+    # Newest first. This is the only ordering that is known *before* scoring —
+    # ``score`` does not exist on a candidate until ``_score_candidates`` runs
+    # below, so a sort by score here could only be a no-op on a constant key.
     fresh.sort(key=lambda p: p.get("posted_at") or datetime.min, reverse=True)
     candidates = fresh[: max(limit * 2, 40)]
 
@@ -308,7 +310,13 @@ async def discover_for_user(
         candidate["company_size_confidence"] = confidence
 
     # ---------------- persist ----------------
+    # One commit per row, not one commit for the batch: the AI verdicts for
+    # this batch have already been *spent*, so a single bad row (a uniqueness
+    # race against a concurrent run is the common one) must be skipped — with
+    # its failure recorded — and the rest of the batch must land. The old
+    # batch commit discarded every good job because of one conflict.
     created: List[Job] = []
+    insert_errors: List[Dict[str, Any]] = []
     for candidate in ranked[:limit]:
         job = Job(
             user_id=user.id,
@@ -336,14 +344,20 @@ async def discover_for_user(
                    "freshness_relaxed": candidate.get("freshness_relaxed", False), "forms": {}},
         )
         db.add(job)
+        try:
+            db.commit()
+        except Exception as exc:  # noqa: BLE001 - one bad row must never discard the batch
+            db.rollback()
+            log.warning("discovery insert failed for %s (%s): %s",
+                        candidate.get("company"), candidate.get("title"), exc)
+            insert_errors.append({
+                "title": candidate.get("title"),
+                "company": candidate.get("company"),
+                "dedupe_key": candidate.get("dedupe_key"),
+                "error": str(exc)[:500],
+            })
+            continue
         created.append(job)
-
-    try:
-        db.commit()
-    except Exception as exc:  # unique constraint race → reload, keep going
-        db.rollback()
-        log.warning("discovery insert conflict: %s", exc)
-        created = []
 
     # Increment usage by actual inserted count (more accurate than trigger-time 1)
     try:
@@ -421,6 +435,11 @@ async def discover_for_user(
     # successful run too); ``why_empty`` is present *only* when this run added
     # zero jobs, so an absent key means "this run found jobs".
     report["summary"] = _run_summary(source_report, freshness_hours=freshness_hours, fresh_count=len(fresh))
+    # Per-row insert failures (v2.2.9): the batch no longer rolls back as a
+    # whole, so a partially-landed run reports exactly which row(s) were
+    # skipped and why. Absent key = nothing failed.
+    if insert_errors:
+        report["insert_errors"] = insert_errors
     why_empty = _classify_empty_run(source_report) if not created else None
     if why_empty:
         report["why_empty"] = why_empty
@@ -430,9 +449,10 @@ async def discover_for_user(
         for job in created
     ]
     log.info(
-        "discovery: %s scanned, %s inserted in %.1fs (ai_rescore enabled=%s skipped=%s scored=%s)%s",
+        "discovery: %s scanned, %s inserted in %.1fs (ai_rescore enabled=%s skipped=%s scored=%s)%s%s",
         report["scanned"], report["inserted"], elapsed,
         ai_rescore["enabled"], ai_rescore["skipped"] or "-", ai_rescore["scored"],
+        f" insert_errors={len(insert_errors)}" if insert_errors else "",
         f" why_empty={why_empty}" if why_empty else "",
         extra={"extra_fields": {"user_id": user.id, **{k: report[k] for k in ("scanned", "fresh", "inserted")},
                                 "ai_rescore": ai_rescore,

@@ -505,6 +505,13 @@ async def apply_job(
 
 
 def _requeue_application(db: Session, user_id: int, job: Job, answers: Dict[str, Any]) -> Optional[PipelineJob]:
+    """Re-run a job's application with the user's answers.
+
+    The re-queued item keeps the *original* mode: an ``execute`` run that
+    paused for a missing field must come back as ``execute`` (and be allowed
+    to submit once the consent chain is green), never silently demoted to a
+    prepare-only run.
+    """
     dedupe_key = f"apply:{job.id}"
     existing = (
         db.query(PipelineJob)
@@ -513,9 +520,24 @@ def _requeue_application(db: Session, user_id: int, job: Job, answers: Dict[str,
         .first()
     )
     if existing is None:
-        return enqueue(db, user_id=user_id, pipeline="application", job_id=job.id, payload={"resume_choice": "auto", "answers": answers, "mode": "prepare"}, priority=1, dedupe_key=dedupe_key)
+        # No live row (finished or dead-lettered): recover the original intent
+        # from the job's most recent application item so an execute run never
+        # re-queues as prepare. No history at all → prepare (the safe default;
+        # submission always comes from an explicit execute intent).
+        last = (
+            db.query(PipelineJob)
+            .filter(PipelineJob.user_id == user_id, PipelineJob.job_id == job.id, PipelineJob.pipeline == "application")
+            .order_by(PipelineJob.id.desc())
+            .first()
+        )
+        last_mode = str(dict(last.payload or {}).get("mode") or "execute") if last is not None else ""
+        mode = "execute" if last_mode == "execute" else "prepare"
+        return enqueue(db, user_id=user_id, pipeline="application", job_id=job.id, payload={"resume_choice": "auto", "answers": answers, "mode": mode}, priority=1, dedupe_key=dedupe_key)
+    # Absent mode means execute (the handler's default) — write it explicitly
+    # so the mode cannot drift between runs.
+    mode = str(dict(existing.payload or {}).get("mode") or "execute")
     if existing.status == "needs_input":
-        existing.payload = {**(existing.payload or {}), "resume_choice": "auto", "answers": answers}
+        existing.payload = {**(existing.payload or {}), "resume_choice": "auto", "answers": answers, "mode": mode}
         existing.status = "queued"
         existing.attempts = 0
         existing.scheduled_at = datetime.utcnow()
@@ -525,7 +547,7 @@ def _requeue_application(db: Session, user_id: int, job: Job, answers: Dict[str,
         db.refresh(existing)
         return existing
     if existing.status == "queued":
-        existing.payload = {**(existing.payload or {}), "resume_choice": "auto", "answers": answers}
+        existing.payload = {**(existing.payload or {}), "resume_choice": "auto", "answers": answers, "mode": mode}
         db.commit()
         db.refresh(existing)
     return existing

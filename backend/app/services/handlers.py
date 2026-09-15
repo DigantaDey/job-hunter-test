@@ -256,10 +256,17 @@ async def handle_application(db: Session, item: PipelineJob) -> Dict[str, Any]:
     # "autofill unavailable" and flip the job to ``failed`` for a step nobody
     # asked for. Absent/``execute`` keeps the historical behaviour (the auto
     # scheduler and the input re-queue depend on it).
-    if str(payload.get("mode") or "execute") == "prepare":
+    mode = str(payload.get("mode") or "execute")
+    if mode == "prepare":
         return {**prepared, "status": prepared.get("status") or job.status, "mode": "prepare"}
 
-    result = await execute_application(db, user, job, answers=payload.get("answers") or {})
+    # Execute intent: ``allow_submit=True`` tells the flow the user confirmed
+    # a real submission, and the consent chain inside ``execute_application``
+    # (the live per-user ``allow_auto_submit`` setting +
+    # ``AUTOFILL_ALLOW_SUBMIT`` + ``AUTOFILL_DRY_RUN``) is what actually gates
+    # it — an intent queued before a consent was revoked (or a flag flipped)
+    # still runs, but as a dry run.
+    result = await execute_application(db, user, job, answers=payload.get("answers") or {}, allow_submit=True)
     return {**prepared, **result}
 
 
