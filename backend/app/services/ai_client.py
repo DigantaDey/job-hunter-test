@@ -746,11 +746,15 @@ MODEL_COSTS = {
 
 def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     m = (model or "").lower()
-    cost_entry = MODEL_COSTS["default"]
-    for key, val in MODEL_COSTS.items():
-        if key in m and key != "default":
-            cost_entry = val
-            break
+    cost_entry = MODEL_COSTS.get(m)
+    if cost_entry is None:
+        # Prefer the most specific family for dated/provider model variants.
+        # Substring matching would price gpt-4o-mini as gpt-4.
+        cost_entry = next(
+            (MODEL_COSTS[key] for key in sorted(MODEL_COSTS, key=len, reverse=True)
+             if key != "default" and m.startswith(key)),
+            MODEL_COSTS["default"],
+        )
     return (prompt_tokens / 1000.0) * cost_entry["input"] + (completion_tokens / 1000.0) * cost_entry["output"]
 
 
@@ -1008,6 +1012,12 @@ def track_ai_usage(
     error: str = "",
     meta: Optional[Dict[str, Any]] = None,
 ) -> None:
+    """Record every outcome; only successful calls consume AI entitlements.
+
+    Workflow quotas belong to completed business units, not provider calls (a
+    business unit can involve retries or multiple guarded calls). Observed
+    tokens, including failed attempts, spend the daily provider safety budget.
+    """
     if total_tokens == 0:
         total_tokens = prompt_tokens + completion_tokens
     cost = estimate_cost(model or "default", prompt_tokens, completion_tokens)
@@ -1035,19 +1045,9 @@ def track_ai_usage(
         )
         db.add(ledger)
         db.commit()
-        try:
+        if success:
             increment_usage(db, user_id, "ai_operations_per_month", 1)
             increment_usage(db, user_id, "ai_credits_per_month", total_tokens)
-            if workflow == "scoring":
-                increment_usage(db, user_id, "job_analysis_per_month", 1)
-            elif workflow == "resume_gen":
-                increment_usage(db, user_id, "tailored_resumes_per_month", 1)
-            elif workflow == "parse":
-                increment_usage(db, user_id, "resume_parses_per_month", 1)
-            elif workflow == "email_gen":
-                increment_usage(db, user_id, "outreach_per_month", 1)
-        except Exception:
-            pass
     except Exception as exc:
         log.warning("failed to track AI usage: %s", exc)
 
@@ -1093,6 +1093,11 @@ async def chat_completion(
     resolved = _resolve_ai_config(workflow, db, user_id)
     cfg = resolved.cfg
     db, user_id = resolved.db, resolved.user_id
+    call_started = time.perf_counter()
+    usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    # Collected at the failure site, written once at the outer boundary. This
+    # also records preflight rejections without inventing provider token usage.
+    failure_meta: Dict[str, Any] = {}
     try:
         if ai_config:
             cfg = {
@@ -1219,31 +1224,12 @@ async def chat_completion(
         last_error: Optional[str] = None
 
         # State accumulated across the wire attempts of this logical call.
-        usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         parsed_result: Optional[Dict[str, Any]] = None   # JSON mode success
         text_result: Optional[str] = None                # text mode success
         final_error: Optional[AIClientError] = None      # 200-but-unusable answer
         data: Dict[str, Any] = {}
         plain_retries = 0     # same-payload retries allowed for empty/flaky answers
         fixups = 0            # provider-parameter fix-ups (don't consume attempts)
-        call_started = time.perf_counter()
-
-        def _ledger_failure(error: str, *, meta: Optional[Dict[str, Any]] = None) -> None:
-            """Record the final failure with the tokens actually spent.
-
-            For waits that expired the provider may still have generated (and
-            billed) tokens the app never saw — the row keeps 0 tokens but
-            carries the attempts spent and an explicit billing caveat instead
-            of silently claiming nothing was spent.
-            """
-            if db and user_id:
-                track_ai_usage(db=db, user_id=user_id, workflow=workflow, model=cfg["model"],
-                               prompt_tokens=usage_totals["prompt_tokens"],
-                               completion_tokens=usage_totals["completion_tokens"],
-                               total_tokens=usage_totals["total_tokens"], success=False,
-                               error=error[:2000],
-                               latency_ms=int((time.perf_counter() - call_started) * 1000),
-                               meta=meta or {})
 
         attempt = 0
         while attempt < attempts:
@@ -1274,11 +1260,11 @@ async def chat_completion(
                         await _sleep_backoff(attempt)
                         continue
                     breaker.record_failure(last_error)
-                    _ledger_failure(last_error, meta={"attempts": attempt,
-                                                       "timeout_seconds": effective_timeout,
-                                                       "connect_timeout_seconds": connect_timeout,
-                                                       "possibly_billed": False,
-                                                       "usage_unknown": False})
+                    failure_meta.update({"attempts": attempt,
+                                         "timeout_seconds": effective_timeout,
+                                         "connect_timeout_seconds": connect_timeout,
+                                         "possibly_billed": False,
+                                         "usage_unknown": False})
                     raise AIClientError(last_error, reason=REASON_UNREACHABLE, retryable=True,
                                         meta={"attempts": attempt, "possibly_billed": False,
                                               "usage_unknown": False,
@@ -1292,10 +1278,10 @@ async def chat_completion(
                 inc("jobhunter_ai_requests_total", workflow=workflow, status="timeout")
                 log.warning("AI %s: %s", workflow, last_error)
                 breaker.record_failure(last_error)
-                _ledger_failure(last_error, meta={"attempts": attempt,
-                                                   "timeout_seconds": effective_timeout,
-                                                   "possibly_billed": True,
-                                                   "usage_unknown": True})
+                failure_meta.update({"attempts": attempt,
+                                     "timeout_seconds": effective_timeout,
+                                     "possibly_billed": True,
+                                     "usage_unknown": True})
                 raise AIClientError(last_error, reason=REASON_TIMEOUT, retryable=True,
                                     meta={"attempts": attempt, "possibly_billed": True,
                                           "usage_unknown": True,
@@ -1308,10 +1294,10 @@ async def chat_completion(
                     await _sleep_backoff(attempt)
                     continue
                 breaker.record_failure(last_error)
-                _ledger_failure(last_error, meta={"attempts": attempt,
-                                                   "timeout_seconds": effective_timeout,
-                                                   "possibly_billed": False,
-                                                   "usage_unknown": False})
+                failure_meta.update({"attempts": attempt,
+                                     "timeout_seconds": effective_timeout,
+                                     "possibly_billed": False,
+                                     "usage_unknown": False})
                 raise AIClientError(last_error, reason=REASON_UNREACHABLE, retryable=True,
                                     meta={"attempts": attempt, "possibly_billed": False,
                                           "usage_unknown": False,
@@ -1376,12 +1362,12 @@ async def chat_completion(
                 if not retryable:
                     if response.status_code in (401, 403):
                         breaker.record_failure(last_error)
-                    _ledger_failure(last_error, meta={"attempts": attempt})
+                    failure_meta.update({"attempts": attempt})
                     raise AIClientError(last_error, status=response.status_code, retryable=False,
                                         meta={"attempts": attempt})
 
                 breaker.record_failure(last_error)
-                _ledger_failure(last_error, meta={"attempts": attempt})
+                failure_meta.update({"attempts": attempt})
                 raise AIClientError(last_error, status=response.status_code, retryable=True,
                                     meta={"attempts": attempt,
                                           "retry_after_hint": retry_hint_for_reason(http_reason, workflow=workflow)})
@@ -1389,7 +1375,6 @@ async def chat_completion(
             # ---------------------------------------------------------------- #
             # 200 — validate the answer instead of trusting it.
             # ---------------------------------------------------------------- #
-            breaker.record_success()
             inc("jobhunter_ai_requests_total", workflow=workflow, status="200")
             try:
                 data = response.json()
@@ -1399,7 +1384,7 @@ async def chat_completion(
                     plain_retries += 1
                     continue
                 breaker.record_failure(last_error)
-                _ledger_failure(last_error, meta={"attempts": attempt})
+                failure_meta.update({"attempts": attempt})
                 raise AIClientError(last_error, retryable=True) from exc
 
             extracted = _extract_content(data)
@@ -1419,7 +1404,7 @@ async def chat_completion(
                     plain_retries += 1
                     continue
                 breaker.record_failure(last_error)
-                _ledger_failure(last_error, meta={"attempts": attempt})
+                failure_meta.update({"attempts": attempt})
                 raise AIClientError(last_error, retryable=True)
 
             if not json_mode:
@@ -1491,11 +1476,12 @@ async def chat_completion(
             break
 
         if final_error is not None:
-            _ledger_failure(str(final_error), meta={"attempts": attempt})
+            breaker.record_failure(str(final_error))
+            failure_meta.update({"attempts": attempt})
             raise final_error
         if parsed_result is None and text_result is None:
             breaker.record_failure(last_error or "unknown error")
-            _ledger_failure(last_error or "unknown error", meta={"attempts": attempt})
+            failure_meta.update({"attempts": attempt})
             raise AIClientError(last_error or "unknown error", retryable=True,
                                 meta={"attempts": attempt,
                                       "retry_after_hint": retry_hint_for_reason(None, workflow=workflow)})
@@ -1505,7 +1491,7 @@ async def chat_completion(
         total_tokens = usage_totals["total_tokens"]
         latency_ms = int((time.perf_counter() - call_started) * 1000)
 
-        _spend_tokens(total_tokens)
+        breaker.record_success()
         bucket = _usage.setdefault(workflow, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0})
         bucket["calls"] += 1
         bucket["prompt_tokens"] += prompt_tokens
@@ -1513,28 +1499,27 @@ async def chat_completion(
         bucket["total_tokens"] += total_tokens
         set_gauge("jobhunter_ai_tokens_total", bucket["total_tokens"], workflow=workflow)
 
-        # Track per-user — success path
-        if db and user_id:
-            track_ai_usage(
-                db=db,
-                user_id=user_id,
-                workflow=workflow,
-                model=cfg["model"],
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                success=True,
-                latency_ms=latency_ms,
-                meta={"attempts": attempt, "timeout_seconds": effective_timeout,
-                      "input_truncated": input_truncated, "max_tokens": current_max_tokens,
-                      # ``output_ceiling: 0`` means unlimited (no clamp was
-                      # applied) — kept as a number so the ledger stays
-                      # queryable, with the flag spelled out beside it.
-                      "output_ceiling": output_ceiling,
-                      "output_unlimited": output_ceiling <= 0,
-                      "escalation_ceiling": escalation_stop,
-                      "input_unlimited": resolved_input <= 0},
-            )
+        # Account once even when there is no user attribution.
+        track_ai_usage(
+            db=db,
+            user_id=user_id,
+            workflow=workflow,
+            model=cfg["model"],
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            success=True,
+            latency_ms=latency_ms,
+            meta={"attempts": attempt, "timeout_seconds": effective_timeout,
+                  "input_truncated": input_truncated, "max_tokens": current_max_tokens,
+                  # ``output_ceiling: 0`` means unlimited (no clamp was
+                  # applied) — kept as a number so the ledger stays
+                  # queryable, with the flag spelled out beside it.
+                  "output_ceiling": output_ceiling,
+                  "output_unlimited": output_ceiling <= 0,
+                  "escalation_ceiling": escalation_stop,
+                  "input_unlimited": resolved_input <= 0},
+        )
 
         if not json_mode:
             return {"content": text_result or "", "raw": data,
@@ -1543,6 +1528,14 @@ async def chat_completion(
         if parsed_result is None:  # pragma: no cover - defensive: failures raise above
             raise AIClientError(last_error or "unknown error", retryable=True)
         return parsed_result
+    except AIClientError as exc:
+        track_ai_usage(
+            db=db, user_id=user_id, workflow=workflow, model=cfg["model"],
+            **usage_totals, success=False, error=str(exc),
+            latency_ms=int((time.perf_counter() - call_started) * 1000),
+            meta={**failure_meta, **exc.meta},
+        )
+        raise
     finally:
         if resolved.owned_session and resolved.db is not None:
             try:
