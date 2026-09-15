@@ -442,6 +442,11 @@ Return JSON:
         warnings.append({"code": "anchor_divergence", "severity": "warning", "field": "score",
                          "value": delta,
                          "message": f"AI score is {delta:+.0f} from the deterministic anchor ({anchor['overall']})."})
+    # One accepted analysis, not one charge per guardrail/correction call.
+    if db is not None and user_id is not None:
+        from app.core.entitlements import increment_usage
+
+        increment_usage(db, user_id, "job_analysis_per_month", 1)
     return {
         "overall": int(round(score)),
         "score": score,

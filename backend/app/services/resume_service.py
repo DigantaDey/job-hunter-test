@@ -15,8 +15,12 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.models.models import Job, Profile, Resume
 from app.services.resume_generator import build_docx, build_pdf, hash_jd, professional_filename
+
+
+log = get_logger("app.resume_service")
 
 
 def render_profile_text(profile: Dict[str, Any]) -> str:
@@ -109,6 +113,15 @@ def build_and_save_resume(
     db.add(resume)
     db.commit()
     db.refresh(resume)
+    # Shared by explicit generation and application preparation. Charge only
+    # after rendering and persistence succeed, never for an AI retry alone.
+    if resume_type == "generated":
+        from app.core.entitlements import increment_usage
+
+        try:
+            increment_usage(db, user_id, "tailored_resumes_per_month", 1)
+        except Exception as exc:  # never lose a saved resume over accounting
+            log.warning("could not charge tailored_resumes_per_month for resume %s: %s", resume.id, exc)
     return resume
 
 

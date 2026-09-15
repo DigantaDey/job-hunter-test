@@ -306,13 +306,6 @@ async def handle_email(db: Session, item: PipelineJob) -> Dict[str, Any]:
             reason = str(exc)
             return {"status": "rejected", "code": reason, "message": DRAFT_REJECTIONS.get(reason, reason)}
         email_row = drafted["email"]
-        from app.core.entitlements import increment_usage as _charge
-
-        for meter in ("outreach_per_month", "contact_discovery_per_month"):
-            try:
-                _charge(db, int(user.id), meter, 1)
-            except Exception as exc:  # noqa: BLE001 - never lose the draft over the ledger
-                log.warning("could not charge %s for item %s: %s", meter, item.id, exc)
         summary = {
             "email_id": email_row.id, "to": email_row.to_email, "company": email_row.company,
             "job_id": email_row.job_id, "subject": email_row.subject,
@@ -417,7 +410,7 @@ async def handle_generate_resume(db: Session, item: PipelineJob, user: User) -> 
 
     Exactly the work ``POST /api/resumes/generate`` used to do inline, minus
     the request/response: generate → fact guard → render + save (``pending``)
-    → tag → persona signal → charge the meter. Nothing half-made is ever
+    + charge the meter → tag → persona signal. Nothing half-made is ever
     saved. A guardrail or fact-guard rejection is a *result* (``status:
     rejected``), not a failure: retrying the same prompt would not make the
     model stop inventing employers, and the user has to see the violations.
@@ -478,12 +471,6 @@ async def handle_generate_resume(db: Session, item: PipelineJob, user: User) -> 
     persona_service.record_signal(db, int(user.id), resume.persona_id, "resume_generated",
                                   {"title": job.title, "company": job.company,
                                    "keywords": tailored.get("tags") or []})
-    from app.core.entitlements import increment_usage
-
-    try:
-        increment_usage(db, int(user.id), "tailored_resumes_per_month", 1)
-    except Exception as exc:  # noqa: BLE001 - never lose the resume over the ledger
-        log.warning("could not charge tailored_resumes_per_month for item %s: %s", item.id, exc)
 
     return {
         "status": "generated",

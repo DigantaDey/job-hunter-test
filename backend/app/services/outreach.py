@@ -191,6 +191,15 @@ async def draft_email(
     db.add(row)
     db.commit()
     db.refresh(row)
+    # Shared by queued drafts and funding-founder outreach: one completed
+    # draft, regardless of how many AI calls were needed to produce it.
+    from app.core.entitlements import increment_usage
+
+    for meter in ("outreach_per_month", "contact_discovery_per_month"):
+        try:
+            increment_usage(db, int(user.id), meter, 1)
+        except Exception as exc:  # never lose a saved draft over accounting
+            log.warning("could not charge %s for email %s: %s", meter, row.id, exc)
     record_email_event(db, user_id=user.id, email_id=row.id, kind="queued",
                        detail="draft created",
                        meta={"contact": {k: v for k, v in contact.items() if k != "email"},
