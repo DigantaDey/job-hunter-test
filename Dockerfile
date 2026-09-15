@@ -18,7 +18,7 @@ RUN npm run build
 # --------------------------------------------------------------------------- #
 # Stage 2 — python runtime
 # --------------------------------------------------------------------------- #
-FROM python:3.11-slim AS api
+FROM python:3.14-slim AS api
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
