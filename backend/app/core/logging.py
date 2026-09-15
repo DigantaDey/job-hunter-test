@@ -5,6 +5,8 @@ Production runs emit one JSON object per line (``LOG_JSON=true``) so logs can be
 shipped to any aggregator without a parsing rule; development keeps the human
 readable format. Every log record automatically carries the request id, the
 authenticated user id and the deployment environment when they are available.
+The user id is a number on every path (``request_id`` stays a string — it is an
+opaque token, not an id) so a shipper never sees the same field as two types.
 
 A log line is a trust boundary like any other output: the request id is a
 caller-supplied header, and messages routinely embed request-derived values, so
@@ -24,6 +26,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 request_id_var: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+#: The authenticated user's primary key. Always an ``int``: the annotation, the
+#: ``audit_logs.user_id`` column and the two callers that pass it explicitly in
+#: ``extra=`` all say so, and JSON mode emits the value verbatim — a ``"7"`` on
+#: one record next to a ``7`` on another is two types for one field at the
+#: aggregator. ``request_id`` stays a string: it is an opaque caller-supplied
+#: token, not an id.
 user_id_var: ContextVar[Optional[int]] = ContextVar("user_id", default=None)
 
 _RESERVED = {
@@ -71,6 +79,35 @@ def sanitize_log_value(value: Any, *, limit: int = 512) -> Any:
     return value
 
 
+#: Sentinel distinguishing "the record carries no ``user_id`` attribute" from
+#: "the record carries ``user_id=None``" — the two are not the same thing here.
+_UNSET = object()
+
+
+def coerce_user_id(value: Any) -> Any:
+    """
+    Return *value* as an ``int`` where that is what it unambiguously is.
+
+    Every record that carries a ``user_id`` must carry a JSON number, whether it
+    arrived via :data:`user_id_var` (auth, worker ``LogContext``) or via
+    ``extra={"user_id": ...}`` (audit, access log). Applying this at the one
+    place both paths converge stops a future caller from reintroducing the
+    string/number split with a stray ``str(user.id)``.
+
+    Never raises: a logging filter that blows up takes the log line with it, so
+    a value that is not a numeric id (a non-numeric string, a sentinel, an
+    already-``None`` context) is left exactly as it was.
+    """
+    if isinstance(value, bool):  # bool is an int subclass; keep the caller's value
+        return value
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+
+
 class ContextFilter(logging.Filter):
     """Inject request/user context into every record."""
 
@@ -86,8 +123,16 @@ class ContextFilter(logging.Filter):
         # record attribute, so *every* formatter and every consumer of
         # ``record.request_id`` sees the safe value — not just the text one.
         record.request_id = sanitize_log_value(request_id_var.get(), limit=64)
-        if user_id_var.get() is not None and not hasattr(record, "user_id"):
-            record.user_id = user_id_var.get()
+        # An explicit ``extra={"user_id": ...}`` wins over the ambient context —
+        # that is why ``audit`` and the access log can log a user id even on the
+        # paths that never populate the ContextVar. Whichever producer supplied
+        # the value, it is normalised here so the JSON emitter cannot see both
+        # ``7`` and ``"7"`` for the same field.
+        user_id = getattr(record, "user_id", _UNSET)
+        if user_id is _UNSET:
+            user_id = user_id_var.get()
+        if user_id is not None:
+            record.user_id = coerce_user_id(user_id)
         return True
 
 
@@ -188,6 +233,9 @@ class LogContext:
     """
 
     def __init__(self, request_id: Optional[str] = None, user_id: Optional[int] = None) -> None:
+        # ``request_id`` is an opaque caller-supplied token and stays a string;
+        # ``user_id`` is an integer id and is stored as one, so JSON mode emits
+        # a number on every path (see :func:`coerce_user_id`).
         self.request_id = request_id
         self.user_id = user_id
         self._tokens: list = []
@@ -196,7 +244,7 @@ class LogContext:
         if self.request_id is not None:
             self._tokens.append((request_id_var, request_id_var.set(str(self.request_id))))
         if self.user_id is not None:
-            self._tokens.append((user_id_var, user_id_var.set(str(self.user_id))))
+            self._tokens.append((user_id_var, user_id_var.set(int(self.user_id))))
         return self
 
     def __exit__(self, *exc: object) -> bool:

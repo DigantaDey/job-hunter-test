@@ -250,7 +250,8 @@ curl -H "Authorization: Bearer $METRICS_TOKEN" http://localhost:8000/api/metrics
 ```
 
 Health probes: `/api/health/live` (process up), `/api/health/ready` (database + migrations + queue).
-Logs are JSON when `LOG_JSON=true`; every record carries `request_id` and `user_id` when known.
+Logs are JSON when `LOG_JSON=true`; every record carries `request_id` (a string token) and
+`user_id` (a number) when known.
 
 ---
 

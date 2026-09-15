@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ from app.services.job_queue import (
     recover_stalled,
 )
 from app.worker import Worker
+from tests.conftest import capture_json_logs
 
 
 async def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> bool:
@@ -192,6 +194,32 @@ async def test_worker_records_failures_without_crashing(db, owner, monkeypatch):
     db.refresh(item)
     assert item.status == "queued"  # retryable → back to the queue
     assert "upstream exploded" in item.error
+
+
+@pytest.mark.asyncio
+async def test_worker_logs_the_queue_users_id_as_a_number(db, owner, monkeypatch):
+    """
+    The worker binds the item's user to ``LogContext``, so its own records read
+    the id off the ContextVar rather than passing it in ``extra=``. In JSON mode
+    that path used to emit ``"7"`` while the access log emitted ``7`` — one
+    field, two types. The queue user is an ``int`` and must stay one.
+    """
+    async def ok_handler(db_session, item):
+        return {"ok": True}
+
+    monkeypatch.setitem(handlers.HANDLERS, "discovery", ok_handler)
+
+    user = _user(db)
+    item = enqueue(db, user_id=user.id, pipeline="discovery",
+                   payload={"task": "noop"}, dedupe_key="json-user-id")
+    worker = Worker(pipelines=["discovery"])
+    with capture_json_logs("app.worker") as sink:
+        await worker._run_item(item.id, "discovery")
+
+    processing = [p for p in sink.payloads if str(p.get("message", "")).startswith("processing")]
+    assert processing, f"the worker did not log its item: {sink.payloads}"
+    assert isinstance(processing[0]["user_id"], int), processing[0]
+    assert processing[0]["user_id"] == user.id
 
 
 def test_worker_ignores_disabled_pipelines():

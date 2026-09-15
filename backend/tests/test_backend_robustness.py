@@ -1,8 +1,8 @@
 """
 Backend robustness: throttle state, the UTC daily cap, blocking DNS, log
-injection and vault key rotation.
+injection, log field types and vault key rotation.
 
-Five independent failure modes, each of which degraded quietly rather than
+Six independent failure modes, each of which degraded quietly rather than
 loudly:
 
 1. the pre-auth login window wiped *everybody's* lockout when a spray of random
@@ -13,7 +13,10 @@ loudly:
    worker for up to five seconds per contact;
 4. the text log formatter interpolated the caller-supplied ``x-request-id``
    header raw, so a newline in it forged log records;
-5. the vault's opportunistic re-key was never committed, and a ciphertext that
+5. the JSON formatter emitted ``user_id`` as a number on the records that pass
+   it explicitly (access log, audit) and as a string on the records that read it
+   back off the ``LogContext`` — one field, two types, for the aggregator;
+6. the vault's opportunistic re-key was never committed, and a ciphertext that
    no longer decrypted was swallowed into an empty password.
 """
 from __future__ import annotations
@@ -29,6 +32,7 @@ from typing import Iterator, List
 import pytest
 
 from app.core.config import settings
+from tests.conftest import capture_json_logs
 
 
 @pytest.fixture
@@ -428,7 +432,8 @@ def test_json_mode_stays_parseable_with_a_forged_id():
         ContextFilter().filter(record)
         payload = json.loads(JsonFormatter().format(record))
 
-    assert str(payload["user_id"]) == "7"
+    assert payload["user_id"] == 7        # a number, not "7" — one type per field
+    assert isinstance(payload["user_id"], int)
     assert "\n" not in payload["request_id"]
 
 
@@ -455,6 +460,67 @@ def test_request_id_header_is_sanitized_at_the_edge(client, caplog):
     for record in records:
         assert "\n" not in str(record.request_id)
         assert _text_line(record).count("\n") == 0
+
+
+# --------------------------------------------------------------------------- #
+# 4b. One field, one JSON type: user_id is a number on every path
+# --------------------------------------------------------------------------- #
+def _json_log(**extra) -> dict:
+    """Log one record through the JSON pipeline and return the parsed payload."""
+    with capture_json_logs("app.test.json") as sink:
+        logging.getLogger("app.test.json").info("did a thing", extra=extra)
+    assert len(sink.payloads) == 1, sink.payloads
+    return sink.payloads[0]
+
+
+def test_user_id_is_an_int_on_both_json_paths():
+    """
+    JSON mode emits ``user_id`` verbatim, so the two producers must agree: the
+    explicit ``extra={"user_id": ...}`` (access log, audit) and a bare record
+    that reads the value off the ``LogContext`` (auth, worker). A ``7`` on one
+    path and a ``"7"`` on the other is one field with two types at the
+    aggregator, where ``user_id: 7`` then fails to match the ``"7"`` records.
+    """
+    from app.core.logging import LogContext
+
+    with LogContext(request_id="req-1", user_id=7):
+        explicit = _json_log(user_id=7)
+        ambient = _json_log()
+
+    for payload in (explicit, ambient):
+        assert isinstance(payload["user_id"], int), payload
+        assert payload["user_id"] == 7, payload
+    assert ambient["user_id"] == explicit["user_id"]
+    # An opaque, caller-supplied token is not a numeric id — it stays a string.
+    assert isinstance(ambient["request_id"], str)
+
+
+def test_the_filter_coerces_a_stringified_user_id_without_raising():
+    """
+    The filter is the last line of defence: a caller that stringifies the id
+    anyway (or a job row whose id arrives as ``"7"``) must still emit a number,
+    and a value that is not an id at all is passed through rather than raising —
+    a logging filter that throws takes the log line with it.
+    """
+    from app.core.logging import LogContext
+
+    with LogContext(user_id=7):
+        stringified = _json_log(user_id="7")
+        not_an_id = _json_log(user_id="system")
+
+    assert isinstance(stringified["user_id"], int) and stringified["user_id"] == 7
+    assert not_an_id["user_id"] == "system"
+
+
+def test_no_user_id_field_is_invented_when_there_is_no_user():
+    """A record logged outside any request/job context stays anonymous."""
+    from app.core.logging import user_id_var
+
+    token = user_id_var.set(None)
+    try:
+        assert "user_id" not in _json_log()
+    finally:
+        user_id_var.reset(token)
 
 
 # --------------------------------------------------------------------------- #

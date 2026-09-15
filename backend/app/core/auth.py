@@ -90,7 +90,7 @@ def get_current_user(
             if user and not _api_key_allows(request.method, row):
                 raise _SCOPE_DENIED
             if user:
-                user_id_var.set(str(user.id))
+                user_id_var.set(int(user.id))
                 request.state.user_id = user.id
                 return user
         raise _UNAUTHENTICATED
@@ -102,7 +102,7 @@ def get_current_user(
             if user and not _api_key_allows(request.method, row):
                 raise _SCOPE_DENIED
             if user:
-                user_id_var.set(str(user.id))
+                user_id_var.set(int(user.id))
                 request.state.user_id = user.id
                 return user
         raise _UNAUTHENTICATED
@@ -117,7 +117,7 @@ def get_current_user(
         user = _active_user(db, int(payload.get("sub", 0)))
         if not user:
             raise _UNAUTHENTICATED
-        user_id_var.set(str(user.id))
+        user_id_var.set(int(user.id))
         request.state.user_id = user.id
         return user
 
@@ -126,7 +126,7 @@ def get_current_user(
         user = db.query(User).filter(User.is_active.is_(True)).order_by(User.id).first()
         if user:
             request.state.user_id = user.id
-            user_id_var.set(str(user.id))
+            user_id_var.set(int(user.id))
             return user
         raise HTTPException(
             status_code=status.HTTP_428_PRECONDITION_REQUIRED,

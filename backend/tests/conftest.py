@@ -7,15 +7,17 @@ tests. Environment variables are set *before* `app.core.config` is imported.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import logging
 import os
 import sys
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, List
 
 _TMP = tempfile.mkdtemp(prefix="jobhunter-test-")
 
@@ -632,6 +634,44 @@ def full_consent(client: TestClient, auth: Dict[str, str]) -> Dict[str, str]:
     )
     assert response.status_code == 200, response.text
     return auth
+
+
+# --------------------------------------------------------------------------- #
+# Log capture helpers
+# --------------------------------------------------------------------------- #
+class JsonLogSink(logging.Handler):
+    """A handler that formats records exactly as ``LOG_JSON=true`` does.
+
+    The text format cannot show the difference between ``7`` and ``"7"`` — both
+    render as ``[user_id=7]`` — so anything asserting on a *field* (its type,
+    its presence) has to go through the JSON formatter and parse the result.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        from app.core.logging import ContextFilter, JsonFormatter
+
+        self.addFilter(ContextFilter())
+        self.setFormatter(JsonFormatter())
+        self.payloads: List[Dict[str, Any]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.payloads.append(json.loads(self.format(record)))
+
+
+@contextlib.contextmanager
+def capture_json_logs(logger_name: str, level: int = logging.INFO) -> Iterator[JsonLogSink]:
+    """Capture the JSON payloads *logger_name* emits inside the block."""
+    logger = logging.getLogger(logger_name)
+    previous_level = logger.level
+    sink = JsonLogSink()
+    logger.setLevel(level)
+    logger.addHandler(sink)
+    try:
+        yield sink
+    finally:
+        logger.removeHandler(sink)
+        logger.setLevel(previous_level)
 
 
 # --------------------------------------------------------------------------- #
