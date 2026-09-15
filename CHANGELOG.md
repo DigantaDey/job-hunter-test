@@ -4,6 +4,102 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.12] — 2026-09-15
+
+**The request edge is now bounded and the client IP is no longer caller-chosen.**
+Five defects, all in the code that runs *before* authentication — where the only
+inputs are attacker-controlled: the rate limiter kept a `dict` keyed on the raw
+tail of the `Authorization` / `X-API-Key` header and pruned an entry only when
+the *same* key came back, so unique random credentials grew it until the API
+process was OOM-killed (no valid token needed — pruning happened before auth);
+the body-size middleware trusted `Content-Length`, so a `Transfer-Encoding:
+chunked` request streamed past it uncapped; `client_ip()` took the **leftmost**
+`X-Forwarded-For` entry with no trust boundary *and* the shipped image started
+uvicorn with `--forwarded-allow-ips='*'`, so any direct client could pick the IP
+that per-IP rate limits, login-failure attribution and `audit_logs.ip` are keyed
+on (lock out a victim, hide your trail); `jobhunter_http_requests_total` was
+labelled with a host and the registry never evicted anything, so every unique
+value created a permanent series; and `WEB_CONCURRENCY` multiplied every
+in-process budget by the worker count without saying so.
+
+### Fixed
+
+- **The rate limiter cannot be grown.** Its hit log is an LRU with a hard cap
+  (`RATE_LIMIT_MAX_KEYS`, 8192) plus a periodic sweep that reclaims idle windows
+  without waiting for the same key to return — eviction is O(1), because an O(n)
+  scan for expired entries is per-request work under exactly the flood it exists
+  to survive. Keys are HMAC fingerprints (never a slice of a raw header, which
+  leaked credential material into a heap-resident dict): a **verified** access
+  token → `u:<hmac(user id)>` (one budget per user, wherever they connect from),
+  a `jh_` API key → `k:<hmac(key)>` *and* the client-IP bucket (the middleware
+  will not spend a DB query per request to verify it, so the credential is
+  unproven and the IP budget is what stops a junk-key flood), and anything else —
+  no credential, forged, expired, random bytes → `ip:<resolved client IP>`.
+  10 000 requests with 10 000 unique `Authorization` values are now **one** IP
+  bucket, not 10 000 entries. Counters (keys/evictions/denials) are on
+  `GET /api/ops/status` under `edge.rate_limiter`.
+- **The body cap is enforced on the wire.** `BodySizeLimitMiddleware` is now pure
+  ASGI and wraps the receive channel: `Content-Length` still fast-rejects before
+  the app runs, *and* bytes are counted as they arrive, so the first chunk that
+  crosses the cap answers `413 {"code":"payload_too_large"}` and unwinds the
+  request. The 413 is written on the outer send channel and every later response
+  from the downstream app is dropped, so a handler that swallows the unwind (or
+  had already started answering) cannot produce a second response. Chunked
+  uploads are now capped exactly like sized ones.
+- **`X-Forwarded-For` is believed only from a configured proxy.**
+  `resolve_client_ip()` walks the header from the **right** and returns the first
+  hop that is not itself in `TRUSTED_PROXIES`, and only when the connecting peer
+  is one — otherwise the peer address wins and the header is ignored, counted
+  (`jobhunter_edge_forwarded_for_total{reason=…}`) and warned about once a minute.
+  The Dockerfile now starts uvicorn with
+  `--forwarded-allow-ips="${FORWARDED_ALLOW_IPS:-127.0.0.1}"` instead of `'*'`,
+  `docker-compose.prod.yml` passes both settings through, and production
+  **refuses to start** on `*`, `0.0.0.0/0` or an unparsable entry in either. With
+  no proxy configured the peer (`request.client.host`) is the client, which is
+  correct for `docker run -p` and fail-closed (never spoofable) behind one.
+  `deps.client_ip()` and the audit trail both use the resolver, so
+  `audit_logs.ip` records the real actor. Topologies are documented in
+  `docs/DEPLOYMENT.md` §3.1.
+- **Metric cardinality is bounded by construction.** Inbound HTTP metrics are
+  labelled `method` + **route template** + `status` and nothing else — the
+  template is now read *after* routing (the middleware used to read
+  `scope["route"]` before the router had set it, so every request was labelled
+  with a collapsed raw path) and restored to its full path (`/api/jobs/{job_id}`);
+  unmatched URLs pass a 64-entry admission list and then count as `other`. The
+  outbound client's `host` label collapses to the organisation-level domain of
+  endpoints the deployment intends to call (`SOURCE_API_DOMAINS`,
+  `OUTBOUND_ALLOWED_HOSTS`, the AI/funding endpoints) with every host pulled out
+  of a job feed counted as `other` — per-source detail already lives on
+  `jobhunter_source_fetch_total{source=…}`. And the registry itself caps each
+  metric at `METRICS_MAX_SERIES_PER_METRIC` (512) series, evicting the least
+  recently updated one beyond that, so a future mistake costs observability
+  (reported as `edge.registry.evicted`) rather than memory.
+- **One worker is the shipped default, and it says why.** `WEB_CONCURRENCY`
+  defaults to 1 in the image and is pinned to 1 in `docker-compose.prod.yml`;
+  raising it now logs a startup warning naming what it multiplies (rate limits,
+  AI token buckets and daily budgets, per-user AI overrides — which otherwise
+  reach only the worker that served the save — login throttling, the metrics
+  registry, and `RUN_WORKER_IN_API`'s pipeline copies). `docs/DEPLOYMENT.md` §6
+  documents the scale-out path (more worker containers, more single-worker API
+  replicas) and the shared-limiter change a cross-replica limit actually needs.
+- **Login throttling is a bounded LRU.** The per-email attempt window was a plain
+  dict with `if len(...) > 2000: clear()` — random addresses grew it, and
+  crossing the threshold wiped *everybody's* lockout state. It is now a
+  `BoundedTTLMap` (4096 entries, 300s TTL): one noisy address costs its own
+  entry, never another account's throttle.
+
+### Added
+
+- `GET /api/ops/status` → `edge`: the rate limiter's key log, the body cap's
+  reject counters, the metrics registry's per-metric series/evictions, the
+  effective client-IP trust boundary and the worker count.
+- Settings: `TRUSTED_PROXIES`, `FORWARDED_ALLOW_IPS`, `WEB_CONCURRENCY`,
+  `RATE_LIMIT_MAX_KEYS`, `METRICS_MAX_SERIES_PER_METRIC` (all documented in
+  `.env.example`); `jobhunter_edge_forwarded_for_total` and
+  `jobhunter_http_payload_too_large_total` metrics.
+
+---
+
 ## [2.2.11] — 2026-09-15
 
 **The autofill browser is now behind the SSRF guard, the worker's caches are

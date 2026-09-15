@@ -5,6 +5,13 @@ Wiring, in order of execution per request:
 
     RequestContext → CORS → SecurityHeaders → RateLimit → BodySizeLimit → routes
 
+Everything in front of the router is written for unauthenticated, hostile input:
+the rate limiter's key set is a bounded LRU keyed on a verified identity or the
+resolved client IP (never a raw header slice), the body cap counts streamed bytes
+rather than trusting ``Content-Length``, and the client IP is only taken from
+``X-Forwarded-For`` when the peer is a configured proxy. See
+``app/core/middleware.py`` and ``docs/DEPLOYMENT.md`` §3/§6.
+
 Startup applies migrations, seeds runtime config, and (optionally) runs the
 pipeline worker in-process. Shutdown is graceful: workers stop, the queue's
 leases expire safely, and the HTTP client pool is closed.
@@ -94,6 +101,12 @@ async def lifespan(app: FastAPI):
     # than letting paid plans silently stop provisioning.
     for problem in settings.billing_webhook_problems():
         log.error("BILLING WEBHOOK MISCONFIGURATION: %s", problem)
+    # In-process budgets (rate limits, AI token buckets/daily budgets, per-user
+    # AI overrides, the metrics registry) exist once *per process*. Running more
+    # than one uvicorn worker multiplies them silently, so say it at boot rather
+    # than letting an operator discover that "the limit doesn't hold".
+    for warning in settings.scaling_warnings():
+        log.warning("SINGLE-NODE STATE: %s", warning)
     init_db()
     for path in (settings.upload_dir, settings.generated_dir, settings.screenshot_dir):
         os.makedirs(path, exist_ok=True)
@@ -158,8 +171,15 @@ def create_app() -> FastAPI:
     )
 
     # --- middleware (added inside-out: last added is outermost) ---
+    # The body cap counts bytes as they stream in, so a chunked request cannot
+    # slip past a Content-Length-only check (see BodySizeLimitMiddleware).
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_upload_mb * 1024 * 1024 + (2 * 1024 * 1024))
+    # Buckets are keyed on a verified identity or the resolved client IP, and the
+    # key set is a hard-bounded LRU (RATE_LIMIT_MAX_KEYS): this runs *before*
+    # authentication, so a caller who sends nothing but unique junk credentials
+    # must not be able to grow it.
     app.add_middleware(RateLimitMiddleware, limit_per_minute=settings.api_rate_limit_per_minute,
+                       max_keys=settings.rate_limit_max_keys,
                        exempt_paths={"/api/health", "/api/health/live", "/api/health/ready", "/api/metrics"})
     # HSTS is only correct once the deployment is actually served over https —
     # sending it on a local/plain-http install makes the origin unreachable.

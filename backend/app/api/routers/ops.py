@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 
 from app.api.deps import CurrentUser, DbSession
-from app.core import metrics
+from app.api.routers.auth import login_throttle_state
+from app.core import metrics, middleware
 from app.core.auth import require_owner
 from app.core.config import settings
 from app.core.entitlements import entitlements_snapshot
@@ -306,6 +307,28 @@ async def ops_status(request: Request, user: CurrentUser, db: DbSession):
         "outbound": {
             "http_cache": http_client.cache_stats(),
             "dns_cache": net_guard.dns_cache_stats(),
+        },
+        # Bounded *edge* state (v2.2.12): the rate limiter's key log, the body
+        # cap and the metrics registry itself. All three are keyed on data a
+        # caller controls, so all three are capped — and the caps are only
+        # useful if the shape is observable. ``keys`` at ``max_keys`` with a
+        # rising ``evictions`` means someone is flooding distinct identities (or
+        # that RATE_LIMIT_MAX_KEYS is too small for the traffic);
+        # ``registry.evicted`` rising means a caller is labelling metrics on
+        # unbounded values.
+        "edge": {
+            "rate_limiter": middleware.rate_limit_state(),
+            "body_limit": middleware.body_limit_state(),
+            "registry": metrics.stats(),
+            # The pre-auth login window is caller-keyed too (email addresses), so
+            # it is a bounded LRU with the same shape of counters.
+            "login_throttle": login_throttle_state(),
+            "client_ip": {
+                "trusted_proxies": list(settings.trusted_proxies),
+                "forwarded_allow_ips": settings.forwarded_allow_ips,
+                "resolution": "rightmost_untrusted_hop" if settings.trusted_proxies else "peer",
+            },
+            "workers": int(settings.web_concurrency or 1),
         },
     }
 

@@ -93,6 +93,23 @@ def clean_database() -> Iterator[None]:
     yield
 
 
+@pytest.fixture(autouse=True)
+def clean_edge_state() -> Iterator[None]:
+    """
+    Every test starts with empty rate-limit buckets.
+
+    The limiter is keyed on a *verified identity* (or the client IP), and the
+    session-scoped TestClient is one client whose accounts are re-created with
+    the same ids in every test: without this, one test's traffic would spend the
+    next test's budget. The bounded key log itself is what
+    ``tests/test_edge_hardening.py`` pins.
+    """
+    from app.core.middleware import reset_rate_limits
+
+    reset_rate_limits()
+    yield
+    reset_rate_limits()
+
 
 # --------------------------------------------------------------------------- #
 # Deterministic AI stand-in

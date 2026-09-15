@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger, request_id_var
+from app.core.middleware import resolve_client_ip
 from app.models.models import AuditLog
 
 logger = get_logger("audit")
@@ -50,7 +51,10 @@ def audit(
     resolved_detail: Dict[str, Any] = dict(detail or {})
     if request is not None:
         try:
-            client_ip = client_ip or (request.client.host if request.client else None)
+            # Same trust boundary the rate limiter uses: a forwarded address is
+            # believed only from a configured proxy, so an audit row cannot be
+            # attributed to an IP the actor chose in a header.
+            client_ip = client_ip or (resolve_client_ip(request.scope) or None)
             agent = request.headers.get("user-agent", "")
             if agent:
                 resolved_detail.setdefault("user_agent", agent[:200])
