@@ -125,7 +125,23 @@ def list_audit(user: CurrentUser, db: DbSession, limit: int = 100, action: Optio
 @router.get("/export")
 def export_account(request: Request, user: CurrentUser, db: DbSession):
     """GDPR-style machine-readable export of everything owned by the account."""
-    from app.services.vault import reveal_password
+    from app.services.vault import VaultDecryptionError, reveal_password
+
+    def vault_row(entry):
+        """One vault entry, with an explicit state when it cannot be decrypted."""
+        row: Dict[str, Any] = {"domain": entry.domain, "username": entry.username,
+                               "created_at": entry.created_at.isoformat()}
+        try:
+            row["password"] = reveal_password(entry, db=db)
+        except VaultDecryptionError as exc:
+            # ``null`` + a named error, never ``""``: a blank password in a data
+            # export is indistinguishable from a credential that was never set,
+            # which is exactly how a rotated VAULT_KEY used to go unnoticed.
+            row["password"] = None
+            row["password_error"] = "undecryptable"
+            log.error("GDPR export could not decrypt vault entry %s (%s): %s",
+                      entry.id, entry.domain, exc)
+        return row
 
     def rows(model, order=None):
         return db.query(model).filter(model.user_id == user.id).order_by(order or model.id).all()
@@ -154,11 +170,7 @@ def export_account(request: Request, user: CurrentUser, db: DbSession):
              "created_at": e.created_at.isoformat()}
             for e in rows(JobEvent)
         ],
-        "vault": [
-            {"domain": v.domain, "username": v.username, "created_at": v.created_at.isoformat(),
-             "password": reveal_password(v)}
-            for v in rows(VaultEntry)
-        ],
+        "vault": [vault_row(v) for v in rows(VaultEntry)],
         "emails": [
             {"id": e.id, "to": e.to_email, "subject": e.subject, "status": e.status,
              "sent_at": e.sent_at.isoformat() if e.sent_at else None, "opens": e.opens}
@@ -242,8 +254,11 @@ def runtime_settings(user: CurrentUser, db: DbSession):
 def usage(user: CurrentUser, db: DbSession):
     """Simple usage counters (the basis for plan limits / billing)."""
     from app.services.ai_client import usage_snapshot
+    from app.services.outreach import utc_day_bounds
 
-    day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    # Same UTC calendar day the outreach daily cap is measured over — one
+    # definition of "today" for the whole app, not one per call site.
+    day_start, day_end = utc_day_bounds()
     return {
         "jobs": {
             "total": db.query(Job).filter(Job.user_id == user.id).count(),
@@ -252,7 +267,8 @@ def usage(user: CurrentUser, db: DbSession):
         },
         "emails": {
             "sent_today": db.query(Email).filter(Email.user_id == user.id, Email.status == "sent",
-                                                 Email.sent_at >= day_start).count(),
+                                                 Email.sent_at >= day_start,
+                                                 Email.sent_at < day_end).count(),
             "pending_approval": db.query(Email).filter(Email.user_id == user.id,
                                                        Email.status == "pending_approval").count(),
         },

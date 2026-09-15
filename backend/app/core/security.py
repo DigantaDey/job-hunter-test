@@ -10,6 +10,10 @@ Design notes
 * Vault/secret encryption uses Fernet with a **per-user key** derived from the
   master key via HKDF-SHA256. A leaked database row cannot be decrypted with the
   key of another user, and rotating the master key is a single documented step.
+  Derived keys are memoised in a bounded, TTL'd LRU (``KEY_CACHE_MAX_ENTRIES``
+  / ``KEY_CACHE_TTL_SECONDS``) — one scope per user vault, so a plain dict there
+  would grow for the whole process lifetime, and the TTL is what stops a
+  rotated master key from being shadowed by a stale derivation forever.
 * Tokens (refresh/API keys) are only ever stored as SHA-256 hashes.
 """
 from __future__ import annotations
@@ -25,6 +29,7 @@ import jwt as pyjwt
 from jwt import PyJWTError as JWTError
 
 from app.core.config import settings
+from app.core.lru import BoundedTTLMap
 
 # --------------------------------------------------------------------------- #
 # Passwords
@@ -148,7 +153,26 @@ def constant_time_equals(a: str, b: str) -> bool:
 # --------------------------------------------------------------------------- #
 from cryptography.fernet import Fernet, InvalidToken  # noqa: E402
 
-_key_cache: Dict[str, bytes] = {}
+_key_cache: BoundedTTLMap = BoundedTTLMap(
+    name="security.key_cache",
+    max_entries=settings.key_cache_max_entries,
+    default_ttl=settings.key_cache_ttl_seconds,
+)
+
+
+def key_cache_stats() -> Dict[str, Any]:
+    """Counters for the derived-key cache (never the keys themselves)."""
+    return _key_cache.stats()
+
+
+def clear_key_cache() -> None:
+    """
+    Drop every derived key so the next use re-derives from the current master.
+
+    Only needed after ``VAULT_KEY`` / ``ENCRYPTION_KEY`` is rotated on a *running*
+    process; the TTL in :data:`_key_cache` bounds the staleness otherwise.
+    """
+    _key_cache.clear()
 
 
 def derive_key(material: str, purpose: str, length: int = 32) -> bytes:
@@ -163,12 +187,19 @@ def derive_key(material: str, purpose: str, length: int = 32) -> bytes:
 
 
 def fernet_for(scope: str) -> Fernet:
-    """Fernet instance for a scope (``user:12`` / ``global``). Cached per key."""
+    """
+    Fernet instance for a scope (``user:12`` / ``global``). Cached per scope.
+
+    The cache is a bounded LRU with a TTL, not a plain dict: the scope embeds
+    the user id, so a multi-tenant deployment would otherwise mint one entry per
+    user for the whole process lifetime. Bounding it also means a rotated master
+    key is picked up within ``KEY_CACHE_TTL_SECONDS`` instead of never.
+    """
     key = _key_cache.get(scope)
     if key is None:
         raw = derive_key(settings.encryption_key_effective, f"jobhunter:{scope}:v1")
         key = base64.urlsafe_b64encode(raw)
-        _key_cache[scope] = key
+        _key_cache.put(scope, key)
     return Fernet(key)
 
 
@@ -225,6 +256,8 @@ __all__ = [
     "constant_time_equals",
     "derive_key",
     "fernet_for",
+    "key_cache_stats",
+    "clear_key_cache",
     "encrypt_secret",
     "decrypt_secret",
     "needs_reencrypt",

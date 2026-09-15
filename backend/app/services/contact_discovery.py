@@ -12,11 +12,19 @@ Everything carries a ``source`` and a ``confidence``; the heuristic path is
 explicitly labelled ``verified=False`` so a guessed address can never be
 mistaken for a discovered one. Guessed addresses are also recorded so the UI can
 warn that deliverability has not been proven.
+
+The MX probe is the one blocking thing this module does. It therefore lives
+behind a worker thread (:func:`resolve_mx`) and async callers go through
+:func:`verify_email_async`; the sync :func:`verify_email` refuses to run it on a
+live event loop and says so in its result instead of freezing the worker.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any, Dict, List, Optional
+
+import anyio
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -43,8 +51,75 @@ def company_domain(company: str, website: str = "") -> str:
     return f"{slug}.com" if slug else ""
 
 
-def verify_email(email: str, *, check_mx: Optional[bool] = None) -> Dict[str, Any]:
-    """Syntax + MX + policy checks. No SMTP probing (that gets IPs blacklisted)."""
+def _mx_timeout() -> float:
+    """Configured MX budget, in seconds (never below a hair over zero)."""
+    return max(0.1, float(settings.contact_mx_timeout_seconds or 5.0))
+
+
+_mx_limiter: Optional["anyio.CapacityLimiter"] = None
+
+
+def _mx_concurrency() -> "anyio.CapacityLimiter":
+    """
+    Thread-pool budget shared by every in-flight MX probe.
+
+    Created lazily: anyio binds a limiter to the running async backend, and this
+    module is imported long before any loop exists.
+    """
+    global _mx_limiter
+    if _mx_limiter is None or _mx_limiter.total_tokens != settings.contact_mx_max_concurrent:
+        _mx_limiter = anyio.CapacityLimiter(max(1, int(settings.contact_mx_max_concurrent or 1)))
+    return _mx_limiter
+
+
+def _resolve_mx(domain: str, timeout: Optional[float] = None) -> Optional[bool]:
+    """
+    Blocking MX probe: ``True``/``False`` on a definitive answer, ``None`` when
+    the lookup could not be completed. **Unknown is never reported as invalid** —
+    a resolver timeout must not silently mark a real address undeliverable.
+
+    This is the only place that touches ``dns.resolver``, and it must not run on
+    the event loop: a slow or blackholed authoritative server holds the thread
+    for the whole ``lifetime``. Use :func:`verify_email_async` (or
+    :func:`resolve_mx`) from a coroutine.
+    """
+    budget = _mx_timeout() if timeout is None else float(timeout)
+    try:
+        import dns.resolver
+
+        answers = dns.resolver.resolve(domain, "MX", lifetime=budget)
+        return len(answers) > 0
+    except Exception as exc:
+        log.debug("MX lookup failed for %s: %s", domain, exc)
+        return None  # unknown ≠ invalid
+
+
+async def resolve_mx(domain: str) -> Optional[bool]:
+    """
+    :func:`_resolve_mx` on a worker thread, so a slow resolver cannot stall the
+    loop (and therefore every other request on this worker).
+
+    The await is bounded by the same budget the resolver itself gets, plus a
+    moment for thread-pool scheduling, and the thread is *abandoned* — not
+    waited on — when that elapses, so the caller always returns on time. The
+    shared limiter caps how many of these may be running at once.
+    """
+    budget = _mx_timeout()
+    try:
+        # ``fail_after`` hands back a CancelScope — a *sync* context manager.
+        with anyio.fail_after(budget + 1.0):
+            return await anyio.to_thread.run_sync(
+                _resolve_mx, domain, budget,
+                limiter=_mx_concurrency(),
+                abandon_on_cancel=True,
+            )
+    except TimeoutError:
+        log.warning("MX lookup for %s exceeded %.1fs and was abandoned", domain, budget)
+        return None
+
+
+def _base_verification(email: str) -> Dict[str, Any]:
+    """Everything about *email* that needs no network at all."""
     result: Dict[str, Any] = {
         "email": email,
         "syntax_ok": False,
@@ -65,19 +140,17 @@ def verify_email(email: str, *, check_mx: Optional[bool] = None) -> Dict[str, An
     result["disposable"] = domain in DISPOSABLE_DOMAINS
     result["freemail"] = domain in FREEMAIL_DOMAINS
     result["role_account"] = email.split("@", 1)[0].lower() in ROLE_PREFIXES
+    return result
 
+
+def _wants_mx(result: Dict[str, Any], check_mx: Optional[bool]) -> bool:
+    """Whether an MX probe is due for a syntactically valid address."""
     if check_mx is None:
         check_mx = settings.contact_verify_mx
-    if check_mx and not result["disposable"]:
-        try:
-            import dns.resolver
+    return bool(check_mx) and bool(result["syntax_ok"]) and not result["disposable"]
 
-            answers = dns.resolver.resolve(domain, "MX", lifetime=5)
-            result["mx_ok"] = len(answers) > 0
-        except Exception as exc:
-            log.debug("MX lookup failed for %s: %s", domain, exc)
-            result["mx_ok"] = None  # unknown ≠ invalid
 
+def _scored(result: Dict[str, Any]) -> Dict[str, Any]:
     score = 0.4
     if result["syntax_ok"]:
         score += 0.2
@@ -90,6 +163,54 @@ def verify_email(email: str, *, check_mx: Optional[bool] = None) -> Dict[str, An
         result["reason"] = "disposable domain"
     result["score"] = round(max(0.0, min(1.0, score)), 2)
     return result
+
+
+def verify_email(email: str, *, check_mx: Optional[bool] = None) -> Dict[str, Any]:
+    """
+    Synchronous syntax + policy check, with the MX probe only when this thread is
+    *not* running an event loop.
+
+    No SMTP probing (that gets IPs blacklisted). From a coroutine use
+    :func:`verify_email_async` — this variant deliberately refuses to block: the
+    resolver's ``lifetime`` is seconds, and a stall here is a stall for every
+    other task on the worker, not just for this contact. The refusal is reported
+    in the result (``mx_ok=None``, ``mx`` explains why) rather than silently
+    scored as if the lookup had happened.
+    """
+    result = _base_verification(email)
+    if not result["syntax_ok"]:
+        return result
+    if _wants_mx(result, check_mx):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            result["mx_ok"] = _resolve_mx(result["domain"])
+        else:
+            log.warning(
+                "verify_email() called from a running event loop; MX probe for %s skipped — "
+                "use verify_email_async() so the blocking resolver runs on a worker thread",
+                result["domain"],
+            )
+            result["mx_ok"] = None
+            result["mx"] = "skipped_event_loop"
+    return _scored(result)
+
+
+async def verify_email_async(email: str, *, check_mx: Optional[bool] = None) -> Dict[str, Any]:
+    """
+    :func:`verify_email` with the MX probe run off the event loop.
+
+    This is the entry point async callers must use — ``discover_decision_makers``
+    verifies every candidate it returns, so with ``CONTACT_VERIFY_MX=on`` a
+    single unreachable domain used to freeze the worker for up to 5 seconds per
+    contact, in series.
+    """
+    result = _base_verification(email)
+    if not result["syntax_ok"]:
+        return result
+    if _wants_mx(result, check_mx):
+        result["mx_ok"] = await resolve_mx(result["domain"])
+    return _scored(result)
 
 
 async def _hunter(domain: str, department: str) -> List[Dict[str, Any]]:
@@ -233,7 +354,9 @@ async def discover_decision_makers(
         email = (contact.get("email") or "").strip().lower()
         if not email or email in deduped:
             continue
-        contact["verification"] = verify_email(email)
+        # Async variant: the MX probe runs on a worker thread, so verifying a
+        # batch of candidates cannot stall the loop (see ``resolve_mx``).
+        contact["verification"] = await verify_email_async(email)
         deduped[email] = contact
 
     ranked = sorted(

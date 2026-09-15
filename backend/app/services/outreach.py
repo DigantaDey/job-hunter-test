@@ -14,8 +14,8 @@ Compliance is enforced in code, not in the UI:
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -79,11 +79,54 @@ def suppress(db: Session, user_id: int, email: str, reason: str = "manual") -> E
     return row
 
 
-def sent_today(db: Session, user_id: int) -> int:
-    start = datetime.combine(date.today(), datetime.min.time())
+def utc_now_naive() -> datetime:
+    """
+    Current UTC time as a *naive* datetime.
+
+    ``Email.sent_at`` is a naive column holding UTC (see ``models.utcnow``), so
+    every comparison against it has to be made in naive UTC too — comparing a
+    naive column against an aware datetime raises in SQLAlchemy 2.x, and
+    comparing it against a *local* midnight is the bug this module used to have.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def utc_day_bounds(moment: Optional[datetime] = None) -> Tuple[datetime, datetime]:
+    """
+    ``[start, end)`` of the UTC calendar day containing *moment* (default: now).
+
+    An explicit, closed-on-the-left range is what makes the daily cap mean one
+    thing everywhere: two workers in different timezones (or one that just
+    crossed a DST change) agree on which sends belong to today, and the day
+    rolls over at 00:00 UTC for all of them instead of at whichever local
+    midnight the process happened to be configured for.
+    """
+    now = moment if moment is not None else utc_now_naive()
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
+
+
+def sent_today(db: Session, user_id: int, *, now: Optional[datetime] = None) -> int:
+    """
+    Sends counted against today's daily cap, in UTC.
+
+    This is the number ``compliance_report`` gates a real send on, so it must not
+    drift with the server's local timezone: the old ``date.today()`` midnight
+    moved with ``TZ`` (and jumped by an hour on a DST change), which meant the
+    same 24 hours of sending was charged to two different days — a user could be
+    granted a second full budget early, or blocked for hours after their budget
+    had already rolled over. ``sent_at`` is written in UTC, so the window is
+    computed in UTC and applied as a range on the column.
+    """
+    start, end = utc_day_bounds(now)
     return int(
         db.query(func.count(Email.id))
-        .filter(Email.user_id == user_id, Email.status.in_(("sent", "opened")), Email.sent_at >= start)
+        .filter(Email.user_id == user_id,
+                Email.status.in_(("sent", "opened")),
+                Email.sent_at >= start,
+                Email.sent_at < end)
         .scalar()
         or 0
     )
@@ -509,6 +552,8 @@ __all__ = [
     "is_suppressed",
     "is_role_mailbox",
     "suppress",
+    "utc_now_naive",
+    "utc_day_bounds",
     "sent_today",
     "tracking_urls",
     "draft_email",
