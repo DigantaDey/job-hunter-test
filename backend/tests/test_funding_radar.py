@@ -201,7 +201,7 @@ def test_funding_api_scopes_to_user(client, auth, member_auth, db):
     member_rows = client.get("/api/funding/companies", headers=member_auth).json()["companies"]
     assert [row["name"] for row in owner_rows] == ["Owner Co"]
     assert member_rows == []
-    assert client.post("/api/funding/Owner Co/process", headers=member_auth).status_code == 404
+    assert client.post("/api/funding/companies/process", json={"company": "Owner Co"}, headers=member_auth).status_code == 404
 
 
 def test_funding_process_creates_job_or_email(client, auth, uploaded_resume, db):
@@ -225,7 +225,7 @@ def test_funding_process_creates_job_or_email(client, auth, uploaded_resume, db)
                           stage="Seed", website="quiet.co", industry="fintech", meta={}))
     db.commit()
 
-    hiring = client.post("/api/funding/Hiring Co/process", headers=auth).json()
+    hiring = client.post("/api/funding/companies/process", json={"company": "Hiring Co"}, headers=auth).json()
     assert hiring["action"] == "apply_flow"
     assert hiring["job_id"]
     assert hiring["positions_source"] == "provider"
@@ -241,7 +241,7 @@ def test_funding_process_creates_job_or_email(client, auth, uploaded_resume, db)
     assert "Open Role at" not in job.title
     assert "Backend Engineer" in job.description and "Seed round reported by imported" in job.description
 
-    quiet = client.post("/api/funding/Quiet Co/process", headers=auth).json()
+    quiet = client.post("/api/funding/companies/process", json={"company": "Quiet Co"}, headers=auth).json()
     assert quiet["action"] == "cold_email_founder"
     assert quiet["email_id"]
     assert quiet["positions_source"] == "none_reported"
@@ -820,7 +820,7 @@ def test_process_without_positions_drafts_a_founder_email(client, auth, uploaded
                           meta={"raised_at_estimated": False}))
     db.commit()
 
-    result = client.post("/api/funding/Solo Co/process", headers=auth).json()
+    result = client.post("/api/funding/companies/process", json={"company": "Solo Co"}, headers=auth).json()
     assert result["action"] == "cold_email_founder"
     assert result["positions_source"] == "none_reported"
     assert "approval required" in result["message"]
@@ -830,15 +830,19 @@ def test_process_without_positions_drafts_a_founder_email(client, auth, uploaded
 
 
 def test_process_matches_the_normalised_name_without_wildcards(client, auth, uploaded_resume, db):
-    """Related bugs: ``ilike`` treated ``%`` as a wildcard and missed casing."""
+    """Related bugs: ``ilike`` treated ``%`` as a wildcard and missed casing.
+
+    The name now arrives in the body (v2.2.9), where ``%``/``_`` are not even
+    URL-special — and they are still plain characters for the lookup.
+    """
     user = db.query(User).filter(User.email == "owner@example.com").first()
     db.add(FundingCompany(user_id=user.id, name="Northwind AI", source="sec_edgar", verified=True,
                           stage="Seed", meta={}))
     db.commit()
 
-    assert client.post("/api/funding/northwind ai/process", headers=auth).status_code == 200
-    assert client.post("/api/funding/%25/process", headers=auth).status_code == 404
-    assert client.post("/api/funding/_/process", headers=auth).status_code == 404
+    assert client.post("/api/funding/companies/process", json={"company": "northwind ai"}, headers=auth).status_code == 200
+    assert client.post("/api/funding/companies/process", json={"company": "%"}, headers=auth).status_code == 404
+    assert client.post("/api/funding/companies/process", json={"company": "_"}, headers=auth).status_code == 404
 
 
 def test_process_creates_one_job_per_provider_posting(client, auth, uploaded_resume, db):
@@ -853,8 +857,8 @@ def test_process_creates_one_job_per_provider_posting(client, auth, uploaded_res
                                                         "url": f"https://x/{index}"}]}))
     db.commit()
 
-    first = client.post("/api/funding/Alpha Co/process", headers=auth)
-    second = client.post("/api/funding/Beta Co/process", headers=auth)
+    first = client.post("/api/funding/companies/process", json={"company": "Alpha Co"}, headers=auth)
+    second = client.post("/api/funding/companies/process", json={"company": "Beta Co"}, headers=auth)
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
     jobs = db.query(Job).all()
@@ -863,7 +867,7 @@ def test_process_creates_one_job_per_provider_posting(client, auth, uploaded_res
     assert all(job.score_source == "funding_context" for job in jobs)
 
     # Re-processing the same company is idempotent (it is already tracked).
-    again = client.post("/api/funding/Alpha Co/process", headers=auth).json()
+    again = client.post("/api/funding/companies/process", json={"company": "Alpha Co"}, headers=auth).json()
     assert again["action"] == "apply_flow"
     assert again["job_id"] == first.json()["job_id"]
     assert db.query(Job).count() == 2
@@ -885,7 +889,7 @@ def test_process_job_description_is_factual(client, auth, uploaded_resume, db):
                                                     "summary": "Python and FastAPI payments work."}]}))
     db.commit()
 
-    result = client.post("/api/funding/Fact Co/process", headers=auth).json()
+    result = client.post("/api/funding/companies/process", json={"company": "Fact Co"}, headers=auth).json()
     job = db.query(Job).filter(Job.id == result["job_id"]).first()
     text = job.description
     for fact in ("Series A round reported by imported", "Payments infrastructure for marketplaces.",
@@ -1488,3 +1492,193 @@ async def test_provider_id_is_case_insensitive(monkeypatch):
     events, report = await funding_sources.fetch_funding_events({"keywords": ["ai"]}, limit=5)
     assert report["scan_status"] == "ok", report["errors"]
     assert report["counts"]["sec_edgar"] == 1 and events[0].name == "Case Co"
+
+
+# =========================================================================== #
+# 8. v2.2.9 — the company name is data, not a URL path; and one funding scan
+#    costs exactly one unit, in whichever mode it ran.
+#
+#  Contract under test:
+#  1. Storage identity is the *normalised* name: UNIQUE(user_id,
+#     name_normalized), the sync keys on it, and the migration backfills it and
+#     collapses an existing duplicate pair keeping the oldest row.
+#  2. ``POST /funding/companies/process`` takes the company in the body, so
+#     spaces, unicode, quotes and slashes need no encoding and cannot fork the
+#     route; ``company_id`` works too.
+#  3. One charge point: a successful scan costs exactly 1
+#     ``funding_companies_per_month``, sync or queued; a failed queued scan
+#     costs nothing (and the trigger no longer spends the quota up front).
+# =========================================================================== #
+def _usage(db, user_id: int) -> int:
+    from app.core.entitlements import current_period
+    from app.models.models import UsageCounter
+
+    row = (db.query(UsageCounter)
+           .filter(UsageCounter.user_id == int(user_id),
+                   UsageCounter.period == current_period(),
+                   UsageCounter.capability == "funding_companies_per_month")
+           .first())
+    return int(row.count) if row else 0
+
+
+def test_normalized_name_is_the_storage_identity(db, owner):
+    """Two casings/spacings of one name are one row — enforced by the DB."""
+    import sqlalchemy.exc
+
+    user = db.query(User).order_by(User.id).first()
+    db.add(FundingCompany(user_id=user.id, name="Acme Inc.", source="imported", verified=True))
+    db.commit()
+    row = db.query(FundingCompany).filter(FundingCompany.user_id == user.id).one()
+    assert row.name_normalized == "acme inc."
+
+    db.add(FundingCompany(user_id=user.id, name="  acme   inc.  ", source="imported", verified=True))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        db.commit()
+    db.rollback()
+
+    # And the sync agrees: the second sighting updates, never inserts.
+    stats = funding_radar.sync_funding_db(
+        db, user.id, [{"name": "ACME Inc.", "stage": "Seed", "source": "imported", "verified": True}], 30)
+    assert stats["added"] == 0 and stats["updated"] == 1
+    assert db.query(FundingCompany).filter(FundingCompany.user_id == user.id).count() == 1
+    assert db.query(FundingCompany).filter(FundingCompany.user_id == user.id).one().name == "Acme Inc."
+
+
+def test_process_takes_the_company_in_the_body(client, auth, uploaded_resume, db):
+    """Spaces, unicode, quotes and a slash: data in a body, not a path segment."""
+    user = db.query(User).filter(User.email == "owner@example.com").first()
+    awkward = 'Bjørn & Søn "Grüße" A/S'
+    db.add(FundingCompany(user_id=user.id, name=awkward, source="sec_edgar", verified=True,
+                          stage="Seed", meta={}))
+    db.commit()
+
+    by_name = client.post("/api/funding/companies/process", json={"company": awkward}, headers=auth)
+    assert by_name.status_code == 200, by_name.text
+    assert by_name.json()["company"] == awkward
+
+    # A different casing/spacing of the same name finds the same row…
+    variant = client.post("/api/funding/companies/process",
+                          json={"company": '  bjørn & søn "grüße" a/s '}, headers=auth)
+    assert variant.status_code == 200, variant.text
+
+    # …and so does the stable id.
+    row = db.query(FundingCompany).filter(FundingCompany.user_id == user.id).one()
+    by_id = client.post("/api/funding/companies/process", json={"company_id": row.id}, headers=auth)
+    assert by_id.status_code == 200, by_id.text
+
+    # Another user's id is not theirs to act on, and an empty body is a 422.
+    assert client.post("/api/funding/companies/process", json={}, headers=auth).status_code == 422
+
+
+def test_successful_sync_scan_charges_exactly_one(client, auth, db, monkeypatch):
+    """The interactive radar used to charge ``len(companies)`` per scan."""
+    user = db.query(User).order_by(User.id).first()
+    _install_providers(monkeypatch, {"sec_edgar": _static_provider(_events("Acme", "Beta", "Gamma"))})
+    _script_ai(monkeypatch, lambda prompt: {"companies": [
+        {"name": name, "matched": True, "rank": index + 1, "why": "fintech seed round."}
+        for index, name in enumerate(("Acme", "Beta", "Gamma"))]})
+
+    assert _usage(db, user.id) == 0
+    body = client.get("/api/funding/companies?refresh=true", headers=auth)
+    assert body.status_code == 200, body.text
+    assert len(body.json()["companies"]) == 3
+    assert _usage(db, user.id) == 1, "one scan, one unit — not one per company"
+
+
+@pytest.mark.asyncio
+async def test_queued_scan_charges_once_on_success_and_never_on_failure(client, auth, db, monkeypatch):
+    """The queued path bills the same as the sync one — and only when it worked."""
+    from app.services.job_queue import enqueue
+    from app.worker import Worker
+
+    user = db.query(User).order_by(User.id).first()
+
+    # 1. Trigger only *checks* the quota — it no longer spends it up front.
+    receipt = client.post("/api/funding/refresh", json={}, headers=auth)
+    assert receipt.status_code == 200, receipt.text
+    assert _usage(db, user.id) == 0, "queueing a scan is not doing one"
+
+    # 2. A failed (blocked, no AI key) queued scan consumes nothing.
+    _install_providers(monkeypatch, {"sec_edgar": _static_provider(_events("Acme"))})
+    failing = enqueue(db, user_id=user.id, pipeline="funding",
+                      payload={"window_days": 30, "provider": "sec_edgar", "context": {"keywords": ["ai"]}},
+                      dedupe_key="funding:charge-fail")
+    await Worker(pipelines=["funding"])._run_item(failing.id, "funding")
+    db.refresh(failing)
+    assert failing.status == "dead", failing.error
+    assert _usage(db, user.id) == 0, "a failed scan must not consume quota"
+
+    # 3. A successful queued scan consumes exactly one.
+    _script_ai(monkeypatch, lambda prompt: {"companies": [
+        {"name": "Acme", "matched": True, "rank": 1, "why": "fintech seed round."}]})
+    ok = enqueue(db, user_id=user.id, pipeline="funding",
+                 payload={"window_days": 30, "provider": "sec_edgar", "context": {"keywords": ["ai"]}},
+                 dedupe_key="funding:charge-ok")
+    await Worker(pipelines=["funding"])._run_item(ok.id, "funding")
+    db.refresh(ok)
+    assert ok.status == "done", ok.error
+    assert ((ok.payload or {}).get("result") or {}).get("charged") == 1
+    assert _usage(db, user.id) == 1, "one successful scan, one unit — same as the sync path"
+
+
+def test_migration_backfills_and_collapses_normalized_duplicates(tmp_path):
+    """A populated previous-head database: backfill, dedupe (oldest wins), UNIQUE."""
+    import os
+    import sqlite3
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "fundnorm.db"
+    env = {**os.environ,
+           "DATABASE_URL": f"sqlite:///{db_path.as_posix()}",
+           "ALEMBIC_DATABASE_URL": f"sqlite:///{db_path.as_posix()}",
+           "ENVIRONMENT": "test", "SECRET_KEY": "0" * 48}
+
+    def alembic(*args: str) -> None:
+        out = subprocess.run([sys.executable, "-m", "alembic", *args], cwd=backend,
+                             env=env, capture_output=True, text=True, timeout=300)
+        assert out.returncode == 0, (out.stdout + out.stderr)[-2000:]
+
+    alembic("upgrade", "e5f6a7b8c9d0")            # the pre-normalized-name schema
+
+    old, new = "2026-07-01 00:00:00", "2026-09-01 00:00:00"
+    con = sqlite3.connect(db_path)
+    for name, seen in (("Acme Inc.", old), ("acme inc.", new), ("Zeta", old)):
+        con.execute(
+            "INSERT INTO funding_companies (user_id,name,stage,source,verified,discovered_at,"
+            "last_seen_at,has_open_positions) VALUES (1,?,'Seed','sec_edgar',1,?,?,0)",
+            (name, seen, seen))
+    con.execute("INSERT INTO funding_companies (user_id,name,stage,source,verified,discovered_at,"
+                "last_seen_at,has_open_positions) VALUES (2,'Acme Inc.','Seed','sec_edgar',1,?,?,0)",
+                (old, old))
+    con.execute("INSERT INTO funding_scans (user_id,scanned_at,status,events_seen,companies_found) "
+                "VALUES (1,?, 'ok',1,1)", (new,))
+    con.execute("INSERT INTO funding_scan_companies (scan_id,company_id,rank,why) VALUES (1,2,1,'dupe')")
+    con.commit()
+    con.close()
+
+    alembic("upgrade", "head")
+
+    con = sqlite3.connect(db_path)
+    rows = list(con.execute("SELECT id,user_id,name,name_normalized,discovered_at "
+                            "FROM funding_companies ORDER BY id"))
+    assert [(r[1], r[2]) for r in rows] == [(1, "Acme Inc."), (1, "Zeta"), (2, "Acme Inc.")], rows
+    assert rows[0][3] == "acme inc.", "the key is backfilled with the app's rule"
+    assert rows[0][4] == old, "the oldest row of a duplicate pair survives"
+    # The history of the collapsed row is re-pointed, never orphaned or dropped.
+    assert list(con.execute("SELECT scan_id,company_id FROM funding_scan_companies")) == [(1, 1)]
+    try:
+        con.execute("INSERT INTO funding_companies (user_id,name,name_normalized,verified,"
+                    "has_open_positions) VALUES (1,'ACME  inc.','acme inc.',1,0)")
+        raise AssertionError("UNIQUE(user_id, name_normalized) is not enforced")
+    except sqlite3.IntegrityError:
+        pass
+    con.close()
+
+    alembic("downgrade", "e5f6a7b8c9d0")
+    con = sqlite3.connect(db_path)
+    assert "name_normalized" not in [r[1] for r in con.execute("PRAGMA table_info(funding_companies)")]
+    con.close()
+    alembic("upgrade", "head")

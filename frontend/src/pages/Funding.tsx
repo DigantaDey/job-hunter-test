@@ -214,7 +214,10 @@ export default function Funding() {
   const process = async (c: Company) => {
     setBusy(c.name); setResult(null); setError(''); setOutage(null)
     try {
-      const { data } = await client.post(`/api/funding/${encodeURIComponent(c.name)}/process`, null, { timeout: AI_REQUEST_TIMEOUT_MS })
+      // The company travels in the body (v2.2.9): a name with spaces, unicode,
+      // quotes or a slash is data, not a URL path segment.
+      const { data } = await client.post('/api/funding/companies/process',
+        { company_id: c.id, company: c.name }, { timeout: AI_REQUEST_TIMEOUT_MS })
       setResult(data)
       await load(false)
     } catch (e: any) {

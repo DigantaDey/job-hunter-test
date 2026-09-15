@@ -17,11 +17,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
 from app.api.deps import CurrentUser, DbSession, search_context
 from app.core import audit
 from app.core.config import settings
-from app.core.entitlements import enforce, increment_usage
+from app.core.entitlements import enforce
 from app.core.logging import get_logger
 from app.models.models import FundingCompany, Job, Profile
 from app.services import funding_radar, funding_search
@@ -30,7 +31,7 @@ from app.services.ai_client import is_ai_error
 from app.services.ai_guardrails import describe_ai_error
 from app.services.company_normalize import normalize_company_name as normalize_job_company
 from app.services.funding_radar import SCAN_BLOCKED, SCAN_OK, SCAN_PAUSED
-from app.services.funding_sources import normalize_company_name, provider_status
+from app.services.funding_sources import provider_status
 from app.services.job_queue import enqueue_or_existing
 from app.services.outreach import draft_email
 from app.services.user_settings import get_setting, set_setting
@@ -148,7 +149,7 @@ async def list_companies(
 
     report = funding_radar.latest_scan_report(db, int(user.id))
     if refresh or funding_radar.funding_needs_refresh(db, user.id):
-        enforce(db, user.id, "funding_companies_per_month")
+        enforce(db, user.id, funding_radar.FUNDING_SCAN_METER)
         provider = get_setting(db, user.id, "funding", "provider", settings.funding_provider)
         try:
             companies, report = await funding_radar.scan_funded_companies(
@@ -187,7 +188,9 @@ async def list_companies(
                         detail={"found": len(companies), "scan_status": report.get("scan_status"),
                                 "reason": report.get("reason"), "errors": report.get("errors") or {},
                                 "provider_report": report})
-            increment_usage(db, user.id, "funding_companies_per_month", len(companies))
+            # One charge point for every funding scan, sync or queued: exactly
+            # one unit for a scan that succeeded, nothing for an outage.
+            funding_radar.charge_funding_scan(db, int(user.id), report)
 
     rows = funding_radar.list_funding_companies(db, user.id, stage=stage, include_unverified=include_unverified)
     profile = db.query(Profile).filter(Profile.user_id == user.id).order_by(Profile.created_at.desc()).first()
@@ -226,7 +229,10 @@ async def refresh(user: CurrentUser, db: DbSession, payload: dict = Body(default
     first — previously it was accepted and then dropped, so re-scanning with a
     new focus changed nothing.
     """
-    enforce(db, user.id, "funding_companies_per_month")
+    # Gate only — the *charge* happens in the worker, once, if the scan
+    # succeeds (``funding_radar.charge_funding_scan``). Charging here billed a
+    # job that may never run, and never refunded a failure.
+    enforce(db, user.id, funding_radar.FUNDING_SCAN_METER)
 
     focus = str((payload or {}).get("context") or "").strip()
     if focus:
@@ -268,26 +274,8 @@ async def refresh(user: CurrentUser, db: DbSession, payload: dict = Body(default
 
 
 def _find_company(db, user_id: int, company_name: str) -> Optional[FundingCompany]:
-    """Look a radar row up by normalised name.
-
-    ``ilike(company_name)`` used to treat ``%``/``_`` in the path as wildcards
-    (any row of that user could match) and missed the casing normalisation the
-    sync now applies — so the lookup uses the same key the dedupe does.
-    """
-    key = normalize_company_name(company_name)
-    if not key:
-        return None
-    exact = (
-        db.query(FundingCompany)
-        .filter(FundingCompany.user_id == user_id, FundingCompany.name == company_name)
-        .first()
-    )
-    if exact is not None:
-        return exact
-    for row in db.query(FundingCompany).filter(FundingCompany.user_id == user_id).all():
-        if normalize_company_name(row.name) == key:
-            return row
-    return None
+    """Look a radar row up by its stored normalised key (shared with the sync)."""
+    return funding_radar.find_funding_company(db, int(user_id), company_name)
 
 
 def _provider_positions(row: FundingCompany) -> List[Dict[str, Any]]:
@@ -350,10 +338,31 @@ def _outreach_context(row: FundingCompany) -> str:
     return " ".join(part for part in parts if part)
 
 
-@router.post("/{company_name}/process")
-async def process_company(company_name: str, request: Request, user: CurrentUser, db: DbSession):
+class ProcessCompanyRequest(BaseModel):
+    """What to act on: the radar row's ``id``, or its name — in the body.
+
+    v2.2.9: the company name used to be a **path segment**
+    (``POST /funding/{company_name}/process``). A user-controlled name in a URL
+    is fragile by construction — unicode and spaces need encoding, ``/`` splits
+    the route, a trailing slash is a different path, and ``%``/``_`` used to be
+    matched as SQL wildcards. The stable identifier (``company_id``) and the
+    free-text name both travel in the body now, where no character is special.
     """
-    Act on a funded company.
+
+    company_id: Optional[int] = None
+    company: Optional[str] = Field(default=None, max_length=300)
+    #: Accepted alias — the radar row calls the field ``name``.
+    name: Optional[str] = Field(default=None, max_length=300)
+
+    def company_name(self) -> str:
+        return str(self.company or self.name or "").strip()
+
+
+@router.post("/companies/process")
+async def process_company(payload: ProcessCompanyRequest, request: Request,
+                          user: CurrentUser, db: DbSession):
+    """
+    Act on a funded company (identified in the **body**, never in the path).
 
     Two honest outcomes, decided by what the *provider* actually reported:
 
@@ -365,7 +374,17 @@ async def process_company(company_name: str, request: Request, user: CurrentUser
     Nothing is applied to and nothing is sent: drafts stay in the approval
     bucket.
     """
-    row = _find_company(db, int(user.id), company_name)
+    row: Optional[FundingCompany] = None
+    if payload.company_id is not None:
+        row = (db.query(FundingCompany)
+               .filter(FundingCompany.id == int(payload.company_id),
+                       FundingCompany.user_id == int(user.id))
+               .first())
+    else:
+        company_name = payload.company_name()
+        if not company_name:
+            raise HTTPException(422, "Provide company_id or company (the company name)")
+        row = _find_company(db, int(user.id), company_name)
     if not row:
         raise HTTPException(404, "Company not in the radar — refresh the scan first")
 

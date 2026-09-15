@@ -4,6 +4,40 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.13] — 2026-09-15
+
+**The funding radar's company name stops being a URL, and one scan costs one
+unit everywhere.** Two defects: `POST /api/funding/{company_name}/process` put a
+raw, user-controlled name in the *path* — unicode, spaces, quotes and slashes
+all needed encoding, a trailing slash was a different route, and the lookup it
+fed was keyed on a name whose storage uniqueness (`UNIQUE(user_id, name)`)
+disagreed with the normalised key every dedupe path already used, so "Acme Inc."
+and "acme inc." were two rows the code believed were one. And the same funding
+scan was billed differently depending on which button ran it: the synchronous
+radar charged `len(companies)` per scan, while the queued path charged at
+*trigger* time and never refunded a job that then failed.
+
+### Fixed
+
+- **The company travels in the body.** `POST /api/funding/companies/process`
+  takes `{"company_id": …}` or `{"company": "<name>"}`; no character is special,
+  no encoding is required, and the route cannot fork on a slash. The SPA sends
+  the row's stable id plus its name.
+- **`funding_companies.name_normalized` is the stored identity.** New column
+  (strip + collapse whitespace + casefold — the app's own
+  `normalize_company_name`), kept in sync by an ORM event so no caller can
+  forget it, with `UNIQUE(user_id, name_normalized)` replacing
+  `uq_funding_user_name`. Migration `f6a7b8c9d0e1` backfills it, collapses
+  existing duplicates keeping the **oldest** row (the one carrying the first-seen
+  history) and re-points `funding_scan_companies` memberships at the survivor.
+  All dedupe and lookup — sync, history linkage, process — read the column.
+- **One charge point for a funding scan.** `funding_radar.charge_funding_scan()`
+  spends exactly one `funding_companies_per_month` for a scan whose
+  `scan_status` is `ok`, and nothing for a paused/blocked/failed one. Both the
+  interactive radar and the queued handler call it; `POST /funding/refresh` now
+  only *checks* the quota it used to spend. A failed queued scan consumes
+  nothing; a successful scan costs the same one unit in either mode.
+
 ## [2.2.12] — 2026-09-15
 
 **The request edge is now bounded and the client IP is no longer caller-chosen.**
