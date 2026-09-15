@@ -19,7 +19,6 @@ from app.core.logging import get_logger
 from app.models.models import Job, Profile, Resume
 from app.services.resume_generator import build_docx, build_pdf, hash_jd, professional_filename
 
-
 log = get_logger("app.resume_service")
 
 
