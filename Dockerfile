@@ -7,7 +7,7 @@
 # --------------------------------------------------------------------------- #
 # Stage 1 — build the React SPA
 # --------------------------------------------------------------------------- #
-FROM node:20-alpine AS web
+FROM node:26-alpine AS web
 
 WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json* ./
