@@ -5,9 +5,19 @@ Provides:
 - Plans listing (public pricing)
 - Current subscription & entitlements
 - Checkout session creation (Stripe/Razorpay/manual)
-- Webhook handling with idempotency
+- Webhook handling with mandatory signature verification and idempotency
 - Usage & credit ledger
 - Upgrade/downgrade/cancel (manual for dev, real via provider)
+
+Webhook trust boundaries (all three routes):
+- Provider secrets / the manual token are mandatory. Unconfigured means the
+  route answers 503 (``webhook_not_configured``) in production — and the
+  manual route in every environment — instead of silently skipping auth or
+  signature verification.
+- Signatures are verified over the raw request body; identity is resolved from
+  the provider subscription/customer id stored on the Subscription row and
+  the plan is derived from the event's price/plan id via server-side maps.
+  An event body can never name a user or a plan.
 """
 
 from __future__ import annotations
@@ -18,7 +28,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import CurrentUser, DbSession, client_ip
 from app.core import audit
 from app.core.config import settings
 from app.core.entitlements import (
@@ -26,12 +36,21 @@ from app.core.entitlements import (
     current_period,
     entitlements_snapshot,
 )
+from app.core.logging import get_logger
+from app.core.security import constant_time_equals
 from app.models.models import AICreditLedger, BillingEvent, Subscription
 from app.services.billing import (
+    MANUAL_WEBHOOK_STATUSES,
     create_or_update_subscription_manual,
     get_provider,
     handle_billing_event,
+    resolve_plan_from_price,
+    resolve_user_id,
+    verify_razorpay_signature,
+    verify_stripe_signature,
 )
+
+log = get_logger("app.billing")
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -265,77 +284,195 @@ def list_invoices(user: CurrentUser, db: DbSession):
 
 
 # --------------------------------------------------------------------------- #
-# Webhooks — idempotent, no auth (signature verified)
+# Webhooks — signature/token verified (never skippable), idempotent, no user auth
 # --------------------------------------------------------------------------- #
+def _require_provider_webhook_secret(provider: str) -> str:
+    """Return the provider webhook secret, or refuse to serve (fail closed).
+
+    A missing secret is a hard configuration error, not a dev convenience:
+    without it there is nothing to verify a signature against, and an open
+    "apply any event" endpoint is a subscription forge. Production answers
+    503 (mirrors the tracking provider webhook) so the provider retries;
+    non-production answers 400 so a misconfigured dev deploy fails loudly
+    instead of silently accepting unsigned events.
+    """
+    if provider == "stripe":
+        secret = (settings.stripe_webhook_secret or "").strip()
+        env_var = "STRIPE_WEBHOOK_SECRET"
+    else:
+        secret = (settings.razorpay_webhook_secret or "").strip()
+        env_var = "RAZORPAY_WEBHOOK_SECRET"
+    if secret:
+        return secret
+    message = (
+        f"Set {env_var} to enable this endpoint — unsigned {provider} events are "
+        f"never accepted (env={settings.environment})"
+    )
+    if settings.is_production:
+        log.error("refusing to serve /billing/webhooks/%s: %s is unset (webhook_not_configured)", provider, env_var)
+        raise HTTPException(503, {"code": "webhook_not_configured", "message": message})
+    log.error("/billing/webhooks/%s is inert: %s is unset — verification is mandatory, refusing event (400)", provider, env_var)
+    raise HTTPException(400, {"code": "webhook_not_configured", "message": message})
+
+
+def _reject_unverified(provider: str, reason: str, request: Request) -> None:
+    """Uniform, log-then-raise path for signature failures (no payload echoes)."""
+    log.warning("%s webhook rejected: %s (ip=%s)", provider, reason, client_ip(request))
+    status = 401 if reason == "signature_mismatch" else 400
+    raise HTTPException(status, {"code": "invalid_signature", "message": f"{provider} webhook signature check failed: {reason}"})
+
+
 @router.post("/webhooks/stripe")
 async def stripe_webhook(request: Request, db: DbSession, stripe_signature: str = Header(default="", alias="Stripe-Signature")):
+    """Stripe events, HMAC-verified over the raw body (no auth — signature IS the auth)."""
+    secret = _require_provider_webhook_secret("stripe")
     payload_bytes = await request.body()
+    ok, reason = verify_stripe_signature(secret, payload_bytes, stripe_signature)
+    if not ok:
+        _reject_unverified("stripe", reason, request)
     provider = get_provider("stripe")
-    if not provider.verify_webhook(payload_bytes, stripe_signature):
-        raise HTTPException(401, "Invalid Stripe signature")
-    try:
-        parsed = provider.parse_event(payload_bytes)
-    except Exception as exc:
-        raise HTTPException(400, f"Failed to parse Stripe event: {exc}") from exc
+    parsed = provider.parse_event(payload_bytes)
+    if parsed.get("kind") == "parse_error":
+        raise HTTPException(400, "Failed to parse Stripe event")
 
     event = handle_billing_event(
         db,
         provider_name="stripe",
-        provider_event_id=parsed.get("event_id") or "unknown",
-        kind=parsed.get("kind") or "stripe.unknown",
+        provider_event_id=parsed["event_id"],
+        kind=parsed["kind"],
         payload=parsed,
-        user_id=parsed.get("user_id") if isinstance(parsed.get("user_id"), int) else None,
     )
-    return {"ok": True, "processed": event.processed, "event_id": event.provider_event_id}
+    response = {"ok": True, "processed": event.processed, "event_id": event.provider_event_id}
+    if not event.user_id:
+        # Signature valid, event stored for audit, nothing applied: no
+        # subscription carries this customer/subscription id. 200 keeps
+        # Stripe from hammering retries for an event we will never map.
+        log.warning(
+            "stripe webhook %s: customer/subscription id matches no stored subscription — event recorded, nothing applied",
+            event.provider_event_id,
+        )
+        response["ignored"] = "unmapped_customer"
+    return response
 
 
 @router.post("/webhooks/razorpay")
 async def razorpay_webhook(request: Request, db: DbSession, x_razorpay_signature: str = Header(default="", alias="X-Razorpay-Signature")):
+    """Razorpay events, HMAC-verified over the raw body (no auth — signature IS the auth)."""
+    secret = _require_provider_webhook_secret("razorpay")
     payload_bytes = await request.body()
+    ok, reason = verify_razorpay_signature(secret, payload_bytes, x_razorpay_signature)
+    if not ok:
+        _reject_unverified("razorpay", reason, request)
     provider = get_provider("razorpay")
-    if not provider.verify_webhook(payload_bytes, x_razorpay_signature):
-        raise HTTPException(401, "Invalid Razorpay signature")
-    try:
-        parsed = provider.parse_event(payload_bytes)
-    except Exception as exc:
-        raise HTTPException(400, f"Failed to parse Razorpay event: {exc}") from exc
+    parsed = provider.parse_event(payload_bytes)
+    if parsed.get("kind") == "parse_error":
+        raise HTTPException(400, "Failed to parse Razorpay event")
 
     event = handle_billing_event(
         db,
         provider_name="razorpay",
-        provider_event_id=parsed.get("event_id") or "unknown",
-        kind=parsed.get("kind") or "razorpay.unknown",
+        provider_event_id=parsed["event_id"],
+        kind=parsed["kind"],
         payload=parsed,
-        user_id=parsed.get("user_id") if isinstance(parsed.get("user_id"), int) else None,
     )
-    return {"ok": True, "processed": event.processed, "event_id": event.provider_event_id}
+    response = {"ok": True, "processed": event.processed, "event_id": event.provider_event_id}
+    if not event.user_id:
+        log.warning(
+            "razorpay webhook %s: subscription id matches no stored subscription — event recorded, nothing applied",
+            event.provider_event_id,
+        )
+        response["ignored"] = "unmapped_customer"
+    return response
 
 
 @router.post("/webhooks/manual")
 async def manual_webhook(request: Request, db: DbSession, x_webhook_token: str = Header(default="")):
     """
     Manual webhook for testing self-hosted billing.
-    Requires EMAIL_WEBHOOK_TOKEN or any token in dev.
-    Payload: {event_id, kind, user_id, plan, status, customer_id, subscription_id}
+
+    Trust boundaries (unlike the old behaviour, all hard):
+    - ``EMAIL_WEBHOOK_TOKEN`` is required in EVERY environment: unset → 503
+      ``webhook_not_configured`` (mirrors the tracking provider webhook);
+      wrong → 401, compared with ``constant_time_equals``.
+    - The body can never set user identity or plan. The event must reference a
+      ``subscription_id``/``customer_id`` already stored on a Subscription row
+      (unknown mapping → logged and rejected with 404), and the plan is
+      derived from the event's price/plan id via the server-side configured
+      maps (STRIPE_PRICE_* / RAZORPAY_PLAN_*).
+    - ``event_id`` is required so the BillingEvent unique constraint dedupes
+      retries.
+
+    Payload: {event_id, kind?, status?, price?, customer_id?, subscription_id?}
     """
+    if not (settings.email_webhook_token or "").strip():
+        log.error("manual billing webhook refused: EMAIL_WEBHOOK_TOKEN is unset (env=%s)", settings.environment)
+        raise HTTPException(
+            503,
+            {"code": "webhook_not_configured",
+             "message": "Set EMAIL_WEBHOOK_TOKEN to enable the manual billing webhook"},
+        )
+    if not constant_time_equals(x_webhook_token, settings.email_webhook_token):
+        log.warning("manual billing webhook rejected: invalid token (ip=%s)", client_ip(request))
+        raise HTTPException(401, "Invalid webhook token")
+
     payload_bytes = await request.body()
-    # Simple auth
-    if settings.email_webhook_token and x_webhook_token != settings.email_webhook_token:
-        if settings.is_production:
-            raise HTTPException(401, "Invalid webhook token")
     try:
         data = json.loads(payload_bytes) if payload_bytes else {}
     except Exception:
-        data = {}
-    provider = get_provider("manual")
-    parsed = provider.parse_event(payload_bytes)
+        raise HTTPException(400, "Manual webhook body must be valid JSON") from None
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Manual webhook body must be a JSON object")
 
+    event_id = str(data.get("event_id") or "").strip()
+    if not event_id:
+        raise HTTPException(400, {"code": "event_id_required",
+                                  "message": "event_id is required so retries are applied exactly once"})
+    kind = str(data.get("kind") or "manual.update")
+    status = str(data.get("status") or "active").strip().lower()
+    if status not in MANUAL_WEBHOOK_STATUSES:
+        raise HTTPException(400, f"status must be one of: {', '.join(sorted(MANUAL_WEBHOOK_STATUSES))}")
+    customer_id = str(data.get("customer_id") or "").strip()
+    subscription_id = str(data.get("subscription_id") or "").strip()
+
+    # Identity ONLY from the stored mapping — `user_id` in the body is not a
+    # supported field, so a forged event can never pick its victim.
+    user_id = resolve_user_id(db, {"provider_subscription_id": subscription_id,
+                                   "provider_customer_id": customer_id})
+    if not user_id:
+        log.warning(
+            "manual billing webhook rejected: subscription_id=%r customer_id=%r matches no stored subscription "
+            "(body user_id is ignored) — event NOT applied",
+            subscription_id or None, customer_id or None,
+        )
+        raise HTTPException(
+            404,
+            {"code": "user_not_found",
+             "message": "No subscription carries the supplied subscription_id/customer_id. "
+                        "Manual events may only target users with a stored provider mapping; "
+                        "identity fields in the body are ignored."},
+        )
+
+    payload = {
+        "event_id": event_id,
+        "kind": kind,
+        "status": status,
+        # Only the price/plan id — the internal plan is resolved server-side.
+        "price_id": str(data.get("price") or data.get("price_id") or "").strip(),
+        "provider_customer_id": customer_id,
+        "provider_subscription_id": subscription_id,
+    }
     event = handle_billing_event(
         db,
         provider_name="manual",
-        provider_event_id=parsed.get("event_id") or f"manual_{datetime.utcnow().timestamp()}",
-        kind=parsed.get("kind") or "manual.update",
-        payload=parsed,
-        user_id=data.get("user_id") if isinstance(data.get("user_id"), int) else None,
+        provider_event_id=event_id,
+        kind=kind,
+        payload=payload,
+        user_id=user_id,
     )
-    return {"ok": True, "processed": event.processed, "event_id": event.provider_event_id}
+    return {
+        "ok": True,
+        "processed": event.processed,
+        "event_id": event.provider_event_id,
+        "plan": resolve_plan_from_price(payload["price_id"]) or "unchanged",
+    }
+

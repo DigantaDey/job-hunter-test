@@ -6,8 +6,6 @@ security control or a config value that depended on the working directory.
 """
 from __future__ import annotations
 
-from tests.conftest import draft_email_now
-
 import os
 import time
 import urllib.error
@@ -15,6 +13,7 @@ import urllib.error
 import pytest
 
 from app.core.config import Settings
+from tests.conftest import draft_email_now
 
 
 # --------------------------------------------------------------------------- #
