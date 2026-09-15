@@ -38,6 +38,7 @@ from app.core.metrics import inc
 from app.models.models import Job, User
 from app.services import sources as source_registry
 from app.services.classifier import ai_company_size, deterministic_company_size
+from app.services.company_normalize import normalize_company_name
 from app.services.demo_pool import demo_jobs
 from app.services.events import record_job_event
 from app.services.form_detector import detect_form_structure
@@ -58,7 +59,7 @@ FORM_DETECT_TOP = 8
 AI_RESCORE_NO_PROFILE = "no_profile"
 AI_RESCORE_PLAN_FREE = "plan_free"
 
-#: The only three reasons a discovery run can add nothing to the board,
+#: The only four reasons a discovery run can add nothing to the board,
 #: reported verbatim as the run's ``why_empty``. Like the ``ai_rescore``
 #: reasons above they are a vocabulary, not free text: "no fresh jobs" used to
 #: be the whole story, and a user could not tell a configuration problem (fix
@@ -73,6 +74,10 @@ AI_RESCORE_PLAN_FREE = "plan_free"
 WHY_NO_SOURCES_CONFIGURED = "no_sources_configured"
 WHY_ALL_SOURCES_FAILED = "all_sources_failed"
 WHY_NO_FRESH_POSTINGS = "no_fresh_postings"
+#: The board is at its plan's ``jobs_max`` storage cap (v2.2.10): the run is a
+#: no-op *by design* — not an outage, not a quiet market, and never an
+#: over-limit insert. The fix is delete jobs or upgrade the plan.
+WHY_JOBS_CAP_REACHED = "jobs_cap_reached"
 
 
 def _demo_pool_enabled() -> bool:
@@ -230,6 +235,33 @@ async def discover_for_user(
     started = datetime.utcnow()
     report: Dict[str, Any] = {"started_at": started.isoformat(), "keywords": keywords}
 
+    # ---------------- storage cap (jobs_max) ----------------
+    # The board has a real size now: the cap is enforced by *row count*, in
+    # the worker as well as at the HTTP trigger (``POST /api/jobs/discover``
+    # answers 429), so concurrent runs can never overshoot it. A full board
+    # is an honest zero-job result with a reason — never a silent no-op and
+    # never an over-limit insert. A nearly-full board is clamped so the run
+    # fills exactly the remaining slots.
+    from app.core.entitlements import check_storage
+
+    _cap_allowed, jobs_used, jobs_limit, _cap_hint = check_storage(db, user.id, "jobs_max")
+    # ``None`` = unlimited; otherwise the exact number of rows this run may add.
+    jobs_remaining: Optional[int] = None if jobs_limit <= 0 else max(0, jobs_limit - jobs_used)
+    if jobs_limit > 0:
+        report["jobs_cap"] = {"used": jobs_used, "limit": jobs_limit}
+    if jobs_remaining == 0:
+        report["sources"] = {}
+        report["scanned"] = 0
+        report["fresh"] = 0
+        report["inserted"] = 0
+        report["elapsed_seconds"] = round((datetime.utcnow() - started).total_seconds(), 2)
+        report["summary"] = _run_summary({}, freshness_hours=freshness_hours, fresh_count=0)
+        report["why_empty"] = WHY_JOBS_CAP_REACHED
+        report["jobs"] = []
+        log.warning("discovery: user %s board at storage cap (%s/%s) — run is a no-op",
+                    user.id, jobs_used, jobs_limit)
+        return report
+
     # ---------------- fetch ----------------
     postings: List[Dict[str, Any]] = []
     source_report: Dict[str, Any] = {}
@@ -317,11 +349,17 @@ async def discover_for_user(
     # batch commit discarded every good job because of one conflict.
     created: List[Job] = []
     insert_errors: List[Dict[str, Any]] = []
-    for candidate in ranked[:limit]:
+    # Clamp to the storage headroom (``None`` = unlimited): a nearly-full
+    # board fills exactly its remaining slots and never overshoots jobs_max.
+    batch_limit = limit if jobs_remaining is None else min(limit, jobs_remaining)
+    for candidate in ranked[:batch_limit]:
         job = Job(
             user_id=user.id,
             title=candidate["title"],
             company=candidate["company"],
+            # SQL-side company filter identity (see Job model / migration
+            # e5f6a7b8c9d0) — stored at import time, not derived per query.
+            company_name_normalized=normalize_company_name(candidate["company"]),
             location=candidate.get("location", ""),
             description=candidate.get("description", ""),
             url=candidate.get("url", ""),

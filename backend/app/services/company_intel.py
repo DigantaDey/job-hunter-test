@@ -17,28 +17,48 @@ log = get_logger("app.company_intel")
 #: Starting output budget (the user's configured output ceiling still caps it).
 INTEL_OUTPUT_TOKENS = 800
 
+#: A cached row is "fresh" — and therefore free to serve — for this long.
+CACHE_TTL_DAYS = 30
+
+
+def get_cached_intel(db: Optional[Session], user_id: Optional[int], company: str) -> Optional[Dict[str, Any]]:
+    """A fresh (less than :data:`CACHE_TTL_DAYS` old) cached row as its
+    response dict — or ``None``.
+
+    The *single* definition of "fresh enough to serve without AI", shared by
+    the read endpoint (which must decide whether to charge) and
+    :func:`fetch_company_intel` (which must decide whether to call the model),
+    so the two can never disagree about what counts as a cache hit.
+    """
+    if not db or not user_id:
+        return None
+    existing = db.query(CompanyIntel).filter(
+        CompanyIntel.user_id == user_id, CompanyIntel.company == company
+    ).first()
+    if existing and (datetime.utcnow() - existing.updated_at).days < CACHE_TTL_DAYS:
+        return {
+            "company": existing.company,
+            "website": existing.website,
+            "industry": existing.industry,
+            "size": existing.size,
+            "funding_stage": existing.funding_stage,
+            "tech_stack": existing.tech_stack,
+            "culture": existing.culture,
+            "recent_news": existing.recent_news,
+            "summary": existing.summary,
+            "sources": existing.sources,
+            "verified": existing.verified,
+            "cached": True,
+        }
+    return None
+
 
 async def fetch_company_intel(company: str, db: Session = None, user_id: Optional[int] = None, force_refresh: bool = False) -> Dict[str, Any]:
     """Fetch or generate company intelligence."""
-    if not force_refresh and db and user_id:
-        existing = db.query(CompanyIntel).filter(CompanyIntel.user_id == user_id, CompanyIntel.company == company).first()
-        if existing:
-            # Return cached if less than 30 days old
-            if (datetime.utcnow() - existing.updated_at).days < 30:
-                return {
-                    "company": existing.company,
-                    "website": existing.website,
-                    "industry": existing.industry,
-                    "size": existing.size,
-                    "funding_stage": existing.funding_stage,
-                    "tech_stack": existing.tech_stack,
-                    "culture": existing.culture,
-                    "recent_news": existing.recent_news,
-                    "summary": existing.summary,
-                    "sources": existing.sources,
-                    "verified": existing.verified,
-                    "cached": True,
-                }
+    if not force_refresh:
+        cached = get_cached_intel(db, user_id, company)
+        if cached is not None:
+            return cached
 
     # Generate via AI. AI is a hard dependency: on failure this raises and the
     # endpoint reports the outage (pausable 503). A failed research call is

@@ -4,6 +4,85 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.10] — 2026-09-15
+
+**Storage caps are real, company-intel bills the work it does, and the hot
+endpoints stop loading whole boards.** Four defects in the monetization and
+query layers: `resumes_max`/`vault_entries_max` were enforced against
+`UsageCounter` rows that nothing ever wrote (and `jobs_max` was not enforced
+at all), so free-tier users stored unlimited rows; the company-intel
+endpoint charged the free cache-hit path and gave the paid AI run away;
+`GET /api/user-input-queue` loaded the user's *entire* job board into a dict
+on every poll; and `GET /api/jobs?company=` fetched every row matching the
+other filters and filtered in Python, applying LIMIT/OFFSET afterwards. The
+list payload also set `has_open_positions` to the `is_funded` flag — a
+semantic lie the Jobs UI rendered as an "open roles" chip.
+
+### Fixed
+
+- **Storage caps enforced by actual row count.** `resumes_max`,
+  `vault_entries_max` and `jobs_max` are now caps on the rows the user
+  actually holds (`entitlements.STORAGE_LIMITS` + `check_storage`),
+  enforced at every creation path: resume upload, vault entry create,
+  discovery (HTTP trigger 429s on a full board; the worker clamps a
+  nearly-full board to its remaining slots and reports
+  `why_empty: "jobs_cap_reached"` on a full one — a no-op by design, never
+  an over-limit insert), and the funding-radar tracked-job. Over-limit
+  answers use the standard `limit_exceeded` 429 shape with the upgrade
+  hint, and deleting a row frees a slot immediately because the rows *are*
+  the counter. `entitlements_snapshot` now reports the real
+  used/limit/remaining for these caps — the usage grid no longer shows a
+  permanent "0 used".
+- **Company-intel billing follows the work.** `GET /api/company/{name}/intel`
+  charges `company_intel_per_month` (and writes the AI ledger) only when the
+  model actually builds or refreshes the intel — cache miss, stale cache, or
+  explicit `?refresh=true`. A fresh (<30d) cache read is free: it answers
+  from the stored row and leaves the counter untouched, including for a user
+  already at their monthly limit (the paywall is on the paid work, not on
+  the read). The shared fresh-cache predicate (`get_cached_intel`) is the
+  single definition of a cache hit for both the billing decision and the AI
+  call.
+- **`GET /api/user-input-queue` joins instead of loading the board.** The
+  pending `UserInputRequest` rows are enriched with title/company/url via a
+  single `LEFT JOIN` to `jobs` — the user's whole board (20k rows on Pro+)
+  is never fetched into a dict on every poll. Pending rows whose job was
+  deleted still render, with empty job fields, exactly as before.
+- **`GET /api/jobs?company=` filters in SQL.** New
+  `jobs.company_name_normalized` column (migration `e5f6a7b8c9d0`, backfilled
+  with the app's own suffix-stripping normalizer, composite
+  `(user_id, company_name_normalized)` index) stores the normalized identity
+  at create/import time (discovery + funding-radar), so the exact-normalized
+  company match runs in SQL with LIMIT/OFFSET applied by the database.
+  Display name (`jobs.company`) is unchanged.
+- **The `has_open_positions` lie is gone.** A Job row *is* an open position,
+  so the field carried no honest meaning — it was the funding flag wearing a
+  different label. The field is removed from the list payload and the Jobs
+  UI; the funding chip remains, labelled as funding. The real
+  `has_open_positions` signal lives on the funding radar's companies.
+- **Migration chain runs clean on PostgreSQL.** The initial migration
+  created `jobs` with a foreign key to `resumes` before `resumes` existed —
+  invisible on SQLite (FKs are not validated at CREATE time), fatal on
+  PostgreSQL. Tables now create in FK-safe order, the jobs ↔ resumes cycle
+  is closed with a named FK added after both tables exist (batch-mode table
+  rebuild on SQLite), and the downgrade breaks the cycle and drops in
+  FK-safe order. `tests/conftest.py` resets the schema per dialect (PRAGMA
+  on SQLite, `DROP TABLE ... CASCADE` on PostgreSQL).
+
+### Tests
+
+- New suite (`tests/test_storage_caps_and_company_billing.py`): free users
+  hitting the resume (10), vault (20) and job (500) caps are blocked with
+  the standard 429 while one slot left still works; discovery clamps a
+  nearly-full board to exactly its remaining slots and a queued run on a
+  full board reports `jobs_cap_reached` without inserting; company-intel
+  build charges once, cache hit charges nothing, refresh charges once, and
+  a user at quota can still read the fresh cache; SQL-echo assertions prove
+  the input queue joins (no standalone board scan) and the company filter
+  runs in SQL with LIMIT; the snapshot reports real used/limit; the
+  migration backfills a populated previous-head database and is reversible.
+- Full suite green on **both** SQLite and PostgreSQL (551 tests each),
+  migrations verified fresh + populated + downgrade on both dialects.
+
 ## [2.2.9] — 2026-09-15
 
 **Auto-apply's Execute phase is alive, and discovery no longer burns a batch

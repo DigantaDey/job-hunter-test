@@ -72,14 +72,19 @@ def clean_database() -> Iterator[None]:
 
     Tables are dropped over a raw connection with foreign keys disabled — the
     schema has an intentional cycle (jobs ↔ resumes) which makes
-    ``metadata.drop_all`` unusable.
+    ``metadata.drop_all`` unusable. SQLite disables its FK enforcement with a
+    PRAGMA; PostgreSQL (no PRAGMAs) gets ``DROP TABLE ... CASCADE``, which
+    resolves the cycle the same way.
     """
+    is_sqlite = engine.dialect.name == "sqlite"
     connection = engine.raw_connection()
     try:
         cursor = connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=OFF")
+        if is_sqlite:
+            cursor.execute("PRAGMA foreign_keys=OFF")
+        suffix = "" if is_sqlite else " CASCADE"
         for table in Base.metadata.tables:
-            cursor.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cursor.execute(f'DROP TABLE IF EXISTS "{table}"{suffix}')
         connection.commit()
         cursor.close()
     finally:

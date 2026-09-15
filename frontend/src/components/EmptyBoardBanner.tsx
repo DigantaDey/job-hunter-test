@@ -14,21 +14,27 @@ import { Link } from 'react-router-dom'
  * this component only renders it, so the banner can never disagree with the
  * queue row or the run's log line.
  *
- * The fifth state is the fallback: a completed run with no `why_empty` (it found
- * jobs) on a board that is empty anyway — the jobs were deleted since, or the
- * board is filtered to something that run did not cover. It exists so the UI
- * never renders a reason-less empty state.
+ * The fourth reason is the storage cap (v2.2.10): the board already holds
+ * every job the plan allows, so discovery is a no-op by design and the fix is
+ * delete jobs or upgrade — not a source configuration or retry.
+ *
+ * The fallback state is the last one: a completed run with no `why_empty`
+ * (it found jobs) on a board that is empty anyway — the jobs were deleted
+ * since, or the board is filtered to something that run did not cover. It
+ * exists so the UI never renders a reason-less empty state.
  */
 
 /** The backend's closed vocabulary — `app.services.discovery.WHY_*`. */
 export const WHY_NO_SOURCES_CONFIGURED = 'no_sources_configured'
 export const WHY_ALL_SOURCES_FAILED = 'all_sources_failed'
 export const WHY_NO_FRESH_POSTINGS = 'no_fresh_postings'
+export const WHY_JOBS_CAP_REACHED = 'jobs_cap_reached'
 
 export const WHY_EMPTY_REASONS = [
   WHY_NO_SOURCES_CONFIGURED,
   WHY_ALL_SOURCES_FAILED,
   WHY_NO_FRESH_POSTINGS,
+  WHY_JOBS_CAP_REACHED,
 ] as const
 
 export type WhyEmpty = (typeof WHY_EMPTY_REASONS)[number]
@@ -143,13 +149,15 @@ export function EmptyBoardBanner({ lastRun, onDiscover, busy = false }: {
   const Icon = state === 'all_sources_failed' ? CloudOff
     : state === 'no_sources_configured' ? Inbox
       : state === 'no_fresh_postings' ? Timer
-        : state === 'unexplained' ? AlertTriangle
-          : Search
+        : state === 'jobs_cap_reached' ? AlertTriangle
+          : state === 'unexplained' ? AlertTriangle
+            : Search
   const headline = state === 'no_run' ? 'No discovery run yet'
     : state === 'no_sources_configured' ? 'No job sources are enabled'
       : state === 'all_sources_failed' ? 'All sources failed on the last run'
         : state === 'no_fresh_postings' ? 'Sources are healthy, but nothing fresh in the window'
-          : `Last run found ${added} ${added === 1 ? 'job' : 'jobs'} on ${formatRunDate(lastRun?.at)}; your board is empty`
+          : state === 'jobs_cap_reached' ? 'Your job board is at its storage limit'
+            : `Last run found ${added} ${added === 1 ? 'job' : 'jobs'} on ${formatRunDate(lastRun?.at)}; your board is empty`
   const retry = state === 'all_sources_failed' || state === 'no_fresh_postings'
 
   return (
@@ -190,6 +198,14 @@ export function EmptyBoardBanner({ lastRun, onDiscover, busy = false }: {
             </p>
           )}
 
+          {state === 'jobs_cap_reached' && (
+            <p className="text-xs mono text-zinc-600 dark:text-zinc-400 mt-1">
+              The last run added nothing because the board already holds every job your plan allows — discovery
+              stops instead of going over the limit. Delete jobs you no longer track, or upgrade for a bigger
+              board.
+            </p>
+          )}
+
           {state === 'unexplained' && (
             <p className="text-xs mono text-zinc-600 dark:text-zinc-400 mt-1">
               That run reported no reason to be empty, so the jobs it found were removed since (or this board is
@@ -222,8 +238,10 @@ export function EmptyBoardBanner({ lastRun, onDiscover, busy = false }: {
             <div className="text-[11px] mono text-zinc-500 mt-2" data-testid="last-run-accounting">
               Last run {formatRunDate(lastRun.at)}
               {/* A report from before v2.2.4 carries no summary: show the counts
-                  only when they were actually reported, never as zeros. */}
-              {summary ? ` • ${attempted.length} source(s) attempted • ${summary.fetched ?? 0} fetched • ${summary.fresh ?? 0} fresh` : ''}
+                  only when they were actually reported, never as zeros. The
+                  cap-reached run fetched nothing at all (by design), so its
+                  zeros would read as an outage — skip the source accounting. */}
+              {summary && state !== 'jobs_cap_reached' ? ` • ${attempted.length} source(s) attempted • ${summary.fetched ?? 0} fetched • ${summary.fresh ?? 0} fresh` : ''}
               {' '}• {added} added
               {summary?.demo_pool_enabled === false && (
                 <span title="INCLUDE_DEMO_POOL is off in this deployment">
@@ -247,6 +265,11 @@ export function EmptyBoardBanner({ lastRun, onDiscover, busy = false }: {
         </button>
         {(state === 'no_sources_configured' || state === 'all_sources_failed' || state === 'no_fresh_postings') && (
           <SourcesSettingsLink />
+        )}
+        {state === 'jobs_cap_reached' && (
+          <Link to="/pricing" className="text-xs mono font-medium underline decoration-dotted inline-flex items-center gap-1">
+            Upgrade for a bigger board
+          </Link>
         )}
       </div>
     </div>

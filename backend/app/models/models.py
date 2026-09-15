@@ -184,12 +184,21 @@ class Job(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "dedupe_key", name="uq_jobs_user_dedupe"),
         Index("ix_jobs_user_status", "user_id", "status"),
+        Index("ix_jobs_user_company_norm", "user_id", "company_name_normalized"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     title = Column(String, nullable=False)
     company = Column(String, nullable=False)
+    #: Normalised company identity for SQL-side filtering and funding linkage
+    #: (see :func:`app.services.company_normalize.normalize_company_name`):
+    #: lowercased, punctuation-stripped, legal-form suffixes dropped. Stored at
+    #: create/import time and backfilled by migration ``e5f6a7b8c9d0`` so
+    #: ``GET /api/jobs?company=`` filters in SQL (LIMIT/OFFSET applied before
+    #: any Python) instead of loading the user's whole board to filter in the
+    #: app. ``company`` stays the display name.
+    company_name_normalized = Column(String(200), default="", nullable=False)
     location = Column(String, default="")
     description = Column(Text, default="")
     url = Column(String, default="")
