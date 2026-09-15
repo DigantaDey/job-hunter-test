@@ -1,10 +1,9 @@
 """Settings validation, secret handling and outreach compliance gates."""
 from __future__ import annotations
 
-from tests.conftest import draft_email_now
-
 from app.core.security import decrypt_secret
 from app.models.models import Email, SettingsModel
+from tests.conftest import draft_email_now
 
 
 def test_settings_defaults_are_returned(client, auth):

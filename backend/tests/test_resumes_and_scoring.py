@@ -6,9 +6,9 @@ import os
 import pytest
 
 from app.models.models import Job, Resume, User
-from tests.conftest import generate_resume_now
 from app.services.resume_service import diff_text, fact_guard_check, render_profile_text, resume_text
 from app.services.scoring import jd_similarity, preliminary_score, tokenize
+from tests.conftest import generate_resume_now
 
 
 def _job(db, description: str = "Python, FastAPI, PostgreSQL, Kubernetes. Payments platform.") -> Job:
