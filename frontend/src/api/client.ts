@@ -183,4 +183,19 @@ export async function downloadResume(resumeId: number, format: 'pdf' | 'docx'): 
   return data.filename as string
 }
 
+/**
+ * Download a vault CSV export the authenticated way.
+ *
+ * The Vault page's buttons used to be bare `<a href="/api/vault/export/chrome">`
+ * links — a browser navigation sends no Authorization header, so they opened a
+ * JSON `{"detail":"Not authenticated"}` page. Same fix as `downloadResume`:
+ * fetch a short-lived signed URL with the bearer token attached, then hand the
+ * browser a URL the export endpoint will accept without that header.
+ */
+export async function downloadVaultCsv(flavour: 'chrome' | 'apple'): Promise<string> {
+  const { data } = await client.get(`/api/vault/export/${flavour}/url`)
+  window.location.assign(data.url)
+  return data.filename as string
+}
+
 export default client

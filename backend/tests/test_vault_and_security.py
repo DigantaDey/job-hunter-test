@@ -1,6 +1,8 @@
 """Vault encryption, tenant isolation, exports, audit trail and re-keying."""
 from __future__ import annotations
 
+import time
+
 import pytest
 from cryptography.fernet import InvalidToken
 
@@ -72,6 +74,62 @@ def test_vault_is_tenant_scoped(client, auth, member_auth):
                                     "password": "owner-password-1"}, headers=auth)
     assert client.get("/api/vault", headers=member_auth).json() == []
     assert "owner@example.com" not in client.get("/api/vault/export/chrome", headers=member_auth).text
+
+
+def test_vault_export_signed_url_downloads_without_auth_header(client, auth):
+    """A signed export URL mimics the SPA's no-header browser navigation."""
+    client.post("/api/vault", json={"domain": "jobs.lever.co", "username": "me@example.com",
+                                    "password": "a-strong-password"}, headers=auth)
+
+    issued = client.get("/api/vault/export/chrome/url", headers=auth)
+    assert issued.status_code == 200, issued.text
+    body = issued.json()
+    assert body["url"].startswith("/api/vault/export/chrome?token=")
+    assert body["filename"] == "jobhunter_chrome_passwords.csv"
+    assert body["expires_in"] > 0
+
+    # The browser follows the URL with *no* Authorization header.
+    download = client.get(body["url"])
+    assert download.status_code == 200, download.text
+    assert download.headers["content-type"].startswith("text/csv")
+    assert "name,url,username,password" in download.text
+    assert "me@example.com" in download.text
+
+    apple = client.get("/api/vault/export/apple/url", headers=auth).json()
+    assert client.get(apple["url"]).text.startswith("Title,URL,Username,Password")
+
+
+def test_vault_export_signed_url_is_bound_and_short_lived(client, auth, member_auth):
+    """A signed token is bound to its owner, flavour and expiry window."""
+    client.post("/api/vault", json={"domain": "jobs.lever.co", "username": "owner@example.com",
+                                    "password": "owner-password-1"}, headers=auth)
+
+    token = client.get("/api/vault/export/chrome/url", headers=auth).json()["url"].split("token=", 1)[1]
+
+    # No auth header + a valid token is exactly the SPA's navigation — it
+    # serves the owner's own CSV.
+    assert client.get(f"/api/vault/export/chrome?token={token}").status_code == 200
+
+    # A different account presenting the token (with its own bearer) still only
+    # ever receives its own data — never the owner's rows.
+    other = client.get(f"/api/vault/export/chrome?token={token}", headers=member_auth)
+    assert other.status_code == 200
+    assert "owner@example.com" not in other.text
+
+    # Wrong flavour breaks the binding.
+    assert client.get(f"/api/vault/export/apple?token={token}").status_code == 401
+
+    # Tampering with the signature is refused.
+    raw_expires, raw_uid, signature = token.split(".", 2)
+    tampered = f"{raw_expires}.{raw_uid}.{'f' * len(signature)}"
+    assert client.get(f"/api/vault/export/chrome?token={tampered}").status_code == 401
+
+    # An expired token is refused.
+    expired = f"{int(time.time()) - 10}.{raw_uid}.{signature}"
+    assert client.get(f"/api/vault/export/chrome?token={expired}").status_code == 401
+
+    # Bearer auth still works first-class.
+    assert client.get("/api/vault/export/chrome", headers=auth).status_code == 200
 
 
 def test_delete_forever_removes_everything(client, auth, db):
