@@ -4,6 +4,57 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.17] — 2026-09-16
+
+**The dashboard stopped failing silently — and its pipeline counters stopped
+freezing.** The page fired five reads in parallel on mount (summary, recent
+jobs, performance, profile, billing) and swallowed every failure: a zero-filled
+summary object, an empty job list, a `null` card. A user whose backend was down
+got an all-zero dashboard with no explanation, or — on the paths where a read
+was still settling when the others had given up — a "Loading dashboard…" screen
+that never resolved and offered no retry. The summary read, which carries the
+"Running / Completed / Failed" pipeline counters and the quota lines, was
+one-shot, so every number on the page went stale until a full page reload.
+
+### Fixed
+
+- **Every error path now ends in something the user can act on.** Each of the
+  five reads settles independently: a success applies its data and clears that
+  section's error, a failure records a human message from `apiError`. When every
+  read fails, the page swaps to an error card with a **Retry** button (which
+  shows "Retrying…" while the attempt is in flight) that re-fetches all five —
+  and re-failing lands back on the same card. When only some reads fail, the
+  page renders everything that loaded and shows a non-blocking banner naming
+  each failed section with its own message, with a retry that re-fetches
+  *exactly* the failed sections; the ones that succeeded are never re-fetched.
+  A failed summary read renders the page with zero-filled cards under that
+  banner instead of crashing on a missing field. The loading screen now ends at
+  the summary's first verdict — success *or* failure — and every request is
+  bounded by the client's 30 s timeout, so no error path can sit on the spinner.
+
+### Added
+
+- **The summary polls while the tab is visible.** `SUMMARY_POLL_MS` (30 s,
+  beside `AUTOMATION_POLL_MS` on Settings) re-reads `/api/dashboard/summary` so
+  the pipeline counters and quota lines stay live without a reload, under the
+  same visibility-aware discipline as the rest of the app: a hidden tab polls
+  nothing, becoming visible re-reads at once and resumes the cadence, a failed
+  tick keeps the last read (the counters are a refresh, never a reset — and a
+  failed tick raises no banner), and the poll arms only once the summary has
+  actually loaded. The timer and the `visibilitychange` listener are both
+  cleared on unmount.
+
+- **`pages/__tests__/DashboardErrorRecovery.test.tsx`** pins both halves: the
+  spinner never outlives the summary's first verdict; all five failing shows the
+  error card with a working retry (and a second all-failed round lands back on
+  it); partial failure renders the loaded data, names the failed sections in
+  the banner, and the banner's retry re-fetches only those — asserted per
+  endpoint, so a regression that re-fetches the whole page fails; and the poll
+  itself — 30 s cadence visible only, silence while hidden (including a tab
+  opened hidden), immediate re-read on becoming visible, last-read kept on a
+  failed tick, no polling before the summary has ever loaded, and unmount
+  cleanup of both the timer and the listener.
+
 ## [2.2.16] — 2026-09-16
 
 **The Queues page stopped asking the backend the same three questions twenty

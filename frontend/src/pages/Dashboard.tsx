@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
-import client from '../api/client'
-import { Briefcase, CheckCircle, AlertTriangle, Clock, Mail, FileText, Vault, Sparkles, TrendingUp, ArrowRight, Activity, Search, ListChecks, Zap, BarChart3, Target, Brain, DollarSign, Bell } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import client, { apiError } from '../api/client'
+import { Briefcase, CheckCircle, AlertTriangle, Clock, Mail, FileText, Vault, Sparkles, TrendingUp, ArrowRight, Activity, Search, ListChecks, Zap, BarChart3, Target, Brain, DollarSign, Bell, RefreshCw } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { fmtRelativeToNow } from '../lib/automation'
 import { creditLabel, usagePercent } from '../lib/credits'
@@ -8,39 +8,199 @@ import { useAIWork } from '../context/AIWorkContext'
 import { StateIcon } from '../components/AIWorkChip'
 import { describeRow, deriveState, toneClasses } from '../lib/aiWork'
 
+/**
+ * The dashboard's five independent reads (P1 #4 error recovery).
+ *
+ * All five load in parallel on mount and each settles on its own:
+ *   • success → apply the data and clear the section's error;
+ *   • failure → record a human message (`apiError`) and keep what did load.
+ * The page renders everything that succeeded and names what failed in a
+ * banner whose retry re-fetches exactly the failed sections; only when every
+ * read fails does the page swap to a full error card with a Retry button.
+ * No error path can spin forever: the loading screen is a `loading` state
+ * that closes on the summary's first verdict — success or failure — and every
+ * request is bounded by the client's 30 s timeout.
+ */
+type Section = 'summary' | 'jobs' | 'performance' | 'profile' | 'billing'
+
+const SECTION_LABEL: Record<Section, string> = {
+  summary: 'Dashboard summary',
+  jobs: 'Recent jobs',
+  performance: 'Application analytics',
+  profile: 'Profile',
+  billing: 'Billing',
+}
+
+const SECTIONS: { key: Section; label: string; url: string }[] = [
+  { key: 'summary', label: SECTION_LABEL.summary, url: '/api/dashboard/summary' },
+  { key: 'jobs', label: SECTION_LABEL.jobs, url: '/api/jobs?limit=6' },
+  { key: 'performance', label: SECTION_LABEL.performance, url: '/api/analytics/performance' },
+  { key: 'profile', label: SECTION_LABEL.profile, url: '/api/profile/current' },
+  { key: 'billing', label: SECTION_LABEL.billing, url: '/api/billing/subscription' },
+]
+const ALL_SECTIONS = SECTIONS.map(s => s.key)
+
+/** How often the summary re-reads while the tab is visible (Settings' auto-mode card uses the same cadence). */
+const SUMMARY_POLL_MS = 30_000
+
+/** Zero state applied when the summary read fails: the page renders 0s under the error banner instead of crashing on a missing field. */
+const EMPTY_SUMMARY = { jobs: {}, emails: {}, resumes: { total: 0, pending_approval: 0 }, vault: 0, user_input: 0 }
+
 export default function Dashboard() {
   const [summary, setSummary] = useState<any>(null)
   const [jobs, setJobs] = useState<any[]>([])
   const [performance, setPerformance] = useState<any>(null)
   const [profile, setProfile] = useState<any>(null)
   const [billing, setBilling] = useState<any>(null)
+  // True until the summary's *first* verdict (success OR failure). The loading
+  // screen is this flag and nothing else: it is set once, closed once, and a
+  // later retry can never re-enter it.
+  const [loading, setLoading] = useState(true)
+  // Failed reads, keyed by section, each with a human message — empty means everything loaded.
+  const [errors, setErrors] = useState<Partial<Record<Section, string>>>({})
+  // Sections whose request is in flight right now (initial load or a retry).
+  const [pending, setPending] = useState<Section[]>([])
+  // True once the summary has loaded: only then does the poll below have a value to refresh.
+  const [summaryOk, setSummaryOk] = useState(false)
+  const mounted = useRef(true)
   // Live layer (v2.2.8): the queue counters below come from the polled
   // snapshot when it is available, so the dashboard's "Running" and "Open
   // queues" numbers move while work is in flight instead of freezing at the
   // value fetched on mount.
   const work = useAIWork()
 
-  useEffect(()=>{
-    let cancelled = false
-    client.get('/api/dashboard/summary')
-      .then(r=>{ if (!cancelled) setSummary(r.data) })
-      .catch(()=>{ if (!cancelled) setSummary({ jobs: {}, emails: {}, resumes: {total:0,pending_approval:0}, vault: 0, user_input: 0 }) })
-    client.get('/api/jobs?limit=6')
-      .then(r=>{ if (!cancelled) setJobs((r.data || []).slice(0, 6)) })
-      .catch(()=>{ if (!cancelled) setJobs([]) })
-    client.get('/api/analytics/performance')
-      .then(r=>{ if (!cancelled) setPerformance(r.data) })
-      .catch(()=>{ if (!cancelled) setPerformance(null) })
-    client.get('/api/profile/current')
-      .then(r=>{ if (!cancelled) setProfile(r.data) })
-      .catch(()=>{ if (!cancelled) setProfile(null) })
-    client.get('/api/billing/subscription')
-      .then(r=>{ if (!cancelled) setBilling(r.data) })
-      .catch(()=>{ if (!cancelled) setBilling(null) })
-    return ()=>{ cancelled = true }
-  },[])
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
-  if(!summary) return <div className="p-8 mono text-sm">Loading dashboard…</div>
+  const applySection = (key: Section, data: any) => {
+    switch (key) {
+      case 'summary': setSummary(data); setSummaryOk(true); break
+      case 'jobs': setJobs((data || []).slice(0, 6)); break
+      case 'performance': setPerformance(data); break
+      case 'profile': setProfile(data); break
+      case 'billing': setBilling(data); break
+    }
+  }
+
+  /**
+   * Remove `key` from the in-flight set. On the summary's *first* verdict it
+   * also closes the loading screen — success and failure both count as a
+   * verdict, which is what guarantees no error path can sit on the spinner.
+   * (A re-fetch for a retry does not touch `loading`: it is already closed,
+   * and the retry shows "Retrying…" on its button instead.)
+   */
+  const settle = (key: Section) => {
+    setPending(p => p.filter(k => k !== key))
+    if (key === 'summary') setLoading(false)
+  }
+
+  /**
+   * Fetch one or more sections (all five on first load). Each request settles
+   * independently, so a slow or failed read can neither hold the page hostage
+   * nor hide the others: a success clears that section's error, a failure
+   * records it. The summary's failure also applies `EMPTY_SUMMARY`, which is
+   * what keeps every card below null-safe while the banner explains why.
+   */
+  const load = (keys?: Section[]) => {
+    const targets = (keys && keys.length > 0 ? keys : ALL_SECTIONS).filter(k => !pending.includes(k))
+    if (targets.length === 0) return
+    setPending(p => [...p, ...targets])
+    for (const section of SECTIONS) {
+      if (!targets.includes(section.key)) continue
+      client.get(section.url)
+        .then(r => {
+          if (!mounted.current) return
+          applySection(section.key, r.data)
+          setErrors(prev => { if (!(section.key in prev)) return prev; const next = { ...prev }; delete next[section.key]; return next })
+          settle(section.key)
+        })
+        .catch(e => {
+          if (!mounted.current) return
+          if (section.key === 'summary') setSummary(EMPTY_SUMMARY)
+          setErrors(prev => ({ ...prev, [section.key]: apiError(e) }))
+          settle(section.key)
+        })
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  /**
+   * Live summary (P1 #4): the mount fetch is one-shot, so the "Running /
+   * Completed / Failed" counters and the quota lines go stale. Re-read the
+   * summary every 30 s while the tab is *visible* — the same visibility-aware
+   * cadence as Settings' auto-mode card: a hidden tab polls nothing, becoming
+   * visible re-reads at once instead of waiting out the interval, and a failed
+   * tick keeps the last read (the counters are a refresh, never a reset).
+   */
+  useEffect(() => {
+    if (!summaryOk) return
+    let timer: ReturnType<typeof setInterval> | null = null
+    const tick = async () => {
+      try {
+        const r = await client.get('/api/dashboard/summary')
+        if (mounted.current) {
+          setSummary(r.data)
+          setErrors(prev => { if (!('summary' in prev)) return prev; const next = { ...prev }; delete next.summary; return next })
+        }
+      } catch {
+        // Keep the last read: a late tick must not blank a working page.
+      }
+    }
+    const start = (readNow = false) => {
+      if (readNow) void tick()
+      if (timer) return
+      timer = setInterval(() => void tick(), SUMMARY_POLL_MS)
+    }
+    const stop = () => { if (timer) clearInterval(timer); timer = null }
+    const onVisibility = () => {
+      if (typeof document === 'undefined') return
+      if (document.visibilityState === 'hidden') stop()
+      else start(true)
+    }
+    // The summary's first read just settled — arm the interval without a
+    // duplicate read, and arm nothing at all behind a hidden tab.
+    if (typeof document === 'undefined' || document.visibilityState !== 'hidden') start(false)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => { stop(); document.removeEventListener('visibilitychange', onVisibility) }
+  }, [summaryOk])
+
+  const failedSections = ALL_SECTIONS.filter(k => k in errors)
+  const allFailed = failedSections.length === ALL_SECTIONS.length
+  const retrying = (keys: Section[]) => keys.some(k => pending.includes(k))
+
+  // The loading screen is one state owned by one flag: `loading` is true only
+  // until the summary's first verdict, and both outcomes close it — success
+  // stores the data, failure stores `EMPTY_SUMMARY` and falls through to the
+  // error card or the page-with-banner below. Every request is bounded by the
+  // client's 30 s timeout, so no error path can ever sit on this screen, and
+  // because the flag only ever closes, a retry can never send the user back
+  // here (it shows "Retrying…" on its own button instead).
+  if (loading)
+    return <div className="p-8 mono text-sm">Loading dashboard…</div>
+
+  if (allFailed) {
+    const busy = retrying(ALL_SECTIONS)
+    return (
+      <div className="p-8">
+        <div role="alert" className="card max-w-lg mx-auto p-8 text-center">
+          <AlertTriangle className="w-10 h-10 mx-auto text-red-500" />
+          <h2 className="mt-4 text-lg font-semibold">Couldn't load the dashboard</h2>
+          <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">{errors.summary || 'Something went wrong.'} Every section failed to load.</p>
+          <button
+            onClick={() => load()}
+            disabled={busy}
+            className="mt-6 inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <RefreshCw className={`w-4 h-4 ${busy ? 'animate-spin' : ''}`} />
+            {busy ? 'Retrying…' : 'Retry'}
+          </button>
+        </div>
+      </div>
+    )
+  }
 
   const ent = summary.entitlements
   const plan = ent?.plan || 'free'
@@ -94,6 +254,32 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
+      {/* Partial failure (P1 #4): everything that loaded renders below; the
+          reads that did not are named here, each with its own message and a
+          retry that re-fetches exactly those sections — never the whole page. */}
+      {failedSections.length > 0 && (
+        <div role="alert" className="card p-4 border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/50">
+          <div className="flex items-center gap-2 text-sm font-medium text-amber-900 dark:text-amber-100">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            {failedSections.length === 1
+              ? `${SECTION_LABEL[failedSections[0]]} failed to load`
+              : `${failedSections.length} parts of the dashboard failed to load`}
+          </div>
+          <ul className="mt-2 space-y-0.5 text-xs mono text-amber-800 dark:text-amber-200">
+            {failedSections.map(k => (
+              <li key={k}><span className="font-medium">{SECTION_LABEL[k]}:</span> {errors[k]}</li>
+            ))}
+          </ul>
+          <button
+            onClick={() => load(failedSections)}
+            disabled={retrying(failedSections)}
+            className="mt-3 text-xs font-medium text-amber-900 dark:text-amber-100 underline decoration-dotted underline-offset-2 disabled:opacity-60"
+          >
+            {retrying(failedSections) ? 'Retrying…' : `Retry ${failedSections.length > 1 ? 'these sections' : 'this section'} →`}
+          </button>
+        </div>
+      )}
+
       {/* hero — command center positioning */}
       <div className="card p-6 bg-gradient-to-br from-zinc-900 to-zinc-800 dark:from-zinc-900 dark:to-black text-white border-zinc-800 overflow-hidden relative">
         <div className="absolute -right-20 -top-20 w-72 h-72 bg-gradient-to-br from-blue-600/20 to-violet-600/20 rounded-full blur-3xl" />
