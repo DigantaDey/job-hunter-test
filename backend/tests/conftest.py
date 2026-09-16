@@ -49,6 +49,11 @@ os.environ.update(
         # from .env.example, which ships METRICS_PORT=9464) must not move the
         # metrics endpoint off /api/metrics for the suite.
         "METRICS_PORT": "0",
+        # AI gateway now reuses the shared HTTP client which has the SSRF guard.
+        # Hermetic AI tests drive a local server on 127.0.0.1, so private must be
+        # allowed in the test environment — the guard still applies to real
+        # provider URLs in production (public by default).
+        "OUTBOUND_ALLOW_PRIVATE": "true",
     }
 )
 
@@ -119,6 +124,44 @@ def clean_edge_state() -> Iterator[None]:
     reset_rate_limits()
     yield
     reset_rate_limits()
+
+
+@pytest.fixture(autouse=True)
+def _allow_private_for_real_ai(monkeypatch, request):
+    """Real AI tests drive a local HTTP server on 127.0.0.1.
+
+    The shared HTTP client (used by the AI gateway after P1 #5) installs the
+    SSRF guard, which blocks loopback by default. For hermetic real_ai tests
+    the guard must allow private/loopback so the in-process provider is
+    reachable — the production guard still applies to real provider URLs.
+    The test environment now sets OUTBOUND_ALLOW_PRIVATE=true by default,
+    but this fixture ensures the flag is set and caches are cleared even if
+    a previous test flipped it.
+    """
+    if request.node.get_closest_marker("real_ai"):
+        monkeypatch.setattr(settings, "outbound_allow_private", True, raising=False)
+        try:
+            from app.services.net_guard import clear_dns_cache
+            clear_dns_cache()
+        except Exception:
+            pass
+        try:
+            from app.services import http as http_service
+            http_service._client = None
+        except Exception:
+            pass
+    yield
+    if request.node.get_closest_marker("real_ai"):
+        try:
+            from app.services.net_guard import clear_dns_cache
+            clear_dns_cache()
+        except Exception:
+            pass
+        try:
+            from app.services import http as http_service
+            http_service._client = None
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #

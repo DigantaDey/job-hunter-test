@@ -51,6 +51,7 @@ from app.core.config import ai_token_budget, settings
 from app.core.logging import get_logger, user_id_var
 from app.core.metrics import inc, observe, set_gauge
 from app.core.rate_limiter import rate_limiter
+from app.services.http import get_client as get_http_client
 
 log = get_logger("app.ai")
 
@@ -1228,6 +1229,11 @@ async def chat_completion(
         client_timeout = httpx.Timeout(effective_timeout, connect=connect_timeout)
         last_error: Optional[str] = None
 
+        # Reuse the process-wide pooled client (connection reuse, SSRF guard,
+        # per-host politeness) — per-request timeout override preserves the
+        # long generation budget (up to 600s for reasoning models).
+        http_client = await get_http_client()
+
         # State accumulated across the wire attempts of this logical call.
         parsed_result: Optional[Dict[str, Any]] = None   # JSON mode success
         text_result: Optional[str] = None                # text mode success
@@ -1243,8 +1249,9 @@ async def chat_completion(
             started = time.perf_counter()
             try:
                 async with _sem():
-                    async with httpx.AsyncClient(timeout=client_timeout) as client:
-                        response = await client.post(url, headers=headers, json=payload)
+                    response = await http_client.post(
+                        url, headers=headers, json=payload, timeout=client_timeout
+                    )
             except httpx.TimeoutException as exc:
                 # httpx stringifies timeouts as "" — the message is built
                 # explicitly so the detail is never blank. The phase matters:
@@ -1649,10 +1656,13 @@ async def _ping_with_config(cfg: Dict[str, Any], timeout: int) -> Dict[str, Any]
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     started = time.perf_counter()
 
+    # Reuse the shared pooled client (SSRF guard, connection reuse). Per-request
+    # timeout override keeps the probe budget (``timeout``) intact.
+    http_client = await get_http_client()
+
     # Stage 1 — cheap models listing (sufficient on most providers).
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(f"{base}/models", headers=headers)
+        response = await http_client.get(f"{base}/models", headers=headers, timeout=timeout)
     except httpx.TimeoutException as exc:
         # The endpoint may be reachable but slow (httpx stringifies timeouts
         # as "" — say so explicitly). NOT cached: slowness is transient.
@@ -1685,12 +1695,12 @@ async def _ping_with_config(cfg: Dict[str, Any], timeout: int) -> Dict[str, Any]
     # so verify with the endpoint the product actually uses. A minimal
     # request keeps the cost at ~1 token.
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            probe = await client.post(
-                f"{base}/chat/completions",
-                headers=headers,
-                json={"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
-            )
+        probe = await http_client.post(
+            f"{base}/chat/completions",
+            headers=headers,
+            json={"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+            timeout=timeout,
+        )
     except httpx.TimeoutException:
         # The chat endpoint was reached but is slow (reasoning models "think"
         # even for a 1-token ping) — that is a wait problem, not proof the
