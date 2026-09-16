@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import hashlib
+import hmac
+import time
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 from app.api.deps import CurrentUser, DbSession
 from app.core import audit
+from app.core.config import settings
 from app.core.entitlements import enforce
-from app.core.logging import get_logger
-from app.models.models import VaultEntry
+from app.core.logging import get_logger, user_id_var
+from app.core.security import constant_time_equals
+from app.models.models import User, VaultEntry
 from app.schemas.schemas import VaultOut
 from app.services.vault import (
     VaultDecryptionError,
@@ -54,6 +59,104 @@ def _audit_export(
             ", ".join(str(i) for i in result.undecryptable),
         )
     audit.audit(db, "vault.exported", user=user, target=flavour, detail=detail, request=request)
+
+
+# --------------------------------------------------------------------------- #
+# Signed CSV download URLs (same pattern as resume downloads)
+#
+# ``GET /api/vault/export/chrome`` and ``/apple`` answer the CSV body directly,
+# but the SPA's download buttons are plain ``<a href>`` links, which carry no
+# Authorization header. Fetching a short-lived signed URL first keeps the
+# click authenticated while still letting the browser trigger the native
+# download. The CSV endpoints themselves only gain an optional signed ``token``
+# query parameter the browser navigation can present.
+# --------------------------------------------------------------------------- #
+EXPORT_TOKEN_TTL_SECONDS = 900
+
+
+def _sign_export(user_id: int, flavour: str, expires: int) -> str:
+    message = f"{user_id}:{flavour}:{expires}".encode()
+    return hmac.new(settings.secret_key.encode(), message, hashlib.sha256).hexdigest()
+
+
+def create_export_token(user_id: int, flavour: str,
+                        ttl: int = EXPORT_TOKEN_TTL_SECONDS) -> str:
+    """``expires.user_id.signature`` — the user id stays in the clear so a
+    token-only request can be attributed to its owner, while the signature
+    (over user id + flavour + expiry, keyed by the app secret) makes it tamper
+    evident and unusable for any other user or format."""
+    expires = int(time.time()) + max(30, ttl)
+    return f"{expires}.{user_id}.{_sign_export(user_id, flavour, expires)}"
+
+
+def verify_export_token(token: Optional[str], flavour: str) -> tuple[bool, Optional[int]]:
+    """Return (valid, user_id) for a signed export token, or (False, None)."""
+    try:
+        raw_expires, raw_user_id, signature = str(token).split(".", 2)
+        expires = int(raw_expires)
+        user_id = int(raw_user_id)
+    except (ValueError, AttributeError):
+        return False, None
+    if expires < int(time.time()):
+        return False, None
+    expected = _sign_export(user_id, flavour, expires)
+    return constant_time_equals(expected, signature), user_id
+
+
+@router.get("/export/{flavour}/url")
+def export_url(flavour: str, user: CurrentUser):
+    """Issue a short-lived signed URL the CSV export endpoint will accept."""
+    if flavour not in ("chrome", "apple"):
+        raise HTTPException(400, "flavour must be 'chrome' or 'apple'")
+    token = create_export_token(user.id, flavour)
+    return {
+        "url": f"/api/vault/export/{flavour}?token={token}",
+        "filename": ("jobhunter_chrome_passwords.csv" if flavour == "chrome"
+                     else "jobhunter_apple_passwords.csv"),
+        "expires_in": EXPORT_TOKEN_TTL_SECONDS,
+    }
+
+
+def _resolve_exporter(request: Request, db: DbSession, flavour: str, token: Optional[str]) -> Any:
+    """Bearer token first (API clients / dev mode); otherwise a valid signed
+    token. The SPA's navigation sends no Authorization header, so the signed
+    token is the only credential a browser download presents. When *both* are
+    present they must agree — a bearer for one account combined with a signed
+    token minted for another is refused rather than silently using whichever
+    was checked first."""
+    from fastapi.security import HTTPAuthorizationCredentials
+
+    from app.core.auth import get_current_user
+
+    header = request.headers.get("authorization") or ""
+    credentials = None
+    if header.lower().startswith("bearer "):
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=header[7:].strip())
+
+    bearer_user: Any = None
+    try:
+        user = get_current_user(request=request, credentials=credentials, db=db)
+        if user:
+            bearer_user = user
+    except HTTPException:
+        pass
+
+    token_user: Any = None
+    if token:
+        valid, user_id = verify_export_token(token, flavour)
+        if valid and user_id is not None:
+            token_user = db.query(User).filter(User.id == user_id, User.is_active.is_(True)).first()
+
+    if bearer_user is not None and token_user is not None:
+        if bearer_user.id != token_user.id:
+            raise HTTPException(401, "Credential mismatch")
+        return bearer_user
+    resolved = token_user or bearer_user
+    if resolved is not None:
+        request.state.user_id = resolved.id
+        user_id_var.set(int(resolved.id))
+        return resolved
+    raise HTTPException(401, "Not authenticated")
 
 
 @router.get("", response_model=list[VaultOut])
@@ -104,7 +207,8 @@ def reveal(entry_id: int, request: Request, user: CurrentUser, db: DbSession):
 
 
 @router.get("/export/chrome")
-def export_chrome(request: Request, user: CurrentUser, db: DbSession):
+def export_chrome(request: Request, db: DbSession, token: Optional[str] = None):
+    user = _resolve_exporter(request, db, "chrome", token)
     entries = list_vault_entries(db, user.id)
     result = export_chrome_csv(entries)
     _audit_export(db, user, request, "chrome", entries, result)
@@ -117,7 +221,8 @@ def export_chrome(request: Request, user: CurrentUser, db: DbSession):
 
 
 @router.get("/export/apple")
-def export_apple(request: Request, user: CurrentUser, db: DbSession):
+def export_apple(request: Request, db: DbSession, token: Optional[str] = None):
+    user = _resolve_exporter(request, db, "apple", token)
     entries = list_vault_entries(db, user.id)
     result = export_apple_csv(entries)
     _audit_export(db, user, request, "apple", entries, result)

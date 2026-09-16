@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import client from '../api/client'
+import client, { downloadVaultCsv } from '../api/client'
 import { Vault as VaultIcon, Download, Trash2, Shield, ExternalLink, KeyRound } from 'lucide-react'
 
 export default function Vault(){
@@ -13,8 +13,8 @@ export default function Vault(){
 
       <div className="card p-5">
         <div className="flex flex-wrap gap-2">
-          <a href="/api/vault/export/chrome" className="px-4 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm inline-flex items-center gap-2"><Download className="w-4 h-4"/> Download Chrome CSV</a>
-          <a href="/api/vault/export/apple" className="px-4 py-2 rounded-full border dark:border-zinc-700 text-sm inline-flex items-center gap-2"><Download className="w-4 h-4"/> Download Apple Keychain CSV</a>
+          <button onClick={()=>void downloadVaultCsv('chrome')} className="px-4 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm inline-flex items-center gap-2 focus:outline-none focus:ring-2 focus:ring-blue-500"><Download className="w-4 h-4"/> Download Chrome CSV</button>
+          <button onClick={()=>void downloadVaultCsv('apple')} className="px-4 py-2 rounded-full border dark:border-zinc-700 text-sm inline-flex items-center gap-2 focus:outline-none focus:ring-2 focus:ring-blue-500"><Download className="w-4 h-4"/> Download Apple Keychain CSV</button>
           <button onClick={async()=>{ if(confirm('Delete ALL credentials forever? This cannot be undone.')){ await client.delete('/api/vault'); load() } }} className="px-4 py-2 rounded-full bg-red-600 text-white text-sm inline-flex items-center gap-2"><Trash2 className="w-4 h-4"/> Delete all forever</button>
         </div>
         <div className="mt-3 text-xs mono text-zinc-500 flex items-start gap-2"><Shield className="w-4 h-4 shrink-0"/> Passwords encrypted (Fernet). Exports: Chrome format (name,url,username,password) • Apple format (Title,URL,Username,Password,Notes,OTPAuth). Choose your platform import.</div>
