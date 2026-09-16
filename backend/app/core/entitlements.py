@@ -14,7 +14,7 @@ All features remain available in Free tier — limits differentiate.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, Type
 
 from sqlalchemy import func
@@ -284,20 +284,170 @@ def current_period() -> str:
     return datetime.utcnow().strftime("%Y-%m")
 
 
-def get_user_plan(db: Session, user_id: int) -> str:
-    """Resolve user's current plan, default free."""
+# These are deliberately kept here, next to plan resolution, rather than in a
+# billing router.  A provider can add a new status at any time; an entitlement
+# reader must fail closed until the application knows what that status means.
+KNOWN_SUBSCRIPTION_STATUSES = frozenset({
+    "active",
+    "trialing",
+    "past_due",
+    "canceled",
+    "cancelled",
+    "expired",
+    "incomplete",
+    "incomplete_expired",
+    "unpaid",
+    "paused",
+})
+
+
+def _naive_utc(moment: Optional[datetime] = None) -> datetime:
+    """Return a comparable, naive UTC timestamp.
+
+    Subscription columns are ``DateTime`` values stored as naive UTC.  SQLite
+    accepts aware values in tests but returns them naive, while a PostgreSQL
+    driver/configuration may hand an aware value back.  Normalising at the
+    boundary avoids a timezone comparison turning an expiry check into a 500.
+    """
+    value = moment or datetime.utcnow()
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _subscription_has_expired(sub: Subscription, now: datetime) -> bool:
+    """Apply date-based state transitions to one subscription row.
+
+    Returns whether the row was changed.  A non-null ``trial_end`` is treated
+    as an unpaid trial marker until the verified billing path clears it on an
+    ``invoice.paid`` event.  That is important for older rows which were stored
+    as ``active`` during a trial rather than ``trialing``.
+    """
+    status = str(sub.status or "").strip().lower()
+
+    # ``past_due`` is intentionally first: the existing grace contract lets a
+    # customer keep the plan through the grace window even if the provider's
+    # period boundary has already passed.  Equality is expired, just as the
+    # old get_user_plan implementation used a strict ``>`` comparison.
+    if status == "past_due":
+        if sub.grace_until is not None and _naive_utc(sub.grace_until) > now:
+            return False
+        if sub.status != "expired":
+            sub.status = "expired"
+            return True
+        return False
+
+    # Canceled/expired subscriptions retain their old grace behaviour.  A
+    # grace window is a temporary entitlement, not a reason to reset the dates.
+    if status in ("canceled", "cancelled", "expired"):
+        if sub.grace_until is not None and _naive_utc(sub.grace_until) > now:
+            return False
+        if status != "expired":
+            sub.status = "expired"
+            return True
+        return False
+
+    # Incomplete (and other non-entitled known states) must remain non-entitled
+    # until the verified invoice-paid path changes the row to active.  Do not
+    # turn it into ``expired`` here: doing so would erase the useful distinction
+    # between an unpaid checkout and a lapsed paid period.
+    if status not in ("active", "trialing"):
+        return False
+
+    # A trial_end is only cleared by a verified payment renewal.  Therefore an
+    # elapsed trial always expires, even when the old row says ``active``.
+    if sub.trial_end is not None and _naive_utc(sub.trial_end) <= now:
+        sub.status = "expired"
+        # A grace window belongs to a payment failure/cancellation, not to an
+        # unpaid trial.  Do not let stale data turn an expired trial back into a
+        # paid entitlement through the canceled/expired grace rule.
+        sub.grace_until = None
+        return True
+
+    # No provider renewal has been observed after this period boundary.  The
+    # webhook code renews this date only for a verified payment event, never from
+    # an arbitrary request/payload date.
+    if sub.current_period_end is not None and _naive_utc(sub.current_period_end) <= now:
+        sub.status = "expired"
+        sub.grace_until = None
+        return True
+
+    return False
+
+
+def effective_subscription(
+    db: Session,
+    user_id: int,
+    *,
+    now: Optional[datetime] = None,
+    persist: bool = True,
+) -> Optional[Subscription]:
+    """Return a user's subscription after applying date-based expiry.
+
+    This is the single state resolver used by request-time entitlement checks
+    and by the background expiry sweep.  It performs one indexed subscription
+    lookup and commits only when a date transition is needed, so ordinary calls
+    do not write.  ``persist=False`` is for the nightly batch, which applies
+    all flips and commits once at the end.
+
+    The returned row is also useful to callers that need to display the
+    subscription, but callers must still use :func:`get_user_plan` for the
+    entitlement decision: unknown, incomplete, unpaid, paused, and invalid
+    plans all resolve to free below.
+    """
     sub = db.query(Subscription).filter(Subscription.user_id == user_id).first()
+    if sub is None:
+        return None
+
+    changed = _subscription_has_expired(sub, _naive_utc(now))
+    if changed and persist:
+        db.commit()
+    return sub
+
+
+def expire_subscriptions(db: Session, *, now: Optional[datetime] = None) -> int:
+    """Run the durable subscription expiry pass used by the worker/scheduler.
+
+    It intentionally scans subscription rows rather than users: there is one
+    row per user, the table is indexed by ``user_id``, and this keeps the pass
+    independent of whether a user has enabled auto mode or has called the API.
+    All due transitions are committed together.  The return value is an
+    operator-friendly count of rows flipped during the pass.
+    """
+    moment = _naive_utc(now)
+    subscriptions = db.query(Subscription).all()
+    changed = 0
+    for sub in subscriptions:
+        before = str(sub.status or "")
+        # Use the same resolver as request-time entitlement checks.  The batch
+        # suppresses per-row commits and commits once below, but it must not
+        # grow a second, subtly different expiry implementation.
+        effective = effective_subscription(db, int(sub.user_id), now=moment, persist=False)
+        if effective is not None and str(effective.status or "") != before:
+            changed += 1
+    if changed:
+        db.commit()
+    return changed
+
+
+def get_user_plan(db: Session, user_id: int) -> str:
+    """Resolve the effective plan, failing closed for unpaid/unknown states."""
+    sub = effective_subscription(db, user_id)
     if not sub:
         return "free"
-    if sub.status in ("canceled", "expired"):
-        if sub.grace_until and sub.grace_until > datetime.utcnow():
-            return sub.plan
+
+    status = str(sub.status or "").strip().lower()
+    if status not in KNOWN_SUBSCRIPTION_STATUSES:
         return "free"
-    if sub.status == "past_due":
-        if sub.grace_until and sub.grace_until > datetime.utcnow():
-            return sub.plan
+    if status in ("incomplete", "incomplete_expired", "unpaid", "paused"):
         return "free"
-    return sub.plan or "free"
+    if status in ("canceled", "cancelled", "expired", "past_due"):
+        if not sub.grace_until or _naive_utc(sub.grace_until) <= _naive_utc():
+            return "free"
+
+    # A malformed plan must not accidentally become a paid entitlement either.
+    plan = str(sub.plan or "free").strip().lower()
+    return plan if plan in PLANS else "free"
 
 
 def get_plan_config(plan: str) -> Dict[str, Any]:

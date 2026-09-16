@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
+from sqlalchemy import func
 
 from app.api.deps import CurrentUser, DbSession
 from app.api.routers.auth import login_throttle_state
@@ -173,10 +174,21 @@ def dashboard(user: CurrentUser, db: DbSession):
     outreach_pending = db.query(Email).filter(Email.user_id == user.id, Email.status == "pending_approval").count()
     outreach_replies = db.query(Email).filter(Email.user_id == user.id, Email.opens > 0).count()
 
-    # AI usage
-    ai_month = db.query(AICreditLedger).filter(AICreditLedger.user_id == user.id, AICreditLedger.created_at >= month_start).all()
-    ai_tokens_used = sum(r.total_tokens for r in ai_month)
-    ai_cost = sum(r.estimated_cost_usd for r in ai_month)
+    # AI usage: aggregate in SQL rather than materialising every ledger row for
+    # the month.  ``COUNT(*)`` preserves the operations metric without loading
+    # the rows themselves into Python.
+    ai_tokens_used, ai_cost, ai_operations_month = (
+        db.query(
+            func.coalesce(func.sum(AICreditLedger.total_tokens), 0),
+            func.coalesce(func.sum(AICreditLedger.estimated_cost_usd), 0.0),
+            func.count(),
+        )
+        .filter(AICreditLedger.user_id == user.id, AICreditLedger.created_at >= month_start)
+        .one()
+    )
+    ai_tokens_used = int(ai_tokens_used or 0)
+    ai_cost = float(ai_cost or 0.0)
+    ai_operations_month = int(ai_operations_month or 0)
 
     # Performance
     total_jobs = db.query(Job).filter(Job.user_id == user.id).count()
@@ -246,7 +258,7 @@ def dashboard(user: CurrentUser, db: DbSession):
             "cost_usd": round(ai_cost, 4),
             "remaining": entitlements["usage"].get("ai_credits_per_month", {}).get("remaining", 0) if entitlements else 0,
             "limit": entitlements["usage"].get("ai_credits_per_month", {}).get("limit", 0) if entitlements else 0,
-            "operations_month": len(ai_month),
+            "operations_month": ai_operations_month,
         },
         "performance": {
             "applications": applied,
