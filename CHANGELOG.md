@@ -4,6 +4,49 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.16] — 2026-09-16
+
+**The Queues page stopped asking the backend the same three questions twenty
+times a minute.** It polled `/api/pipelines/stats`, `/api/pipelines/jobs` and
+`/api/user-input-queue` every 3 s — 60 requests a minute from a single open tab,
+8× the 25 s cadence the rest of the frontend uses — and every one of those rounds
+bought per-pipeline counters and a job list that move at worker speed, not at 3 s.
+The page already had a genuinely live part: the "Processing now" card reads the
+global `useAIWork()` layer, which polls `/api/queues/ai` on its own 4 s cadence
+and is shared with the header chip, so nothing a user was actually watching
+depended on the fast interval. The visibility wrapper around the poll was already
+correct — pause while hidden, re-read the moment the tab is visible again — so
+only the number had to change.
+
+### Changed
+
+- **Queues polls every 20 s instead of every 3 s.** `QUEUES_POLL_MS` is now a
+  named export on `pages/Queues.tsx`, next to `POLL_INTERVAL_MS` on Emails (25 s)
+  and `AUTOMATION_POLL_MS` on Settings (30 s): 9 requests a minute from an open
+  tab rather than 60, for the same three reads. Everything else about the poll is
+  unchanged — it is armed only while the tab is visible, it re-reads immediately
+  when the tab becomes visible again and when the pipeline filter changes, and a
+  failed round still keeps the last good view and turns the pill red. The live
+  card is untouched and still moves on the global 4 s read, several times between
+  two page reads. The header pill's wording is unchanged; it now says on hover
+  what the cadence is and which of the two reads is the live one.
+
+### Added
+
+- **`pages/__tests__/QueuesPolling.test.tsx`** pins the cadence and the behaviour
+  wrapped around it: all three endpoints read on open and then every 20 s (and
+  nothing at 15 s, so a return to 3 s fails); a minute on the page is 12 requests,
+  not 63; no polling at all while hidden, including a tab opened in the
+  background, which reads only once it is shown; an immediate re-read on becoming
+  visible with the 20 s cadence resuming from there; a filter change re-reading at
+  once with the new pipeline and leaving exactly one interval armed; a failed
+  round keeping the last counters and reporting "live update failed"; and cleanup
+  of the timer *and* the `visibilitychange` listener on unmount. It also asserts
+  the part that must not regress by slowing down — the "Processing now" card shows
+  a different worker's run after one 4 s global tick while this page's own reads
+  have not moved. Mutation-checked: putting `QUEUES_POLL_MS` back to `3_000` fails
+  2 of the 9.
+
 ## [2.2.15] — 2026-09-16
 
 **Erasure became complete because it stopped being a list, and the suite got its

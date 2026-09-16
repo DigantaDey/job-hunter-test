@@ -1,9 +1,27 @@
 import { useEffect, useState } from 'react'
 import client, { apiError } from '../api/client'
 import { useAIWork } from '../context/AIWorkContext'
+import { AI_QUEUE_POLL_MS } from '../hooks/useAIQueue'
 import { StateIcon } from '../components/AIWorkChip'
 import { describeRow, deriveState, toneClasses } from '../lib/aiWork'
 import { Layers, Bot, Search, Send, Clock, CheckCircle, AlertTriangle, Pause, Play, ArrowRight, UserCheck } from 'lucide-react'
+
+/**
+ * Cadence for this page's three reads — `/api/pipelines/stats`,
+ * `/api/pipelines/jobs` and `/api/user-input-queue`.
+ *
+ * It was 3 s: 60 requests a minute from a single open tab, 8× the 25 s the rest
+ * of the app polls at, and all of it for numbers that move slowly (per-pipeline
+ * counters, a job list). The one thing on this page that genuinely *is* live —
+ * the "Processing now" card — reads the global `useAIWork()` layer, which polls
+ * `/api/queues/ai` on its own 4 s cadence (`useAIQueue`), not this one. So
+ * slowing these three reads down to 20 s changes what a user sees by nothing
+ * they were watching for, and takes the page from 60 req/min to 9.
+ *
+ * Same shape as `POLL_INTERVAL_MS` on Emails (25 s) and `AUTOMATION_POLL_MS` on
+ * Settings (30 s): a named constant, armed only while the tab is visible.
+ */
+export const QUEUES_POLL_MS = 20_000
 
 /** The seven statuses `queue_stats` returns per pipeline — rendered in this order. */
 const STATUS_CHIPS = ['queued','processing','done','failed','needs_input','paused','dead'] as const
@@ -81,11 +99,15 @@ export default function Queues(){
       setLoadError(apiError(e, 'Live update failed'))
     }
   }
-  // Live (v2.2.8): poll every 3s while the tab is visible; pause when hidden
-  // and re-read immediately when it becomes visible again.
+  // Live (v2.2.8): poll every QUEUES_POLL_MS (20 s) while the tab is visible;
+  // pause when hidden and re-read immediately when it becomes visible again.
+  // What is running *right now* is not this poll's job — the "Processing now"
+  // card below reads the global `useAIWork()` layer, which polls on its own
+  // `AI_QUEUE_POLL_MS` cadence, so this interval only has to keep the counters
+  // and the job list roughly current.
   useEffect(()=>{
     let id: ReturnType<typeof setInterval> | null = null
-    const start = ()=>{ if(id) return; load(); id = setInterval(load, 3000) }
+    const start = ()=>{ if(id) return; load(); id = setInterval(load, QUEUES_POLL_MS) }
     const stop = ()=>{ if(id) clearInterval(id); id = null }
     const onVis = ()=>{ document.visibilityState === 'hidden' ? stop() : start() }
     if(document.visibilityState !== 'hidden') start()
@@ -124,7 +146,15 @@ export default function Queues(){
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-semibold tracking-tight flex items-center gap-2 flex-wrap"><Layers className="w-5 h-5"/> Pipelines & Queues <span className="text-xs mono font-normal text-zinc-500">three in parallel • FIFO</span>
-        <span className="ml-auto text-[11px] mono font-normal text-zinc-500 inline-flex items-center gap-1" aria-live="polite">
+        {/* The cadence is honest but slow, so say so on hover (the wording is
+            unchanged — the timestamp already tells the truth): these three reads
+            come every QUEUES_POLL_MS, while "Processing now" is the global 4 s
+            live layer. Same footnote Settings puts under its auto-mode card. */}
+        <span
+          className="ml-auto text-[11px] mono font-normal text-zinc-500 inline-flex items-center gap-1"
+          aria-live="polite"
+          title={`Counters and the job list re-read every ${QUEUES_POLL_MS / 1000}s while this tab is visible — polling pauses in a background tab and catches up the moment you come back. “Processing now” is the global live read, every ${AI_QUEUE_POLL_MS / 1000}s.`}
+        >
           <span className={`w-2 h-2 rounded-full ${loadError ? 'bg-red-500' : 'bg-emerald-500 animate-pulse'}`} aria-hidden />
           {loadError ? `live update failed — ${loadError}` : `live • updated ${lastPollAt ? new Date(lastPollAt).toLocaleTimeString() : '…'}`}
         </span>
