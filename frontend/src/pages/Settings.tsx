@@ -95,16 +95,58 @@ export default function Settings(){
   }
   useEffect(()=>{ load() },[])
 
+  /**
+   * One tick of the page's live layer: the auto-mode schedule (last/next run,
+   * quota, blocking reasons) and the AI status badge (online, latency, key
+   * source, remaining RPM) are both the backend's truth, so they are re-read
+   * rather than derived here. A failed tick keeps the last read — neither the
+   * card nor the badge ever blanks out because one request was late.
+   */
+  const refreshLive = async () => {
+    await loadAuto()
+    try{
+      const { data: status } = await client.get('/api/settings/ai/status')
+      if(mounted.current) setAiStatus(status)
+    }catch{
+      // Keep the previous status: the last known signal stands.
+    }
+  }
+
   // While this page is open the schedule is live — last/next run, the quota and
-  // the AI banner refresh on a 30s timer, cleared on unmount so a background
-  // tab never polls (same interval the Jobs banner uses).
+  // the AI banner refresh on a 30 s timer that only runs while the tab is
+  // *visible*: a hidden tab polls nothing at all (~2 wasted req/min per
+  // background tab before this), and becoming visible again re-reads at once
+  // instead of waiting out the rest of the interval. Same cadence pattern as
+  // `hooks/useAIQueue.ts` and `pages/Emails.tsx`; the timer and the listener
+  // are both cleared on unmount.
   useEffect(()=>{
     mounted.current = true
-    const t = setInterval(()=>{
-      void loadAuto()
-      void client.get('/api/settings/ai/status').then(r=>{ if(mounted.current) setAiStatus(r.data) }).catch(()=>undefined)
-    }, AUTOMATION_POLL_MS)
-    return ()=>{ mounted.current = false; clearInterval(t) }
+    let timer: ReturnType<typeof setInterval> | null = null
+    /** Arm the interval; `readNow` also re-reads before the first tick. */
+    const start = (readNow = true) => {
+      if (timer) return
+      if (readNow) void refreshLive()
+      timer = setInterval(() => void refreshLive(), AUTOMATION_POLL_MS)
+    }
+    const stop = () => {
+      if (timer) clearInterval(timer)
+      timer = null
+    }
+    const onVisibility = () => {
+      if (typeof document === 'undefined') return
+      if (document.visibilityState === 'hidden') stop()
+      else start()
+    }
+    // Mount: `load()` above has just read the schedule and the AI status, so
+    // only the timer is armed here — no duplicate pair of requests on open.
+    // A tab that opens hidden arms nothing and reads the moment it is shown.
+    if (typeof document === 'undefined' || document.visibilityState !== 'hidden') start(false)
+    document.addEventListener('visibilitychange', onVisibility)
+    return ()=>{
+      mounted.current = false
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
   },[])
 
   const updateWf = (wf:string, key:string, value:string)=> setWfConfig({...wfConfig, [wf]: {...(wfConfig[wf]||{}), [key]: value}})
@@ -467,7 +509,7 @@ export default function Settings(){
             </table>
           </div>
           <div className="mt-1 text-[10px] mono text-zinc-500">
-            “Next” is the first moment the sweep may start that run — the loop wakes every {Math.max(1, Math.round((auto?.sweep_interval_seconds ?? 300) / 60))} min, so a run can start up to that much later. No time is promised while a run is in flight or auto mode is blocked. This card re-reads the schedule every {AUTOMATION_POLL_MS / 1000}s while open.
+            “Next” is the first moment the sweep may start that run — the loop wakes every {Math.max(1, Math.round((auto?.sweep_interval_seconds ?? 300) / 60))} min, so a run can start up to that much later. No time is promised while a run is in flight or auto mode is blocked. This card re-reads the schedule every {AUTOMATION_POLL_MS / 1000}s while this tab is visible — polling pauses in a background tab and catches up the moment you come back.
           </div>
 
           {auto?.quota && (
