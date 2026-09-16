@@ -190,7 +190,15 @@ async def persona_context(persona_id: int, user: CurrentUser, db: DbSession):
 @router.delete("/{persona_id}")
 def delete_persona(persona_id: int, request: Request, user: CurrentUser, db: DbSession):
     row = _persona_or_404(db, user.id, persona_id)
-    persona_service.delete_persona(db, user.id, persona_id)
+    # Jobs/resumes/emails that were produced under this track are detached by the
+    # service; anything the schema refuses to detach is reported, not forced.
+    try:
+        persona_service.delete_persona(db, user.id, persona_id)
+    except persona_service.PersonaInUseError as exc:
+        raise HTTPException(409, {"code": "persona_in_use",
+                                  "message": f"The track '{exc.name}' is still referenced by "
+                                             f"{', '.join(exc.blockers)} and cannot be deleted yet.",
+                                  "blockers": exc.blockers}) from exc
     invalidate_context(user.id)
     audit.audit(db, "persona.deleted", user=user, target=row.name, request=request)
     return {"ok": True}

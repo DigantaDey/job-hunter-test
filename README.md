@@ -208,7 +208,8 @@ image and audits dependencies (pip-audit + npm audit).
 Test coverage includes: auth/tenancy isolation, vault encryption + re-keying, queue leasing and
 worker execution, discovery/source adapters, form detection, autofill planning, resume generation
 + fact guard + diff/polish, outreach compliance gates, suppression/unsubscribe/open tracking,
-funding providers (including the anti-fabrication guard), GDPR export/delete, metrics and health.
+funding providers (including the anti-fabrication guard), GDPR export/delete under **enforced** foreign keys
+(the schema's FKs are checked, not disabled), metrics and health.
 
 ---
 

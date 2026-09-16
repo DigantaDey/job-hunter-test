@@ -202,19 +202,25 @@ def test_sent_today_counts_a_utc_day_not_a_local_one(db, owner, restore_tz):
     ``date.today()`` midnight moved with ``TZ``: with the process in IST, a send
     made at 10:00 UTC was charged to the *previous* day for half the evening,
     handing out a second full budget.
+
+    The day is derived from the current UTC clock rather than written out as a
+    literal: the default-clock assertion below compares against *now*, so a
+    hardcoded date turned this into a test that only passed until the midnight
+    it was written around.
     """
     from app.models.models import User
     from app.services import outreach
 
     user = db.query(User).order_by(User.id).first()
-    morning = datetime(2026, 9, 15, 10, 0, 0)          # 10:00 UTC
-    evening = datetime(2026, 9, 15, 23, 30, 0)         # 23:30 UTC, same UTC day
-    previous = datetime(2026, 9, 14, 23, 59, 0)        # just before the boundary
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    morning = today + timedelta(hours=10)              # 10:00 UTC, today
+    evening = today + timedelta(hours=23, minutes=30)  # 23:30 UTC, same UTC day
+    previous = today - timedelta(seconds=1)            # just before the boundary
     _email_row(db, user.id, morning)
     _email_row(db, user.id, evening)
     _email_row(db, user.id, previous)
 
-    now = datetime(2026, 9, 15, 23, 45, 0)
+    now = today + timedelta(hours=23, minutes=45)
     for zone in ("UTC", "Asia/Kolkata", "America/Los_Angeles"):
         os.environ["TZ"] = zone
         time.tzset()

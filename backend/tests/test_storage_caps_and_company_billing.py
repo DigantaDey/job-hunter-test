@@ -475,7 +475,17 @@ def test_user_input_queue_joins_not_boards(client, auth, db, sql_log):
 
 
 def test_user_input_queue_survives_a_deleted_job(client, auth, db):
-    """A pending row whose job row was deleted still shows (empty job fields)."""
+    """A pending row whose job row was deleted still shows (empty job fields).
+
+    The dangling version of this state used to be constructible by simply
+    deleting the job — which only worked because the suite ran with foreign keys
+    disabled. ``user_input_requests.job_id`` is a FK like every other reference
+    in this schema, so the row has to be detached first; that is exactly what a
+    job-deletion endpoint would have to do, and what
+    :func:`app.services.erasure.break_references` does for every table.
+    """
+    from app.services.erasure import break_references
+
     user = _owner(db)
     job = Job(user_id=user.id, title="Ghost", company="Gone Co",
               company_name_normalized="gone co", dedupe_key="ghost:1",
@@ -489,12 +499,13 @@ def test_user_input_queue_survives_a_deleted_job(client, auth, db):
                                    status="pending")
     db.add(request_row)
     db.commit()
+    assert break_references(db, "jobs", job.id)[0] == {"user_input_requests.job_id": 1}
     db.delete(job)
     db.commit()
 
     body = client.get("/api/user-input-queue", headers=auth).json()
     assert len(body) == 1
-    assert body[0]["job_id"] == job.id
+    assert body[0]["job_id"] is None
     assert body[0]["job"] == {"title": "", "company": "", "url": ""}
 
 

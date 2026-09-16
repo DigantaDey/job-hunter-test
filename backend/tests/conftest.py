@@ -56,7 +56,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import create_engine
+from sqlalchemy.pool import NullPool
 
+from app.core.config import settings
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -70,28 +73,33 @@ def client() -> Iterator[TestClient]:
 @pytest.fixture(autouse=True)
 def clean_database() -> Iterator[None]:
     """
-    Every test starts from an empty schema.
+    Every test starts from an empty schema — **with foreign keys enforced**.
 
-    Tables are dropped over a raw connection with foreign keys disabled — the
-    schema has an intentional cycle (jobs ↔ resumes) which makes
-    ``metadata.drop_all`` unusable. SQLite disables its FK enforcement with a
-    PRAGMA; PostgreSQL (no PRAGMAs) gets ``DROP TABLE ... CASCADE``, which
-    resolves the cycle the same way.
+    The schema has an intentional cycle (jobs ↔ resumes), which makes
+    ``metadata.drop_all`` unusable, so the tables are dropped on their own
+    un-pooled engine instead. That distinction is the whole point: a
+    ``PRAGMA foreign_keys=OFF`` issued on the app engine's *pooled* connection
+    used to be handed straight back to the next test (``app/db.py`` sets the
+    pragma on *connect*, which a pooled connection never repeats), so FK
+    violations were invisible to the entire suite — including every deletion
+    path, which is exactly where they live. Postgres (no PRAGMAs) gets
+    ``DROP TABLE ... CASCADE``, which resolves the cycle the same way.
     """
     is_sqlite = engine.dialect.name == "sqlite"
-    connection = engine.raw_connection()
+    reset_kwargs: Dict[str, Any] = {"poolclass": NullPool}
+    if is_sqlite:
+        # No ``PRAGMA foreign_keys`` listener on this engine: enforcement is off
+        # *here*, and only here, so the cycle can be dropped.
+        reset_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+    reset_engine = create_engine(settings.database_url, **reset_kwargs)
     try:
-        cursor = connection.cursor()
-        if is_sqlite:
-            cursor.execute("PRAGMA foreign_keys=OFF")
-        suffix = "" if is_sqlite else " CASCADE"
-        for table in Base.metadata.tables:
-            cursor.execute(f'DROP TABLE IF EXISTS "{table}"{suffix}')
-        connection.commit()
-        cursor.close()
+        with reset_engine.begin() as connection:
+            suffix = "" if is_sqlite else " CASCADE"
+            for table in Base.metadata.tables:
+                connection.exec_driver_sql(f'DROP TABLE IF EXISTS "{table}"{suffix}')
+        Base.metadata.create_all(bind=reset_engine)
     finally:
-        connection.close()
-    Base.metadata.create_all(bind=engine)
+        reset_engine.dispose()
     yield
 
 
