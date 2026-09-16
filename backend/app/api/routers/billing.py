@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
+from sqlalchemy import func
 
 from app.api.deps import CurrentUser, DbSession, client_ip
 from app.core import audit
@@ -128,20 +129,26 @@ def get_credits(user: CurrentUser, db: DbSession, limit: int = Query(100, le=500
     )
     total_tokens = sum(r.total_tokens for r in rows)
     total_cost = sum(r.estimated_cost_usd for r in rows)
-    # Monthly aggregation
+    # Monthly aggregation stays in the database.  The ledger response above is
+    # intentionally a bounded recent sample; the current-month totals must not
+    # turn into an unbounded Python list as the account grows.
     period = current_period()
-    monthly = (
-        db.query(AICreditLedger)
-        .filter(AICreditLedger.user_id == user.id, AICreditLedger.created_at >= datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0))
-        .all()
+    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    monthly_tokens, monthly_cost, monthly_operations = (
+        db.query(
+            func.coalesce(func.sum(AICreditLedger.total_tokens), 0),
+            func.coalesce(func.sum(AICreditLedger.estimated_cost_usd), 0.0),
+            func.count(),
+        )
+        .filter(AICreditLedger.user_id == user.id, AICreditLedger.created_at >= month_start)
+        .one()
     )
-    monthly_tokens = sum(r.total_tokens for r in monthly)
-    monthly_cost = sum(r.estimated_cost_usd for r in monthly)
 
     return {
         "period": period,
-        "monthly_tokens": monthly_tokens,
-        "monthly_cost_usd": round(monthly_cost, 4),
+        "monthly_tokens": int(monthly_tokens or 0),
+        "monthly_cost_usd": round(float(monthly_cost or 0.0), 4),
+        "monthly_operations": int(monthly_operations or 0),
         "total_tokens_sample": total_tokens,
         "total_cost_sample_usd": round(total_cost, 4),
         "ledger": [

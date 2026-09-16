@@ -468,24 +468,70 @@ def apply_subscription_change(
     payload: Dict[str, Any],
     provider_name: str,
 ) -> Optional[Subscription]:
-    """Apply a webhook's subscription state change.
+    """Apply the *normalised* result of a verified billing event.
 
-    Side effects are set-from-event (plan, status, provider ids) and
-    re-applyable: replaying a retried event produces the same row state, so
-    the idempotency gate in :func:`handle_billing_event` is what limits
-    *when* this runs, and nothing here depends on running exactly once.
+    This function is intentionally defensive even though the route verifies the
+    provider signature before calling it.  It consumes only the fields emitted
+    by the provider parsers: a configured ``price_id`` for the plan and a
+    closed set of provider statuses.  Raw ``plan`` values, arbitrary dates, and
+    unknown statuses never become paid entitlements.
 
-    The plan is derived from the event's price/plan id through the server's
-    configured maps — a body-supplied ``plan`` string is never consulted. An
-    unrecognised price id leaves the current plan untouched (fail-safe).
+    Period dates are server-controlled.  An active subscription event may fill
+    a missing period with a normal 30-day server period, but it cannot move an
+    existing boundary.  Only a verified payment event (``invoice.paid`` / the
+    provider equivalent) can renew a period, and even then the renewal is the
+    bounded server period below; ``payload[current_period_end]`` is never read.
     """
+    payload = payload or {}
+    now = datetime.utcnow()
+
+    # ``price_id`` is the only plan channel.  In particular, do not fall back
+    # to payload["plan"]: that field is user/provider input, not a server-side
+    # entitlement decision.
     plan = resolve_plan_from_price(payload.get("price_id"))
-    status = str(payload.get("status") or "active").strip().lower()
-    customer_id = str(payload.get("provider_customer_id") or "")
-    sub_id = str(payload.get("provider_subscription_id") or "")
+
+    # Provider parsers normalise status before this function.  Keep the allowlist
+    # here as a second fail-closed boundary; an unknown status is represented as
+    # incomplete so it cannot inherit paid access from the old row.
+    known_statuses = {
+        "active",
+        "trialing",
+        "past_due",
+        "canceled",
+        "cancelled",
+        "expired",
+        "incomplete",
+        "incomplete_expired",
+        "unpaid",
+        "paused",
+    }
+    raw_status = str(payload.get("status") or "").strip().lower()
+    status = raw_status if raw_status in known_statuses else "incomplete"
+    if status == "cancelled":
+        status = "canceled"
+
+    event_kind = str(payload.get("kind") or "").strip().lower()
+    # These are the normalised event names emitted by Stripe/Razorpay/manual's
+    # authenticated test provider.  The flag is used only for the date renewal;
+    # the signature/auth boundary remains in the router owned by the other
+    # billing change.
+    verified_payment = event_kind in {
+        "invoice.paid",
+        "invoice.payment_succeeded",
+        "subscription.charge.succeeded",
+    }
+    # A payment-success event is itself the verified activation signal.  This
+    # also handles a normalised/internal payload that omitted its derived
+    # status; an invoice.paid event must not remain stuck in incomplete.
+    if verified_payment:
+        status = "active"
+    customer_id = str(payload.get("provider_customer_id") or "").strip()
+    sub_id = str(payload.get("provider_subscription_id") or "").strip()
 
     sub = db.query(Subscription).filter(Subscription.user_id == user_id).first()
     if not sub:
+        # A new row gets only a server-generated boundary.  It is never copied
+        # from a date supplied by a webhook body.
         sub = Subscription(
             user_id=user_id,
             plan=plan or "free",
@@ -493,9 +539,14 @@ def apply_subscription_change(
             provider=provider_name,
             provider_customer_id=customer_id,
             provider_subscription_id=sub_id,
-            current_period_start=datetime.utcnow(),
-            current_period_end=datetime.utcnow() + timedelta(days=30),
+            current_period_start=now,
+            current_period_end=now + timedelta(days=30),
         )
+        if status == "trialing":
+            # The trial duration is application configuration, not an event
+            # supplied date.  Existing trial rows keep their persisted marker.
+            trial_days = max(0, int(getattr(settings, "trial_days", 0) or 0))
+            sub.trial_end = now + timedelta(days=trial_days) if trial_days else None
         db.add(sub)
     else:
         if plan:
@@ -506,17 +557,37 @@ def apply_subscription_change(
             sub.provider_customer_id = customer_id
         if sub_id:
             sub.provider_subscription_id = sub_id
-        # Handle cancellation
-        if status in ("canceled", "cancelled", "expired"):
+
+        if status in ("canceled", "expired"):
             sub.cancel_at_period_end = True
-            sub.grace_until = datetime.utcnow() + timedelta(days=3)
-        elif status in ("past_due", "unpaid"):
-            sub.grace_until = datetime.utcnow() + timedelta(days=3)
+            if not sub.grace_until or sub.grace_until <= now:
+                sub.grace_until = now + timedelta(days=3)
+        elif status == "past_due":
+            if not sub.grace_until or sub.grace_until <= now:
+                sub.grace_until = now + timedelta(days=3)
         elif status == "active":
             sub.grace_until = None
             sub.cancel_at_period_end = False
-            sub.current_period_start = datetime.utcnow()
-            sub.current_period_end = datetime.utcnow() + timedelta(days=30)
+            # A subscription.updated event is allowed to describe an active
+            # row, but it is not a payment renewal.  Fill only a missing date;
+            # never extend an existing one from event input.
+            if sub.current_period_end is None:
+                sub.current_period_start = now
+                sub.current_period_end = now + timedelta(days=30)
+            if verified_payment:
+                # A paid invoice is the one trusted renewal signal.  Do not
+                # shorten a still-live period, but recover a lapsed/missing
+                # period with one bounded server period.  The payload's date is
+                # deliberately ignored, so a forged far-future date cannot
+                # grant a year (or forever) of access.
+                if sub.current_period_end is None or sub.current_period_end <= now:
+                    sub.current_period_start = now
+                    sub.current_period_end = now + timedelta(days=30)
+                sub.trial_end = None
+        elif status == "trialing" and sub.trial_end is None:
+            trial_days = max(0, int(getattr(settings, "trial_days", 0) or 0))
+            if trial_days:
+                sub.trial_end = now + timedelta(days=trial_days)
 
     db.commit()
     db.refresh(sub)

@@ -40,6 +40,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 from app.core.config import settings
+from app.core.entitlements import expire_subscriptions
 from app.core.logging import LogContext, configure_logging, get_logger
 from app.core.metrics import inc, set_gauge
 from app.db import SessionLocal, init_db
@@ -90,6 +91,10 @@ class Worker:
             else float(getattr(settings, "worker_reaper_safety_seconds", 300.0))
         )
         self._last_reap = time.monotonic()  # start interval from now
+        # Subscription expiry is maintenance work, not a user-triggered queue
+        # item.  Run it at boot and at most once per day from the worker so it
+        # still happens when auto mode is disabled or no user has enabled it.
+        self._last_subscription_expiry = 0.0
         self.running = False
         self.worker_id = worker_id()
         #: slot name (``loop-0..N-1``, ``watchdog``, ``auto-scheduler``) -> live task
@@ -188,6 +193,33 @@ class Worker:
     # ------------------------------------------------------------------ #
     # Execution
     # ------------------------------------------------------------------ #
+    def _run_subscription_expiry_pass(self, *, force: bool = False) -> None:
+        """Flip elapsed trials/periods without waiting for an API request.
+
+        The auto scheduler also calls the same batch function, but the worker
+        owns this boot/daily fallback so deployments with
+        ``AUTO_SCHEDULER_INTERVAL_SECONDS=0`` do not leave subscriptions live
+        forever.  Failures are isolated from queue recovery; the next pass can
+        retry after a transient database problem.
+        """
+        now = time.monotonic()
+        if not force and now - self._last_subscription_expiry < 24 * 60 * 60:
+            return
+        db = None
+        try:
+            db = SessionLocal()
+            expired = expire_subscriptions(db, now=datetime.utcnow())
+            self._last_subscription_expiry = now
+            if expired:
+                log.info("subscription expiry pass flipped %s row(s)", expired)
+        except Exception as exc:  # pragma: no cover - DB hiccup
+            if db is not None:
+                db.rollback()
+            log.warning("subscription expiry pass failed: %s: %s", type(exc).__name__, exc)
+        finally:
+            if db is not None:
+                db.close()
+
     async def _recover(self) -> None:
         db = SessionLocal()
         try:
@@ -198,6 +230,17 @@ class Worker:
                 pipelines=self.pipelines,
                 safety_margin_seconds=self.reaper_safety,
             )
+            # Reuse the recovery session for the boot expiry pass.  Apart from
+            # avoiding an unnecessary connection, this keeps startup's normal
+            # session shape stable for workers and health checks.
+            try:
+                expired = expire_subscriptions(db, now=datetime.utcnow())
+                self._last_subscription_expiry = time.monotonic()
+                if expired:
+                    log.info("subscription expiry pass flipped %s row(s)", expired)
+            except Exception as exc:  # pragma: no cover - DB hiccup
+                db.rollback()
+                log.warning("subscription expiry pass failed: %s: %s", type(exc).__name__, exc)
         finally:
             db.close()
         # Start the periodic interval from now, after the boot sweep.
@@ -223,6 +266,7 @@ class Worker:
             log.error("reaper failed: %s", exc)
         finally:
             db.close()
+        self._run_subscription_expiry_pass()
 
     async def _run_item(self, item_id: int, pipeline: str) -> None:
         db = SessionLocal()

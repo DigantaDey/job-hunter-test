@@ -41,7 +41,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.entitlements import can as capability_can
-from app.core.entitlements import check_limit, current_period, get_user_plan, usage_for
+from app.core.entitlements import check_limit, current_period, expire_subscriptions, get_user_plan, usage_for
 from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.db import SessionLocal
@@ -409,6 +409,11 @@ class AutoScheduler:
             settings.auto_scheduler_interval_seconds if interval_seconds is None else interval_seconds
         )
         self.running = False
+        # Subscription expiry is a daily maintenance pass, not a per-user auto
+        # workflow.  Keeping the clock on the scheduler prevents a five-minute
+        # sweep from writing the subscriptions table on every iteration while
+        # still making a long-lived trial expire without an API request.
+        self._last_subscription_expiry: Optional[datetime] = None
 
     @property
     def enabled(self) -> bool:
@@ -444,6 +449,23 @@ class AutoScheduler:
         counts = {"users": 0, "enqueued": 0, "skipped": 0, "errors": 0}
         db = SessionLocal()
         try:
+            # This pass is deliberately independent of ``auto_mode``.  A user
+            # who never enables scheduled workflows can still have a trial or
+            # paid period end, so expiry belongs to the scheduler maintenance
+            # path rather than to the candidate-user query below.
+            if (
+                self._last_subscription_expiry is None
+                or moment - self._last_subscription_expiry >= timedelta(days=1)
+            ):
+                try:
+                    expired = expire_subscriptions(db, now=moment)
+                    self._last_subscription_expiry = moment
+                    if expired:
+                        log.info("subscription expiry pass flipped %s row(s)", expired)
+                except Exception as exc:  # pragma: no cover - DB hiccup
+                    db.rollback()
+                    log.warning("subscription expiry pass failed: %s: %s", type(exc).__name__, exc)
+
             candidates = users_with_auto_mode(db)
         finally:
             db.close()
