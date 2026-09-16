@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import client, { apiError } from '../api/client'
 import { Mail, Send, Check, Pencil, Search, Building2, User, Clock, AlertTriangle, Loader2, Briefcase, ExternalLink, ShieldCheck, ShieldAlert, XCircle } from 'lucide-react'
 import { aiOutage, type AIOutage } from '../api/client'
@@ -29,12 +29,52 @@ export default function Emails(){
   const draftRow = work.findRow({ key: 'email:draft', pipeline: 'email' })
   const draftLive = !!draftRow && ['queued','processing','paused'].includes(String(draftRow.status))
 
-  const load=async()=>{
-    const {data}=await client.get('/api/emails', {params: filter?{status:filter}: {}})
-    setEmails(data)
-    const j=await client.get('/api/jobs'); setJobs(j.data)
-  }
-  useEffect(()=>{ load(); const id=setInterval(load, 4000); return ()=>clearInterval(id)},[filter])
+  const POLL_INTERVAL_MS = 25_000
+  const inFlight = useRef<Promise<void> | null>(null)
+  const alive = useRef(true)
+
+  /**
+   * Fetch emails + jobs. In-flight coalescing: if a request is already running
+   * (from the poll or a user-triggered `load()`), callers share it rather than
+   * firing a second one. User-initiated mutations (approve, send, update) call
+   * `load()` directly for an immediate visual refresh; the coalescing means
+   * that if a poll was already mid-flight they just piggy-back on it.
+   */
+  const load = useCallback(async () => {
+    if (inFlight.current) return inFlight.current
+    inFlight.current = (async () => {
+      const { data } = await client.get('/api/emails', { params: filter ? { status: filter } : {} })
+      if (alive.current) setEmails(data)
+      const j = await client.get('/api/jobs')
+      if (alive.current) setJobs(j.data)
+    })().finally(() => { inFlight.current = null })
+    return inFlight.current
+  }, [filter])
+
+  useEffect(() => {
+    alive.current = true
+    let timer: ReturnType<typeof setInterval> | null = null
+    const start = () => {
+      if (timer) return
+      void load()
+      timer = setInterval(() => void load(), POLL_INTERVAL_MS)
+    }
+    const stop = () => {
+      if (timer) clearInterval(timer)
+      timer = null
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') stop()
+      else start()
+    }
+    if (document.visibilityState !== 'hidden') start()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      alive.current = false
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [load])
 
   const generate=async()=>{
     if(!company && !jobId) return setNotice({id:-1, kind:'err', text:'Enter a company name (or pick a job) first'})
