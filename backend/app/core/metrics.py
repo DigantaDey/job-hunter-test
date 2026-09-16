@@ -33,7 +33,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, TypedDict
 
 from app.core.config import settings
 
@@ -43,10 +43,18 @@ DEFAULT_BUCKETS: Sequence[float] = (
 
 SeriesKey = Tuple[Tuple[str, str], ...]
 
+
+class _HistogramEntry(TypedDict):
+    count: int
+    sum: float
+    buckets: Dict[float, int]
+    bounds: Tuple[float, ...]
+
+
 _LOCK = threading.Lock()
 _COUNTERS: Dict[Tuple[str, SeriesKey], float] = defaultdict(float)
 _GAUGES: Dict[Tuple[str, SeriesKey], float] = {}
-_HISTOGRAMS: Dict[Tuple[str, SeriesKey], Dict[str, object]] = {}
+_HISTOGRAMS: Dict[Tuple[str, SeriesKey], _HistogramEntry] = {}
 #: metric name -> its series in least-recently-updated order (the eviction queue).
 _RECENCY: Dict[str, "OrderedDict[SeriesKey, None]"] = {}
 #: metric name -> series dropped because the cap was reached.
@@ -163,10 +171,10 @@ def observe(name: str, value: float, labels: Optional[Dict[str, str]] = None,
             {"count": 0, "sum": 0.0, "buckets": dict.fromkeys(buckets, 0), "bounds": tuple(buckets)},
         )
         _touch(key, series, _HISTOGRAMS)
-        entry["count"] = int(entry["count"]) + 1  # type: ignore[arg-type]
-        entry["sum"] = float(entry["sum"]) + float(value)  # type: ignore[arg-type]
-        bucket_counts = entry["buckets"]  # type: ignore[assignment]
-        for bound in entry["bounds"]:  # type: ignore[union-attr]
+        entry["count"] = entry["count"] + 1
+        entry["sum"] = entry["sum"] + float(value)
+        bucket_counts = entry["buckets"]
+        for bound in entry["bounds"]:
             if value <= bound:
                 bucket_counts[bound] = bucket_counts.get(bound, 0) + 1
 
@@ -184,7 +192,7 @@ class Timer:
         self._start = time.perf_counter()
         return self
 
-    def __exit__(self, *exc: object) -> bool:
+    def __exit__(self, *exc: object) -> Literal[False]:
         observe(self.name, time.perf_counter() - self._start, self.labels, self.buckets)
         return False
 
@@ -223,8 +231,8 @@ def render_prometheus() -> str:
         for (name, labels), entry in sorted(_HISTOGRAMS.items()):
             base = dict(labels)
             cumulative = 0.0
-            for bound in entry["bounds"]:  # type: ignore[union-attr]
-                cumulative += entry["buckets"].get(bound, 0)  # type: ignore[union-attr]
+            for bound in entry["bounds"]:
+                cumulative += entry["buckets"].get(bound, 0)
                 emitted[name].append(f"{name}_bucket{_render_labels({**base, 'le': str(bound)})} {_format(cumulative)}")
             emitted[name].append(
                 f"{name}_bucket{_render_labels({**base, 'le': '+Inf'})} {_format(entry['count'])}")
@@ -254,8 +262,8 @@ def snapshot() -> Dict[str, float]:
         out = {f"{name}{_render_labels(dict(labels))}": value for (name, labels), value in _COUNTERS.items()}
         out.update({f"{name}{_render_labels(dict(labels))}": value for (name, labels), value in _GAUGES.items()})
         for (name, labels), entry in _HISTOGRAMS.items():
-            out[f"{name}_count{_render_labels(dict(labels))}"] = int(entry["count"])  # type: ignore[arg-type]
-            out[f"{name}_sum{_render_labels(dict(labels))}"] = round(float(entry["sum"]), 4)  # type: ignore[arg-type]
+            out[f"{name}_count{_render_labels(dict(labels))}"] = entry["count"]
+            out[f"{name}_sum{_render_labels(dict(labels))}"] = round(entry["sum"], 4)
     return out
 
 

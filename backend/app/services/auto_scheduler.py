@@ -633,23 +633,23 @@ def reconcile(db: Session, user_id: int) -> int:
     for row in open_rows:
         item = db.query(PipelineJob).filter(PipelineJob.id == row.queue_job_id).first()
         if item is None:
-            row.state = STATE_FAILED  # type: ignore[assignment]
-            row.reason = "queue item is gone (deleted or never created)"  # type: ignore[assignment]
+            row.state = STATE_FAILED
+            row.reason = "queue item is gone (deleted or never created)"
             changed += 1
         elif item.status == "done":
-            row.state = STATE_DONE  # type: ignore[assignment]
+            row.state = STATE_DONE
             changed += 1
         elif item.status == "paused":
-            row.state = STATE_PAUSED  # type: ignore[assignment]
-            row.reason = (item.error or "")[:1000]  # type: ignore[assignment]
+            row.state = STATE_PAUSED
+            row.reason = (item.error or "")[:1000]
             changed += 1
         elif item.status == "needs_input":
-            row.state = STATE_NEEDS_INPUT  # type: ignore[assignment]
-            row.reason = "waiting for your input (see the job's input request)"  # type: ignore[assignment]
+            row.state = STATE_NEEDS_INPUT
+            row.reason = "waiting for your input (see the job's input request)"
             changed += 1
         elif item.status in ("dead", "failed"):
-            row.state = STATE_FAILED  # type: ignore[assignment]
-            row.reason = (item.error or "queue item dead-lettered")[:1000]  # type: ignore[assignment]
+            row.state = STATE_FAILED
+            row.reason = (item.error or "queue item dead-lettered")[:1000]
             changed += 1
         # queued / processing → still open: leave the row (the guard keeps holding).
     if changed:
@@ -746,7 +746,7 @@ def mark_job_queued(db: Session, user_id: int, job_id: int) -> None:
     job = db.query(Job).filter(Job.id == job_id, Job.user_id == user_id).first()
     if job is None or job.status in ("applied", "skipped"):
         return
-    job.status = "queued"  # type: ignore[assignment]
+    job.status = "queued"
     db.commit()
     from app.services.events import record_job_event
 

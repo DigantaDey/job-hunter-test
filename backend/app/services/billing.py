@@ -439,6 +439,15 @@ def handle_billing_event(
 
 def _apply_side_effects(db: Session, event: BillingEvent) -> BillingEvent:
     """Apply subscription side effects and mark the stored event processed."""
+    if event.user_id is None:
+        # handle_billing_event only reaches this with a resolved user (it logs
+        # and skips otherwise); a stored row that predates resolution is left
+        # unprocessed rather than crashed against the NOT NULL constraint.
+        event.processed = False
+        event.error = "no user resolved for event"
+        db.commit()
+        log.error("billing event %s has no user; not applying", event.provider_event_id)
+        return event
     try:
         apply_subscription_change(db, event.user_id, event.payload or {}, event.provider)
         event.processed = True

@@ -670,8 +670,8 @@ def pipelines(user: CurrentUser, db: DbSession):
 
     # The "AI queue" is the durable queue (v2.1.1): the ai_queue block is
     # built from real pipeline_jobs rows only — never synthesized.
-    stats: Dict[str, Any] = queue_stats(db, user_id=user.id)  # type: ignore[arg-type]
-    stats["ai_queue"] = ai_queue_view(db, user_id=user.id)  # type: ignore[arg-type]
+    stats: Dict[str, Any] = queue_stats(db, user_id=user.id)
+    stats["ai_queue"] = ai_queue_view(db, user_id=user.id)
     stats["rate_limiter"] = rate_limiter.stats()
     return stats
 

@@ -670,10 +670,10 @@ async def build_portrait(db: Session, user: User, persona: Persona, *, force: bo
     persona.portrait_at = datetime.utcnow()
     # Fold the directives into the track's own search context so discovery and
     # scoring immediately act on them.
-    directives = portrait["search_directives"]
+    directives = list(portrait["search_directives"])
     if directives:
         context = _clean_context(persona.search_context or {})
-        keywords = list(dict.fromkeys(directives + (context.get("keywords") or [])))[:24]
+        keywords = list(dict.fromkeys(directives + list(context.get("keywords") or [])))[:24]
         persona.search_context = {**context, "keywords": keywords}
     db.commit()
     db.refresh(persona)

@@ -53,7 +53,7 @@ def get_cached_intel(db: Optional[Session], user_id: Optional[int], company: str
     return None
 
 
-async def fetch_company_intel(company: str, db: Session = None, user_id: Optional[int] = None, force_refresh: bool = False) -> Dict[str, Any]:
+async def fetch_company_intel(company: str, db: Optional[Session] = None, user_id: Optional[int] = None, force_refresh: bool = False) -> Dict[str, Any]:
     """Fetch or generate company intelligence."""
     if not force_refresh:
         cached = get_cached_intel(db, user_id, company)

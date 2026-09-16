@@ -14,7 +14,7 @@ remains only as an explicitly-labelled *preview* helper for diagnostics/tests.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from pdfminer.high_level import extract_text as pdfminer_extract
 from pypdf import PdfReader
@@ -82,7 +82,9 @@ def extract_layout(filepath: str) -> Dict[str, Any]:
         fonts: List[str] = []
         try:
             if page and "/Resources" in page:
-                fonts = [str(f) for f in page["/Resources"].get("/Font", {}).keys()]
+                # pypdf's PdfObject isn't subscript-typed; DictionaryObject has .get.
+                resources = cast(Any, page["/Resources"])
+                fonts = [str(f) for f in resources.get("/Font", {}).keys()]
         except Exception:
             pass
         return {

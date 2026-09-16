@@ -11,11 +11,11 @@ Production notes
   append-only trail (required for the "delete forever" / cold-outreach flows).
 """
 from datetime import datetime
+from typing import Any, Optional
 
 from sqlalchemy import (
     JSON,
     Boolean,
-    Column,
     DateTime,
     Float,
     ForeignKey,
@@ -26,6 +26,7 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
 )
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
 
@@ -41,33 +42,33 @@ def utcnow() -> datetime:
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(320), nullable=False, unique=True, index=True)
-    name = Column(String(200), default="")
-    password_hash = Column(String(255), nullable=False)
-    role = Column(String(20), default="owner")  # owner | member
-    is_active = Column(Boolean, default=True, nullable=False)
-    timezone = Column(String(64), default="UTC")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), default="owner", nullable=True)  # owner | member
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC", nullable=True)
 
     # Compliance state (see docs/COMPLIANCE.md). Timestamps prove *when* the
     # user accepted each disclosure; automation is blocked until they are set.
-    consents = Column(JSON, default=dict)
-    last_login_at = Column(DateTime, nullable=True)
+    consents: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
-    created_at = Column(DateTime, default=utcnow, nullable=False)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
 
 
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    token_hash = Column(String(128), nullable=False, unique=True, index=True)
-    expires_at = Column(DateTime, nullable=False)
-    revoked_at = Column(DateTime, nullable=True)
-    user_agent = Column(String(300), default="")
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    user_agent: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class ApiKey(Base):
@@ -75,15 +76,15 @@ class ApiKey(Base):
 
     __tablename__ = "api_keys"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    name = Column(String(120), default="default")
-    prefix = Column(String(16), nullable=False, index=True)
-    key_hash = Column(String(128), nullable=False, unique=True, index=True)
-    scopes = Column(JSON, default=list)
-    last_used_at = Column(DateTime, nullable=True)
-    revoked_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(120), default="default", nullable=True)
+    prefix: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    key_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    scopes: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -92,17 +93,17 @@ class ApiKey(Base):
 class Profile(Base):
     __tablename__ = "profiles"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    data = Column(JSON, default=dict)  # extracted profile details
-    layout = Column(JSON, default=dict)  # layout json
-    master_resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)  # extracted profile details
+    layout: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)  # layout json
+    master_resume_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("resumes.id"), nullable=True)
     # Where the extraction came from. "ai" is the only supported source for the
     # master profile — anything else means the AI layer was unavailable and the
     # row must not be trusted as ground truth.
-    extraction_source = Column(String(20), default="ai")
-    created_at = Column(DateTime, default=utcnow)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    extraction_source: Mapped[str] = mapped_column(String(20), default="ai", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
 
 
 class Persona(Base):
@@ -123,61 +124,61 @@ class Persona(Base):
         UniqueConstraint("user_id", "name", name="uq_personas_user_name"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    name = Column(String(120), nullable=False)
-    target_role = Column(String(200), default="")
-    is_active = Column(Boolean, default=True, nullable=False)
-    is_default = Column(Boolean, default=False, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    target_role: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     #: Derived search context for this track (keywords/roles/industries/…)
-    search_context = Column(JSON, default=dict)
+    search_context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
     #: Hard preferences the user states (salary, remote, company stage, exclusions)
-    preferences = Column(JSON, default=dict)
+    preferences: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
     #: Learned state: signals, observed strengths/gaps, funnel counters
-    memory = Column(JSON, default=dict)
+    memory: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
 
     #: AI reflection of the user under this persona, plus the evidence it rests on
-    portrait = Column(Text, default="")
-    portrait_evidence = Column(JSON, default=dict)
-    portrait_at = Column(DateTime, nullable=True)
+    portrait: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    portrait_evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    portrait_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
-    stats = Column(JSON, default=dict)
-    source_resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
+    stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    source_resume_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("resumes.id"), nullable=True)
 
-    last_used_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
 
 
 
 class Resume(Base):
     __tablename__ = "resumes"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    filename = Column(String, nullable=False)
-    filepath = Column(String, nullable=False)
-    type = Column(String, default="master")  # master | generated | uploaded_polished
-    profile_snapshot = Column(JSON, default=dict)
-    layout = Column(JSON, default=dict)
-    tags = Column(JSON, default=list)
-    jd_hash = Column(String, nullable=True)
-    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
-    parent_resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
-    status = Column(String, default="approved")  # approved | pending | rejected | archived
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    filepath: Mapped[str] = mapped_column(String, nullable=False)
+    type: Mapped[str] = mapped_column(String, default="master", nullable=True)  # master | generated | uploaded_polished
+    profile_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    layout: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    tags: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    jd_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=True)
+    parent_resume_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("resumes.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String, default="approved", nullable=True)  # approved | pending | rejected | archived
     # Text snapshot of the *rendered* document, used for diff/preview without
     # re-parsing files on every request.
-    text_snapshot = Column(Text, default="")
+    text_snapshot: Mapped[str] = mapped_column(Text, default="", nullable=True)
     #: Professional download name ("Diganta-Dey-Wirelane-Embedded-Engineer.pdf").
     #: ``filepath`` stays an opaque unique path on disk; this is what the user sees.
-    display_name = Column(String(300), default="")
+    display_name: Mapped[str] = mapped_column(String(300), default="", nullable=True)
     #: Which persona/track this resume was tailored for.
-    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
+    persona_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("personas.id"), nullable=True)
     #: Guardrail verdict (accuracy + ATS quality checks) — see ai_guardrails.py
-    guardrail_report = Column(JSON, default=dict)
-    approved_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=utcnow)
+    guardrail_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
 
 
 class Job(Base):
@@ -188,10 +189,10 @@ class Job(Base):
         Index("ix_jobs_user_company_norm", "user_id", "company_name_normalized"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    title = Column(String, nullable=False)
-    company = Column(String, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    company: Mapped[str] = mapped_column(String, nullable=False)
     #: Normalised company identity for SQL-side filtering and funding linkage
     #: (see :func:`app.services.company_normalize.normalize_company_name`):
     #: lowercased, punctuation-stripped, legal-form suffixes dropped. Stored at
@@ -199,32 +200,32 @@ class Job(Base):
     #: ``GET /api/jobs?company=`` filters in SQL (LIMIT/OFFSET applied before
     #: any Python) instead of loading the user's whole board to filter in the
     #: app. ``company`` stays the display name.
-    company_name_normalized = Column(String(200), default="", nullable=False)
-    location = Column(String, default="")
-    description = Column(Text, default="")
-    url = Column(String, default="")
-    source = Column(String, default="unknown")  # live source id or curated pool id
-    external_id = Column(String, default="")
-    dedupe_key = Column(String(300), default="")
-    status = Column(String, default="discovered")  # discovered|queued|needs_input|applying|applied|failed|emailed|rejected
-    score = Column(Float, default=0.0)
-    score_reason = Column(Text, default="")
+    company_name_normalized: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    location: Mapped[str] = mapped_column(String, default="", nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    url: Mapped[str] = mapped_column(String, default="", nullable=True)
+    source: Mapped[str] = mapped_column(String, default="unknown", nullable=True)  # live source id or curated pool id
+    external_id: Mapped[str] = mapped_column(String, default="", nullable=True)
+    dedupe_key: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    status: Mapped[str] = mapped_column(String, default="discovered", nullable=True)  # discovered|queued|needs_input|applying|applied|failed|emailed|rejected
+    score: Mapped[float] = mapped_column(Float, default=0.0, nullable=True)
+    score_reason: Mapped[str] = mapped_column(Text, default="", nullable=True)
     #: Provenance of ``score``: "ai" (guardrail-verified), "pending" (AI offline,
     #: not yet scored) or "unscored" (no profile/JD to score against).
-    score_source = Column(String(20), default="pending")
+    score_source: Mapped[str] = mapped_column(String(20), default="pending", nullable=True)
     #: Rubric breakdown + evidence + guardrail report for the score above.
-    score_detail = Column(JSON, default=dict)
+    score_detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
     #: Persona/track this job was discovered and scored for.
-    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
-    company_size = Column(String, default="unknown")  # big, medium, small, startup
-    company_info = Column(JSON, default=dict)
-    discovered_at = Column(DateTime, default=utcnow)
-    posted_at = Column(DateTime, nullable=True)
-    freshness_hours = Column(Integer, default=24)
-    applied_with_resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
-    extra = Column(JSON, default=dict)  # forms structure, questions, autofill plan…
-    error = Column(Text, default="")
-    applied_at = Column(DateTime, nullable=True)
+    persona_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("personas.id"), nullable=True)
+    company_size: Mapped[str] = mapped_column(String, default="unknown", nullable=True)  # big, medium, small, startup
+    company_info: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    freshness_hours: Mapped[int] = mapped_column(Integer, default=24, nullable=True)
+    applied_with_resume_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("resumes.id"), nullable=True)
+    extra: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)  # forms structure, questions, autofill plan…
+    error: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class JobEvent(Base):
@@ -232,67 +233,67 @@ class JobEvent(Base):
 
     __tablename__ = "job_events"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
-    stage = Column(String(60), default="discovered")
-    status = Column(String(30), default="info")  # info | success | warning | error
-    message = Column(Text, default="")
-    meta = Column(JSON, default=dict)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    stage: Mapped[str] = mapped_column(String(60), default="discovered", nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="info", nullable=True)  # info | success | warning | error
+    message: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class VaultEntry(Base):
     __tablename__ = "vault_entries"
     __table_args__ = (UniqueConstraint("user_id", "domain", name="uq_vault_user_domain"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    domain = Column(String, nullable=False)
-    username = Column(String, nullable=False)
-    password_enc = Column(String, nullable=False)
-    origin = Column(String(30), default="auto")  # auto | manual
-    created_at = Column(DateTime, default=utcnow)
-    last_used_at = Column(DateTime, nullable=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    domain: Mapped[str] = mapped_column(String, nullable=False)
+    username: Mapped[str] = mapped_column(String, nullable=False)
+    password_enc: Mapped[str] = mapped_column(String, nullable=False)
+    origin: Mapped[str] = mapped_column(String(30), default="auto", nullable=True)  # auto | manual
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class Email(Base):
     __tablename__ = "emails"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    to_email = Column(String, nullable=False)
-    to_name = Column(String, default="")
-    subject = Column(String, default="")
-    body = Column(Text, default="")
-    status = Column(String, default="draft")  # draft|pending_approval|queued|sending|sent|failed|needs_otp|suppressed
-    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
-    company = Column(String, default="")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    to_email: Mapped[str] = mapped_column(String, nullable=False)
+    to_name: Mapped[str] = mapped_column(String, default="", nullable=True)
+    subject: Mapped[str] = mapped_column(String, default="", nullable=True)
+    body: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    status: Mapped[str] = mapped_column(String, default="draft", nullable=True)  # draft|pending_approval|queued|sending|sent|failed|needs_otp|suppressed
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=True)
+    company: Mapped[str] = mapped_column(String, default="", nullable=True)
     #: Denormalised job context so the approval bucket can show *which* posting
     #: this draft was written for without a join (and survives job deletion).
-    job_title = Column(String(300), default="")
-    job_url = Column(String(500), default="")
-    jd_excerpt = Column(Text, default="")
+    job_title: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    job_url: Mapped[str] = mapped_column(String(500), default="", nullable=True)
+    jd_excerpt: Mapped[str] = mapped_column(Text, default="", nullable=True)
     #: Persona/track the outreach was written for.
-    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
-    recipient_type = Column(String, default="hiring_manager")  # hiring_manager | founder
-    source = Column(String, default="heuristic")  # ai | hunter | clearbit | apollo | heuristic | manual
-    confidence = Column(Float, default=0.0)
+    persona_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("personas.id"), nullable=True)
+    recipient_type: Mapped[str] = mapped_column(String, default="hiring_manager", nullable=True)  # hiring_manager | founder
+    source: Mapped[str] = mapped_column(String, default="heuristic", nullable=True)  # ai | hunter | clearbit | apollo | heuristic | manual
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=True)
     #: True only when the address came from a verifying provider (hunter/apollo
     #: or an MX-confirmed personal address). Role mailboxes are always False.
-    verified = Column(Boolean, default=False, nullable=False)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     #: True when the message text was written by the model (vs. a template).
-    ai_used = Column(Boolean, default=False, nullable=False)
+    ai_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     #: Guardrail verdict for the drafted subject/body.
-    guardrail_report = Column(JSON, default=dict)
-    tracking_token = Column(String(64), default="", index=True)
-    unsubscribe_token = Column(String(64), default="", index=True)
-    opens = Column(Integer, default=0)
-    last_opened_at = Column(DateTime, nullable=True)
-    dry_run = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=utcnow)
-    sent_at = Column(DateTime, nullable=True)
-    error = Column(Text, default="")
+    guardrail_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    tracking_token: Mapped[str] = mapped_column(String(64), default="", index=True, nullable=True)
+    unsubscribe_token: Mapped[str] = mapped_column(String(64), default="", index=True, nullable=True)
+    opens: Mapped[int] = mapped_column(Integer, default=0, nullable=True)
+    last_opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="", nullable=True)
 
 
 class EmailEvent(Base):
@@ -300,13 +301,13 @@ class EmailEvent(Base):
 
     __tablename__ = "email_events"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    email_id = Column(Integer, ForeignKey("emails.id"), nullable=False, index=True)
-    kind = Column(String(40), default="info")  # queued|sent|open|bounce|complaint|unsubscribe|blocked|failed
-    detail = Column(Text, default="")
-    meta = Column(JSON, default=dict)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    email_id: Mapped[int] = mapped_column(Integer, ForeignKey("emails.id"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(40), default="info", nullable=True)  # queued|sent|open|bounce|complaint|unsubscribe|blocked|failed
+    detail: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class EmailOptOut(Base):
@@ -315,49 +316,49 @@ class EmailOptOut(Base):
     __tablename__ = "email_opt_outs"
     __table_args__ = (UniqueConstraint("user_id", "email", name="uq_optout_user_email"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    email = Column(String(320), nullable=False, index=True)
-    reason = Column(String(200), default="user_request")
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    reason: Mapped[str] = mapped_column(String(200), default="user_request", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class SettingsModel(Base):
     __tablename__ = "settings"
     __table_args__ = (UniqueConstraint("user_id", "category", "key", name="uq_settings_user_cat_key"),)
 
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    category = Column(String, nullable=False)
-    key = Column(String, nullable=False)
-    value = Column(JSON, nullable=True)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    category: Mapped[str] = mapped_column(String, nullable=False)
+    key: Mapped[str] = mapped_column(String, nullable=False)
+    value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
 
 
 class ErrorLog(Base):
     __tablename__ = "error_logs"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    timestamp = Column(DateTime, default=utcnow, index=True)
-    pipeline = Column(String, default="general")
-    level = Column(String, default="error")  # debug|info|warning|error|critical
-    message = Column(Text, default="")
-    job_id = Column(Integer, nullable=True)
-    request_id = Column(String(64), default="")
-    meta = Column(JSON, default=dict)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True, nullable=True)
+    pipeline: Mapped[str] = mapped_column(String, default="general", nullable=True)
+    level: Mapped[str] = mapped_column(String, default="error", nullable=True)  # debug|info|warning|error|critical
+    message: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    request_id: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
 
 
 class UserInputRequest(Base):
     __tablename__ = "user_input_requests"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    job_id = Column(Integer, ForeignKey("jobs.id"))
-    fields = Column(JSON, default=list)  # [{name, label, type, required, value}]
-    status = Column(String, default="pending")  # pending, completed, cancelled
-    created_at = Column(DateTime, default=utcnow)
-    completed_at = Column(DateTime, nullable=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=True)
+    fields: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)  # [{name, label, type, required, value}]
+    status: Mapped[str] = mapped_column(String, default="pending", nullable=True)  # pending, completed, cancelled
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class PipelineJob(Base):
@@ -369,28 +370,28 @@ class PipelineJob(Base):
         UniqueConstraint("user_id", "dedupe_key", name="uq_pipeline_user_dedupe"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    pipeline = Column(String, nullable=False)  # discovery|application|email|funding|ai
-    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
-    payload = Column(JSON, default=dict)
-    status = Column(String, default="queued")  # queued|processing|paused|done|failed|needs_input|dead
-    priority = Column(Integer, default=5)  # 1 highest
-    attempts = Column(Integer, default=0)
-    max_attempts = Column(Integer, default=3)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    pipeline: Mapped[str] = mapped_column(String, nullable=False)  # discovery|application|email|funding|ai
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="queued", nullable=True)  # queued|processing|paused|done|failed|needs_input|dead
+    priority: Mapped[int] = mapped_column(Integer, default=5, nullable=True)  # 1 highest
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=True)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=True)
     #: How many times this row has been re-queued because its lease expired
     #: (crash/restart). Tracked separately from ``attempts`` (handler failures)
     #: so a crash-looping job can be dead-lettered after N reclaims instead of
     #: bouncing forever. Incremented atomically in :func:`recover_stalled`.
-    reclaim_count = Column(Integer, default=0, nullable=False)
-    dedupe_key = Column(String(300), default="")
-    scheduled_at = Column(DateTime, default=utcnow, index=True)
-    lease_expires_at = Column(DateTime, nullable=True)
-    locked_by = Column(String(80), default="")
-    created_at = Column(DateTime, default=utcnow)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
-    finished_at = Column(DateTime, nullable=True)
-    error = Column(Text, default="")
+    reclaim_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True, nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str] = mapped_column(String(80), default="", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="", nullable=True)
 
 
 class ScheduledRun(Base):
@@ -424,22 +425,22 @@ class ScheduledRun(Base):
         Index("ix_scheduled_runs_user_bucket", "user_id", "workflow", "cycle_bucket"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     #: discovery | funding | application_prep (see auto_scheduler.CADENCE_SECONDS)
-    workflow = Column(String(40), nullable=False)
+    workflow: Mapped[str] = mapped_column(String(40), nullable=False)
     #: The cadence window this decision belongs to (epoch seconds // cadence).
-    cycle_bucket = Column(Integer, nullable=False, default=0)
-    triggered_at = Column(DateTime, default=utcnow, nullable=False)
+    cycle_bucket: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    triggered_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     #: The queue item this decision enqueued (``null`` for a skip).
-    queue_job_id = Column(Integer, nullable=True)
+    queue_job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     #: The job an application-prep run targets; ``null`` for the other workflows.
-    job_id = Column(Integer, nullable=True)
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     #: queued|done|paused|failed|needs_input|skipped_outage|skipped_quota|skipped_no_consent
-    state = Column(String(30), default="queued", nullable=False)
-    reason = Column(Text, default="")
-    meta = Column(JSON, default=dict)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    state: Mapped[str] = mapped_column(String(30), default="queued", nullable=False)
+    reason: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class FundingCompany(Base):
@@ -470,29 +471,29 @@ class FundingCompany(Base):
         Index("ix_funding_user_seen", "user_id", "last_seen_at"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    name = Column(String, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
     #: Dedupe/lookup key — :func:`funding_sources.normalize_company_name`
     #: (strip + collapse whitespace + casefold). ``name`` keeps the provider's
     #: display casing.
-    name_normalized = Column(String(200), nullable=False, default="", server_default="", index=True)
-    stage = Column(String, default="Undisclosed")  # Seed, Series A-D, Undisclosed
-    raised_at = Column(DateTime, default=utcnow)
-    website = Column(String, default="")
-    industry = Column(String, default="")
-    summary = Column(Text, default="")
-    keywords_matched = Column(JSON, default=list)
-    source = Column(String, default="demo")  # sec_edgar | crunchbase | tracxn | imported | demo
-    verified = Column(Boolean, default=False, nullable=False)
+    name_normalized: Mapped[str] = mapped_column(String(200), nullable=False, default="", server_default="", index=True)
+    stage: Mapped[str] = mapped_column(String, default="Undisclosed", nullable=True)  # Seed, Series A-D, Undisclosed
+    raised_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
+    website: Mapped[str] = mapped_column(String, default="", nullable=True)
+    industry: Mapped[str] = mapped_column(String, default="", nullable=True)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    keywords_matched: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    source: Mapped[str] = mapped_column(String, default="demo", nullable=True)  # sec_edgar | crunchbase | tracxn | imported | demo
+    verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     #: First scan that surfaced this company (never rewritten).
-    discovered_at = Column(DateTime, default=utcnow)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
     #: Most recent scan that still returned it — the prune clock.
-    last_seen_at = Column(DateTime, default=utcnow)
-    meta = Column(JSON, default=dict)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
     #: v2.2.5 linkage — does this user have ≥1 live job whose company
     #: normalizes to this name (via company_normalize.normalize_company_name).
-    has_open_positions = Column(Boolean, default=False, nullable=False)
+    has_open_positions: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class FundingScan(Base):
@@ -510,14 +511,14 @@ class FundingScan(Base):
         Index("ix_funding_scans_user_scanned", "user_id", "scanned_at"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    scanned_at = Column(DateTime, default=utcnow, nullable=False)
-    status = Column(String(20), default="ok", nullable=False)  # ok | scan_failed
-    provider_errors = Column(JSON, default=dict)
-    events_seen = Column(Integer, default=0, nullable=False)
-    companies_found = Column(Integer, default=0, nullable=False)
-    meta = Column(JSON, default=dict)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    scanned_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ok", nullable=False)  # ok | scan_failed
+    provider_errors: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    events_seen: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    companies_found: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
 
 
 class FundingScanCompany(Base):
@@ -530,11 +531,11 @@ class FundingScanCompany(Base):
         Index("ix_funding_scan_companies_company", "company_id"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    scan_id = Column(Integer, ForeignKey("funding_scans.id", ondelete="CASCADE"), nullable=False)
-    company_id = Column(Integer, ForeignKey("funding_companies.id", ondelete="CASCADE"), nullable=False)
-    rank = Column(Integer, nullable=False)
-    why = Column(Text, default="")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    scan_id: Mapped[int] = mapped_column(Integer, ForeignKey("funding_scans.id", ondelete="CASCADE"), nullable=False)
+    company_id: Mapped[int] = mapped_column(Integer, ForeignKey("funding_companies.id", ondelete="CASCADE"), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    why: Mapped[str] = mapped_column(Text, default="", nullable=True)
 
 
 class AuditLog(Base):
@@ -543,15 +544,15 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("ix_audit_user_created", "user_id", "created_at"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    action = Column(String(80), nullable=False)
-    target = Column(String(200), default="")
-    detail = Column(JSON, default=dict)
-    actor = Column(String(320), default="")
-    ip = Column(String(64), default="")
-    request_id = Column(String(64), default="")
-    created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(80), nullable=False)
+    target: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    actor: Mapped[str] = mapped_column(String(320), default="", nullable=True)
+    ip: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    request_id: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False, index=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -568,20 +569,20 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
     __table_args__ = (UniqueConstraint("user_id", name="uq_subscriptions_user"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    plan = Column(String(20), default="free", nullable=False)  # free | pro | pro_plus
-    status = Column(String(20), default="active", nullable=False)
-    provider = Column(String(20), default="manual")  # manual | stripe | razorpay
-    provider_customer_id = Column(String(200), default="")
-    provider_subscription_id = Column(String(200), default="")
-    current_period_start = Column(DateTime, default=utcnow)
-    current_period_end = Column(DateTime, nullable=True)
-    trial_end = Column(DateTime, nullable=True)
-    cancel_at_period_end = Column(Boolean, default=False, nullable=False)
-    grace_until = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    plan: Mapped[str] = mapped_column(String(20), default="free", nullable=False)  # free | pro | pro_plus
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    provider: Mapped[str] = mapped_column(String(20), default="manual", nullable=True)  # manual | stripe | razorpay
+    provider_customer_id: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    provider_subscription_id: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    current_period_start: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=True)
+    current_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    trial_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    grace_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
 
 
 class BillingEvent(Base):
@@ -593,15 +594,15 @@ class BillingEvent(Base):
         Index("ix_billing_user_created", "user_id", "created_at"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    provider = Column(String(20), nullable=False)  # stripe | razorpay | manual
-    provider_event_id = Column(String(200), nullable=False)
-    kind = Column(String(80), default="")  # e.g., invoice.paid, subscription.updated
-    payload = Column(JSON, default=dict)
-    processed = Column(Boolean, default=False, nullable=False)
-    error = Column(Text, default="")
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)  # stripe | razorpay | manual
+    provider_event_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    kind: Mapped[str] = mapped_column(String(80), default="", nullable=True)  # e.g., invoice.paid, subscription.updated
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    processed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    error: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class AICreditLedger(Base):
@@ -613,19 +614,19 @@ class AICreditLedger(Base):
     __tablename__ = "ai_credit_ledger"
     __table_args__ = (Index("ix_ai_ledger_user_created", "user_id", "created_at"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    workflow = Column(String(40), nullable=False)  # parse, scoring, resume_gen, etc.
-    model = Column(String(120), default="")
-    prompt_tokens = Column(Integer, default=0)
-    completion_tokens = Column(Integer, default=0)
-    total_tokens = Column(Integer, default=0)
-    estimated_cost_usd = Column(Float, default=0.0)
-    success = Column(Boolean, default=True, nullable=False)
-    latency_ms = Column(Integer, default=0)
-    error = Column(Text, default="")
-    meta = Column(JSON, default=dict)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    workflow: Mapped[str] = mapped_column(String(40), nullable=False)  # parse, scoring, resume_gen, etc.
+    model: Mapped[str] = mapped_column(String(120), default="", nullable=True)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=True)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=True)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=True)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class UsageCounter(Base):
@@ -640,14 +641,14 @@ class UsageCounter(Base):
         Index("ix_usage_user_period", "user_id", "period"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    period = Column(String(7), nullable=False)  # YYYY-MM
-    capability = Column(String(40), nullable=False)  # jobs_discovered, ai_ops, resumes, etc.
-    count = Column(Integer, default=0, nullable=False)
-    limit = Column(Integer, default=0, nullable=False)  # snapshot of limit at time
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    period: Mapped[str] = mapped_column(String(7), nullable=False)  # YYYY-MM
+    capability: Mapped[str] = mapped_column(String(40), nullable=False)  # jobs_discovered, ai_ops, resumes, etc.
+    count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    limit: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # snapshot of limit at time
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class Notification(Base):
@@ -656,15 +657,15 @@ class Notification(Base):
     __tablename__ = "notifications"
     __table_args__ = (Index("ix_notifications_user_read", "user_id", "read", "created_at"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    kind = Column(String(40), default="info")  # high_match, automation_failed, email_reply, etc.
-    title = Column(String(200), default="")
-    body = Column(Text, default="")
-    link = Column(String(500), default="")
-    read = Column(Boolean, default=False, nullable=False)
-    meta = Column(JSON, default=dict)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(40), default="info", nullable=True)  # high_match, automation_failed, email_reply, etc.
+    title: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    body: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    link: Mapped[str] = mapped_column(String(500), default="", nullable=True)
+    read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class InterviewPrep(Base):
@@ -673,17 +674,17 @@ class InterviewPrep(Base):
     __tablename__ = "interview_preps"
     __table_args__ = (Index("ix_interview_user_job", "user_id", "job_id"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
-    job_title = Column(String(300), default="")
-    company = Column(String(200), default="")
-    questions = Column(JSON, default=list)  # [{q, category, difficulty}]
-    answers = Column(JSON, default=dict)  # user answers
-    feedback = Column(JSON, default=dict)  # AI feedback per answer
-    status = Column(String(20), default="draft")  # draft | in_progress | completed
-    created_at = Column(DateTime, default=utcnow, nullable=False)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=True)
+    job_title: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    company: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    questions: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)  # [{q, category, difficulty}]
+    answers: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)  # user answers
+    feedback: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)  # AI feedback per answer
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=True)  # draft | in_progress | completed
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
 
 
 class CompanyIntel(Base):
@@ -692,21 +693,21 @@ class CompanyIntel(Base):
     __tablename__ = "company_intel"
     __table_args__ = (UniqueConstraint("user_id", "company", name="uq_intel_user_company"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    company = Column(String(200), nullable=False)
-    website = Column(String(500), default="")
-    industry = Column(String(200), default="")
-    size = Column(String(50), default="unknown")
-    funding_stage = Column(String(50), default="")
-    tech_stack = Column(JSON, default=list)
-    culture = Column(Text, default="")
-    recent_news = Column(JSON, default=list)
-    sources = Column(JSON, default=list)
-    summary = Column(Text, default="")
-    verified = Column(Boolean, default=False, nullable=False)
-    created_at = Column(DateTime, default=utcnow, nullable=False)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    company: Mapped[str] = mapped_column(String(200), nullable=False)
+    website: Mapped[str] = mapped_column(String(500), default="", nullable=True)
+    industry: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    size: Mapped[str] = mapped_column(String(50), default="unknown", nullable=True)
+    funding_stage: Mapped[str] = mapped_column(String(50), default="", nullable=True)
+    tech_stack: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    culture: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    recent_news: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    sources: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
 
 
 # --------------------------------------------------------------------------- #

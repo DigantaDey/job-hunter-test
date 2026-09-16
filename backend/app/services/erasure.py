@@ -39,10 +39,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple, cast
 
-from sqlalchemy import Table, bindparam, delete, func, or_, select, update
+from sqlalchemy import Executable, Table, bindparam, delete, func, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import BindParameter
 
 from app.core.logging import get_logger
 from app.db import Base
@@ -55,7 +57,13 @@ USERS_TABLE = "users"
 USER_COLUMN = "user_id"
 
 #: Bound by the caller: ``db.execute(stmt, {"uid": user_id})``.
-UID = bindparam("uid")
+UID: BindParameter[Any] = bindparam("uid")
+
+
+def _rowcount(db: Session, statement: Executable, params: Dict[str, Any]) -> int:
+    """Rows affected by a DML statement; ``Session.execute`` returns a
+    ``CursorResult`` for these at runtime, but types it as a plain ``Result``."""
+    return int(cast(CursorResult[Any], db.execute(statement, params)).rowcount or 0)
 
 
 @dataclass(frozen=True)
@@ -63,11 +71,11 @@ class Statements:
     """Labelled Core statements — ``table`` for a delete, ``table.column`` for a
     null-out, so the affected-row counts read well in a log line or a failure."""
 
-    items: Tuple[Tuple[str, object], ...] = field(default_factory=tuple)
+    items: Tuple[Tuple[str, Executable], ...] = field(default_factory=tuple)
 
     def run(self, db: Session, user_id: int, counts: Dict[str, int]) -> Dict[str, int]:
         for label, stmt in self.items:
-            counts[label] = int(db.execute(stmt, {"uid": user_id}).rowcount or 0)
+            counts[label] = _rowcount(db, stmt, {"uid": user_id})
         return counts
 
 
@@ -148,8 +156,8 @@ def _owned_ids(parent: Table):
 def build_plan() -> ErasurePlan:
     """Compute the erasure plan from the live schema metadata (once per process)."""
     owned = _owned_tables()
-    nulls: List[Tuple[str, object]] = []
-    link_statements: List[Tuple[str, object]] = []
+    nulls: List[Tuple[str, Executable]] = []
+    link_statements: List[Tuple[str, Executable]] = []
     #: parent table -> children that reference it through a NOT NULL FK.
     children_of: Dict[str, Set[str]] = {}
 
@@ -216,7 +224,7 @@ def build_plan() -> ErasurePlan:
     # user_id is nullable (error logs, the audit trail, billing events).
     order = [name for name in order if name != USERS_TABLE] + [USERS_TABLE]
 
-    deletes: List[Tuple[str, object]] = []
+    deletes: List[Tuple[str, Executable]] = []
     for name in order:
         table = _table(name)
         if name == USERS_TABLE:
@@ -269,9 +277,7 @@ def break_references(db: Session, table_name: str, row_id: int) -> Tuple[Dict[st
             if not column.nullable:
                 blockers.append(label)
                 continue
-            count = int(db.execute(
-                update(table).where(column == row_id).values({column.name: None})
-            ).rowcount or 0)
+            count = _rowcount(db, update(table).where(column == row_id).values({column.name: None}), {})
             if count:
                 nulled[label] = count
     return nulled, blockers

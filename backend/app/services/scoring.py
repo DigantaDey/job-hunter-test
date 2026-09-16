@@ -45,7 +45,7 @@ def tokenize(text: str) -> List[str]:
 def tf(text: str) -> Dict[str, float]:
     toks = tokenize(text)
     total = len(toks) or 1
-    freq = {}
+    freq: Dict[str, int] = {}
     for t in toks:
         freq[t] = freq.get(t, 0) + 1
     return {k: v/total for k,v in freq.items()}
@@ -309,7 +309,8 @@ def _score_checks(profile: Dict[str, Any], jd: str, anchor: Dict[str, Any]):
                                "message": f"'{token}' is not mentioned in the job description."})
 
         # The breakdown must be numeric, in range, and consistent with the total.
-        breakdown = data.get("breakdown") if isinstance(data.get("breakdown"), dict) else {}
+        raw_breakdown = data.get("breakdown")
+        breakdown = raw_breakdown if isinstance(raw_breakdown, dict) else {}
         numeric = {k: v for k, v in breakdown.items() if isinstance(v, (int, float))}
         for key, value in numeric.items():
             if not 0 <= float(value) <= 100:

@@ -135,8 +135,11 @@ def _extract_fields(soup: BeautifulSoup, portal: str) -> List[Dict[str, Any]]:
     seen: set[str] = set()
     for form in soup.find_all("form") or [soup]:
         for element in form.find_all(["input", "select", "textarea"]):
-            name = (element.get("name") or element.get("id") or "").strip()
-            field_type = (element.get("type") or element.name or "text").lower()
+            # BeautifulSoup can report a multi-valued attribute (AttributeValueList)
+            # for attrs like class; name/id/type are single-valued in practice,
+            # so str() here is a typeshed-alignment coercion, not a behaviour change.
+            name = str(element.get("name") or element.get("id") or "").strip()
+            field_type = str(element.get("type") or element.name or "text").lower()
             if field_type in IGNORED_INPUT_TYPES:
                 continue
             if not name or any(hint in name.lower() for hint in IGNORED_NAME_HINTS):

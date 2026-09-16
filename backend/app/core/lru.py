@@ -29,7 +29,10 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-_MISSING = object()
+#: Sentinel for "absent": typed ``Any`` so ``dict.get(key, _MISSING)`` results
+#: stay unpackable after the identity check (mypy does not narrow ``is`` on a
+#: module-level ``object()`` singleton).
+_MISSING: Any = object()
 
 
 class BoundedTTLMap:

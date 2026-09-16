@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
+from typing import Any, Dict
 
 from fastapi import APIRouter
 
@@ -46,9 +47,9 @@ def performance_analytics(user: CurrentUser, db: DbSession):
     interview_rate = round(len(interviews) / max(1, len(applied)) * 100, 1) if applied else 0.0
 
     # Per-role performance
-    role_counter = Counter()
-    role_applied = Counter()
-    role_interview = Counter()
+    role_counter: Counter[str] = Counter()
+    role_applied: Counter[str] = Counter()
+    role_interview: Counter[str] = Counter()
     for job in jobs:
         # Normalize title to role family
         title = (job.title or "").lower()
@@ -76,7 +77,7 @@ def performance_analytics(user: CurrentUser, db: DbSession):
 
     # Best performing role
     best_role = None
-    best_rate = 0
+    best_rate: float = 0
     for family in role_counter:
         rate = role_interview[family] / max(1, role_applied[family]) if role_applied[family] else 0
         if rate > best_rate and role_applied[family] >= 2:
@@ -122,12 +123,12 @@ def performance_analytics(user: CurrentUser, db: DbSession):
 
     # AI usage trend
     ai_ops = db.query(AICreditLedger).filter(AICreditLedger.user_id == user.id).order_by(AICreditLedger.created_at.desc()).limit(100).all()
-    ai_daily = defaultdict(int)
+    ai_daily: defaultdict[str, int] = defaultdict(int)
     for op in ai_ops:
         d = op.created_at.strftime("%Y-%m-%d")
         ai_daily[d] += op.total_tokens
 
-    result = {
+    result: Dict[str, Any] = {
         "summary": {
             "total_jobs": total,
             "applied": len(applied),
@@ -147,7 +148,8 @@ def performance_analytics(user: CurrentUser, db: DbSession):
                 "interviews": role_interview[role],
                 "interview_rate": round(role_interview[role] / max(1, role_applied[role]) * 100, 1) if role_applied[role] else 0,
             }
-            for role in role_counter.most_common(10)
+            # most_common yields (role, count) pairs; the role string is the key.
+            for role, _count in role_counter.most_common(10)
         ],
         "skills": {
             "strongest": [{"skill": s, "count": c} for s, c in strongest],
@@ -194,7 +196,7 @@ def cost_analytics(user: CurrentUser, db: DbSession):
     ledger = db.query(AICreditLedger).filter(AICreditLedger.user_id == user.id).all()
     total_cost = sum(r.estimated_cost_usd for r in ledger)
     total_tokens = sum(r.total_tokens for r in ledger)
-    by_workflow = defaultdict(lambda: {"tokens": 0, "cost": 0.0, "count": 0})
+    by_workflow: defaultdict[str, Dict[str, float]] = defaultdict(lambda: {"tokens": 0, "cost": 0.0, "count": 0})
     for r in ledger:
         by_workflow[r.workflow]["tokens"] += r.total_tokens
         by_workflow[r.workflow]["cost"] += r.estimated_cost_usd

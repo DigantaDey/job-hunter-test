@@ -298,8 +298,8 @@ async def diagnose_outage(exc: BaseException, *, workflow: str = "",
     probe: Dict[str, Any] = {}
     try:
         probe = await ping(workflow, db=db, user_id=user_id, timeout=6)
-    except Exception as exc:  # pragma: no cover - diagnostics must never fail
-        probe = {"online": False, "reason": "unreachable", "error": str(exc)}
+    except Exception as ping_exc:  # pragma: no cover - diagnostics must never fail
+        probe = {"online": False, "reason": "unreachable", "error": str(ping_exc)}
     outage = describe_ai_error(exc, workflow=workflow, probe=probe)
     return outage.payload()
 
@@ -424,7 +424,7 @@ class FactLedger:
     raw: str = ""
 
     def knows(self, kind: str, value: Any) -> bool:
-        bucket = getattr(self, kind, set())
+        bucket: Set[str] = getattr(self, kind, set())
         return _norm(value) in bucket
 
     def contains_text(self, value: Any) -> bool:
@@ -594,8 +594,8 @@ class SchemaSpec:
                     issues.append({"code": "missing_field", "severity": "error", "field": spec.name,
                                    "message": f"'{spec.name}' is required and was missing or empty."})
                 continue
-            expected = {"str": str, "int": int, "float": (int, float), "bool": bool,
-                        "list": list, "dict": dict}.get(spec.kind)
+            expected: Any = {"str": str, "int": int, "float": (int, float), "bool": bool,
+                             "list": list, "dict": dict}.get(spec.kind)
             if expected and not isinstance(value, expected):
                 issues.append({"code": "wrong_type", "severity": "error", "field": spec.name,
                                "message": f"'{spec.name}' must be {spec.kind}, got {type(value).__name__}."})

@@ -42,7 +42,8 @@ def board_tokens_for(source_id: str, extra: Optional[List[str]] = None) -> List[
         "smartrecruiters": settings.smartrecruiters_board_tokens,
         "workday": settings.workday_board_tokens,
     }.get(source_id, "")
-    for group in (DEFAULT_BOARD_TOKENS.get(source_id, []), [t.strip() for t in (env_tokens or "").split(",")], extra or []):
+    env_list = env_tokens.split(",") if isinstance(env_tokens, str) else list(env_tokens or [])
+    for group in (DEFAULT_BOARD_TOKENS.get(source_id, []), [t.strip() for t in env_list], extra or []):
         for token in group:
             token = (token or "").strip()
             if token and token not in tokens:
@@ -453,7 +454,7 @@ class _BoardSource(Source):
         results = await asyncio.gather(*(self.fetch_board(token, per_board) for token in tokens), return_exceptions=True)
         postings: List[Posting] = []
         for token, result in zip(tokens, results, strict=False):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 log.debug("%s board %s failed: %s", self.id, token, result)
                 continue
             postings.extend(result)
