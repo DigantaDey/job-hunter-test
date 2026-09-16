@@ -15,6 +15,9 @@ from typing import List, Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
+from sqlalchemy import case
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession, get_owned_profile, invalidate_context, search_context
 from app.core import audit
@@ -25,6 +28,7 @@ from app.core.security import constant_time_equals
 from app.models.models import Job, Profile, Resume
 from app.schemas.schemas import ProfileOut, ResumeOut
 from app.services import persona as persona_service
+from app.services.erasure import break_references
 from app.services.job_queue import enqueue, enqueue_or_existing
 from app.services.resume_parser import ai_extract_profile, extract_layout, extract_text
 from app.services.resume_service import (
@@ -681,19 +685,119 @@ async def upload_polished(
 
 @router.delete("/resumes/{resume_id}")
 def delete_resume(resume_id: int, request: Request, user: CurrentUser, db: DbSession):
+    """
+    Delete one resume — without leaving a reference behind.
+
+    Four columns point at a resume row: ``jobs.applied_with_resume_id``,
+    ``resumes.parent_resume_id``, ``personas.source_resume_id`` and
+    ``profiles.master_resume_id``. All four are ``NO ACTION``, so the bare
+    ``db.delete(resume)`` this endpoint used to run aborted with an
+    ``IntegrityError`` for any resume that had ever been attached to an
+    application — which is to say, for exactly the resumes worth cleaning up —
+    and a 500 that leaves the row (and the download) in place is the worst of
+    both outcomes.
+
+    References are therefore resolved before the delete, each with the treatment
+    that matches what it means, and the set of columns comes from the schema (see
+    :func:`app.services.erasure.break_references`) rather than from this function:
+
+    * a job's applied resume, a polished copy's parent and a persona's source
+      resume are *history* — nulled, so those rows survive the file they once
+      pointed at;
+    * the profile's master is a *current* dependency (scoring, tailoring and
+      search context all read it), so it is re-pointed at a surviving resume when
+      one exists. When it does not — the user's only resume — the pointer is
+      detached rather than the request refused: a 409 here would mean the
+      product can be talked into keeping a document its owner asked to delete,
+      and everything that reads the master already answers "upload a master
+      resume first";
+    * a NOT NULL reference — which no resume has today — is refused with a 409
+      naming it, because *that* one really would orphan someone's data.
+
+    Files are removed after the commit, for the same reason account deletion does:
+    a transaction that fails must not cost the user documents it can still show.
+    """
     resume = db.query(Resume).filter(Resume.id == resume_id, Resume.user_id == user.id).first()
     if not resume:
         raise HTTPException(404, "Resume not found")
-    for path in {resume.filepath, os.path.splitext(resume.filepath)[0] + ".pdf"}:
+
+    paths = _resume_paths(resume)
+    # Read before the null-out below detaches them.
+    orphaned_masters = (db.query(Profile)
+                        .filter(Profile.user_id == user.id, Profile.master_resume_id == resume.id)
+                        .all())
+    repointed_to: Optional[int] = None
+    try:
+        nulled, blockers = break_references(db, "resumes", resume.id)
+        if blockers:
+            db.rollback()
+            raise HTTPException(409, {
+                "code": "resume_referenced",
+                "message": (f"Resume {resume.id} is still referenced by "
+                            f"{', '.join(blockers)}, which cannot be detached. Delete those rows first."),
+                "blockers": blockers,
+            })
+
+        successor = _master_successor(db, user.id, exclude=resume.id) if orphaned_masters else None
+        for profile in orphaned_masters:
+            # Nulled above; re-pointed here when there is something to point at.
+            profile.master_resume_id = successor.id if successor else None
+        if successor:
+            repointed_to = successor.id
+
+        db.delete(resume)
+        db.commit()
+    except IntegrityError as exc:
+        # The reference list above is derived, so arriving here means the schema
+        # was mutated between reading and deleting. Refuse cleanly, keep the files.
+        db.rollback()
+        log.error("resume %s (user %s) could not be deleted: %s", resume.id, user.id, exc)
+        raise HTTPException(409, {"code": "resume_referenced",
+                                  "message": f"Resume {resume.id} is still referenced by rows that could "
+                                             f"not be detached; nothing was deleted."}) from exc
+    else:
+        removed_files = _remove_resume_files(paths)
+        audit.audit(db, "resume.deleted", user=user, target=resume.filename, request=request,
+                    detail={"resume_id": resume.id, "unlinked": nulled,
+                            "master_repointed_to": repointed_to, "files_removed": removed_files})
+
+    return {"ok": True, "unlinked": nulled, "master_repointed_to": repointed_to,
+            "master_detached": bool(orphaned_masters) and repointed_to is None}
+
+
+
+def _resume_paths(resume: Resume) -> List[str]:
+    """Every file this resume row owns: the stored document plus its rendered PDF."""
+    return sorted({p for p in (resume.filepath, os.path.splitext(resume.filepath or "")[0] + ".pdf") if p})
+
+
+def _remove_resume_files(paths: List[str]) -> int:
+    """Best-effort, logged, after the commit — a file that will not go is not a reason to 500."""
+    removed = 0
+    for path in paths:
         try:
-            if path and os.path.exists(path):
+            if os.path.exists(path):
                 os.remove(path)
-        except OSError as exc:  # pragma: no cover
-            log.warning("could not delete %s: %s", path, exc)
-    db.delete(resume)
-    db.commit()
-    audit.audit(db, "resume.deleted", user=user, target=resume.filename, request=request)
-    return {"ok": True}
+                removed += 1
+        except OSError as exc:  # pragma: no cover - depends on the filesystem
+            log.warning("resume deletion could not remove %s: %s", path, exc)
+    return removed
+
+
+def _master_successor(db: Session, user_id: int, *, exclude: int) -> Optional[Resume]:
+    """
+    The resume that should become the profile's master.
+
+    Preference order is the one the upload flow already implies: another master
+    wins, an approved one beats a pending or rejected one, and the newest id
+    breaks the tie (``id`` is monotonic, unlike a second-granularity timestamp).
+    """
+    return (db.query(Resume)
+            .filter(Resume.user_id == user_id, Resume.id != exclude)
+            .order_by(case((Resume.type == "master", 0), else_=1),
+                      case((Resume.status == "approved", 0), else_=1),
+                      Resume.id.desc())
+            .first())
 
 
 @router.post("/resumes/generate-cover-letter")

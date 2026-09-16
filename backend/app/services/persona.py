@@ -38,6 +38,7 @@ from app.services.ai_guardrails import (
     run_guarded_task,
     strip_ai_artifacts,
 )
+from app.services.erasure import break_references
 
 log = get_logger("app.persona")
 
@@ -49,6 +50,21 @@ class PersonaExistsError(Exception):
         self.name = name
         self.persona_id = persona_id
         super().__init__(f"A track named '{name}' already exists")
+
+
+class PersonaInUseError(Exception):
+    """
+    A row references this track through a FK that cannot be nulled.
+
+    Which is a decision about *that* row, so it belongs to the caller (the API
+    answers 409 and names the blockers) and not to a service that deletes.
+    """
+
+    def __init__(self, name: str, blockers: List[str]):
+        self.name = name
+        self.blockers = list(blockers)
+        super().__init__(f"The track '{name}' is still referenced by {', '.join(self.blockers)}")
+
 
 #: Signals that count as real evidence of the user's behaviour/intent.
 SIGNAL_KINDS = {
@@ -252,10 +268,25 @@ def set_active_persona(db: Session, user_id: int, persona_id: int) -> Persona:
 
 
 def delete_persona(db: Session, user_id: int, persona_id: int) -> bool:
+    """
+    Delete one track.
+
+    Jobs, resumes and emails record the track they were produced under through a
+    nullable ``NO ACTION`` FK, so those pointers are detached first: the history
+    they belong to survives and simply stops naming a track that is gone. Without
+    that, deleting a persona that had ever scored a job aborted with an
+    ``IntegrityError`` — a 500 on an ordinary edit. A reference the schema does
+    not allow to be nulled raises :class:`PersonaInUseError` instead, so the
+    caller refuses knowingly rather than half-deleting.
+    """
     row = get_persona(db, user_id, persona_id)
     if not row:
         return False
     was_default = bool(row.is_default)
+    _unlinked, blockers = break_references(db, "personas", row.id)
+    if blockers:
+        db.rollback()
+        raise PersonaInUseError(row.name, blockers)
     db.delete(row)
     db.commit()
     if was_default:
@@ -756,7 +787,7 @@ def _json(value: Any, limit: int) -> str:
 
 __all__ = [
     "SIGNAL_KINDS", "list_personas", "get_persona", "ensure_persona", "ensure_default_persona",
-    "create_persona", "update_persona", "set_active_persona", "delete_persona",
+    "create_persona", "update_persona", "set_active_persona", "delete_persona", "PersonaInUseError",
     "context_for_persona", "record_signal", "memory_summary", "build_portrait",
     "portrait_dict", "portrait_is_stale", "suggest_tracks", "to_dict",
     "AIUnavailableError", "GuardrailError",

@@ -4,6 +4,95 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.15] — 2026-09-16
+
+**Erasure became complete because it stopped being a list, and the suite got its
+foreign keys back.** Every FK in this schema is `NO ACTION`, so a `DELETE` that
+misses one referencing row is an `IntegrityError` — and `delete_account` was a
+hand-written list of tables that had fallen behind the schema by ten (personas,
+subscriptions, billing events, the credit ledger, usage counters, notifications,
+interview prep, company intel, funding scans, scheduled runs). Anyone who had used
+the product at all therefore met a 500 on the one endpoint a data subject is
+entitled to, on an account left in the middle of its own deletion. `DELETE
+/api/resumes/{id}` and `DELETE /api/personas/{id}` were the same defect in
+miniature. None of it was visible in CI: the test harness turned SQLite's FK
+enforcement off on a *pooled* connection, and every later test inherited a
+database that accepted dangling references.
+
+### Fixed
+
+- **The erasure plan is derived from the schema, not remembered.** New
+  `app/services/erasure.py`: every table with a FK to `users.id` is deleted by
+  `user_id`; the nullable references *between* those tables are nulled first, which
+  is the only way to break the intentional cycles (`jobs` ↔ `resumes`,
+  `personas` ↔ `resumes`, `profiles` → `resumes`); the deletes are then
+  topologically sorted over the FKs that cannot be nulled (`job_events.job_id`,
+  `email_events.email_id`) with `users` last; and ownerless join tables
+  (`funding_scan_companies`) are cleaned explicitly rather than relying on
+  `ON DELETE CASCADE` firing. A table added to `models.py` can no longer be
+  forgotten at deletion time, because there is no list left to forget. If the
+  database still refuses, the transaction rolls back and the answer is
+  `409 deletion_blocked` — an intact account, an honest message, and the audit row
+  says so.
+- **Files are removed after the commit, never before — and there are more of them
+  than the endpoint knew about.** Uploads and generated PDFs used to be deleted
+  *first*, so any abort left an account fully present with its resumes destroyed on
+  disk: data deleted by a deletion that had failed. The sweep is now
+  `{resume filepath, rendered PDF}` **plus** the autofill screenshots, which live in
+  `SCREENSHOT_DIR` as `job_{job_id}_{utc}.png` and are recorded only inside a JSON
+  blob — the job id in the filename is the only tenant key they have, so they are
+  matched by listing the directory once against the account's own job ids (a
+  `job_*` wildcard would have deleted the neighbours' screenshots, a worse bug than
+  the one being fixed). Removal is best-effort and logged, and counted in both the
+  response (`rows_removed`, `tables`, `files_removed`) and the retained
+  `account.deleted` audit row, which also carries `leftover_tables` — and an ERROR
+  log — if the erasure ever leaves a row behind.
+- **`DELETE /api/resumes/{id}` detaches what points at it.** A job's
+  `applied_with_resume_id`, a derived copy's `parent_resume_id` and a persona's
+  `source_resume_id` are nulled so those rows survive the file they once named; the
+  profile's `master_resume_id` — a *current* dependency, not history — is
+  re-pointed at a surviving resume (another master, then an approved one, then the
+  newest), and detached with `master_detached: true` when the deleted file was the
+  only one, because refusing there would let the product keep a document its owner
+  asked to remove. A NOT NULL referrer is answered with `409 resume_referenced`
+  naming the blocker. No `IntegrityError` escapes any branch, and the response
+  reports exactly which columns were unlinked.
+- **`DELETE /api/personas/{id}` stops 500-ing on its own track history.** The same
+  bug against `jobs.persona_id`, `emails.persona_id` and `resumes.persona_id`: those
+  pointers are now detached, and anything the schema forbids detaching raises
+  `PersonaInUseError` → `409 persona_in_use` instead of aborting mid-delete.
+- **The GDPR export streams, and it is actually everything.** Each collection is
+  read as a keyset-paginated *projection* (`WHERE user_id = :uid AND id > :last
+  ORDER BY id LIMIT 500`) and serialised chunk by chunk into a `StreamingResponse`,
+  so a heavy account is no longer loaded — twice, as entities and then as dicts —
+  into the request; the offset-free pagination also cannot skip or repeat a row
+  while the account is being written to. The document gained the collections it
+  claimed to have (`format_version` stays `2.0`), and a non-finite float is written
+  as `null` rather than truncating the download.
+- **`tests/conftest.py` no longer disables FK enforcement on the app engine.** The
+  cycle in the schema still means dropping tables with enforcement off, so the drop
+  now happens on its own `NullPool` engine and pooled app connections stay
+  enforcing for the whole run. `tests/test_deletion_integrity.py` pins that
+  enforcement itself, seeds a row into every tenant table (and fails when the seed
+  list falls behind the schema), and covers both regressions end to end.
+- **A migration for `pipeline_jobs.reclaim_count`.** The column had been in the
+  models since v2.2 and in no migration, so an install on the Alembic path failed
+  every queue insert with "no such column" — invisible because the suite builds its
+  schema with `create_all`. Revision `a7b8c9d0e1f2` adds it, and
+  `test_migrated_schema_builds_every_column_the_models_declare` fails if the chain
+  and the metadata drift apart again.
+
+### Changed
+
+- `docs/COMPLIANCE.md` now states the export's real contents, and that erasure
+  covers every table the schema declares rather than the ones the endpoint names.
+
+**Verified**: the full suite is **767 passed** with FK enforcement on (baseline
+750) and `ruff` clean. A manual run against a fresh Alembic-migrated database —
+register, seed a row into every user-owned table, export, delete — returns 200,
+leaves zero rows anywhere (including no dangling reference from another account),
+removes the account's four files, and leaves a second account's data untouched.
+
 ## [2.2.14] — 2026-09-15
 
 **Long-lived process state stops being attacker-resettable, the daily cap stops

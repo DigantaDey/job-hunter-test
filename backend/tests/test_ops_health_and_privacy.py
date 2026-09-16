@@ -256,3 +256,48 @@ def test_alembic_migrations_apply_to_a_fresh_database(tmp_path):
     up = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
                         cwd=backend, env=env, capture_output=True, text=True)
     assert up.returncode == 0, up.stderr
+
+
+def test_migrated_schema_builds_every_column_the_models_declare(tmp_path):
+    """``create_all`` (the suite) and the Alembic chain (production) must agree.
+
+    A column that exists only in ``app/models/models.py`` is invisible to every
+    test, because the test schema is built from that same metadata — and fatal in
+    a deployed install, where the first ``INSERT`` through the ORM names a column
+    the database never got. That is exactly how ``pipeline_jobs.reclaim_count``
+    shipped (migration ``a7b8c9d0e1f2`` closed it), and it is the same blind spot
+    the deletion bugs hid behind: the suite describes *a* database rather than
+    reading the one production runs.
+    """
+    db_path = tmp_path / "drift.db"
+    env = {
+        **os.environ,
+        "DATABASE_URL": f"sqlite:///{db_path}",
+        "ALEMBIC_DATABASE_URL": f"sqlite:///{db_path}",
+        "ENVIRONMENT": "test",
+        "SECRET_KEY": "test-secret-key-that-is-long-enough-1234567890",
+        "ENCRYPTION_KEY": "test-encryption-key-1234567890-abcdefghij",
+    }
+    backend = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    result = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
+                            cwd=backend, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+    import sqlite3
+
+    from app.db import Base
+    from app.models import models  # noqa: F401  (registers the metadata)
+
+    connection = sqlite3.connect(db_path)
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    drift: dict[str, list[str]] = {}
+    for name, table in Base.metadata.tables.items():
+        if name not in tables:
+            drift[name] = ["<table missing>"]
+            continue
+        built = {row[1] for row in connection.execute(f'PRAGMA table_info("{name}")')}
+        missing = sorted(set(table.columns.keys()) - built)
+        if missing:
+            drift[name] = missing
+    connection.close()
+    assert not drift, f"the migration chain does not build what the models declare: {drift}"
