@@ -120,7 +120,10 @@ def export_url(flavour: str, user: CurrentUser):
 def _resolve_exporter(request: Request, db: DbSession, flavour: str, token: Optional[str]) -> Any:
     """Bearer token first (API clients / dev mode); otherwise a valid signed
     token. The SPA's navigation sends no Authorization header, so the signed
-    token is the only credential a browser download presents."""
+    token is the only credential a browser download presents. When *both* are
+    present they must agree — a bearer for one account combined with a signed
+    token minted for another is refused rather than silently using whichever
+    was checked first."""
     from fastapi.security import HTTPAuthorizationCredentials
 
     from app.core.auth import get_current_user
@@ -130,21 +133,29 @@ def _resolve_exporter(request: Request, db: DbSession, flavour: str, token: Opti
     if header.lower().startswith("bearer "):
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=header[7:].strip())
 
+    bearer_user: Any = None
     try:
         user = get_current_user(request=request, credentials=credentials, db=db)
         if user:
-            return user
+            bearer_user = user
     except HTTPException:
         pass
 
+    token_user: Any = None
     if token:
         valid, user_id = verify_export_token(token, flavour)
         if valid and user_id is not None:
             token_user = db.query(User).filter(User.id == user_id, User.is_active.is_(True)).first()
-            if token_user:
-                request.state.user_id = token_user.id
-                user_id_var.set(int(token_user.id))
-                return token_user
+
+    if bearer_user is not None and token_user is not None:
+        if bearer_user.id != token_user.id:
+            raise HTTPException(401, "Credential mismatch")
+        return bearer_user
+    resolved = token_user or bearer_user
+    if resolved is not None:
+        request.state.user_id = resolved.id
+        user_id_var.set(int(resolved.id))
+        return resolved
     raise HTTPException(401, "Not authenticated")
 
 

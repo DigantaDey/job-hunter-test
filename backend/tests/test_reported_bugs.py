@@ -101,6 +101,26 @@ def test_bare_download_link_is_rejected_but_signed_url_works(client: TestClient,
     assert "attachment" in followed.headers.get("content-disposition", "")
 
 
+def test_resume_download_rejects_mismatched_bearer_and_signed_token(
+        client: TestClient, auth: Dict[str, str], member_auth: Dict[str, str], uploaded_resume, db):
+    """A bearer for one account and a signed token for another must not mix."""
+    resume = db.query(Resume).filter(Resume.type == "master").first()
+    assert resume is not None
+
+    owner_url = client.get(f"/api/resumes/{resume.id}/download-url?format=docx", headers=auth).json()["url"]
+    token = owner_url.split("token=", 1)[1]
+
+    # Owner bearer + owner token: fine.
+    assert client.get(f"/api/resumes/{resume.id}/download?format=docx&token={token}",
+                      headers=auth).status_code == 200
+
+    # Member bearer + owner token: refused, not silently served the owner's file.
+    mismatch = client.get(f"/api/resumes/{resume.id}/download?format=docx&token={token}",
+                          headers=member_auth)
+    assert mismatch.status_code == 401, mismatch.text
+    assert mismatch.json()["detail"]["code"] == "credential_mismatch"
+
+
 def test_download_filename_is_professional_not_resume_id_hash(client: TestClient, auth: Dict[str, str],
                                                              uploaded_resume, db):
     """``resume_26_a6786c6`` was the reported filename. It must be a real name."""

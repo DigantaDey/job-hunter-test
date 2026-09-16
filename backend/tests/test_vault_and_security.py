@@ -110,11 +110,16 @@ def test_vault_export_signed_url_is_bound_and_short_lived(client, auth, member_a
     # serves the owner's own CSV.
     assert client.get(f"/api/vault/export/chrome?token={token}").status_code == 200
 
-    # A different account presenting the token (with its own bearer) still only
-    # ever receives its own data — never the owner's rows.
+    # A different account presenting the owner's token alongside its own bearer
+    # is a credential mismatch, not a bearer-vs-token precedence decision.
     other = client.get(f"/api/vault/export/chrome?token={token}", headers=member_auth)
-    assert other.status_code == 200
-    assert "owner@example.com" not in other.text
+    assert other.status_code == 401, other.text
+
+    # The token alone is still the member's *own* route to their own export.
+    member_issued = client.get("/api/vault/export/chrome/url", headers=member_auth).json()
+    member_download = client.get(member_issued["url"])
+    assert member_download.status_code == 200
+    assert "owner@example.com" not in member_download.text
 
     # Wrong flavour breaks the binding.
     assert client.get(f"/api/vault/export/apple?token={token}").status_code == 401

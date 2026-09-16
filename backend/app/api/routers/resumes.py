@@ -578,24 +578,40 @@ def download_resume(
 
 
 def _resolve_downloader(request: Request, db, resume_id: int, fmt: str, token: Optional[str]) -> int:
-    """Bearer token first; otherwise a valid signed download token."""
-    from app.core.auth import get_current_user
-    from app.db import get_db  # noqa: F401  (db already injected)
+    """Bearer token first; otherwise a valid signed download token.
 
+    When *both* are presented they must agree — a bearer that resolves to one
+    account combined with a signed token minted for another is refused rather
+    than silently using whichever was checked first.
+    """
+    from app.core.auth import get_current_user
+
+    bearer_user_id: Optional[int] = None
     try:
         user = get_current_user(request=request, credentials=_bearer_credentials(request), db=db)
         if user:
-            return user.id
+            bearer_user_id = user.id
     except HTTPException:
         pass
 
+    token_user_id: Optional[int] = None
     if token:
         # The signed token is bound to (resume_id, user_id, format) — but the
-        # user id is inside the signature, so verify against every candidate by
-        # checking the resume's owner.
+        # user id is inside the signature, so the owner is the resume's.
         resume = db.query(Resume).filter(Resume.id == resume_id).first()
         if resume and verify_download_token(token, resume_id, resume.user_id, fmt):
-            return resume.user_id
+            token_user_id = resume.user_id
+
+    if bearer_user_id is not None and token_user_id is not None:
+        if bearer_user_id != token_user_id:
+            raise HTTPException(401, {"code": "credential_mismatch",
+                                      "message": "The bearer token and signed download token "
+                                                 "belong to different accounts."})
+        return bearer_user_id
+    if token_user_id is not None:
+        return token_user_id
+    if bearer_user_id is not None:
+        return bearer_user_id
     raise HTTPException(401, {"code": "not_authenticated",
                               "message": "Sign in again, or fetch a fresh download link from Resume Studio."})
 
