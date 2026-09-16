@@ -15,7 +15,7 @@ from typing import Iterator
 
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
 
@@ -43,7 +43,10 @@ def _engine_kwargs() -> dict:
 
 engine: Engine = create_engine(settings.database_url, **_engine_kwargs())
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
-Base = declarative_base()
+
+
+class Base(DeclarativeBase):
+    """Declarative base for every ORM model (SQLAlchemy 2.0 annotated mappings)."""
 
 
 if IS_SQLITE:

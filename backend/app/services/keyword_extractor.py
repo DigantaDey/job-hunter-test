@@ -161,7 +161,7 @@ async def ai_extract_context(
     profile: Dict[str, Any],
     resume_text: str = "",
     extra_context: str = "",
-    ai_config: Dict[str, Any] = None,
+    ai_config: Optional[Dict[str, Any]] = None,
     *,
     db=None,
     user_id: Optional[int] = None,

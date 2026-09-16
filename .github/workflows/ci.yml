@@ -34,7 +34,12 @@ jobs:
         run: ruff check backend
 
       - name: Type check (mypy)
-        run: mypy backend/app --ignore-missing-imports || true
+        # Hard gate: config lives in backend/pyproject.toml ([tool.mypy]) and
+        # the annotated SQLAlchemy models make `Column` inference a non-issue;
+        # a type error fails the build (no `|| true`, mypy is in
+        # requirements-dev.txt).
+        working-directory: backend
+        run: mypy app
 
       - name: Run test suite
         working-directory: backend

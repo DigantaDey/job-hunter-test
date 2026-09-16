@@ -551,7 +551,7 @@ def is_configured(workflow: Optional[str] = None, db=None, user_id: Optional[int
         try:
             return bool(resolved.cfg["api_key"])
         finally:
-            if resolved.owned_session:
+            if resolved.owned_session and resolved.db is not None:
                 resolved.db.close()
     return bool(resolve_config(workflow)["api_key"])
 

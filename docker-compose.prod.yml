@@ -107,6 +107,9 @@ services:
       - generated:/app/backend/generated
       - screenshots:/app/backend/artifacts/screenshots
 
+  # Manual one-shot backup (kept for operator runs and pre-upgrade snapshots).
+  # The absolute path matters: the image WORKDIR is /app, so
+  # `python scripts/backup.py` would resolve to the nonexistent /app/scripts/.
   backup:
     build:
       context: .
@@ -115,7 +118,45 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: ["python", "scripts/backup.py", "--out", "/backups", "--keep", "14"]
+    command: ["python", "/app/backend/scripts/backup.py", "--out", "/backups", "--keep", "14"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-jobhunter}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jobhunter}
+      # A backup job must never touch the schema.
+      AUTO_MIGRATE: "false"
+      METRICS_PORT: "0"
+    volumes:
+      - backups:/backups
+
+  # Automated backup: a tiny scheduler loop in the same image — no extra
+  # packages, no host crontab required. It runs scripts/backup.py once the
+  # stack is up and then every BACKUP_INTERVAL_SECONDS (default 24h), keeping
+  # the newest BACKUP_KEEP generations (default 14) on the `backups` named
+  # volume (same docker volume store as db-data). A failed run exits non-zero,
+  # is logged to stderr, and the loop keeps going — so
+  # `docker compose logs backup-scheduler` is where a broken backup shows up,
+  # and the next tick retries it.
+  backup-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        while :; do
+          echo "backup-scheduler: starting backup at $$(date -u +%FT%TZ)"
+          if python /app/backend/scripts/backup.py --out /backups --keep "$${BACKUP_KEEP:-14}"; then
+            echo "backup-scheduler: ok, next run in $${BACKUP_INTERVAL_SECONDS:-86400}s"
+          else
+            echo "backup-scheduler: BACKUP FAILED (exit $$?) at $$(date -u +%FT%TZ)" >&2
+          fi
+          sleep "$${BACKUP_INTERVAL_SECONDS:-86400}"
+        done
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-jobhunter}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jobhunter}

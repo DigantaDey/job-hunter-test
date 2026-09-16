@@ -9,7 +9,7 @@ code path.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -62,7 +62,7 @@ def _notify_run(db: Session, item: PipelineJob, kind: str, title: str, body: str
 
     create_notification(db, int(item.user_id), kind, title[:200], body=body[:2000], link=link,
                         meta={"pipeline_job_id": int(item.id), **(meta or {})})
-    item.payload = {**payload, "auto_notified": sent + [kind]}  # type: ignore[assignment]
+    item.payload = {**payload, "auto_notified": sent + [kind]}
     db.commit()
     return True
 
@@ -305,7 +305,8 @@ async def handle_email(db: Session, item: PipelineJob) -> Dict[str, Any]:
             # say exactly why nothing landed in the bucket.
             reason = str(exc)
             return {"status": "rejected", "code": reason, "message": DRAFT_REJECTIONS.get(reason, reason)}
-        email_row = drafted["email"]
+        # draft_email raises for every no-row case, so the row is always here.
+        email_row = cast(Email, drafted["email"])
         summary = {
             "email_id": email_row.id, "to": email_row.to_email, "company": email_row.company,
             "job_id": email_row.job_id, "subject": email_row.subject,

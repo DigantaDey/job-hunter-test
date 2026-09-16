@@ -48,11 +48,11 @@ async def metrics_app(scope: Dict[str, Any], receive: Any, send: Any) -> None:
         return
     path = scope.get("path", "")
     if scope.get("method") not in ("GET", "HEAD") or path.rstrip("/") not in ("/metrics", ""):
-        body = b"Not found. Metrics live at /metrics on this port.\n"
+        not_found = b"Not found. Metrics live at /metrics on this port.\n"
         await send({"type": "http.response.start", "status": 404,
                     "headers": [(b"content-type", b"text/plain"),
-                                (b"content-length", str(len(body)).encode())]})
-        await send({"type": "http.response.body", "body": body})
+                                (b"content-length", str(len(not_found)).encode())]})
+        await send({"type": "http.response.body", "body": not_found})
         return
 
     supplied = ""
@@ -102,7 +102,10 @@ class MetricsServer:
         config = uvicorn.Config(metrics_app, host=self.host, port=self.port,
                                 log_level="warning", access_log=False, loop="asyncio")
         server = uvicorn.Server(config)
-        server.install_signal_handlers = lambda: None  # the API process owns signals
+        # The API process owns signal handling (uvicorn>=0.20 no longer calls
+        # this from serve() outside the main thread, but older releases do —
+        # so override it when the attribute exists; typeshed already dropped it).
+        server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
 
         loop = asyncio.new_event_loop()
 

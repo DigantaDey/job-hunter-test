@@ -23,7 +23,7 @@ import re
 import sys
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 request_id_var: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 #: The authenticated user's primary key. Always an ``int``: the annotation, the
@@ -247,7 +247,7 @@ class LogContext:
             self._tokens.append((user_id_var, user_id_var.set(int(self.user_id))))
         return self
 
-    def __exit__(self, *exc: object) -> bool:
+    def __exit__(self, *exc: object) -> Literal[False]:
         for var, token in reversed(self._tokens):
             var.reset(token)
         self._tokens.clear()

@@ -139,7 +139,8 @@ Return JSON:
 # --------------------------------------------------------------------------- #
 def _normalise_tailored(data: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
     """Shape the model's answer into the renderable profile form."""
-    tailored = data.get("tailored_profile") if isinstance(data.get("tailored_profile"), dict) else dict(data)
+    wrapped = data.get("tailored_profile")
+    tailored: Dict[str, Any] = wrapped if isinstance(wrapped, dict) else dict(data)
 
     def clean(value: Any, limit: int = 400) -> str:
         return strip_ai_artifacts(str(value or ""))[:limit]
@@ -210,7 +211,8 @@ def _resume_checks(profile: Dict[str, Any], ledger: FactLedger):
 
     def accuracy_and_ats_checks(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         issues: List[Dict[str, Any]] = []
-        tailored = data.get("tailored_profile") if isinstance(data.get("tailored_profile"), dict) else data
+        wrapped = data.get("tailored_profile")
+        tailored = wrapped if isinstance(wrapped, dict) else data
         experience = tailored.get("experience") or []
         if not experience:
             issues.append({"code": "no_experience", "severity": "error", "field": "experience",
@@ -348,6 +350,13 @@ def _slug(value: str, limit: int = 40) -> str:
     return cleaned[:limit].strip("-")
 
 
+def _job_field(job: Any, field: str) -> str:
+    """Company/title from either an ORM ``Job`` row or a plain dict."""
+    if isinstance(job, dict):
+        return str(job.get(field) or "")
+    return str(getattr(job, field, "") or "")
+
+
 def professional_filename(profile: Dict[str, Any], job: Any = None, extension: str = "pdf") -> str:
     """
     ``Diganta-Dey-Wirelane-Embedded-Software-Engineer.pdf``
@@ -359,8 +368,8 @@ def professional_filename(profile: Dict[str, Any], job: Any = None, extension: s
     name = _slug(profile.get("name") or "Resume", 40) or "Resume"
     parts = [name]
     if job is not None:
-        company = _slug(getattr(job, "company", "") or (job.get("company") if isinstance(job, dict) else ""), 30)
-        title = _slug(getattr(job, "title", "") or (job.get("title") if isinstance(job, dict) else ""), 44)
+        company = _slug(_job_field(job, "company"), 30)
+        title = _slug(_job_field(job, "title"), 44)
         if company:
             parts.append(company)
         if title:
@@ -422,7 +431,10 @@ def build_docx(tailored: Dict[str, Any], profile: Dict[str, Any], layout: Dict[s
     section.bottom_margin = Inches(0.55)
     section.left_margin = Inches(0.7)
     section.right_margin = Inches(0.7)
-    usable_width = section.page_width - section.left_margin - section.right_margin
+    # python-docx types page geometry as optional (a minimal template can lack
+    # it); the default template always defines it, US-Letter is the fallback.
+    page_width = section.page_width or Inches(8.5)
+    usable_width = page_width - Inches(0.7) - Inches(0.7)
 
     normal = doc.styles["Normal"]
     normal.font.name = base_font

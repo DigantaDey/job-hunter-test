@@ -431,8 +431,10 @@ def persist_funding_scan(
         if status in (SCAN_PAUSED, SCAN_BLOCKED):
             return None
         status = SCAN_FAILED if status else SCAN_OK
-    events_seen = int(report.get("scanned") or report.get("fetched") or report.get("total") or 0)
-    companies_found = int(report.get("returned") if report.get("returned") is not None else len(companies))
+    scanned_total = report.get("scanned") or report.get("fetched") or report.get("total") or 0
+    events_seen = int(scanned_total if isinstance(scanned_total, (int, float, str)) else 0)
+    returned_count = report.get("returned")
+    companies_found = int(returned_count) if isinstance(returned_count, (int, float, str)) else len(companies)
     provider_errors = report.get("errors") or report.get("provider_errors") or {}
     if not isinstance(provider_errors, dict):
         provider_errors = {"error": str(provider_errors)[:300]}
@@ -451,13 +453,13 @@ def persist_funding_scan(
     if companies:
         existing: Dict[str, FundingCompany] = {}
         link_lookup: Dict[str, FundingCompany] = {}
-        for row in db.query(FundingCompany).filter(FundingCompany.user_id == int(user_id)).all():
-            fk = row.name_normalized or funding_sources.normalize_company_name(row.name)
+        for stored in db.query(FundingCompany).filter(FundingCompany.user_id == int(user_id)).all():
+            fk = stored.name_normalized or funding_sources.normalize_company_name(stored.name)
             if fk and fk not in existing:
-                existing[fk] = row
-            lk = normalize_link_name(row.name)
+                existing[fk] = stored
+            lk = normalize_link_name(stored.name)
             if lk and lk not in link_lookup:
-                link_lookup[lk] = row
+                link_lookup[lk] = stored
         for idx, comp in enumerate(companies):
             name = str(comp.get("name") or "").strip()
             if not name:
@@ -502,8 +504,8 @@ def get_funding_history(db: Session, user_id: int, limit: int = 5) -> List[Dict[
         company_ids.add(int(m.company_id))
     comps: Dict[int, FundingCompany] = {}
     if company_ids:
-        for c in db.query(FundingCompany).filter(FundingCompany.id.in_(company_ids)).all():
-            comps[int(c.id)] = c
+        for comp_row in db.query(FundingCompany).filter(FundingCompany.id.in_(company_ids)).all():
+            comps[int(comp_row.id)] = comp_row
     sets: Dict[int, set[int]] = {sid: {int(m.company_id) for m in mem_by_scan.get(sid, [])} for sid in scan_ids}
     result: List[Dict[str, Any]] = []
     for idx, scan in enumerate(scans):

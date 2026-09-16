@@ -11,7 +11,7 @@ import threading as _threading
 import time
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -351,10 +351,10 @@ async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file
                 pass
         # Don't overwrite the detailed AI failure progress set above
         if _get_progress(user.id).get("step") not in ("failed",):
-            detail = exc.detail if hasattr(exc, "detail") else str(exc)
-            if isinstance(detail, dict):
-                detail = detail.get("message") or detail.get("detail") or str(detail)
-            _set_progress(user.id, "failed", str(detail)[:200], 0)
+            error_detail: Any = exc.detail if hasattr(exc, "detail") else str(exc)
+            if isinstance(error_detail, dict):
+                error_detail = error_detail.get("message") or error_detail.get("detail") or str(error_detail)
+            _set_progress(user.id, "failed", str(error_detail)[:200], 0)
         raise
     except Exception as exc:
         if not keep_file and os.path.exists(path):

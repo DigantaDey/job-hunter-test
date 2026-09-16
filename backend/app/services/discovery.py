@@ -425,7 +425,7 @@ async def discover_for_user(
     if form_tasks:
         results = await asyncio.gather(*form_tasks, return_exceptions=True)
         for job, schema in zip(created[:FORM_DETECT_TOP], results, strict=False):
-            if isinstance(schema, Exception):
+            if isinstance(schema, BaseException):
                 continue
             extra = dict(job.extra or {})
             extra["forms"] = schema

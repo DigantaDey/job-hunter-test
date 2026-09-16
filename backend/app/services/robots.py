@@ -39,10 +39,10 @@ async def _load(url: str) -> Optional[RobotFileParser]:
             parser.parse(response.text.splitlines())
             return parser
         if response.status_code in (401, 403):
-            parser.disallow_all = True
+            parser.disallow_all = True  # type: ignore[attr-defined]  # CPython sets it; typeshed does not expose it
             return parser
         # 404 / 4xx → no restrictions
-        parser.allow_all = True
+        parser.allow_all = True  # type: ignore[attr-defined]  # same runtime-only attribute
         return parser
     except Exception as exc:  # unreachable robots.txt must not block the app
         log.debug("robots.txt unavailable for %s: %s", robots_url, exc)

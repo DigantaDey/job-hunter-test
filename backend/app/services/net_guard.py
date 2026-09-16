@@ -62,11 +62,14 @@ import asyncio
 import ipaddress
 import socket
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from app.core.config import settings
 from app.core.logging import get_logger
+
+if TYPE_CHECKING:  # only the transport-guard signature needs it
+    import httpx
 from app.core.lru import BoundedTTLMap
 
 log = get_logger("app.net_guard")
@@ -392,18 +395,21 @@ def clear_dns_cache() -> None:
     _DNS_CACHE.clear()
 
 
-def install_transport_guard(transport: object) -> object:
+def install_transport_guard(transport: "httpx.AsyncBaseTransport") -> "httpx.AsyncBaseTransport":
     """
     Wrap an ``httpx`` async transport so that *every* request it carries —
     including each redirect hop httpx resolves for us — is policy-checked.
     """
-    original = transport.handle_async_request  # type: ignore[attr-defined]
+    original = transport.handle_async_request
 
-    async def guarded(request):  # type: ignore[no-untyped-def]
+    async def guarded(request: "httpx.Request") -> "httpx.Response":
         await check_url(str(request.url))
         return await original(request)
 
-    transport.handle_async_request = guarded  # type: ignore[attr-defined]
+    # Instance-level override of an httpx method: the guard must see every hop,
+    # including redirects httpx resolves inside this transport.
+    wrapper: Any = transport
+    wrapper.handle_async_request = guarded
     return transport
 
 

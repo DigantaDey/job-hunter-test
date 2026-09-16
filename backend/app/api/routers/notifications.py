@@ -5,6 +5,7 @@ Notifications system — in-app alerts for job matches, automation failures, etc
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Query
 from sqlalchemy.orm import Session
@@ -85,7 +86,7 @@ def update_preferences(payload: dict, user: CurrentUser, db: DbSession):
     return {"ok": True}
 
 
-def create_notification(db: Session, user_id: int, kind: str, title: str, body: str = "", link: str = "", meta: dict = None):
+def create_notification(db: Session, user_id: int, kind: str, title: str, body: str = "", link: str = "", meta: Optional[Dict[str, Any]] = None):
     """Helper to create notification from anywhere."""
     try:
         n = Notification(

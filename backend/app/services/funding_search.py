@@ -51,7 +51,7 @@ market.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -203,7 +203,7 @@ async def _search_tavily(query: str, window_days: int, limit: int) -> List[Dict[
 #: results → AI extraction with citations → ranked radar) runs hermetically,
 #: not to mimic a real index. Events extracted from these rows are labelled
 #: ``verified=False`` — synthetic fixture data must never look authoritative.
-_STUB_RESULTS = (
+_STUB_RESULTS: Tuple[Dict[str, Any], ...] = (
     {
         "title": "VectorLoom AI raises $12M Series A to scale vector search infrastructure",
         "url": "https://example.com/press/vectorloom-series-a",

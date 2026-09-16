@@ -19,7 +19,7 @@ for before calling the deployment production-grade.
 | 7 | Email block configured **only if** you send real mail | `EMAIL_SENDING_ENABLED`, `EMAIL_DRY_RUN=false`, `EMAIL_POSTAL_ADDRESS`, `EMAIL_UNSUBSCRIBE_BASE_URL`, SPF/DKIM/DMARC |
 | 8 | `EMAIL_WEBHOOK_TOKEN` set if your provider posts engagement events | `POST /api/track/events` |
 | 9 | `ALLOW_SYNTHETIC_FUNDING_DATA=false` | demo data must never reach users |
-| 10 | Backups scheduled and **restore-tested** | `backend/scripts/backup.py` (see §5) |
+| 10 | Backups scheduled **and restore-tested** | `backup-scheduler` runs daily out of the box (see §5); verify once with `logs backup-scheduler` |
 | 11 | `AUTOFILL_*` left at defaults unless you accept the portal-ToS risk | dry-run by default |
 | 12 | Log shipper configured | `LOG_JSON=true`, ship stdout |
 | 13 | Billing provider configured | `BILLING_PROVIDER=stripe|razorpay|manual`, `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`; the webhook secret is mandatory — without it the billing webhook routes refuse every event (400; 503 in production) rather than skipping verification; webhooks idempotent via `billing_events` unique constraint |
@@ -148,11 +148,37 @@ proxy, list it in TRUSTED_PROXIES (and/or FORWARDED_ALLOW_IPS ...)
 
 ## 5. Backups & restore
 
-```bash
-# manual
-docker compose -f docker-compose.prod.yml run --rm backup
+**Automated backups ship enabled.** The `backup-scheduler` service in `docker-compose.prod.yml`
+runs `backend/scripts/backup.py --out /backups --keep 14` once when the stack comes up and then
+every 24 hours — nothing to install, no host crontab required (`docker compose up -d` starts it
+with everything else). Writes land on the `backups` named volume, which lives in the same Docker
+volume store as `db-data`; prune keeps the newest `BACKUP_KEEP` generations.
 
-# cron (host)
+| Knob | Default | Effect |
+|---|---|---|
+| `BACKUP_KEEP` (`.env`) | `14` | generations retained (≈2 weeks of daily backups) |
+| `BACKUP_INTERVAL_SECONDS` (add to `.env`) | `86400` | scheduler-only knob (not an app setting, hence not in `.env.example`); period between runs — keep ≤86400 so backups stay at-least-daily |
+
+Check that backups are actually happening — `backup.py` exits non-zero on failure and the
+scheduler logs and retries on the next tick:
+
+```bash
+docker compose -f docker-compose.prod.yml logs --tail=20 backup-scheduler
+# backup-scheduler: starting backup at 2026-09-16T03:00:01Z
+# backup ok: /backups/jobhunter-20260916-030001-000001.sql.gz (412.7 KiB), pruned 1 old backup(s)
+```
+
+Manual runs (e.g. before an upgrade) use the one-shot service:
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm backup
+```
+
+Prefer a fixed wall-clock schedule over the loop, or run no scheduler container at all
+(`docker compose up -d --scale backup-scheduler=0`)? Host cron is the alternative — this is the
+equivalent of the shipped job:
+
+```bash
 0 3 * * * docker compose -f /srv/jobhunter/docker-compose.prod.yml run --rm backup >> /var/log/jobhunter-backup.log 2>&1
 ```
 

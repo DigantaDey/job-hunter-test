@@ -272,27 +272,25 @@ def pause(db: Session, item: PipelineJob, error: str) -> str:
     the work never used). The only cap on this path is :data:`AI_PAUSE_MAX`,
     counted separately in the payload's ``paused_count``.
     """
-    # (mypy sees ORM attribute assignments as Column-typed — same known noise
-    # class as fail()/complete(); ignored here to keep the mypy delta at zero.)
-    item.error = (error or "ai_transient_outage")[:2000]  # type: ignore[assignment]
-    item.locked_by = ""  # type: ignore[assignment]
-    item.lease_expires_at = None  # type: ignore[assignment]
+    item.error = (error or "ai_transient_outage")[:2000]
+    item.locked_by = ""
+    item.lease_expires_at = None
     payload = dict(item.payload or {})
     pauses = int(payload.get("paused_count") or 0) + 1
     if pauses > AI_PAUSE_MAX:
-        item.status = "dead"  # type: ignore[assignment]
-        item.finished_at = datetime.utcnow()  # type: ignore[assignment]
-        item.error = f"paused {AI_PAUSE_MAX} times during AI outages, giving up: {item.error}"  # type: ignore[assignment]
+        item.status = "dead"
+        item.finished_at = datetime.utcnow()
+        item.error = f"paused {AI_PAUSE_MAX} times during AI outages, giving up: {item.error}"
         db.commit()
         inc("jobhunter_queue_dead_total", pipeline=item.pipeline)
         log.error("queue item %s dead-lettered after repeated AI outages", item.id)
         return "dead"
     payload["paused_count"] = pauses
     delay = min(600, int(settings.ai_backoff_base ** min(pauses, 8) * 5))
-    item.payload = payload  # type: ignore[assignment]
-    item.status = "paused"  # type: ignore[assignment]
-    item.scheduled_at = datetime.utcnow() + timedelta(seconds=delay)  # type: ignore[assignment]
-    item.updated_at = datetime.utcnow()  # type: ignore[assignment]
+    item.payload = payload
+    item.status = "paused"
+    item.scheduled_at = datetime.utcnow() + timedelta(seconds=delay)
+    item.updated_at = datetime.utcnow()
     db.commit()
     inc("jobhunter_queue_paused_total", pipeline=item.pipeline)
     log.warning("queue item %s paused (AI transient outage), re-queue in %ss: %s",
@@ -319,9 +317,9 @@ def drain_paused(db: Session, *, user_id: Optional[int] = None,
     items = query.order_by(PipelineJob.priority.asc(), PipelineJob.id.asc()).limit(limit).all()
     now = datetime.utcnow()
     for item in items:
-        item.status = "queued"  # type: ignore[assignment]
-        item.scheduled_at = now  # type: ignore[assignment]
-        item.updated_at = now  # type: ignore[assignment]
+        item.status = "queued"
+        item.scheduled_at = now
+        item.updated_at = now
     if items:
         db.commit()
         inc("jobhunter_queue_resumed_total", value=len(items))
@@ -348,7 +346,7 @@ def fail(db: Session, item: PipelineJob, error: str, *, retryable: bool = True) 
     item.error = (error or "unknown error")[:2000]
     item.locked_by = ""
     item.lease_expires_at = None
-    item.attempts = int(item.attempts or 0) + 1  # type: ignore[assignment]
+    item.attempts = int(item.attempts or 0) + 1
     if retryable and item.attempts < (item.max_attempts or settings.worker_max_attempts):
         # Backoff is keyed on the failure just recorded, so the progression
         # is unchanged from the caller's point of view: first failure →

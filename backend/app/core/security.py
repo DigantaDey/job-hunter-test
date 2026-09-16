@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import secrets
 import time
+from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
 
 import jwt as pyjwt
@@ -34,6 +35,7 @@ from app.core.lru import BoundedTTLMap
 # --------------------------------------------------------------------------- #
 # Passwords
 # --------------------------------------------------------------------------- #
+_bcrypt: Optional[ModuleType]
 try:  # pragma: no cover - import guard
     import bcrypt as _bcrypt
 except Exception:  # pragma: no cover

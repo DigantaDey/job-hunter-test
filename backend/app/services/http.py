@@ -381,15 +381,27 @@ async def request(
     raise last_error or RuntimeError("request failed")
 
 
+def _status_error(response: Union[httpx.Response, CachedResponse], url: str) -> httpx.HTTPStatusError:
+    """One construction for both response kinds (callers catch HTTPStatusError)."""
+    if isinstance(response, httpx.Response):
+        return httpx.HTTPStatusError(f"{response.status_code} from {url}",
+                                     request=response.request, response=response)
+    # Only 200s are cached (see request()), so reaching this with a
+    # CachedResponse is defensive: synthesise the request/response pair.
+    req = httpx.Request("GET", url)
+    return httpx.HTTPStatusError(f"{response.status_code} from {url}", request=req,
+                                 response=httpx.Response(response.status_code, request=req))
+
+
 async def get_json(url: str, **kwargs) -> Any:
     response = await request("GET", url, **kwargs)
     if response.status_code != 200:
-        raise httpx.HTTPStatusError(f"{response.status_code} from {url}", request=response.request, response=response)
+        raise _status_error(response, url)
     return response.json()
 
 
 async def get_text(url: str, **kwargs) -> str:
     response = await request("GET", url, **kwargs)
     if response.status_code != 200:
-        raise httpx.HTTPStatusError(f"{response.status_code} from {url}", request=response.request, response=response)
+        raise _status_error(response, url)
     return response.text
