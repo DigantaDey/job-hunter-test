@@ -190,7 +190,7 @@ export default function Funding() {
   const scanFinished = scanRow && !scanLive ? `${scanRow.id}:${scanRow.status}` : ''
   useEffect(() => {
     if (!scanFinished) return
-    load(false).then(() => setRefreshedAt(new Date().toISOString()))
+    load(false).then(() => { if (alive.current) setRefreshedAt(new Date().toISOString()) })
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanFinished])
 
@@ -227,7 +227,7 @@ export default function Funding() {
   // leaves the badge unrendered, never the page.
   useEffect(() => {
     client.get('/api/funding/providers')
-      .then(({ data }) => setSearchInfo(data?.search || null))
+      .then(({ data }) => { if (alive.current) setSearchInfo(data?.search || null) })
       .catch(() => {})
   }, [])
 

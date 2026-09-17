@@ -512,7 +512,6 @@ def grouped(db: Session, user: User, *, reveal_secrets: bool = False) -> Dict[st
     # grouped is per-user; owner fallback for display is same as get_user_ai_config
     # so show the user's own provider, or the owner's when they have no key.
     try:
-        from app.services.user_settings import get_user_ai_config as _g
         # Use helper to resolve provider with fallback logic
         cfg_for_provider = get_user_ai_config(db, user.id)
         result["ai"]["provider"] = cfg_for_provider.get("provider", "openai_compatible")

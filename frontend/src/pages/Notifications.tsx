@@ -1,13 +1,21 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import client from '../api/client'
 import { Bell, CheckCheck, Trash2 } from 'lucide-react'
 
 export default function Notifications() {
   const [notifs, setNotifs] = useState<any[]>([])
   const [filter, setFilter] = useState<'all'|'unread'>('all')
+  // cancelled-ref guard (same pattern as Dashboard): the async read below must
+  // never setState after the page has unmounted.
+  const mounted = useRef(true)
+  useEffect(()=>{
+    mounted.current = true
+    return ()=>{ mounted.current = false }
+  },[])
 
   const load = ()=>{
-    client.get(`/api/notifications?unread_only=${filter==='unread'}`).then(r=>setNotifs(r.data)).catch(()=>{})
+    client.get(`/api/notifications?unread_only=${filter==='unread'}`).then(r=>{ if(mounted.current) setNotifs(r.data) }).catch(()=>{})
   }
   useEffect(()=>{ load() },[filter])
 
@@ -34,7 +42,14 @@ export default function Notifications() {
               <div className="text-sm font-medium">{n.title}</div>
               <div className="text-xs text-zinc-600 dark:text-zinc-400 mt-1">{n.body}</div>
               <div className="text-[11px] mono text-zinc-500 mt-1">{n.kind} • {new Date(n.created_at).toLocaleString()}</div>
-              {n.link && <a href={n.link} className="text-xs text-blue-600 dark:text-blue-400 mt-1 inline-block">{n.link} →</a>}
+              {/* Internal links (/...) route client-side via <Link> — a bare
+                  <a href> would force a full page reload. External links
+                  (http...) open in a new tab. */}
+              {n.link && (typeof n.link === 'string' && n.link.startsWith('/') ? (
+                <Link to={n.link} className="text-xs text-blue-600 dark:text-blue-400 mt-1 inline-block">{n.link} →</Link>
+              ) : (
+                <a href={n.link} target="_blank" rel="noreferrer" className="text-xs text-blue-600 dark:text-blue-400 mt-1 inline-block">{n.link} ↗</a>
+              ))}
             </div>
             <div className="flex flex-col gap-1">
               {!n.read && <button onClick={async()=>{ await client.post(`/api/notifications/${n.id}/read`); load()}} className="p-1 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800"><CheckCheck className="w-4 h-4"/></button>}
