@@ -384,6 +384,7 @@ async def test_a_negative_dns_verdict_is_cached_too(monkeypatch):
         return ["10.9.8.7"]
 
     monkeypatch.setattr(net_guard, "_resolve", private)
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
     for _ in range(3):
         with pytest.raises(net_guard.OutboundURLBlocked):
             await net_guard.check_url("https://internal-jobs.example.com/")

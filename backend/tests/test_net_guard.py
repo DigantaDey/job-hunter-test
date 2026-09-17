@@ -58,7 +58,10 @@ async def _metadata_resolver(*_args, **_kwargs):
     ],
 )
 @pytest.mark.asyncio
-async def test_dangerous_urls_are_refused(url):
+async def test_dangerous_urls_are_refused(url, monkeypatch):
+    # The test suite now allows private by default for hermetic AI tests (P1 #5);
+    # this guard test must enforce the production default (private blocked).
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
     with pytest.raises(OutboundURLBlocked):
         await check_url(url)
 
@@ -72,6 +75,7 @@ async def test_public_host_is_allowed(monkeypatch):
 @pytest.mark.asyncio
 async def test_private_dns_answer_is_refused(monkeypatch):
     monkeypatch.setattr(net_guard, "_resolve", _private_resolver)
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
     with pytest.raises(OutboundURLBlocked) as excinfo:
         await check_url("https://jobs.example.com/listing")
     assert "private address" in str(excinfo.value)
@@ -80,6 +84,7 @@ async def test_private_dns_answer_is_refused(monkeypatch):
 @pytest.mark.asyncio
 async def test_metadata_ip_in_dns_answer_is_refused(monkeypatch):
     monkeypatch.setattr(net_guard, "_resolve", _metadata_resolver)
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
     with pytest.raises(OutboundURLBlocked):
         await check_url("https://sneaky.example.com/")
 
@@ -105,6 +110,7 @@ async def test_allowlist_bypasses_the_private_address_check(monkeypatch):
 async def test_allowlist_matches_subdomains(monkeypatch):
     monkeypatch.setattr(net_guard, "_resolve", _private_resolver)
     monkeypatch.setattr(settings, "outbound_allowed_hosts", ["corp.example.com"], raising=False)
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
     await check_url("http://intranet.corp.example.com/dashboard")
     with pytest.raises(OutboundURLBlocked):
         await check_url("http://notcorp.example.com/dashboard")
@@ -136,15 +142,35 @@ async def test_dns_verdicts_are_cached(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_http_layer_enforces_the_policy():
+async def test_http_layer_enforces_the_policy(monkeypatch):
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
     from app.services import http
+
+    # Ensure fresh client picks up the setting
+    try:
+        from app.services.net_guard import clear_dns_cache
+        clear_dns_cache()
+    except Exception:
+        pass
+    if http._client is not None:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(http._client.aclose())
+            else:
+                loop.run_until_complete(http._client.aclose())
+        except Exception:
+            pass
+        http._client = None
 
     with pytest.raises(OutboundURLBlocked):
         await http.request("GET", "http://127.0.0.1:9/internal")
 
 
 @pytest.mark.asyncio
-async def test_transport_guard_checks_redirect_hops():
+async def test_transport_guard_checks_redirect_hops(monkeypatch):
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
     seen = []
 
     class FakeTransport:
@@ -171,6 +197,7 @@ async def test_transport_guard_checks_redirect_hops():
 async def test_preflight_answers_instead_of_raising(monkeypatch):
     """Callers that must decline *before* expensive work (a browser) get a verdict."""
     monkeypatch.setattr(net_guard, "_resolve", _metadata_resolver)
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
 
     verdict = await net_guard.preflight("https://sneaky.example.com/")
     assert verdict.allowed is False
