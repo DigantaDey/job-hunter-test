@@ -34,7 +34,7 @@ export default function Settings(){
   const [msg, setMsg]=useState('')
   const [showKey, setShowKey]=useState(false)
   // max_input_tokens / max_output_tokens: 0 = unlimited (provider default).
-  const [aiForm, setAiForm]=useState({base_url:'', model:'', api_key:'', rpm:60, timeout:300, max_input_tokens:0, max_output_tokens:0})
+  const [aiForm, setAiForm]=useState({base_url:'', model:'', api_key:'', rpm:60, timeout:300, max_input_tokens:0, max_output_tokens:0, provider:'openai_compatible'})
   const [aiStatus, setAiStatus]=useState<any>(null)
   const [aiSaving, setAiSaving]=useState(false)
   const [extracted, setExtracted]=useState<any>(null)
@@ -89,7 +89,8 @@ export default function Settings(){
         // 0 round-trips as 0 — it means unlimited, not "unset" (the old
         // `|| 12000` showed a cap the user had switched off).
         max_input_tokens: budgetValue(data.ai.max_input_tokens, data.ai.platform_max_input_tokens ?? 0),
-        max_output_tokens: budgetValue(data.ai.max_output_tokens, data.ai.platform_max_output_tokens ?? 0)
+        max_output_tokens: budgetValue(data.ai.max_output_tokens, data.ai.platform_max_output_tokens ?? 0),
+        provider: data.ai.provider || status?.user_config?.provider || status?.provider || 'openai_compatible'
       })
     }
   }
@@ -169,6 +170,8 @@ export default function Settings(){
       if (timeoutSecs < 5 || timeoutSecs > 1800) {
         setMsg('timeout must be between 5 and 1800 seconds — heavy reasoning models need minutes'); return
       }
+      // Auto-detect provider from base_url if not explicitly set: Google detection
+      const inferredProvider = (aiForm as any).provider || (aiForm.base_url && aiForm.base_url.includes('generativelanguage.googleapis.com') ? 'google' : 'openai_compatible')
       const payload:any = {
         ai: {
           base_url: aiForm.base_url,
@@ -179,6 +182,7 @@ export default function Settings(){
           // `|| 16000` turned "unlimited" back into a ceiling on every save.
           max_input_tokens: budgetValue(aiForm.max_input_tokens, data?.ai?.platform_max_input_tokens ?? 0),
           max_output_tokens: budgetValue(aiForm.max_output_tokens, data?.ai?.platform_max_output_tokens ?? 0),
+          provider: inferredProvider,
         }
       }
       if(aiForm.api_key && aiForm.api_key.trim()){
@@ -260,9 +264,27 @@ export default function Settings(){
             </div>
           )}
 
+          <div className="mt-3">
+            <label className="text-xs mono font-medium flex items-center gap-1"><Cpu className="w-3 h-3"/> Provider</label>
+            <select value={(aiForm as any).provider || 'openai_compatible'} onChange={e=>{
+              const v = e.target.value
+              setAiForm({...aiForm, provider: v} as any)
+              // Auto-switch base_url hint when provider changes
+              if(v==='google' && !aiForm.base_url.includes('generativelanguage.googleapis.com')){
+                setAiForm(prev=> ({...prev, provider: v, base_url: 'https://generativelanguage.googleapis.com', model: prev.model.startsWith('gpt')||prev.model.startsWith('claude') ? 'gemini-1.5-flash' : prev.model} as any))
+              } else if(v==='openai_compatible' && aiForm.base_url.includes('generativelanguage.googleapis.com')){
+                setAiForm(prev=> ({...prev, provider: v, base_url: 'https://api.openai.com/v1', model: prev.model.startsWith('gemini') ? 'gpt-4o-mini' : prev.model} as any))
+              }
+            }} className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700">
+              <option value="openai_compatible">OpenAI compatible — OpenAI, Groq, Together, OpenRouter, Ollama, etc.</option>
+              <option value="google">Google AI Studio — generativelanguage.googleapis.com (Gemini)</option>
+              <option value="google_ai_studio">Google AI Studio (alias)</option>
+            </select>
+            <div className="text-[11px] mono text-zinc-500 mt-1">Choose the API style. Google uses x-goog-api-key and /v1beta/models/&#123;model&#125;:generateContent. OpenAI compatible uses Bearer and /chat/completions. Auto-detected from base_url when provider is blank.</div>
+          </div>
           <div className="mt-4 grid md:grid-cols-3 gap-3">
             <div className="md:col-span-2">
-              <label className="text-xs mono font-medium flex items-center gap-1"><Globe className="w-3 h-3"/> Base URL — OpenAI compatible endpoint</label>
+              <label className="text-xs mono font-medium flex items-center gap-1"><Globe className="w-3 h-3"/> Base URL — { (aiForm as any).provider==='google' || (aiForm as any).provider==='google_ai_studio' ? 'Google endpoint' : 'OpenAI compatible endpoint'}</label>
               <input value={aiForm.base_url} onChange={e=>setAiForm({...aiForm, base_url:e.target.value})} placeholder="https://api.openai.com/v1" className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700"/>
               <div className="text-[11px] mono text-zinc-500 mt-1">Examples: https://api.openai.com/v1, https://api.groq.com/openai/v1, https://api.together.xyz/v1, http://localhost:11434/v1 (Ollama), https://openrouter.ai/api/v1</div>
             </div>
@@ -338,9 +360,14 @@ export default function Settings(){
                       <span className="text-[11px] mono font-medium">{wf} {active && <span className="text-emerald-600">• override set</span>}</span>
                       <button onClick={()=>saveWf(wf)} disabled={saving} className="text-[11px] px-2 py-1 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 disabled:opacity-50">Save</button>
                     </div>
-                    <div className="mt-1.5 grid grid-cols-3 gap-1.5">
+                    <div className="mt-1.5 grid grid-cols-4 gap-1.5">
                       <input value={cfg.base_url||''} onChange={e=>updateWf(wf,'base_url',e.target.value)} placeholder="Base URL (inherit if blank)" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700"/>
                       <input value={cfg.model||''} onChange={e=>updateWf(wf,'model',e.target.value)} placeholder="Model" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700"/>
+                      <select value={cfg.provider||''} onChange={e=>updateWf(wf,'provider',e.target.value)} className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700">
+                        <option value="">Provider (auto)</option>
+                        <option value="openai_compatible">OpenAI</option>
+                        <option value="google">Google</option>
+                      </select>
                       <input value={cfg.api_key||''} onChange={e=>updateWf(wf,'api_key',e.target.value)} type="password" placeholder="API key" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700"/>
                     </div>
                   </div>

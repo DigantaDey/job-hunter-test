@@ -730,7 +730,7 @@ async def tag_resume(profile: Dict[str, Any], ai_config=None, *, db=None, user_i
     from app.services.ai_client import chat_completion
 
     data = await chat_completion("tagging", prompt, temperature=0.2,
-                                 ai_config=ai_config, db=db, user_id=user_id)
+                                 ai_config=ai_config, db=db, user_id=user_id, stream=True)
     tags = data.get("tags") if isinstance(data, dict) else None
     if isinstance(tags, list) and tags:
         cleaned = [re.sub(r"[^a-z0-9\-+#]", "-", str(t).lower()).strip("-") for t in tags]

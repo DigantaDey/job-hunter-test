@@ -339,6 +339,28 @@ def test_gateway_maps_timeout_phase_to_reason(direct_ai, monkeypatch):
     async def _read_timeout(self, *args, **kwargs):
         raise httpx.ReadTimeout("")
 
+    async def _connect_timeout_stream(self, *a, **kw):
+        raise httpx.ConnectTimeout("")
+    async def _read_timeout_stream(self, *a, **kw):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _connect_timeout)
+    monkeypatch.setattr(httpx.AsyncClient, "stream", lambda self, *a, **kw: (_ for _ in ()).throw(httpx.ConnectTimeout("")) if False else None)
+    # Proper stream mock for connect timeout
+    def _stream_connect(self, *a, **kw):
+        class _C:
+            async def __aenter__(self):
+                raise httpx.ConnectTimeout("")
+            async def __aexit__(self, *a):
+                return False
+        return _C()
+    monkeypatch.setattr(httpx.AsyncClient, "stream", _stream_connect)
+    with pytest.raises(ai_client.AIClientError) as excinfo:
+        asyncio.run(ai_client.chat_completion("parse", "hi", timeout=30, stream=True))
+    assert excinfo.value.reason == "unreachable", f"got {excinfo.value}: {excinfo.value!r} stream"
+    assert "connect" in str(excinfo.value).lower()
+    assert str(excinfo.value).split(":", 1)[1].strip()
+    # Also test non-stream still
     monkeypatch.setattr(httpx.AsyncClient, "post", _connect_timeout)
     with pytest.raises(ai_client.AIClientError) as excinfo:
         asyncio.run(ai_client.chat_completion("parse", "hi", timeout=30))
@@ -346,6 +368,20 @@ def test_gateway_maps_timeout_phase_to_reason(direct_ai, monkeypatch):
     assert "connect" in str(excinfo.value).lower()
     assert str(excinfo.value).split(":", 1)[1].strip()
 
+    def _stream_read(self, *a, **kw):
+        class _C:
+            async def __aenter__(self):
+                raise httpx.ReadTimeout("")
+            async def __aexit__(self, *a):
+                return False
+        return _C()
+    monkeypatch.setattr(httpx.AsyncClient, "post", _read_timeout)
+    monkeypatch.setattr(httpx.AsyncClient, "stream", _stream_read)
+    with pytest.raises(ai_client.AIClientError) as excinfo:
+        asyncio.run(ai_client.chat_completion("parse", "hi", timeout=30, stream=True))
+    assert excinfo.value.reason == "timeout", f"got {excinfo.value}: {excinfo.value!r} stream"
+    assert "still generating" in str(excinfo.value)
+    assert str(excinfo.value).split(":", 1)[1].strip()
     monkeypatch.setattr(httpx.AsyncClient, "post", _read_timeout)
     with pytest.raises(ai_client.AIClientError) as excinfo:
         asyncio.run(ai_client.chat_completion("parse", "hi", timeout=30))

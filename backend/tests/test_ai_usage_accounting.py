@@ -45,11 +45,84 @@ def gateway(monkeypatch):
         if state["responses"]:
             body = state["responses"].pop(0)
         else:
-            prompt = " ".join(m["content"] for m in kwargs["json"]["messages"])
+            # Handle both OpenAI (messages) and Google (contents) payloads
+            req = kwargs.get("json") or {}
+            if "messages" in req:
+                prompt = " ".join(m.get("content") or "" for m in req.get("messages") or [])
+            else:
+                parts = []
+                for c in req.get("contents") or []:
+                    for part in c.get("parts") or []:
+                        parts.append(str(part.get("text") or ""))
+                sys_inst = req.get("systemInstruction") or {}
+                for part in sys_inst.get("parts") or []:
+                    parts.append(str(part.get("text") or ""))
+                prompt = " ".join(parts)
             body = completion(_scripted_answer(prompt))
         return httpx.Response(state["status"], json=body, request=httpx.Request("POST", url))
 
+    def fake_stream(_client, method, url, **kwargs):
+        # Streaming mock — reuse same logic but return a stream-like response (sync func returning async ctx manager)
+        req_json = kwargs.get("json") or {}
+        state["requests"].append(req_json)
+        if state["responses"]:
+            body = state["responses"].pop(0)
+        else:
+            if "messages" in req_json:
+                prompt = " ".join(m.get("content") or "" for m in req_json.get("messages") or [])
+            else:
+                parts = []
+                for c in req_json.get("contents") or []:
+                    for part in c.get("parts") or []:
+                        parts.append(str(part.get("text") or ""))
+                sys_inst = req_json.get("systemInstruction") or {}
+                for part in sys_inst.get("parts") or []:
+                    parts.append(str(part.get("text") or ""))
+                prompt = " ".join(parts)
+            body = completion(_scripted_answer(prompt))
+        import json as _json
+        if state["status"] != 200:
+            resp = httpx.Response(state["status"], json=body, request=httpx.Request(method, url))
+            async def _aread_error():
+                return _json.dumps(body).encode()
+            resp.aread = _aread_error
+            async def _aiter_error():
+                if False:
+                    yield ""
+            resp.aiter_lines = _aiter_error
+            resp.headers["content-type"] = "application/json"
+            class _CtxErr:
+                async def __aenter__(self):
+                    return resp
+                async def __aexit__(self, *a):
+                    return False
+            return _CtxErr()
+        resp = httpx.Response(200, json=body, request=httpx.Request(method, url))
+        resp.headers["content-type"] = "application/json"
+        async def _aread():
+            return _json.dumps(body).encode()
+        resp.aread = _aread
+        async def _aiter():
+            if False:
+                yield ""
+        resp.aiter_lines = _aiter
+        class _Ctx:
+            async def __aenter__(self):
+                return resp
+            async def __aexit__(self, *a):
+                return False
+        return _Ctx()
+
     monkeypatch.setattr(httpx.AsyncClient, "post", post)
+    monkeypatch.setattr(httpx.AsyncClient, "stream", fake_stream)
+    # Also patch the shared http client if already created
+    try:
+        from app.services import http as http_service
+        if http_service._client is not None:
+            http_service._client.post = post.__get__(http_service._client, httpx.AsyncClient)
+            http_service._client.stream = fake_stream.__get__(http_service._client, httpx.AsyncClient)
+    except Exception:
+        pass
     return state
 
 

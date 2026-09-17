@@ -279,7 +279,7 @@ async def detect_form_structure(
         )
         # No per-call timeout — inherit the global wait so slow reasoning models
         # are not cut off (ai.timeout / AI_TIMEOUT is the single knob).
-        data = await chat_completion("form_detect", prompt, temperature=0)
+        data = await chat_completion("form_detect", prompt, temperature=0, stream=True)
         mapping = data.get("mapping") if isinstance(data, dict) else {}
         for field in unmapped:
             suggested = (mapping or {}).get(field["name"])

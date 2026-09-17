@@ -701,7 +701,7 @@ async def run_guarded_task(
             result = await chat_completion(
                 workflow, current_prompt, system=system, temperature=temperature,
                 max_tokens=max_tokens, timeout=timeout, db=db, user_id=user_id,
-            )
+             stream=True)
         except Exception as exc:
             raise describe_ai_error(exc, workflow=workflow) from exc
 

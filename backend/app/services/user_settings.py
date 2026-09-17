@@ -51,6 +51,27 @@ def _secret_scope(user_id: int) -> str:
     return f"user:{user_id}:settings"
 
 
+#: Supported AI providers — canonical values stored in DB.
+AI_PROVIDER_OPENAI = "openai_compatible"
+AI_PROVIDER_GOOGLE = "google"
+# Alias accepted from frontend/docs: google_ai_studio == google
+AI_PROVIDERS = frozenset({AI_PROVIDER_OPENAI, AI_PROVIDER_GOOGLE, "google_ai_studio"})
+
+def _normalize_provider(value) -> str:
+    text = str(value or "").strip().lower()
+    if text in ("google", "google_ai_studio", "google_ai"):
+        return AI_PROVIDER_GOOGLE
+    if text in ("openai_compatible", "openai", "openai-compatible", ""):
+        return AI_PROVIDER_OPENAI
+    return text
+
+def _detect_provider_from_base_url(base_url: str) -> str:
+    lowered = (base_url or "").lower()
+    if "generativelanguage.googleapis.com" in lowered or "generativelanguage" in lowered:
+        return AI_PROVIDER_GOOGLE
+    return AI_PROVIDER_OPENAI
+
+
 def defaults() -> Dict[str, Dict[str, Any]]:
     """Factory for the default settings document of a user."""
     return {
@@ -136,7 +157,7 @@ def defaults() -> Dict[str, Dict[str, Any]]:
 # Keys that may be written per category (everything else → 400).
 WRITABLE_KEYS: Dict[str, set] = {
     "ai": {"base_url", "model", "rpm", "max_retries", "timeout", "api_key",
-           "max_input_tokens", "max_output_tokens"},
+           "max_input_tokens", "max_output_tokens", "provider"},
     "scraping": {"keywords", "sources", "live_enabled", "live_sources", "freshness_hours"},
     "general": {"strict_skeleton", "auto_approve_email", "default_resume_format",
                 "require_resume_approval", "reuse_similarity_threshold", "generate_min_score"},
@@ -307,7 +328,7 @@ def set_setting(db: Session, user_id: int, category: str, key: str, value: Any) 
 # Rows written by older versions stored the key in plaintext; readers accept
 # both (``read_workflow_override``) and writers always encrypt.
 # --------------------------------------------------------------------------- #
-_OVERRIDE_KEYS = ("base_url", "model", "api_key")
+_OVERRIDE_KEYS = ("base_url", "model", "api_key", "provider")
 
 
 def read_workflow_override(db: Session, user_id: int, workflow: str) -> Dict[str, str]:
@@ -332,12 +353,25 @@ def read_workflow_override(db: Session, user_id: int, workflow: str) -> Dict[str
         except Exception as exc:
             log.warning("workflow override api_key for user %s/%s could not be decrypted: %s", user_id, workflow, exc)
             cfg["api_key"] = ""
+    # Normalize provider; auto-detect from base_url if not set
+    provider_raw = (raw.get("provider") or "").strip()
+    if provider_raw:
+        cfg["provider"] = _normalize_provider(provider_raw)
+    else:
+        cfg["provider"] = _detect_provider_from_base_url(cfg.get("base_url") or "") if cfg.get("base_url") else ""
     return cfg
 
 
 def write_workflow_override(db: Session, user_id: int, workflow: str, cfg: Dict[str, Any]) -> Dict[str, str]:
     """Persist an override (api_key encrypted at rest). Returns the cleaned, decrypted view."""
     cleaned = {k: str((cfg or {}).get(k) or "").strip() for k in _OVERRIDE_KEYS}
+    # Normalize provider
+    if cleaned.get("provider"):
+        cleaned["provider"] = _normalize_provider(cleaned["provider"])
+    elif cleaned.get("base_url"):
+        cleaned["provider"] = _detect_provider_from_base_url(cleaned["base_url"])
+    else:
+        cleaned["provider"] = ""
     if cleaned["api_key"] and _looks_masked(cleaned["api_key"]):
         from fastapi import HTTPException
 
@@ -346,6 +380,10 @@ def write_workflow_override(db: Session, user_id: int, workflow: str, cfg: Dict[
             {"code": "masked_api_key",
              "message": "That looks like a masked placeholder — paste the full API key (it is never displayed back in full)."},
         )
+    # Validate provider if set
+    if cleaned.get("provider") and cleaned["provider"] not in AI_PROVIDERS:
+        from fastapi import HTTPException
+        raise HTTPException(400, {"code": "invalid_provider", "message": f"provider must be one of {sorted(AI_PROVIDERS)}"})
     stored = dict(cleaned)
     if cleaned["api_key"]:
         stored["api_key"] = encrypt_secret(cleaned["api_key"], _secret_scope(user_id))
@@ -382,6 +420,8 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
     base_url = get_setting(db, user_id, "ai", "base_url", None)
     model = get_setting(db, user_id, "ai", "model", None)
     api_key, api_key_error = get_secret_setting(db, user_id, "ai", "api_key")
+    provider_raw = get_setting(db, user_id, "ai", "provider", None)
+    provider = _normalize_provider(provider_raw) if provider_raw else ""
     key_source: Optional[str] = "user" if api_key else None
 
     # Token budgets: the user's own value, else the owner's (the operator's
@@ -390,6 +430,7 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
     max_output_tokens = get_setting(db, user_id, "ai", "max_output_tokens", None)
 
     # If current user doesn't have api_key, try owner fallback
+    owner_provider = None
     if not api_key:
         try:
             owner = db.query(User).filter(User.role == "owner").order_by(User.id.asc()).first()
@@ -399,11 +440,15 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
                     api_key = owner_key
                     base_url = base_url or get_setting(db, owner.id, "ai", "base_url", None)
                     model = model or get_setting(db, owner.id, "ai", "model", None)
+                    if not provider:
+                        owner_provider = get_setting(db, owner.id, "ai", "provider", None)
                     key_source = "owner"
                 if max_input_tokens is None:
                     max_input_tokens = get_setting(db, int(owner.id), "ai", "max_input_tokens", None)
                 if max_output_tokens is None:
                     max_output_tokens = get_setting(db, int(owner.id), "ai", "max_output_tokens", None)
+                if not provider and owner_provider:
+                    provider = _normalize_provider(owner_provider)
         except Exception:
             pass
 
@@ -411,8 +456,17 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
         api_key = settings.ai_api_key
         key_source = "env"
 
+    # Resolve provider: explicit -> owner fallback -> auto-detect from base_url -> default
+    final_base = base_url or settings.ai_base_url
+    if not provider:
+        provider = _detect_provider_from_base_url(final_base)
+    # Normalize google alias
+    provider = _normalize_provider(provider)
+    if provider not in AI_PROVIDERS:
+        provider = AI_PROVIDER_OPENAI
+
     return {
-        "base_url": base_url or settings.ai_base_url,
+        "base_url": final_base,
         "model": model or settings.ai_model,
         "api_key": api_key or "",
         "api_key_set": bool(api_key),
@@ -426,6 +480,7 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
         # back into the env ceiling.
         "max_input_tokens": _budget_or(max_input_tokens, settings.ai_max_input_tokens),
         "max_output_tokens": _budget_or(max_output_tokens, settings.ai_max_output_tokens),
+        "provider": provider,
     }
 
 
@@ -452,6 +507,18 @@ def grouped(db: Session, user: User, *, reveal_secrets: bool = False) -> Dict[st
             continue  # handled above from the decrypted values
         bucket[row.key] = row.value
 
+    # Provider — respect stored value or auto-detect from base_url
+    provider_raw = get_setting(db, user.id, "ai", "provider", None)
+    # grouped is per-user; owner fallback for display is same as get_user_ai_config
+    # so show the user's own provider, or the owner's when they have no key.
+    try:
+        from app.services.user_settings import get_user_ai_config as _g
+        # Use helper to resolve provider with fallback logic
+        cfg_for_provider = get_user_ai_config(db, user.id)
+        result["ai"]["provider"] = cfg_for_provider.get("provider", "openai_compatible")
+    except Exception:
+        result["ai"]["provider"] = _normalize_provider(provider_raw) if provider_raw else _detect_provider_from_base_url(str(result["ai"].get("base_url") or ""))
+    result["ai"]["openai_compatible"] = result["ai"]["provider"] == AI_PROVIDER_OPENAI
     result["ai"]["api_key_set"] = bool(ai_key or settings.ai_api_key)
     # ``0`` on a token budget means unlimited (no clamp — the provider's own
     # maximum). Spelled out for the UI so it can render an "Unlimited" badge
@@ -561,6 +628,18 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
                     },
                 )
 
+    # Validate provider if present
+    if "ai" in payload and "provider" in (payload["ai"] or {}):
+        prov = _normalize_provider((payload["ai"] or {}).get("provider"))
+        if prov not in AI_PROVIDERS:
+            raise HTTPException(400, {"code": "invalid_provider", "message": f"provider must be one of {sorted(AI_PROVIDERS)} — got {prov!r}"})
+        # Normalize in place so stored value is canonical
+        (payload["ai"] or {})["provider"] = prov
+        # When provider is google, base_url defaults to Google endpoint if not provided
+        if prov == AI_PROVIDER_GOOGLE and not (payload["ai"] or {}).get("base_url"):
+            # Allow auto-detect; no default injection here — client will default, but validate that model looks like gemini if provided
+            pass
+
     # Pre-validate OpenAI compatible format if ai category present
     if "ai" in payload:
         ai_payload = payload["ai"] or {}
@@ -642,8 +721,12 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
             # Hygiene for AI connection fields: paste artifacts (trailing
             # whitespace/newlines) and masked placeholders are the two classic
             # ways a *valid* key ends up rejected by the provider.
-            if category == "ai" and key in ("base_url", "model", "api_key") and value is not None:
+            if category == "ai" and key in ("base_url", "model", "api_key", "provider") and value is not None:
                 value = str(value).strip()
+                if key == "provider" and value:
+                    value = _normalize_provider(value)
+                    if value not in AI_PROVIDERS:
+                        raise HTTPException(400, {"code": "invalid_provider", "message": f"provider must be one of {sorted(AI_PROVIDERS)}"})
                 if key == "api_key" and value and _looks_masked(value):
                     raise HTTPException(
                         400,

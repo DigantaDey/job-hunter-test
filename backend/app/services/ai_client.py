@@ -114,13 +114,13 @@ def reason_from_message(message: str, status: Optional[int] = None) -> str:
     head = text.split(":", 1)[0].strip().lower()
     if head in _REASON_PREFIXES:
         return _REASON_PREFIXES[head]
-    if status in (401, 403) or "incorrect api key" in lowered or "invalid api key" in lowered:
+    if status in (401, 403) or "incorrect api key" in lowered or "invalid api key" in lowered or "api key not valid" in lowered or "api_key_invalid" in lowered:
         return REASON_INVALID_API_KEY
     if status == 429:
         return REASON_RATE_LIMITED
-    if status in (402, 429) or "quota" in lowered or "insufficient_quota" in lowered or "billing" in lowered:
+    if status in (402, 429) or "quota" in lowered or "insufficient_quota" in lowered or "billing" in lowered or "resource_exhausted" in lowered:
         return REASON_QUOTA
-    if status == 404 or "model_not_found" in lowered or "does not exist" in lowered:
+    if status == 404 or "model_not_found" in lowered or "does not exist" in lowered or "model not found" in lowered or "not found" in lowered and "model" in lowered:
         return REASON_MODEL_UNAVAILABLE
     if status and status >= 500:
         return REASON_PROVIDER_STATUS
@@ -267,6 +267,147 @@ WORKFLOWS = {
     "persona": "user-persona reflection / track suggestions",
 }
 
+#: Supported AI providers
+AI_PROVIDER_OPENAI = "openai_compatible"
+AI_PROVIDER_GOOGLE = "google"
+AI_VALID_PROVIDERS = frozenset({AI_PROVIDER_OPENAI, AI_PROVIDER_GOOGLE, "google_ai_studio"})
+
+def _normalize_provider(value) -> str:
+    text = str(value or "").strip().lower()
+    if text in ("google", "google_ai_studio", "google_ai"):
+        return AI_PROVIDER_GOOGLE
+    if text in ("openai_compatible", "openai", "openai-compatible", ""):
+        return AI_PROVIDER_OPENAI
+    return text
+
+def _detect_provider_from_base_url(base_url: str) -> str:
+    lowered = (base_url or "").lower()
+    if "generativelanguage.googleapis.com" in lowered or "generativelanguage" in lowered:
+        return AI_PROVIDER_GOOGLE
+    return AI_PROVIDER_OPENAI
+
+def _is_google_provider(cfg: Dict[str, Any]) -> bool:
+    prov = _normalize_provider(cfg.get("provider"))
+    if prov == AI_PROVIDER_GOOGLE:
+        return True
+    # Auto-detect from base_url when provider not explicitly set
+    if not cfg.get("provider") and cfg.get("base_url"):
+        return _detect_provider_from_base_url(str(cfg["base_url"])) == AI_PROVIDER_GOOGLE
+    return False
+
+def _build_openai_url(cfg: Dict[str, Any]) -> str:
+    base = str(cfg.get("base_url") or "").strip().rstrip("/")
+    return f"{base}/chat/completions"
+
+def _build_google_url(cfg: Dict[str, Any], stream: bool = False) -> str:
+    base = str(cfg.get("base_url") or "https://generativelanguage.googleapis.com").strip().rstrip("/")
+    # Normalise base that may already contain /v1beta or /v1
+    # For tests, allow localhost/127.0.0.1 as fake Google endpoint — do not override to real host
+    is_local = any(h in base for h in ("127.0.0.1", "localhost", "0.0.0.0"))
+    if "generativelanguage.googleapis.com" not in base and not is_local:
+        # If user set provider=google but base_url is still openai style or empty, default to google host
+        # Keep any explicit base (e.g. custom proxy) if it looks like a URL, otherwise default
+        if not base or base.startswith("https://api.openai.com") or base.startswith("https://api.groq.com") or base == "" or "/chat/completions" in base:
+            base = "https://generativelanguage.googleapis.com"
+        # If base is still a non-google custom URL, keep it as-is and just ensure version
+        elif "http" in base and "generativelanguage" not in base:
+            # If it's a custom/test URL, keep it; don't force google host
+            pass
+        else:
+            base = "https://generativelanguage.googleapis.com"
+    # Ensure /v1beta
+    if "/v1beta" not in base and "/v1" not in base:
+        base = f"{base}/v1beta"
+    elif base.endswith("/v1"):
+        base = base[:-3] + "/v1beta"
+    model = str(cfg.get("model") or "gemini-1.5-flash").strip()
+    action = "streamGenerateContent" if stream else "generateContent"
+    # Use :streamGenerateContent?alt=sse for streaming per spec, else :generateContent
+    if stream:
+        return f"{base}/models/{model}:{action}?alt=sse"
+    return f"{base}/models/{model}:{action}"
+
+def _translate_to_google_payload(messages, system: str, temperature: float, max_tokens: int, json_mode: bool) -> Dict[str, Any]:
+    # Translate OpenAI messages -> Google contents
+    contents = []
+    system_instruction = None
+    for msg in messages or []:
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        if role == "system":
+            # Collect system as systemInstruction
+            if content.strip():
+                if system_instruction is None:
+                    system_instruction = {"parts": [{"text": content}]}
+                else:
+                    # Append
+                    system_instruction["parts"][0]["text"] += "\n\n" + content
+            continue
+        # user/assistant -> user/model
+        g_role = "model" if role == "assistant" else "user"
+        contents.append({"role": g_role, "parts": [{"text": str(content)}]})
+    # Also add explicit system param if provided and not already in messages
+    if system and not system_instruction:
+        system_instruction = {"parts": [{"text": system.replace("```", "").strip()}]}
+    payload: Dict[str, Any] = {"contents": contents}
+    if system_instruction:
+        payload["systemInstruction"] = system_instruction
+    gen_config: Dict[str, Any] = {}
+    if temperature is not None:
+        gen_config["temperature"] = float(temperature)
+    if max_tokens:
+        gen_config["maxOutputTokens"] = int(max_tokens)
+    if json_mode:
+        gen_config["responseMimeType"] = "application/json"
+    if gen_config:
+        payload["generationConfig"] = gen_config
+    return payload
+
+def _translate_from_google_response(data: Dict[str, Any]) -> Dict[str, Any]:
+    # Google -> OpenAI-like unified shape for _extract_content
+    candidates = data.get("candidates") or []
+    candidate = candidates[0] if candidates else {}
+    content_obj = candidate.get("content") or {}
+    parts = content_obj.get("parts") or []
+    text = ""
+    if parts and isinstance(parts, list):
+        texts = [p.get("text") or "" for p in parts if isinstance(p, dict)]
+        text = "\n".join(t for t in texts if t)
+    finish_reason = candidate.get("finishReason")
+    # Map finishReason to OpenAI style
+    if finish_reason == "MAX_TOKENS":
+        finish_reason = "length"
+    elif finish_reason == "SAFETY":
+        finish_reason = "content_filter"
+    elif finish_reason == "STOP":
+        finish_reason = "stop"
+    # Build OpenAI-compatible wrapper
+    return {
+        "choices": [{"message": {"content": text}, "finish_reason": finish_reason}],
+        "usage": data.get("usageMetadata") or data.get("usage") or {},
+        "_google_raw": data,
+    }
+
+def _translate_from_google_stream_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    # Each SSE data is already a candidates chunk
+    candidates = chunk.get("candidates") or []
+    candidate = candidates[0] if candidates else {}
+    content_obj = candidate.get("content") or {}
+    parts = content_obj.get("parts") or []
+    text = ""
+    if parts and isinstance(parts, list):
+        texts = [p.get("text") or "" for p in parts if isinstance(p, dict)]
+        text = "".join(t for t in texts if t)
+    finish_reason = candidate.get("finishReason")
+    if finish_reason == "MAX_TOKENS":
+        finish_reason = "length"
+    elif finish_reason == "SAFETY":
+        finish_reason = "content_filter"
+    elif finish_reason == "STOP":
+        finish_reason = "stop"
+    usage = chunk.get("usageMetadata") or {}
+    return {"content": text, "reasoning": "", "finish_reason": finish_reason, "usage": usage}
+
 _workflow_overrides: Dict[Tuple[int, str], Dict[str, str]] = {}
 _semaphore: Optional[asyncio.Semaphore] = None
 
@@ -360,8 +501,12 @@ def set_workflow_overrides(overrides: Dict[str, Dict[str, str]], user_id: int = 
         if workflow not in WORKFLOWS:
             continue
         if isinstance(cfg, dict):
-            cleaned = {k: (str(v).strip() if v else "") for k, v in cfg.items() if k in ("base_url", "api_key", "model")}
-            if any(cleaned.values()):
+            cleaned = {k: (str(v).strip() if v else "") for k, v in cfg.items() if k in ("base_url", "api_key", "model", "provider")}
+            if cleaned.get("provider"):
+                cleaned["provider"] = _normalize_provider(cleaned["provider"])
+            elif cleaned.get("base_url"):
+                cleaned["provider"] = _detect_provider_from_base_url(cleaned["base_url"])
+            if any(v for k,v in cleaned.items() if k != "provider"):  # provider alone does not create an override
                 _workflow_overrides[(user_id, workflow)] = cleaned
             else:
                 _workflow_overrides.pop((user_id, workflow), None)
@@ -377,10 +522,14 @@ def resolve_config(workflow: Optional[str] = None) -> Dict[str, Any]:
     """Env-level config (no user context). Includes the legacy system bucket."""
     override = _workflow_overrides.get((0, workflow or ""), {}) if workflow else {}
     api_key = (override.get("api_key") or settings.ai_api_key or "").strip()
+    base_url = (override.get("base_url") or settings.ai_base_url).strip().rstrip("/")
+    provider_raw = (override.get("provider") or "").strip()
+    provider = _normalize_provider(provider_raw) if provider_raw else _detect_provider_from_base_url(base_url)
     return {
-        "base_url": (override.get("base_url") or settings.ai_base_url).strip().rstrip("/"),
+        "base_url": base_url,
         "api_key": api_key,
         "model": (override.get("model") or settings.ai_model).strip(),
+        "provider": provider,
         "key_source": "workflow_override" if override.get("api_key") else ("env" if api_key else None),
         "timeout": settings.ai_timeout,
         "max_retries": settings.ai_max_retries,
@@ -408,6 +557,7 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
     user_max_retries: Any = settings.ai_max_retries
     user_max_input_tokens: Any = settings.ai_max_input_tokens
     user_max_output_tokens: Any = settings.ai_max_output_tokens
+    provider: str = AI_PROVIDER_OPENAI
     try:
         from app.services.user_settings import get_user_ai_config
         user_cfg = get_user_ai_config(db, user_id)
@@ -416,6 +566,7 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
         api_key = user_cfg.get("api_key") or settings.ai_api_key
         key_source = user_cfg.get("key_source") or ("env" if api_key else None)
         key_error = user_cfg.get("api_key_error")
+        provider = _normalize_provider(user_cfg.get("provider")) if user_cfg.get("provider") else _detect_provider_from_base_url(base_url)
         user_timeout = user_cfg.get("timeout", settings.ai_timeout)
         user_max_retries = user_cfg.get("max_retries", settings.ai_max_retries)
         user_max_input_tokens = user_cfg.get("max_input_tokens", settings.ai_max_input_tokens)
@@ -425,6 +576,7 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
         base_url = settings.ai_base_url
         model = settings.ai_model
         api_key = settings.ai_api_key
+        provider = _detect_provider_from_base_url(base_url)
         key_source = "env" if api_key else None
 
     # Apply per-workflow override if present (overrides per-user and env)
@@ -436,6 +588,10 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
                 base_url = override.get("base_url") or base_url
                 api_key = override.get("api_key") or api_key
                 model = override.get("model") or model
+                if override.get("provider"):
+                    provider = _normalize_provider(override["provider"])
+                elif override.get("base_url"):
+                    provider = _detect_provider_from_base_url(override["base_url"])
                 if override.get("api_key"):
                     key_source = "workflow_override"
                     key_error = None
@@ -450,10 +606,15 @@ def resolve_config_for_user(db, user_id: int, workflow: Optional[str] = None) ->
     if plan_cap > 0:
         resolved_output = plan_cap if resolved_output <= 0 else min(resolved_output, plan_cap)
 
+    # Final provider auto-detect if still empty or inconsistent with base_url
+    if not provider or provider not in AI_VALID_PROVIDERS:
+        provider = _detect_provider_from_base_url(base_url or "")
+    provider = _normalize_provider(provider)
     return {
         "base_url": (base_url or "").strip().rstrip("/"),
         "api_key": (api_key or "").strip(),
         "model": (model or "").strip(),
+        "provider": provider,
         "key_source": key_source,
         "key_error": key_error,
         "timeout": user_timeout,
@@ -747,6 +908,10 @@ MODEL_COSTS = {
     # free/open models via aggregators (OpenRouter, z-ai, etc.)
     "glm": {"input": 0.0001, "output": 0.0003},
     "z-ai": {"input": 0.0001, "output": 0.0003},
+    "gemini-1.5-flash": {"input": 0.000075, "output": 0.0003},
+    "gemini-1.5-pro": {"input": 0.00125, "output": 0.005},
+    "gemini-2.0-flash": {"input": 0.0001, "output": 0.0004},
+    "gemini": {"input": 0.0001, "output": 0.0004},
     "default": {"input": 0.001, "output": 0.002},
 }
 
@@ -865,16 +1030,26 @@ def _parse_model_json(content: str):
 def _extract_content(data: Any) -> Dict[str, Any]:
     """
     Pull the answer out of an OpenAI-compatible chat completion body without
-    ever raising.
+    ever raising. Also handles Google generateContent shape (candidates[0].content.parts[0].text).
 
     The wild is messy: ``content`` arrives as ``None``, as a list of parts
     (``[{"type": "text", "text": ...}]``), or empty with the real answer in
     ``reasoning_content`` (reasoning models whose thinking phase consumed the
     whole ``max_tokens`` budget). Legacy completions proxies put the text in
-    ``choices[0].text``. All of those are normalised here.
+    ``choices[0].text``. All of those are normalised here. Google returns
+    ``candidates[0].content.parts[0].text`` with ``finishReason`` and
+    ``usageMetadata``.
     """
     empty: Dict[str, Any] = {"content": "", "reasoning": "", "finish_reason": None,
                              "message": {}, "well_formed": False}
+    if not isinstance(data, dict):
+        return empty
+    # Google shape: translate first
+    if "candidates" in data and "choices" not in data:
+        try:
+            data = _translate_from_google_response(data)
+        except Exception:
+            pass
     choices = data.get("choices") if isinstance(data, dict) else None
     choice = choices[0] if isinstance(choices, list) and choices else None
     if not isinstance(choice, dict):
@@ -912,8 +1087,11 @@ def _extract_content(data: Any) -> Dict[str, Any]:
 
 
 def _read_usage(data: Dict[str, Any], prompt: str, content: str) -> Tuple[int, int, int]:
-    """Extract token usage, handling the many provider field variants."""
-    raw_usage = data.get("usage") or data.get("usage_metadata") or {}
+    """Extract token usage, handling the many provider field variants (OpenAI + Google)."""
+    raw_usage = data.get("usage") or data.get("usage_metadata") or data.get("usageMetadata") or {}
+    # Google also nests usage at top level _google_raw
+    if not raw_usage and isinstance(data.get("_google_raw"), dict):
+        raw_usage = data["_google_raw"].get("usageMetadata") or {}
     if not isinstance(raw_usage, dict):
         raw_usage = {}
 
@@ -926,9 +1104,9 @@ def _read_usage(data: Dict[str, Any], prompt: str, content: str) -> Tuple[int, i
                 return int(v)
         return 0
 
-    prompt_tokens = _int_field("prompt_tokens", "input_tokens", "promptTokens", "inputTokens", "prompt_tokens_count")
-    completion_tokens = _int_field("completion_tokens", "output_tokens", "completionTokens", "outputTokens", "candidatesTokenCount")
-    total_tokens = _int_field("total_tokens", "totalTokens")
+    prompt_tokens = _int_field("prompt_tokens", "input_tokens", "promptTokens", "promptTokenCount", "inputTokens", "prompt_tokens_count")
+    completion_tokens = _int_field("completion_tokens", "output_tokens", "completionTokens", "candidatesTokenCount", "outputTokens", "candidatesTokenCount")
+    total_tokens = _int_field("total_tokens", "totalTokens", "totalTokenCount")
     if total_tokens == 0:
         total_tokens = (prompt_tokens + completion_tokens) if (prompt_tokens or completion_tokens) else 0
     # Fallback estimate when the provider omits usage entirely (common on free tiers)
@@ -1073,49 +1251,32 @@ async def chat_completion(
     system: Optional[str] = None,
     db=None,
     user_id: Optional[int] = None,
+    stream: bool = False,
 ) -> Dict[str, Any]:
-    """Send a chat completion. Raises ``AIClientError`` on failure.
+    """Send a chat completion. Raises AIClientError on failure.
 
-    A 200 response is not trusted blindly: reasoning models can return an
-    empty ``content`` (the whole ``max_tokens`` budget spent on thinking), the
-    JSON can be truncated mid-way (``finish_reason=length``), and some
-    providers accept ``response_format=json_object`` but then emit nothing.
-    All of those are retried *automatically with a targeted fix* — more output
-    tokens, or without ``response_format`` — before the caller ever sees an
-    ``invalid_json`` / ``empty_response`` / ``truncated_response`` error.
-
-    Wait budget (per wire attempt): explicit ``timeout`` → the caller's
-    per-user ``ai.timeout`` setting → ``AI_TIMEOUT`` (default 300s, generous
-    enough for heavy reasoning models). The TCP+TLS connect phase gets its own
-    short deadline (``AI_CONNECT_TIMEOUT``) so a genuinely unreachable
-    endpoint still fails fast. A read/write wait that expires is reported
-    honestly as ``timeout`` — never ``unreachable`` — and is *not* retried
-    automatically: the provider accepted the request and may still be
-    generating (and billing), so another attempt would spend — and bill —
-    a second full generation.
+    Streaming: when stream=True, uses http_client.stream with Timeout(1800, connect 10, read 60, write 60, pool 60) + SSE parsing.
     """
-    # Resolution order: explicit ai_config > per-user DB config (explicit or
-    # ambient request/worker user, with owner fallback) > env defaults.
     resolved = _resolve_ai_config(workflow, db, user_id)
     cfg = resolved.cfg
     db, user_id = resolved.db, resolved.user_id
     call_started = time.perf_counter()
     usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    # Collected at the failure site, written once at the outer boundary. This
-    # also records preflight rejections without inventing provider token usage.
     failure_meta: Dict[str, Any] = {}
     try:
         if ai_config:
+            merged_provider = ai_config.get("provider") or cfg.get("provider")
+            if not merged_provider and ai_config.get("base_url"):
+                merged_provider = _detect_provider_from_base_url(ai_config["base_url"])
             cfg = {
                 "base_url": (ai_config.get("base_url") or cfg["base_url"]).rstrip("/"),
                 "api_key": (ai_config.get("api_key") or cfg["api_key"]).strip(),
                 "model": (ai_config.get("model") or cfg["model"]).strip(),
+                "provider": _normalize_provider(merged_provider) if merged_provider else cfg.get("provider"),
                 "key_source": "explicit" if ai_config.get("api_key") else cfg.get("key_source"),
                 "key_error": cfg.get("key_error"),
                 "timeout": cfg.get("timeout"),
                 "max_retries": cfg.get("max_retries"),
-                # ``0`` is a *setting* (unlimited), not a missing value — the
-                # merge must be first-one-set, never ``a or b``.
                 "max_input_tokens": _first_budget(
                     (ai_config.get("max_input_tokens"), cfg.get("max_input_tokens")),
                     settings.ai_max_input_tokens),
@@ -1123,6 +1284,10 @@ async def chat_completion(
                     (ai_config.get("max_output_tokens"), cfg.get("max_output_tokens")),
                     settings.ai_max_output_tokens),
             }
+        if not cfg.get("provider") or cfg.get("provider") not in AI_VALID_PROVIDERS:
+            cfg["provider"] = _detect_provider_from_base_url(cfg.get("base_url") or "")
+        cfg["provider"] = _normalize_provider(cfg.get("provider"))
+        is_google = _is_google_provider(cfg)
         if not cfg["api_key"]:
             if cfg.get("key_error"):
                 raise AIClientError(
@@ -1134,69 +1299,41 @@ async def chat_completion(
                 "no_api_key: AI is not configured (set AI_API_KEY in Settings or per-workflow override — OpenAI compatible format: base_url like https://api.openai.com/v1, model like gpt-4o-mini)",
                 reason=REASON_NO_API_KEY,
             )
-
-        # Per-user entitlement pre-check if db/user_id provided
         if db is not None and user_id is not None:
             try:
                 from app.core.entitlements import enforce
                 enforce(db, user_id, "ai_operations_per_month")
                 enforce(db, user_id, "ai_credits_per_month")
             except Exception as e:
-                # Plan limit reached: a BLOCKED outcome (limit_exceeded) — the
-                # call is refused honestly, never substituted with an estimate.
                 raise AIClientError(f"limit_exceeded: {e}", retryable=False) from e
-
         if budget_exhausted():
             inc("jobhunter_ai_requests_total", workflow=workflow, status="budget_exhausted")
             raise AIClientError(
                 f"budget_exhausted: daily AI token budget of {settings.ai_daily_token_budget} reached",
                 retryable=True,
             )
-
         breaker = _breaker(workflow)
         if breaker.is_open():
             inc("jobhunter_ai_requests_total", workflow=workflow, status="breaker_open")
             raise AIClientError(f"circuit_open: {breaker.last_error}", retryable=True,
                                 meta={"retry_after_hint": retry_hint_for_reason(REASON_CIRCUIT_OPEN, workflow=workflow)})
-
-        # ------------------------------------------------------------------ #
-        # User token budgets — the single source of truth (Settings → AI API)
-        #
-        # ``0`` on either budget means UNLIMITED: no clamp, no client-side
-        # prompt truncation, and the escalation on truncation may grow past any
-        # shipped ceiling (bounded only by ``escalation_ceiling``). An explicit
-        # ``0`` always wins over a default after it — a ``value or default``
-        # chain would silently re-introduce the cap the user switched off.
-        # ------------------------------------------------------------------ #
         output_ceiling = resolve_output_ceiling(cfg.get("max_output_tokens"))
         escalation_stop = escalation_ceiling(output_ceiling)
         resolved_input = resolve_input_budget(cfg.get("max_input_tokens"))
-        input_budget_chars = 0 if resolved_input <= 0 else max(1000, resolved_input * CHARS_PER_TOKEN)
+        input_budget_chars_val = 0 if resolved_input <= 0 else max(1000, resolved_input * CHARS_PER_TOKEN)
         input_truncated = False
-
         messages: List[Dict[str, str]] = []
         if system:
-            # Sanitize system prompt — treat external data as untrusted, then
-            # cap it at the user's input budget (no hardcoded slices).
-            safe_system, _system_truncated = fit_prompt_part(system.replace("```", ""), input_budget_chars,
+            safe_system, _system_truncated = fit_prompt_part(system.replace("```", ""), input_budget_chars_val,
                                                              label=f"{workflow}.system")
             input_truncated = input_truncated or _system_truncated
             messages.append({"role": "system", "content": safe_system})
-        # Sanitize user prompt: remove potential injection, cap at the budget.
         safe_prompt, _prompt_truncated = fit_prompt_part(
-            prompt.replace("SYSTEM:", "").replace("Ignore previous", ""), input_budget_chars,
+            prompt.replace("SYSTEM:", "").replace("Ignore previous", ""), input_budget_chars_val,
             label=f"{workflow}.prompt")
         input_truncated = input_truncated or _prompt_truncated
         messages.append({"role": "user", "content": safe_prompt})
-
-        payload: Dict[str, Any] = {"model": cfg["model"], "messages": messages, "temperature": temperature}
         json_mode_active = json_mode
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        # Output budget: the task's own starting budget (per call), clamped to
-        # the user's configured ceiling *when there is one*. With an unlimited
-        # ceiling nothing is clamped — the task's budget goes out as asked and
-        # the automatic escalation below may grow past any shipped default.
         try:
             starting_budget = max(1, int(max_tokens or _DEFAULT_OUTPUT_START))
         except (TypeError, ValueError):
@@ -1207,11 +1344,23 @@ async def chat_completion(
             starting_budget = output_ceiling
         current_max_tokens = starting_budget
         max_tokens_key = "max_tokens"
-        payload[max_tokens_key] = current_max_tokens
-
-        headers = {"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}
-        url = f"{cfg['base_url']}/chat/completions"
-        # Wait budget: explicit per-call override → per-user setting → env default.
+        payload: Dict[str, Any] = {}
+        headers: Dict[str, str] = {}
+        url: str = ""
+        if is_google:
+            payload = _translate_to_google_payload(messages, system, temperature, current_max_tokens, json_mode)
+            url = _build_google_url(cfg, stream=stream)
+            headers = {"Content-Type": "application/json", "x-goog-api-key": cfg["api_key"]}
+        else:
+            payload = {"model": cfg["model"], "messages": messages, "temperature": temperature}
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            payload[max_tokens_key] = current_max_tokens
+            headers = {"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}
+            url = _build_openai_url(cfg)
+            if stream:
+                payload["stream"] = True
+                payload["stream_options"] = {"include_usage": True}
         try:
             cfg_timeout = float(cfg.get("timeout") or settings.ai_timeout)
         except (TypeError, ValueError):
@@ -1219,47 +1368,382 @@ async def chat_completion(
         effective_timeout = float(timeout) if timeout is not None else cfg_timeout
         if not effective_timeout or effective_timeout <= 0:
             effective_timeout = settings.ai_timeout
+        if effective_timeout > 1800:
+            effective_timeout = 1800
         try:
             attempts = max(1, int(cfg.get("max_retries") or settings.ai_max_retries))
         except (TypeError, ValueError):
             attempts = max(1, settings.ai_max_retries)
-        # Short connect deadline inside the long generation wait: DNS/TLS/TCP
-        # failures surface in seconds while a healthy generation gets minutes.
         connect_timeout = min(settings.ai_connect_timeout, effective_timeout)
         client_timeout = httpx.Timeout(effective_timeout, connect=connect_timeout)
+        # Streaming uses idle timeout (read 60s) while total respects per-call/per-user budget
+        # Effective read is min(60, effective_timeout) so a 0.4s budget still times out promptly
+        read_timeout = min(60, effective_timeout) if effective_timeout and effective_timeout > 0 else 60
+        streaming_timeout = httpx.Timeout(effective_timeout if effective_timeout <= 1800 else 1800, connect=10, read=read_timeout, write=60, pool=60)
         last_error: Optional[str] = None
-
-        # Reuse the process-wide pooled client (connection reuse, SSRF guard,
-        # per-host politeness) — per-request timeout override preserves the
-        # long generation budget (up to 600s for reasoning models).
         http_client = await get_http_client()
-
-        # State accumulated across the wire attempts of this logical call.
-        parsed_result: Optional[Dict[str, Any]] = None   # JSON mode success
-        text_result: Optional[str] = None                # text mode success
-        final_error: Optional[AIClientError] = None      # 200-but-unusable answer
+        parsed_result: Optional[Dict[str, Any]] = None
+        text_result: Optional[str] = None
+        final_error: Optional[AIClientError] = None
         data: Dict[str, Any] = {}
-        plain_retries = 0     # same-payload retries allowed for empty/flaky answers
-        fixups = 0            # provider-parameter fix-ups (don't consume attempts)
-
+        plain_retries = 0
+        fixups = 0
         attempt = 0
         while attempt < attempts:
             attempt += 1
             await rate_limiter.wait_and_acquire(1)
             started = time.perf_counter()
+            if is_google:
+                if "generationConfig" not in payload:
+                    payload["generationConfig"] = {}
+                payload["generationConfig"]["maxOutputTokens"] = int(current_max_tokens)
+                if json_mode_active:
+                    payload["generationConfig"]["responseMimeType"] = "application/json"
+                elif "responseMimeType" in payload["generationConfig"]:
+                    payload["generationConfig"].pop("responseMimeType", None)
+                url = _build_google_url(cfg, stream=stream)
+            else:
+                payload[max_tokens_key] = current_max_tokens
+                if json_mode_active and "response_format" not in payload:
+                    payload["response_format"] = {"type": "json_object"}
+                elif not json_mode_active and "response_format" in payload:
+                    payload.pop("response_format", None)
+                if stream and "stream" not in payload:
+                    payload["stream"] = True
             try:
-                async with _sem():
-                    response = await http_client.post(
-                        url, headers=headers, json=payload, timeout=client_timeout
-                    )
+                if stream:
+                    async with _sem():
+                        try:
+                            async with http_client.stream("POST", url, headers=headers, json=payload, timeout=streaming_timeout) as response:
+                                if response.status_code != 200:
+                                    body_bytes = await response.aread()
+                                    body = body_bytes.decode(errors="ignore")[:400]
+                                    last_error = f"status {response.status_code}: {body}"
+                                    lowered = body.lower()
+                                    if response.status_code == 400 and fixups < 3:
+                                        fixup_applied = False
+                                        if json_mode_active and ("response_format" in lowered or "responsemimetype" in lowered or "response_mime_type" in lowered):
+                                            log.warning("AI %s: provider rejected json mode, retrying without it", workflow)
+                                            json_mode_active = False
+                                            if is_google and "generationConfig" in payload:
+                                                payload["generationConfig"].pop("responseMimeType", None)
+                                            else:
+                                                payload.pop("response_format", None)
+                                            fixup_applied = True
+                                        if (not fixup_applied and max_tokens_key in payload and "max_completion_tokens" in lowered and "unsupported" in lowered):
+                                            log.warning("AI %s: provider wants max_completion_tokens, renaming the parameter", workflow)
+                                            payload["max_completion_tokens"] = payload.pop(max_tokens_key)
+                                            max_tokens_key = "max_completion_tokens"
+                                            fixup_applied = True
+                                        if (not fixup_applied and "temperature" in payload and "temperature" in lowered and ("unsupported" in lowered or "not supported" in lowered)):
+                                            log.warning("AI %s: provider rejected temperature, retrying without it", workflow)
+                                            payload.pop("temperature", None)
+                                            if is_google and "generationConfig" in payload:
+                                                payload["generationConfig"].pop("temperature", None)
+                                            fixup_applied = True
+                                        if (not fixup_applied and (max_tokens_key in payload or (is_google and "generationConfig" in payload)) and "max_tokens" in lowered and any(w in lowered for w in ("too large", "too high", "at most", "maximum", "exceeds"))):
+                                            clamped = max(256, current_max_tokens // 2)
+                                            if clamped < current_max_tokens:
+                                                log.warning("AI %s: max_tokens=%d exceeds the model limit, retrying with %d",
+                                                            workflow, current_max_tokens, clamped)
+                                                current_max_tokens = clamped
+                                                if is_google:
+                                                    payload["generationConfig"]["maxOutputTokens"] = clamped
+                                                else:
+                                                    payload[max_tokens_key] = clamped
+                                                fixup_applied = True
+                                        if fixup_applied:
+                                            fixups += 1
+                                            attempt -= 1
+                                            raise _StreamFixupNeeded()
+                                    retryable = response.status_code == 429 or 500 <= response.status_code < 600
+                                    http_reason = reason_from_message(last_error, response.status_code)
+                                    inc("jobhunter_ai_requests_total", workflow=workflow, status=str(response.status_code))
+                                    if retryable and attempt < attempts:
+                                        delay = _retry_delay_stream(body, response, attempt)
+                                        log.warning("AI %s -> %s, retrying in %.1fs", workflow, response.status_code, delay)
+                                        await asyncio.sleep(delay)
+                                        continue
+                                    if not retryable:
+                                        if response.status_code in (401, 403):
+                                            breaker.record_failure(last_error)
+                                        failure_meta.update({"attempts": attempt})
+                                        raise AIClientError(last_error, status=response.status_code, retryable=False,
+                                                            meta={"attempts": attempt})
+                                    breaker.record_failure(last_error)
+                                    failure_meta.update({"attempts": attempt})
+                                    raise AIClientError(last_error, status=response.status_code, retryable=True,
+                                                        meta={"attempts": attempt, "retry_after_hint": retry_hint_for_reason(http_reason, workflow=workflow)})
+                                inc("jobhunter_ai_requests_total", workflow=workflow, status="200")
+                                # If provider returned JSON instead of SSE (e.g. legacy test handler not supporting streaming), fallback to JSON
+                                content_type = response.headers.get("content-type", "")
+                                if "application/json" in content_type:
+                                    # Read as JSON directly — streaming request got a non-stream response
+                                    body_bytes = await response.aread()
+                                    try:
+                                        data = json.loads(body_bytes.decode())
+                                    except Exception as exc:
+                                        last_error = f"malformed_response: provider returned a non-JSON body ({exc})"
+                                        if plain_retries < 1:
+                                            plain_retries += 1
+                                            continue
+                                        breaker.record_failure(last_error)
+                                        failure_meta.update({"attempts": attempt})
+                                        raise AIClientError(last_error, retryable=True) from exc
+                                    extracted = _extract_content(data)
+                                    content = extracted["content"]
+                                    finish_reason = extracted["finish_reason"]
+                                    reasoning = extracted["reasoning"]
+                                    p_tok, c_tok, t_tok = _read_usage(data, prompt, content)
+                                    usage_totals["prompt_tokens"] += p_tok
+                                    usage_totals["completion_tokens"] += c_tok
+                                    usage_totals["total_tokens"] += t_tok
+                                    if not extracted["well_formed"]:
+                                        last_error = ("malformed_response: provider returned 200 without a usable choices[0].message")
+                                        if plain_retries < 1:
+                                            plain_retries += 1
+                                            continue
+                                        breaker.record_failure(last_error)
+                                        failure_meta.update({"attempts": attempt})
+                                        raise AIClientError(last_error, retryable=True)
+                                    if not json_mode:
+                                        if content.strip() and finish_reason != "length":
+                                            text_result = content
+                                            break
+                                        action = _json_retry_action(content, finish_reason, json_mode_active=False, plain_retries=plain_retries)
+                                    else:
+                                        parsed = None
+                                        if content.strip():
+                                            parsed = _parse_model_json(content)
+                                        if parsed is None and reasoning.strip():
+                                            parsed = _parse_model_json(reasoning)
+                                        if isinstance(parsed, dict):
+                                            parsed_result = parsed
+                                            break
+                                        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                                            parsed_result = parsed[0]
+                                            break
+                                        action = _json_retry_action(content, finish_reason, json_mode_active=json_mode_active, plain_retries=plain_retries)
+                                    if action is not None and attempt >= attempts:
+                                        action = None
+                                    if action == "raise_max_tokens_big" or action == "raise_max_tokens":
+                                        factor, floor = (4, 4000) if action == "raise_max_tokens_big" else (2, 2400)
+                                        new_max = min(max(current_max_tokens * factor, floor), escalation_stop)
+                                        if new_max > current_max_tokens:
+                                            what = "the thinking phase used the whole budget" if not content.strip() else "the JSON was cut off"
+                                            log.warning("AI %s: %s at %d tokens (finish_reason=%s) — retrying with %d tokens",
+                                                        workflow, what, current_max_tokens, finish_reason, new_max)
+                                            current_max_tokens = new_max
+                                            if is_google:
+                                                payload["generationConfig"]["maxOutputTokens"] = new_max
+                                            else:
+                                                payload[max_tokens_key] = new_max
+                                            continue
+                                        action = None
+                                    elif action == "drop_response_format":
+                                        log.warning("AI %s: model returned an empty answer with response_format=json_object — retrying without it", workflow)
+                                        json_mode_active = False
+                                        if is_google and "generationConfig" in payload:
+                                            payload["generationConfig"].pop("responseMimeType", None)
+                                        else:
+                                            payload.pop("response_format", None)
+                                        continue
+                                    elif action == "plain_retry":
+                                        log.warning("AI %s: model returned an %s answer (finish_reason=%s) — retrying",
+                                                    workflow, "empty" if not content.strip() else "unparseable", finish_reason)
+                                        plain_retries += 1
+                                        continue
+                                    final_error = _invalid_json_error(content, finish_reason, current_max_tokens)
+                                    break
+                                content_parts: List[str] = []
+                                reasoning_parts: List[str] = []
+                                finish_reason = None
+                                usage_data: Dict[str, Any] = {}
+                                # Fallback: if SSE yields nothing, try to read remaining as json
+                                had_sse = False
+                                async for line in response.aiter_lines():
+                                    if not line:
+                                        continue
+                                    stripped = line.strip()
+                                    if stripped.startswith("data:"):
+                                        had_sse = True
+                                    if not stripped.startswith("data:"):
+                                        # If not SSE at all, treat as raw json fallback
+                                        try:
+                                            fallback_data = json.loads(stripped)
+                                            # If we haven't had SSE, this might be raw JSON body
+                                            if not had_sse:
+                                                data = fallback_data
+                                                extracted = _extract_content(data)
+                                                content = extracted["content"]
+                                                finish_reason = extracted["finish_reason"]
+                                                reasoning = extracted["reasoning"]
+                                                p_tok, c_tok, t_tok = _read_usage(data, prompt, content)
+                                                usage_totals["prompt_tokens"] += p_tok
+                                                usage_totals["completion_tokens"] += c_tok
+                                                usage_totals["total_tokens"] += t_tok
+                                                # handle validation similar to above but simplified: if well_formed etc.
+                                                if extracted["well_formed"]:
+                                                    if not json_mode:
+                                                        if content.strip() and finish_reason != "length":
+                                                            text_result = content
+                                                            break
+                                                    else:
+                                                        parsed = _parse_model_json(content) if content.strip() else None
+                                                        if parsed is None and reasoning.strip():
+                                                            parsed = _parse_model_json(reasoning)
+                                                        if isinstance(parsed, dict):
+                                                            parsed_result = parsed
+                                                            break
+                                                        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                                                            parsed_result = parsed[0]
+                                                            break
+                                                # Fall through to SSE handling if not matched
+                                        except Exception:
+                                            pass
+                                        continue
+                                    data_str = stripped[5:].strip()
+                                    if data_str == "[DONE]" or not data_str:
+                                        break
+                                    try:
+                                        chunk = json.loads(data_str)
+                                    except Exception:
+                                        continue
+                                    if is_google:
+                                        parsed = _translate_from_google_stream_chunk(chunk)
+                                        if parsed.get("content"):
+                                            content_parts.append(parsed["content"])
+                                        if parsed.get("reasoning"):
+                                            reasoning_parts.append(parsed["reasoning"])
+                                        if parsed.get("finish_reason"):
+                                            finish_reason = parsed["finish_reason"]
+                                        if parsed.get("usage"):
+                                            usage_data = parsed["usage"]
+                                        if "usageMetadata" in chunk:
+                                            usage_data = chunk["usageMetadata"]
+                                    else:
+                                        choices = chunk.get("choices") or []
+                                        if choices:
+                                            delta = choices[0].get("delta") or {}
+                                            if isinstance(delta.get("content"), str):
+                                                content_parts.append(delta["content"])
+                                            rc = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                                            if isinstance(rc, str) and rc:
+                                                reasoning_parts.append(rc)
+                                            fr = choices[0].get("finish_reason")
+                                            if fr:
+                                                finish_reason = fr
+                                        if "usage" in chunk and isinstance(chunk["usage"], dict):
+                                            usage_data = chunk["usage"]
+                                # If we already produced result via fallback JSON inside loop, continue
+                                if parsed_result is not None or text_result is not None or final_error is not None:
+                                    break
+                                if not had_sse and not content_parts and not usage_data:
+                                    # No SSE data at all — try to read body as JSON (server returned JSON with text/event-stream header or empty)
+                                    # Already handled json fallback above, but if still empty, treat as empty_response
+                                    pass
+                                content = "".join(content_parts)
+                                reasoning = "".join(reasoning_parts)
+                                # If SSE was empty (handler returned JSON), fallback already handled via content_type branch above; if we reach here with empty content, it means handler returned SSE empty
+                                data = {"choices": [{"message": {"content": content, "reasoning_content": reasoning}, "finish_reason": finish_reason}], "usage": usage_data}
+                                if is_google and usage_data:
+                                    data["_google_raw"] = {"usageMetadata": usage_data, "candidates": [{"content": {"parts": [{"text": content}]}, "finishReason": finish_reason}]}
+                                p_tok, c_tok, t_tok = _read_usage(data, prompt, content)
+                                usage_totals["prompt_tokens"] += p_tok
+                                usage_totals["completion_tokens"] += c_tok
+                                usage_totals["total_tokens"] += t_tok
+                                extracted = {"content": content, "reasoning": reasoning, "finish_reason": finish_reason, "message": {"content": content}, "well_formed": True}
+                                if not extracted["well_formed"]:
+                                    last_error = ("malformed_response: provider returned 200 without a usable choices[0].message")
+                                    if plain_retries < 1:
+                                        plain_retries += 1
+                                        continue
+                                    breaker.record_failure(last_error)
+                                    failure_meta.update({"attempts": attempt})
+                                    raise AIClientError(last_error, retryable=True)
+                                if not json_mode:
+                                    if content.strip() and finish_reason != "length":
+                                        text_result = content
+                                        break
+                                    action = _json_retry_action(content, finish_reason, json_mode_active=False, plain_retries=plain_retries)
+                                else:
+                                    parsed = None
+                                    if content.strip():
+                                        parsed = _parse_model_json(content)
+                                    if parsed is None and reasoning.strip():
+                                        parsed = _parse_model_json(reasoning)
+                                    if isinstance(parsed, dict):
+                                        parsed_result = parsed
+                                        break
+                                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                                        parsed_result = parsed[0]
+                                        break
+                                    action = _json_retry_action(content, finish_reason, json_mode_active=json_mode_active, plain_retries=plain_retries)
+                                if action is not None and attempt >= attempts:
+                                    action = None
+                                if action == "raise_max_tokens_big" or action == "raise_max_tokens":
+                                    factor, floor = (4, 4000) if action == "raise_max_tokens_big" else (2, 2400)
+                                    new_max = min(max(current_max_tokens * factor, floor), escalation_stop)
+                                    if new_max > current_max_tokens:
+                                        what = "the thinking phase used the whole budget" if not content.strip() else "the JSON was cut off"
+                                        log.warning("AI %s: %s at %d tokens (finish_reason=%s) — retrying with %d tokens",
+                                                    workflow, what, current_max_tokens, finish_reason, new_max)
+                                        current_max_tokens = new_max
+                                        if is_google:
+                                            payload["generationConfig"]["maxOutputTokens"] = new_max
+                                        else:
+                                            payload[max_tokens_key] = new_max
+                                        continue
+                                    action = None
+                                elif action == "drop_response_format":
+                                    log.warning("AI %s: model returned an empty answer with response_format=json_object — retrying without it", workflow)
+                                    json_mode_active = False
+                                    if is_google and "generationConfig" in payload:
+                                        payload["generationConfig"].pop("responseMimeType", None)
+                                    else:
+                                        payload.pop("response_format", None)
+                                    continue
+                                elif action == "plain_retry":
+                                    log.warning("AI %s: model returned an %s answer (finish_reason=%s) — retrying",
+                                                workflow, "empty" if not content.strip() else "unparseable", finish_reason)
+                                    plain_retries += 1
+                                    continue
+                                final_error = _invalid_json_error(content, finish_reason, current_max_tokens)
+                                break
+                        except _StreamFixupNeeded:
+                            continue
+                        except httpx.TimeoutException as exc:
+                            waited = time.perf_counter() - started
+                            if isinstance(exc, httpx.ConnectTimeout):
+                                last_error = (f"http_error: connection to {cfg['base_url']} timed out after {connect_timeout:g}s (attempt {attempt}/{attempts}) — check the base_url in Settings → AI API")
+                                inc("jobhunter_ai_requests_total", workflow=workflow, status="network_error")
+                                if attempt < attempts:
+                                    await _sleep_backoff(attempt)
+                                    continue
+                                breaker.record_failure(last_error)
+                                failure_meta.update({"attempts": attempt, "timeout_seconds": effective_timeout, "connect_timeout_seconds": connect_timeout, "possibly_billed": False, "usage_unknown": False})
+                                raise AIClientError(last_error, reason=REASON_UNREACHABLE, retryable=True, meta={"attempts": attempt, "possibly_billed": False, "usage_unknown": False, "retry_after_hint": retry_hint_for_reason(REASON_UNREACHABLE)}) from exc
+                            last_error = (f"timeout: model '{cfg['model']}' was still generating after {effective_timeout:g}s (attempt {attempt}/{attempts}, waited {waited:.1f}s) — the endpoint was reached; {attempt} attempt(s) spent and each may still have been billed. Raise Timeout in Settings → AI API (or AI_TIMEOUT) and retry")
+                            inc("jobhunter_ai_requests_total", workflow=workflow, status="timeout")
+                            log.warning("AI %s: %s", workflow, last_error)
+                            breaker.record_failure(last_error)
+                            failure_meta.update({"attempts": attempt, "timeout_seconds": effective_timeout, "possibly_billed": True, "usage_unknown": True})
+                            raise AIClientError(last_error, reason=REASON_TIMEOUT, retryable=True, meta={"attempts": attempt, "possibly_billed": True, "usage_unknown": True, "retry_after_hint": retry_hint_for_reason(REASON_TIMEOUT)}) from exc
+                    # end streaming sem
+                else:
+                    async with _sem():
+                        if is_google:
+                            response = await http_client.post(url, headers=headers, json=payload, timeout=client_timeout)
+                        else:
+                            response = await http_client.post(url, headers=headers, json=payload, timeout=client_timeout)
+                if stream:
+                    if parsed_result is not None or text_result is not None or final_error is not None:
+                        break
+                    continue
             except httpx.TimeoutException as exc:
-                # httpx stringifies timeouts as "" — the message is built
-                # explicitly so the detail is never blank. The phase matters:
-                # a *connect* timeout means the endpoint was never reached
-                # (honest `unreachable`, safe to retry); a read/write/pool
-                # timeout means the request was accepted and the model may
-                # still be generating — honest `timeout`, must NOT be retried
-                # (each retry would spend and bill another full generation).
+                if stream:
+                    # already handled inside streaming block; re-raise if not
+                    raise
                 waited = time.perf_counter() - started
                 if isinstance(exc, httpx.ConnectTimeout):
                     last_error = (
@@ -1299,6 +1783,8 @@ async def chat_completion(
                                           "usage_unknown": True,
                                           "retry_after_hint": retry_hint_for_reason(REASON_TIMEOUT)}) from exc
             except httpx.HTTPError as exc:
+                if isinstance(exc, _StreamFixupNeeded):
+                    raise
                 raw = str(exc).strip() or type(exc).__name__
                 last_error = f"http_error: {raw} (attempt {attempt}/{attempts})"
                 inc("jobhunter_ai_requests_total", workflow=workflow, status="network_error")
@@ -1316,39 +1802,37 @@ async def chat_completion(
                                           "retry_after_hint": retry_hint_for_reason(REASON_UNREACHABLE)}) from exc
             finally:
                 observe("jobhunter_ai_latency_seconds", time.perf_counter() - started, workflow=workflow)
-
+            if stream:
+                if parsed_result is not None or text_result is not None or final_error is not None:
+                    break
+                continue
             if response.status_code != 200:
                 body = response.text[:400]
                 last_error = f"status {response.status_code}: {body}"
                 lowered = body.lower()
-
-                # -------------------------------------------------------------- #
-                # Provider-parameter fix-ups (a 400 that says exactly which
-                # parameter is unsupported). They don't consume a retry.
-                # -------------------------------------------------------------- #
                 if response.status_code == 400 and fixups < 3:
                     fixup_applied = False
-                    # Some providers (e.g. z-ai via aggregators) don't support
-                    # json_object response_format and 400 mentioning it.
-                    if json_mode_active and "response_format" in lowered:
+                    if json_mode_active and ("response_format" in lowered or "responsemimetype" in lowered):
                         log.warning("AI %s: provider rejected json_object response_format, retrying without it", workflow)
-                        payload.pop("response_format", None)
+                        if is_google and "generationConfig" in payload:
+                            payload["generationConfig"].pop("responseMimeType", None)
+                        else:
+                            payload.pop("response_format", None)
                         json_mode_active = False
                         fixup_applied = True
-                    # Newer OpenAI models want max_completion_tokens instead of max_tokens.
                     if (not fixup_applied and max_tokens_key in payload
                             and "max_completion_tokens" in lowered and "unsupported" in lowered):
                         log.warning("AI %s: provider wants max_completion_tokens, renaming the parameter", workflow)
                         payload["max_completion_tokens"] = payload.pop(max_tokens_key)
                         max_tokens_key = "max_completion_tokens"
                         fixup_applied = True
-                    # Reasoning models also reject temperature != 1.
                     if (not fixup_applied and "temperature" in payload and "temperature" in lowered
                             and ("unsupported" in lowered or "not supported" in lowered)):
                         log.warning("AI %s: provider rejected temperature, retrying without it", workflow)
                         payload.pop("temperature", None)
+                        if is_google and "generationConfig" in payload:
+                            payload["generationConfig"].pop("temperature", None)
                         fixup_applied = True
-                    # We escalated max_tokens past what the model supports.
                     if (not fixup_applied and max_tokens_key in payload and "max_tokens" in lowered
                             and any(w in lowered for w in ("too large", "too high", "at most", "maximum", "exceeds"))):
                         clamped = max(256, current_max_tokens // 2)
@@ -1356,13 +1840,15 @@ async def chat_completion(
                             log.warning("AI %s: max_tokens=%d exceeds the model limit, retrying with %d",
                                         workflow, current_max_tokens, clamped)
                             current_max_tokens = clamped
-                            payload[max_tokens_key] = clamped
+                            if is_google:
+                                payload["generationConfig"]["maxOutputTokens"] = clamped
+                            else:
+                                payload[max_tokens_key] = clamped
                             fixup_applied = True
                     if fixup_applied:
                         fixups += 1
-                        attempt -= 1  # a parameter fix-up is not a retry
+                        attempt -= 1
                         continue
-
                 retryable = response.status_code == 429 or 500 <= response.status_code < 600
                 http_reason = reason_from_message(last_error, response.status_code)
                 inc("jobhunter_ai_requests_total", workflow=workflow, status=str(response.status_code))
@@ -1377,16 +1863,11 @@ async def chat_completion(
                     failure_meta.update({"attempts": attempt})
                     raise AIClientError(last_error, status=response.status_code, retryable=False,
                                         meta={"attempts": attempt})
-
                 breaker.record_failure(last_error)
                 failure_meta.update({"attempts": attempt})
                 raise AIClientError(last_error, status=response.status_code, retryable=True,
                                     meta={"attempts": attempt,
                                           "retry_after_hint": retry_hint_for_reason(http_reason, workflow=workflow)})
-
-            # ---------------------------------------------------------------- #
-            # 200 — validate the answer instead of trusting it.
-            # ---------------------------------------------------------------- #
             inc("jobhunter_ai_requests_total", workflow=workflow, status="200")
             try:
                 data = response.json()
@@ -1398,17 +1879,14 @@ async def chat_completion(
                 breaker.record_failure(last_error)
                 failure_meta.update({"attempts": attempt})
                 raise AIClientError(last_error, retryable=True) from exc
-
             extracted = _extract_content(data)
             content = extracted["content"]
             finish_reason = extracted["finish_reason"]
             reasoning = extracted["reasoning"]
-
             p_tok, c_tok, t_tok = _read_usage(data, prompt, content)
             usage_totals["prompt_tokens"] += p_tok
             usage_totals["completion_tokens"] += c_tok
             usage_totals["total_tokens"] += t_tok
-
             if not extracted["well_formed"]:
                 last_error = ("malformed_response: provider returned 200 without a usable "
                               "choices[0].message")
@@ -1418,75 +1896,58 @@ async def chat_completion(
                 breaker.record_failure(last_error)
                 failure_meta.update({"attempts": attempt})
                 raise AIClientError(last_error, retryable=True)
-
             if not json_mode:
                 if content.strip() and finish_reason != "length":
                     text_result = content
                     break
-                # Empty or truncated text — same recovery decisions as JSON mode.
                 action = _json_retry_action(content, finish_reason,
                                             json_mode_active=False, plain_retries=plain_retries)
             else:
-                parsed: Any = None
+                parsed = None
                 if content.strip():
                     parsed = _parse_model_json(content)
                 if parsed is None and reasoning.strip():
-                    # Reasoning model: the answer (or its final draft) lives in
-                    # the reasoning channel while `content` came back empty.
                     parsed = _parse_model_json(reasoning)
                 if isinstance(parsed, dict):
                     parsed_result = parsed
                     break
                 if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
-                    # Some models return a list with one object
                     parsed_result = parsed[0]
                     break
                 action = _json_retry_action(content, finish_reason,
                                             json_mode_active=json_mode_active,
                                             plain_retries=plain_retries)
-
-            # -------------------------------------------------------------- #
-            # Targeted recovery for an empty/invalid answer.
-            # -------------------------------------------------------------- #
             if action is not None and attempt >= attempts:
-                action = None  # no attempts left to retry with — report precisely
-
+                action = None
             if action == "raise_max_tokens_big" or action == "raise_max_tokens":
                 factor, floor = (4, 4000) if action == "raise_max_tokens_big" else (2, 2400)
-                # PR #29 escalation is preserved. A user who set an explicit
-                # output ceiling gets it as the hard stop; a user with an
-                # UNLIMITED ceiling is no longer pinned at the shipped default
-                # (which is exactly what made long job descriptions + reasoning
-                # models come back `truncated_response` forever) — the growth
-                # stops at the safety bound in ``escalation_ceiling`` instead.
                 new_max = min(max(current_max_tokens * factor, floor), escalation_stop)
                 if new_max > current_max_tokens:
-                    what = "the thinking phase used the whole budget" if not content.strip() \
-                        else "the JSON was cut off"
+                    what = "the thinking phase used the whole budget" if not content.strip() else "the JSON was cut off"
                     log.warning("AI %s: %s at %d tokens (finish_reason=%s) — retrying with %d tokens",
                                 workflow, what, current_max_tokens, finish_reason, new_max)
                     current_max_tokens = new_max
-                    payload[max_tokens_key] = new_max
+                    if is_google:
+                        payload["generationConfig"]["maxOutputTokens"] = new_max
+                    else:
+                        payload[max_tokens_key] = new_max
                     continue
-                # Already at the effective stop (the user's ceiling, or the
-                # safety bound when it is unlimited) — retrying cannot help.
                 action = None
             elif action == "drop_response_format":
-                log.warning("AI %s: model returned an empty answer with response_format=json_object "
-                            "— retrying without it", workflow)
-                payload.pop("response_format", None)
+                log.warning("AI %s: model returned an empty answer with response_format=json_object — retrying without it", workflow)
                 json_mode_active = False
+                if is_google and "generationConfig" in payload:
+                    payload["generationConfig"].pop("responseMimeType", None)
+                else:
+                    payload.pop("response_format", None)
                 continue
             elif action == "plain_retry":
                 log.warning("AI %s: model returned an %s answer (finish_reason=%s) — retrying",
-                            workflow, "empty" if not content.strip() else "unparseable",
-                            finish_reason)
+                            workflow, "empty" if not content.strip() else "unparseable", finish_reason)
                 plain_retries += 1
                 continue
-
             final_error = _invalid_json_error(content, finish_reason, current_max_tokens)
             break
-
         if final_error is not None:
             breaker.record_failure(str(final_error))
             failure_meta.update({"attempts": attempt})
@@ -1497,12 +1958,10 @@ async def chat_completion(
             raise AIClientError(last_error or "unknown error", retryable=True,
                                 meta={"attempts": attempt,
                                       "retry_after_hint": retry_hint_for_reason(None, workflow=workflow)})
-
         prompt_tokens = usage_totals["prompt_tokens"]
         completion_tokens = usage_totals["completion_tokens"]
         total_tokens = usage_totals["total_tokens"]
         latency_ms = int((time.perf_counter() - call_started) * 1000)
-
         breaker.record_success()
         bucket = _usage.setdefault(workflow, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0})
         bucket["calls"] += 1
@@ -1510,8 +1969,6 @@ async def chat_completion(
         bucket["completion_tokens"] += completion_tokens
         bucket["total_tokens"] += total_tokens
         set_gauge("jobhunter_ai_tokens_total", bucket["total_tokens"], workflow=workflow)
-
-        # Account once even when there is no user attribution.
         track_ai_usage(
             db=db,
             user_id=user_id,
@@ -1524,20 +1981,16 @@ async def chat_completion(
             latency_ms=latency_ms,
             meta={"attempts": attempt, "timeout_seconds": effective_timeout,
                   "input_truncated": input_truncated, "max_tokens": current_max_tokens,
-                  # ``output_ceiling: 0`` means unlimited (no clamp was
-                  # applied) — kept as a number so the ledger stays
-                  # queryable, with the flag spelled out beside it.
                   "output_ceiling": output_ceiling,
                   "output_unlimited": output_ceiling <= 0,
                   "escalation_ceiling": escalation_stop,
-                  "input_unlimited": resolved_input <= 0},
+                  "input_unlimited": resolved_input <= 0, "stream": stream, "provider": cfg.get("provider")},
         )
-
         if not json_mode:
             return {"content": text_result or "", "raw": data,
                     "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                               "total_tokens": total_tokens}}
-        if parsed_result is None:  # pragma: no cover - defensive: failures raise above
+        if parsed_result is None:
             raise AIClientError(last_error or "unknown error", retryable=True)
         return parsed_result
     except AIClientError as exc:
@@ -1556,6 +2009,9 @@ async def chat_completion(
                 pass
 
 
+class _StreamFixupNeeded(Exception):
+    pass
+
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
     retry_after = response.headers.get("retry-after")
     if retry_after:
@@ -1565,6 +2021,16 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
             pass
     return min(20.0, settings.ai_backoff_base ** attempt) * (0.7 + random.random() * 0.6)
 
+def _retry_delay_stream(body: str, response, attempt: int) -> float:
+    retry_after = None
+    if hasattr(response, "headers"):
+        retry_after = response.headers.get("retry-after")
+    if retry_after:
+        try:
+            return min(30.0, float(retry_after))
+        except ValueError:
+            pass
+    return min(20.0, settings.ai_backoff_base ** attempt) * (0.7 + random.random() * 0.6)
 
 async def _sleep_backoff(attempt: int) -> None:
     await asyncio.sleep(min(20.0, settings.ai_backoff_base ** attempt) * (0.7 + random.random() * 0.6))
@@ -1585,19 +2051,26 @@ def _key_preview(key: str) -> str:
 
 
 def _provider_error(response: Optional[httpx.Response]) -> str:
-    """Best-effort human-readable error from a provider response."""
+    """Best-effort human-readable error from a provider response (OpenAI + Google)."""
     if response is None:
         return ""
     try:
         data = response.json()
         err = data.get("error") if isinstance(data, dict) else None
         if isinstance(err, dict):
-            return str(err.get("message") or "")[:200]
+            # Google: {error: {message, code, status}} ; OpenAI: {error: {message}}
+            msg = err.get("message") or err.get("status") or ""
+            if not msg and "code" in err:
+                msg = f"{err.get('code')}: {err.get('message') or ''}".strip(": ")
+            return str(msg)[:300]
         if err:
-            return str(err)[:200]
+            return str(err)[:300]
+        # Google may return error at top level without wrapper
+        if isinstance(data, dict) and "message" in data:
+            return str(data.get("message"))[:300]
     except Exception:
         pass
-    return (response.text or "")[:200]
+    return (response.text or "")[:300]
 
 
 # The status probe is polled every ~15s by the SPA; cache results so a
@@ -1631,9 +2104,11 @@ async def _ping_with_config(cfg: Dict[str, Any], timeout: int) -> Dict[str, Any]
     key = (cfg.get("api_key") or "").strip()
     base = (cfg.get("base_url") or "").strip().rstrip("/")
     model = (cfg.get("model") or "").strip()
+    provider = _normalize_provider(cfg.get("provider")) if cfg.get("provider") else _detect_provider_from_base_url(base)
     meta = {
         "base_url": base,
         "model": model,
+        "provider": provider,
         "key_source": cfg.get("key_source"),
         "key_preview": _key_preview(key),
     }
@@ -1644,16 +2119,30 @@ async def _ping_with_config(cfg: Dict[str, Any], timeout: int) -> Dict[str, Any]
                 **meta}
     if not key:
         return {"online": False, "reason": "no_api_key", "latency_ms": None,
-                "hint": "Set API key in Settings → AI API (OpenAI compatible: base_url like https://api.openai.com/v1)",
+                "hint": "Set API key in Settings → AI API (OpenAI compatible: base_url like https://api.openai.com/v1. For Google, use https://generativelanguage.googleapis.com)",
                 **meta}
 
-    cache_key = f"{base}|{model}|{hashlib.sha256(key.encode()).hexdigest()[:16]}"
+    cache_key = f"{base}|{model}|{provider}|{hashlib.sha256(key.encode()).hexdigest()[:16]}"
     now = time.monotonic()
     cached = _PING_CACHE.get(cache_key)
     if cached and cached[0] > now:
         return cached[1]
 
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    is_google = provider == AI_PROVIDER_GOOGLE or _is_google_provider(cfg)
+    if is_google:
+        headers = {"Content-Type": "application/json", "x-goog-api-key": key}
+        # Base for google probes
+        ping_base = base
+        if "generativelanguage.googleapis.com" not in ping_base:
+            ping_base = "https://generativelanguage.googleapis.com"
+        if "/v1beta" not in ping_base and "/v1" not in ping_base:
+            ping_base = f"{ping_base}/v1beta"
+        elif ping_base.endswith("/v1"):
+            ping_base = ping_base[:-3] + "/v1beta"
+        models_url = f"{ping_base}/models"
+    else:
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        models_url = f"{base}/models"
     started = time.perf_counter()
 
     # Reuse the shared pooled client (SSRF guard, connection reuse). Per-request
@@ -1662,7 +2151,7 @@ async def _ping_with_config(cfg: Dict[str, Any], timeout: int) -> Dict[str, Any]
 
     # Stage 1 — cheap models listing (sufficient on most providers).
     try:
-        response = await http_client.get(f"{base}/models", headers=headers, timeout=timeout)
+        response = await http_client.get(models_url, headers=headers, timeout=timeout)
     except httpx.TimeoutException as exc:
         # The endpoint may be reachable but slow (httpx stringifies timeouts
         # as "" — say so explicitly). NOT cached: slowness is transient.
@@ -1695,12 +2184,20 @@ async def _ping_with_config(cfg: Dict[str, Any], timeout: int) -> Dict[str, Any]
     # so verify with the endpoint the product actually uses. A minimal
     # request keeps the cost at ~1 token.
     try:
-        probe = await http_client.post(
-            f"{base}/chat/completions",
-            headers=headers,
-            json={"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
-            timeout=timeout,
-        )
+        if is_google:
+            probe = await http_client.post(
+                f"{ping_base}/models/{model}:generateContent",
+                headers=headers,
+                json={"contents": [{"role": "user", "parts": [{"text": "ping"}]}], "generationConfig": {"maxOutputTokens": 1}},
+                timeout=timeout,
+            )
+        else:
+            probe = await http_client.post(
+                f"{base}/chat/completions",
+                headers=headers,
+                json={"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+                timeout=timeout,
+            )
     except httpx.TimeoutException:
         # The chat endpoint was reached but is slow (reasoning models "think"
         # even for a 1-token ping) — that is a wait problem, not proof the
@@ -1721,18 +2218,18 @@ async def _ping_with_config(cfg: Dict[str, Any], timeout: int) -> Dict[str, Any]
 
     latency_ms = int((time.perf_counter() - started) * 1000)
     if probe.status_code == 200:
-        result = {"online": True, "latency_ms": latency_ms, "status": 200, "probe": "chat_completions",
+        result = {"online": True, "latency_ms": latency_ms, "status": 200, "probe": "chat_completions" if not is_google else "generateContent",
                   "note": "models endpoint unavailable/restricted — chat completions verified working",
                   **meta}
     elif probe.status_code in (401, 403):
         result = {"online": False, "reason": "invalid_api_key", "status": probe.status_code,
-                  "latency_ms": latency_ms, "probe": "chat_completions",
+                  "latency_ms": latency_ms, "probe": "chat_completions" if not is_google else "generateContent",
                   "detail": _provider_error(probe) or _provider_error(response),
                   "hint": f"The provider rejected this key for {base}. Double-check the key, and that base_url + model belong to the same provider.",
                   **meta}
     else:
         result = {"online": False, "reason": f"status_{probe.status_code}", "status": probe.status_code,
-                  "latency_ms": latency_ms, "probe": "chat_completions",
+                  "latency_ms": latency_ms, "probe": "chat_completions" if not is_google else "generateContent",
                   "detail": _provider_error(probe), **meta}
     _PING_CACHE[cache_key] = (now + _PING_TTL_SECONDS, result)
     return result

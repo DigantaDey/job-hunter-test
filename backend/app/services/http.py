@@ -308,6 +308,12 @@ async def request(
     A cache hit returns a :class:`CachedResponse` (status + headers + parsed
     body) rather than the original ``httpx.Response``; both satisfy the surface
     callers use (``status_code``, ``headers``, ``json()``, ``text``).
+
+    **AI bypass note:** :mod:`app.services.ai_client` intentionally bypasses this
+    helper's politeness/cache and calls :func:`get_client` directly. AI calls are
+    not idempotent GETs and must not be cached or delayed by per-host politeness
+    (they target a single provider host at high concurrency). The SSRF guard is
+    still enforced because it lives on the shared client's transport.
     """
     host = urlparse(url).netloc
     # Metric labels are permanent series, so the host is collapsed to a bounded

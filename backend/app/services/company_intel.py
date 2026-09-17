@@ -92,7 +92,7 @@ Be concise, no hallucination beyond reasonable public knowledge. If unknown, use
         max_tokens=INTEL_OUTPUT_TOKENS,
         db=db,
         user_id=user_id,
-    )
+     stream=True)
 
     if db and user_id:
         try:

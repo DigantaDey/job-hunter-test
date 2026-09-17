@@ -219,7 +219,7 @@ Respond ONLY with JSON.
     from app.services.ai_client import chat_completion
 
     data = await chat_completion("keyword_extract", prompt, temperature=0.2,
-                                 ai_config=ai_config, db=db, user_id=user_id)
+                                 ai_config=ai_config, db=db, user_id=user_id, stream=True)
     if not isinstance(data, dict):
         from app.services.ai_client import AIClientError
 

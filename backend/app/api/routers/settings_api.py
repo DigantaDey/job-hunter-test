@@ -103,6 +103,7 @@ async def ai_status(user: CurrentUser, db: DbSession):
         "configured": is_configured(db=db, user_id=user.id),
         "model": health.get("model") or user_cfg.get("model") or settings.ai_model,
         "base_url": health.get("base_url") or user_cfg.get("base_url") or settings.ai_base_url,
+        "provider": health.get("provider") or user_cfg.get("provider") or "openai_compatible",
         "latency_ms": health.get("latency_ms"),
         "reason": reason,
         "hint": hint,
@@ -117,6 +118,8 @@ async def ai_status(user: CurrentUser, db: DbSession):
             "model": user_cfg.get("model"),
             "api_key_set": user_cfg.get("api_key_set"),
             "rpm": user_cfg.get("rpm"),
+            "provider": user_cfg.get("provider", "openai_compatible"),
+            "timeout": user_cfg.get("timeout"),
         },
         "is_owner": user.role == "owner",
         **stats,
@@ -161,11 +164,16 @@ def get_ai_config(user: CurrentUser, db: DbSession):
     result: Dict[str, Any] = {}
     for workflow in WORKFLOWS:
         cfg = read_workflow_override(db, user.id, workflow)
-        if not any(cfg.values()):
-            continue
+        # Consider provider-aware emptiness: provider alone without other fields does not count as override
+        if not any(v for k,v in cfg.items() if k != "provider" and v):
+            # But if provider is explicitly set to google, still consider it an override? Keep empty check as any value including provider non-empty counts?
+            # For consistency with existing tests, provider alone not considered? We'll check any truthy including provider
+            if not any(cfg.values()):
+                continue
         result[workflow] = {
             "base_url": cfg.get("base_url", ""),
             "model": cfg.get("model", ""),
+            "provider": cfg.get("provider", "") or "openai_compatible",
             "api_key": "",
             "api_key_set": bool(cfg.get("api_key")),
         }
@@ -174,8 +182,8 @@ def get_ai_config(user: CurrentUser, db: DbSession):
 
 @router.post("/ai/config")
 def update_ai_config(payload: Dict[str, Any], request: Request, user: CurrentUser, db: DbSession):
-    """Configure a different base_url/model/key per workflow (blank = inherit)."""
-    from app.services.user_settings import delete_workflow_override, read_workflow_override, write_workflow_override
+    """Configure a different base_url/model/key/provider per workflow (blank = inherit)."""
+    from app.services.user_settings import delete_workflow_override, read_workflow_override, write_workflow_override, _normalize_provider, _detect_provider_from_base_url, AI_PROVIDERS
 
     normalized: Dict[str, Dict[str, str]] = {}
     for workflow, config in (payload or {}).items():
@@ -183,17 +191,30 @@ def update_ai_config(payload: Dict[str, Any], request: Request, user: CurrentUse
             raise HTTPException(400, f"Unknown workflow '{workflow}'")
         if not isinstance(config, dict):
             raise HTTPException(400, f"Workflow '{workflow}' must be an object")
-        cleaned = {key: str(config.get(key) or "").strip() for key in ("base_url", "model", "api_key")}
+        cleaned = {key: str(config.get(key) or "").strip() for key in ("base_url", "model", "api_key", "provider")}
+        # Normalize provider
+        if cleaned.get("provider"):
+            cleaned["provider"] = _normalize_provider(cleaned["provider"])
+            if cleaned["provider"] not in AI_PROVIDERS:
+                raise HTTPException(400, {"code": "invalid_provider", "message": f"provider must be one of {sorted(AI_PROVIDERS)}"})
+        elif cleaned.get("base_url"):
+            cleaned["provider"] = _detect_provider_from_base_url(cleaned["base_url"])
         existing = read_workflow_override(db, user.id, workflow)
         # A blank api_key means "keep the stored one" (the UI never receives it).
         if not cleaned["api_key"] and existing.get("api_key"):
             cleaned["api_key"] = existing["api_key"]
-        if not any(cleaned.values()):
+        # Preserve existing provider if not provided
+        if not cleaned.get("provider") and existing.get("provider"):
+            cleaned["provider"] = existing.get("provider")
+        # Empty check: provider alone does not create an override; need at least one of base_url/model/api_key
+        if not any(cleaned.get(k) for k in ("base_url", "model", "api_key")):
+            # If workflow had existing but now all blank, delete it
             delete_workflow_override(db, user.id, workflow)
+            normalized[workflow] = {"base_url": "", "api_key": "", "model": "", "provider": ""}
         else:
             # Stores the key encrypted at rest (same per-user scope as the default key).
             write_workflow_override(db, user.id, workflow, cleaned)
-        normalized[workflow] = cleaned
+            normalized[workflow] = cleaned
 
     db.commit()
     set_workflow_overrides(normalized, user_id=user.id)

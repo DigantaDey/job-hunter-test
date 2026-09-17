@@ -888,7 +888,7 @@ async def ai_rank_events(
     )
     # No per-call timeout — inherit the global wait (ai.timeout / AI_TIMEOUT).
     data = await chat_completion("funding_scan", prompt, system=RANK_SYSTEM, temperature=0.1,
-                                db=db, user_id=user_id)
+                                db=db, user_id=user_id, stream=True)
     payload = data.get("content") if isinstance(data, dict) and "content" in data else data
     rows = payload.get("companies") if isinstance(payload, dict) else None
     if rows is None and isinstance(payload, list):
@@ -1087,7 +1087,7 @@ async def ai_extract_events_from_results(
         '"raised_at": "<YYYY-MM-DD>"|null, "industry": "<from the snippet>"}]}'
     )
     data = await chat_completion("funding_scan", prompt, system=EXTRACT_SYSTEM, temperature=0.1,
-                                 db=db, user_id=user_id)
+                                 db=db, user_id=user_id, stream=True)
     payload = data.get("content") if isinstance(data, dict) and "content" in data else data
     rows = payload.get("companies") if isinstance(payload, dict) else None
     if rows is None and isinstance(payload, list):
