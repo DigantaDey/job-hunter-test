@@ -40,8 +40,8 @@ const SECTIONS: { key: Section; label: string; url: string }[] = [
 ]
 const ALL_SECTIONS = SECTIONS.map(s => s.key)
 
-/** How often the summary re-reads while the tab is visible (Settings' auto-mode card uses the same cadence). */
-const SUMMARY_POLL_MS = 30_000
+/** How often the summary re-reads while the tab is visible (visibility-aware; stops when hidden). */
+const SUMMARY_POLL_MS = 60_000
 
 /** Zero state applied when the summary read fails: the page renders 0s under the error banner instead of crashing on a missing field. */
 const EMPTY_SUMMARY = { jobs: {}, emails: {}, resumes: { total: 0, pending_approval: 0 }, vault: 0, user_input: 0 }
@@ -60,9 +60,13 @@ export default function Dashboard() {
   const [errors, setErrors] = useState<Partial<Record<Section, string>>>({})
   // Sections whose request is in flight right now (initial load or a retry).
   const [pending, setPending] = useState<Section[]>([])
-  // True once the summary has loaded: only then does the poll below have a value to refresh.
-  const [summaryOk, setSummaryOk] = useState(false)
+  // True once the summary has made its first verdict (success OR failure):
+  // only then does the polling effect below know to arm. A failure arms the
+  // poll too so the stats recover without a manual reload.
+  const [summaryReady, setSummaryReady] = useState(false)
   const mounted = useRef(true)
+  // Coalesce in-flight poll ticks so a slow response cannot stack requests.
+  const summaryInFlight = useRef(false)
   // Live layer (v2.2.8): the queue counters below come from the polled
   // snapshot when it is available, so the dashboard's "Running" and "Open
   // queues" numbers move while work is in flight instead of freezing at the
@@ -76,7 +80,7 @@ export default function Dashboard() {
 
   const applySection = (key: Section, data: any) => {
     switch (key) {
-      case 'summary': setSummary(data); setSummaryOk(true); break
+      case 'summary': setSummary(data); setSummaryReady(true); break
       case 'jobs': setJobs((data || []).slice(0, 6)); break
       case 'performance': setPerformance(data); break
       case 'profile': setProfile(data); break
@@ -86,14 +90,18 @@ export default function Dashboard() {
 
   /**
    * Remove `key` from the in-flight set. On the summary's *first* verdict it
-   * also closes the loading screen — success and failure both count as a
-   * verdict, which is what guarantees no error path can sit on the spinner.
+   * also closes the loading screen AND arms polling — success and failure
+   * both count as a verdict, which is what guarantees no error path can sit
+   * on the spinner and a failing first read still gets retried by the poll.
    * (A re-fetch for a retry does not touch `loading`: it is already closed,
    * and the retry shows "Retrying…" on its button instead.)
    */
   const settle = (key: Section) => {
     setPending(p => p.filter(k => k !== key))
-    if (key === 'summary') setLoading(false)
+    if (key === 'summary') {
+      setLoading(false)
+      setSummaryReady(true)
+    }
   }
 
   /**
@@ -128,17 +136,20 @@ export default function Dashboard() {
   useEffect(() => { load() }, [])
 
   /**
-   * Live summary (P1 #4): the mount fetch is one-shot, so the "Running /
-   * Completed / Failed" counters and the quota lines go stale. Re-read the
-   * summary every 30 s while the tab is *visible* — the same visibility-aware
-   * cadence as Settings' auto-mode card: a hidden tab polls nothing, becoming
-   * visible re-reads at once instead of waiting out the interval, and a failed
-   * tick keeps the last read (the counters are a refresh, never a reset).
+   * Live summary: the mount fetch is one-shot, so the "Running / Completed /
+   * Failed" counters and the quota lines would go stale. Re-read the summary
+   * every 60 s while the tab is *visible* — visibility-aware (same pattern as
+   * Funding/Emails/Queues): a hidden tab polls nothing, becoming visible
+   * re-reads immediately instead of waiting out the interval, and a failed
+   * tick keeps the last read (counters are a refresh, never a reset). In-flight
+   * ticks are coalesced so a slow network cannot stack duplicate requests.
    */
   useEffect(() => {
-    if (!summaryOk) return
+    if (!summaryReady) return
     let timer: ReturnType<typeof setInterval> | null = null
     const tick = async () => {
+      if (summaryInFlight.current) return
+      summaryInFlight.current = true
       try {
         const r = await client.get('/api/dashboard/summary')
         if (mounted.current) {
@@ -147,6 +158,8 @@ export default function Dashboard() {
         }
       } catch {
         // Keep the last read: a late tick must not blank a working page.
+      } finally {
+        summaryInFlight.current = false
       }
     }
     const start = (readNow = false) => {
@@ -165,7 +178,7 @@ export default function Dashboard() {
     if (typeof document === 'undefined' || document.visibilityState !== 'hidden') start(false)
     document.addEventListener('visibilitychange', onVisibility)
     return () => { stop(); document.removeEventListener('visibilitychange', onVisibility) }
-  }, [summaryOk])
+  }, [summaryReady])
 
   const failedSections = ALL_SECTIONS.filter(k => k in errors)
   const allFailed = failedSections.length === ALL_SECTIONS.length

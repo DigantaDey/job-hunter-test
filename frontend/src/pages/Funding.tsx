@@ -28,6 +28,14 @@ type Company = {
   rank?: number | null
   /** Open positions the *provider* reported (never inferred). */
   open_positions?: OpenPosition[]
+  /**
+   * Maintained by the backend cross-reference: true when the user already has
+   * one or more tracked Jobs whose company normalises to this radar row
+   * (v2.2.5 linkage — discovery ⇄ funding). Lets the UI badge "has open roles"
+   * and choose the right CTA even when the provider did not directly report
+   * openings.
+   */
+  has_open_positions?: boolean
 }
 
 type ScanReport = {
@@ -530,6 +538,11 @@ export default function Funding() {
                     <Briefcase className="w-3 h-3" /> {c.open_positions!.length} open role{c.open_positions!.length === 1 ? '' : 's'} (provider)
                   </span>
                 )}
+                {c.has_open_positions && (c.open_positions || []).length === 0 && (
+                  <span className="text-[11px] px-2 py-0.5 rounded-full mono border bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950 dark:border-emerald-800 dark:text-emerald-300 inline-flex items-center gap-1" title="A tracked job on your board matches this company">
+                    <Briefcase className="w-3 h-3" /> has open roles
+                  </span>
+                )}
                 {c.url && (
                   <a href={c.url} target="_blank" rel="noreferrer" className="text-[11px] px-2 py-0.5 rounded-full mono border bg-white dark:bg-zinc-900 dark:border-zinc-700 text-blue-600 dark:text-blue-400 inline-flex items-center gap-1">
                     {c.source === 'search' ? 'source' : 'filing'} <ExternalLink className="w-3 h-3" />
@@ -563,13 +576,20 @@ export default function Funding() {
               )}
               <div className="mt-3 flex items-center gap-2">
                 {/* The backend decides from provider facts: a real posting is
-                    tracked as a job, otherwise a founder draft needs approval. */}
-                <button onClick={() => process(c)} disabled={!!busy} className="ml-auto flex-1 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 min-h-[44px] focus:ring-2 focus:ring-blue-500">
-                  {busy === c.name
-                    ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    : (c.open_positions || []).length > 0 ? <Briefcase className="w-3.5 h-3.5" /> : <Mail className="w-3.5 h-3.5" />}
-                  {(c.open_positions || []).length > 0 ? 'Track the open role' : 'Draft founder outreach'}
-                </button>
+                    tracked as a job (if provider-reported or the user already
+                    tracks this company via the jobs board), otherwise a
+                    founder draft needs approval. */}
+                {(() => {
+                  const hasRoles = (c.open_positions || []).length > 0 || !!c.has_open_positions
+                  return (
+                    <button onClick={() => process(c)} disabled={!!busy} className="ml-auto flex-1 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 min-h-[44px] focus:ring-2 focus:ring-blue-500">
+                      {busy === c.name
+                        ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        : hasRoles ? <Briefcase className="w-3.5 h-3.5" /> : <Mail className="w-3.5 h-3.5" />}
+                      {hasRoles ? 'Track the open role' : 'Draft founder outreach'}
+                    </button>
+                  )
+                })()}
               </div>
             </div>
           ))}
