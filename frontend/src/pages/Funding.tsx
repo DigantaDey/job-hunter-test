@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import client, { apiError, aiOutage, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
 import { useAIWork } from '../context/AIWorkContext'
 import { WorkStatusLine } from '../components/AIWorkChip'
@@ -122,38 +122,58 @@ export default function Funding() {
   // direct — robots-checked — EDGAR path). Fetched once, secret-free.
   const [searchInfo, setSearchInfo] = useState<SearchProviderInfo | null>(null)
 
-  const load = useCallback(async (refresh = false) => {
-    setError('')
-    if (refresh) setScanning(true)
-    try {
-      const { data } = await client.get('/api/funding/companies', { params: { refresh }, timeout: AI_REQUEST_TIMEOUT_MS })
-      setCompanies(data.companies || [])
-      setContext(data.context || null)
-      setResume(data.resume || null)
-      setRefreshedAt(data.refreshed_at || '')
-      setScanStatus(data.scan_status || 'ok')
-      setReason(data.reason || '')
-      setScanned(typeof data.scanned === 'number' ? data.scanned : null)
-      setLastReport(data.last_report || null)
-      setWindowDays(data.window_days || 45)
-      if (refresh) setOutage(null)
-      // load recent scans (funding history)
-      try { const h = await client.get('/api/funding/history', { params:{limit:5}}); setHistory(h.data.history||h.data||[])} catch {}
+  // Refs for visibility-aware polling and request coalescing
+  const POLL_INTERVAL_MS = 25_000
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const inFlight = useRef<Promise<void> | null>(null)
+  const alive = useRef(true)
 
-    } catch (e: any) {
-      // A refresh the model could not rank comes back as the v2.1 outage shape:
-      // show the diagnosis (and keep the rows already on the radar).
-      const o = aiOutage(e)
-      if (o) {
-        setOutage(o)
-        setScanStatus(o.pausable ? 'paused' : 'blocked')
-      } else {
-        setError(apiError(e, 'Failed to load funding radar'))
+  const load = useCallback(async (refresh = false) => {
+    // Coalesce: if a request is already in flight, share it rather than firing another
+    if (inFlight.current) return inFlight.current
+    inFlight.current = (async () => {
+      setError('')
+      if (refresh) setScanning(true)
+      try {
+        const { data } = await client.get('/api/funding/companies', { params: { refresh }, timeout: AI_REQUEST_TIMEOUT_MS })
+        if (alive.current) {
+          setCompanies(data.companies || [])
+          setContext(data.context || null)
+          setResume(data.resume || null)
+          setRefreshedAt(data.refreshed_at || '')
+          setScanStatus(data.scan_status || 'ok')
+          setReason(data.reason || '')
+          setScanned(typeof data.scanned === 'number' ? data.scanned : null)
+          setLastReport(data.last_report || null)
+          setWindowDays(data.window_days || 45)
+          if (refresh) setOutage(null)
+        }
+        // load recent scans (funding history)
+        try { 
+          const h = await client.get('/api/funding/history', { params:{limit:5}})
+          if (alive.current) setHistory(h.data.history||h.data||[])
+        } catch {}
+
+      } catch (e: any) {
+        // A refresh the model could not rank comes back as the v2.1 outage shape:
+        // show the diagnosis (and keep the rows already on the radar).
+        const o = aiOutage(e)
+        if (o) {
+          if (alive.current) {
+            setOutage(o)
+            setScanStatus(o.pausable ? 'paused' : 'blocked')
+          }
+        } else {
+          if (alive.current) setError(apiError(e, 'Failed to load funding radar'))
+        }
+      } finally {
+        if (alive.current) {
+          setLoading(false)
+          setScanning(false)
+        }
       }
-    } finally {
-      setLoading(false)
-      setScanning(false)
-    }
+    })().finally(() => { inFlight.current = null })
+    return inFlight.current
   }, [])
 
   useEffect(() => { load() }, [load])
@@ -173,6 +193,35 @@ export default function Funding() {
     load(false).then(() => setRefreshedAt(new Date().toISOString()))
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scanFinished])
+
+  // Visibility-aware polling: re-read companies every 25-30s while tab is visible
+  // (matching Emails/Queues pattern). Stops when hidden, resumes with immediate
+  // refresh when visible again. Uses load(false) — the non-refresh variant — which
+  // is cheap and already exists.
+
+  useEffect(() => {
+    alive.current = true
+    const start = () => {
+      if (pollRef.current) return
+      void load(false)
+      pollRef.current = setInterval(() => void load(false), POLL_INTERVAL_MS)
+    }
+    const stop = () => {
+      if (pollRef.current) clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') stop()
+      else start()
+    }
+    if (document.visibilityState !== 'hidden') start()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      alive.current = false
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [load])
 
   // Search-provider status (badge): a non-critical read — a failure just
   // leaves the badge unrendered, never the page.
