@@ -471,6 +471,26 @@ class ScriptedAIHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # client already gave up (timeout) — like a real provider
 
+    def _send_sse(self, chunks, final_usage=None):
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            for ch in chunks:
+                line = f"data: {json.dumps(ch)}\n\n".encode()
+                self.wfile.write(line)
+                self.wfile.flush()
+            if final_usage is not None:
+                # Some tests expect usage in final chunk
+                pass
+            # Send [DONE]
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     @classmethod
     def _outage_active(cls) -> bool:
         """Is the scripted provider currently down?
@@ -490,16 +510,26 @@ class ScriptedAIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # The /models probe — green only while the provider is up.
+        # Support both /v1/models and /v1beta/models (Google)
         if self._outage_active():
             self._outage_response()
             return
-        self._send(200, {"data": [{"id": "scripted-model"}]})
+        if "v1beta" in self.path or "generativelanguage" in self.path:
+            self._send(200, {"models": [{"name": "models/scripted-model"}]})
+        else:
+            self._send(200, {"data": [{"id": "scripted-model"}]})
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
-        request_body = json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length) or b"{}"
+        try:
+            request_body = json.loads(raw)
+        except Exception:
+            request_body = {}
         behavior = self.behavior
         behavior["requests"].append(request_body)
+        # Also store path for google debugging if needed
+        behavior.setdefault("raw_requests", []).append({"path": self.path, "body": request_body})
         delay = behavior.get("delay") or 0.0
         if delay:
             time.sleep(delay)
@@ -512,16 +542,249 @@ class ScriptedAIHandler(BaseHTTPRequestHandler):
         # One-off raw responses (tests of truncated/abnormal model answers).
         override = behavior.get("override")
         if isinstance(override, list) and override:
+            # Check if streaming requested but override is single full response — still need to handle SSE?
+            # For simplicity, if override[0] has special marker, handle.
             self._send(200, override.pop(0))
             return
-        messages = request_body.get("messages") or []
-        text = " ".join(str(m.get("content") or "") for m in messages)
+        # Detect streaming: OpenAI stream flag or Google alt=sse
+        is_stream = False
+        is_google = False
+        if "generateContent" in self.path or "generativelanguage" in self.path or request_body.get("contents") is not None:
+            is_google = True
+            if "streamGenerateContent" in self.path or "alt=sse" in self.path:
+                is_stream = True
+        elif request_body.get("stream") is True:
+            is_stream = True
+        # Detect google payload via contents
+        if request_body.get("contents") is not None:
+            is_google = True
+        # Build answer
+        # For Google, contents is list with parts; extract prompt text for routing
+        if is_google:
+            contents = request_body.get("contents") or []
+            text_parts = []
+            for c in contents:
+                parts = c.get("parts") or []
+                for part in parts:
+                    if isinstance(part, dict) and "text" in part:
+                        text_parts.append(str(part["text"]))
+            # Also include systemInstruction
+            sys_inst = request_body.get("systemInstruction") or {}
+            sys_parts = sys_inst.get("parts") or []
+            for part in sys_parts:
+                if isinstance(part, dict) and "text" in part:
+                    text_parts.append(str(part["text"]))
+            text = " ".join(text_parts)
+            answer_obj = _scripted_answer(text)
+            answer_str = json.dumps(answer_obj)
+            usage = {"promptTokenCount": 500, "candidatesTokenCount": 200, "totalTokenCount": 700}
+            if is_stream:
+                # Split answer_str into two deltas
+                mid = len(answer_str)//2
+                chunks = [
+                    {"candidates": [{"content": {"parts": [{"text": answer_str[:mid]}]}}]},
+                    {"candidates": [{"content": {"parts": [{"text": answer_str[mid:]}]}, "finishReason": "STOP"}], "usageMetadata": usage}
+                ]
+                self._send_sse(chunks)
+                return
+            else:
+                self._send(200, {
+                    "candidates": [{"content": {"parts": [{"text": answer_str}]}, "finishReason": "STOP"}],
+                    "usageMetadata": usage
+                })
+                return
+        else:
+            messages = request_body.get("messages") or []
+            text = " ".join(str(m.get("content") or "") for m in messages)
+            answer_obj = _scripted_answer(text)
+            answer_str = json.dumps(answer_obj)
+            usage = {"prompt_tokens": 500, "completion_tokens": 200, "total_tokens": 700}
+            if is_stream:
+                mid = len(answer_str)//2
+                chunks = [
+                    {"choices": [{"delta": {"content": answer_str[:mid]}}]},
+                    {"choices": [{"delta": {"content": answer_str[mid:]}}, {"delta": {}, "finish_reason": "stop"}]},
+                    {"choices": [], "usage": usage}
+                ]
+                # Fix second chunk shape to match real OpenAI streaming: choices[0].delta.content and finish_reason
+                # Our earlier chunks: second should have delta and finish_reason
+                # Correct:
+                chunks = [
+                    {"choices": [{"delta": {"content": answer_str[:mid]}, "finish_reason": None}]},
+                    {"choices": [{"delta": {"content": answer_str[mid:]}, "finish_reason": None}]},
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": usage}
+                ]
+                self._send_sse(chunks)
+                return
+            self._send(200, {
+                "choices": [{"message": {"content": answer_str},
+                             "finish_reason": "stop"}],
+                "usage": usage,
+            })
+
+
+
+class FakeGoogleHandler(BaseHTTPRequestHandler):
+    """A minimal Google AI Studio (Generative Language) fake.
+
+    Handles:
+      GET  /v1beta/models -> {models: [...]}
+      POST /v1beta/models/{model}:generateContent -> {candidates: [...], usageMetadata}
+      POST /v1beta/models/{model}:streamGenerateContent?alt=sse -> SSE
+    Auth: expects x-goog-api-key header; rejects wrong keys with 400/401 Google shape.
+    """
+    behavior: Dict[str, Any] = {"requests": [], "good": 0, "status": 503, "fail_after": None, "delay": 0.0, "override": []}
+    VALID_KEY = "test-google-key"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, status: int, obj: Any) -> None:
+        body = json.dumps(obj).encode()
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _send_sse(self, chunks):
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            for ch in chunks:
+                line = f"data: {json.dumps(ch)}\n\n".encode()
+                self.wfile.write(line)
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    @classmethod
+    def _outage_active(cls) -> bool:
+        b = cls.behavior
+        fa = b.get("fail_after")
+        return fa is not None and b.get("good", 0) >= fa
+
+    def _google_error(self, status: int, message: str):
+        self._send(status, {"error": {"code": status, "message": message, "status": "INVALID_ARGUMENT" if status==400 else "UNAUTHENTICATED" if status in (401,403) else "INTERNAL"}})
+
+    def do_GET(self):
+        if self._outage_active():
+            self._google_error(int(self.behavior.get("status") or 503), "scripted google outage")
+            return
+        # Check auth
+        key = self.headers.get("x-goog-api-key") or ""
+        if not key or key != self.VALID_KEY:
+            # Also allow query param ?key=
+            if "key=" in self.path:
+                import urllib.parse as _up
+                qs = _up.urlparse(self.path).query
+                params = _up.parse_qs(qs)
+                qkey = params.get("key", [""])[0]
+                if qkey == self.VALID_KEY:
+                    key = qkey
+            if key != self.VALID_KEY:
+                self._google_error(401, "API key not valid. Please pass a valid API key.")
+                return
+        # Models listing
+        if "models" in self.path:
+            self._send(200, {"models": [{"name": "models/gemini-1.5-flash"}, {"name": "models/gemini-1.5-pro"}, {"name": "models/gemini-2.0-flash"}]})
+            return
+        self._send(200, {"models": []})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) or b"{}"
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {}
+        FakeGoogleHandler.behavior["requests"].append(body)
+        FakeGoogleHandler.behavior.setdefault("raw_requests", []).append({"path": self.path, "body": body})
+        delay = FakeGoogleHandler.behavior.get("delay") or 0.0
+        if delay:
+            time.sleep(delay)
+        if self._outage_active():
+            self._google_error(int(self.behavior.get("status") or 503), "scripted google outage")
+            return
+        # Auth check
+        key = self.headers.get("x-goog-api-key") or ""
+        if not key or key != self.VALID_KEY:
+            import urllib.parse as _up
+            qs = _up.urlparse(self.path).query
+            params = _up.parse_qs(qs)
+            qkey = params.get("key", [""])[0]
+            if qkey == self.VALID_KEY:
+                key = qkey
+            if key != self.VALID_KEY:
+                self._google_error(401, "API key not valid. Please pass a valid API key.")
+                return
+        FakeGoogleHandler.behavior["good"] = FakeGoogleHandler.behavior.get("good", 0) + 1
+        override = FakeGoogleHandler.behavior.get("override")
+        if isinstance(override, list) and override:
+            self._send(200, override.pop(0))
+            return
+        contents = body.get("contents") or []
+        text_parts = []
+        for c in contents:
+            parts = c.get("parts") or []
+            for part in parts:
+                if isinstance(part, dict) and "text" in part:
+                    text_parts.append(str(part["text"]))
+        sys_inst = body.get("systemInstruction") or {}
+        for part in (sys_inst.get("parts") or []):
+            if isinstance(part, dict) and "text" in part:
+                text_parts.append(str(part["text"]))
+        text = " ".join(text_parts)
+        answer_obj = _scripted_answer(text)
+        answer_str = json.dumps(answer_obj)
+        usage = {"promptTokenCount": 500, "candidatesTokenCount": 200, "totalTokenCount": 700}
+        is_stream = "streamGenerateContent" in self.path
+        if is_stream:
+            mid = len(answer_str)//2
+            chunks = [
+                {"candidates": [{"content": {"parts": [{"text": answer_str[:mid]}]}}]},
+                {"candidates": [{"content": {"parts": [{"text": answer_str[mid:]}]}, "finishReason": "STOP"}], "usageMetadata": usage}
+            ]
+            self._send_sse(chunks)
+            return
         self._send(200, {
-            "choices": [{"message": {"content": json.dumps(_scripted_answer(text))},
-                         "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 500, "completion_tokens": 200,
-                      "total_tokens": 700},
+            "candidates": [{"content": {"parts": [{"text": answer_str}]}, "finishReason": "STOP"}],
+            "usageMetadata": usage
         })
+
+@pytest.fixture()
+def google_provider():
+    """Start a local fake Google provider; yield its base URL.
+
+    Point a user at it with provider='google', base_url pointing here, model like gemini-1.5-flash.
+    """
+    FakeGoogleHandler.behavior = {"requests": [], "good": 0, "status": 503, "fail_after": None, "delay": 0.0, "override": [], "VALID_KEY": "test-google-key"}
+    FakeGoogleHandler.VALID_KEY = "test-google-key"
+    server = HTTPServer(("127.0.0.1", 0), FakeGoogleHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/v1beta"
+    yield base
+    server.shutdown()
+    thread.join(timeout=5)
+
+@pytest.fixture()
+def google_owner(client: TestClient, auth: Dict[str, str], google_provider: str) -> str:
+    """Owner points at fake Google provider."""
+    saved = client.put("/api/settings", json={
+        "ai": {"base_url": google_provider, "model": "gemini-1.5-flash",
+               "api_key": FakeGoogleHandler.VALID_KEY, "rpm": 600, "provider": "google"},
+    }, headers=auth)
+    assert saved.status_code == 200, saved.text
+    return google_provider
 
 
 def _scripted_answer(prompt_text: str) -> Any:

@@ -81,7 +81,7 @@ JD:
         max_tokens=QUESTIONS_OUTPUT_TOKENS,
         db=db,
         user_id=user_id,
-    )
+     stream=True)
     questions = data.get("questions", [])[:count] if isinstance(data, dict) else []
     # Validate structure
     cleaned = []
@@ -150,7 +150,7 @@ Rules:
         max_tokens=FEEDBACK_OUTPUT_TOKENS,
         db=db,
         user_id=user_id,
-    )
+     stream=True)
     return {
         "score": int(data.get("score", 5)),
         "strengths": (data.get("strengths") or [])[:5] if isinstance(data, dict) else [],

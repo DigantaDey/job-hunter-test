@@ -36,7 +36,7 @@ export const tokenStore = {
  * server would otherwise complete. Non-AI requests keep the short default
  * below and fail fast on hangs.
  */
-export const AI_REQUEST_TIMEOUT_MS = 600_000
+export const AI_REQUEST_TIMEOUT_MS = 1800000
 
 const client = axios.create({ baseURL: '', timeout: 30000 })
 

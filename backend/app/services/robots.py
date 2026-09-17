@@ -27,12 +27,15 @@ def _robots_url(url: str) -> str:
 
 
 async def _load(url: str) -> Optional[RobotFileParser]:
-    import httpx
-
     robots_url = _robots_url(url)
     try:
-        async with httpx.AsyncClient(timeout=6, headers={"User-Agent": settings.http_user_agent}) as client:
-            response = await client.get(robots_url)
+        from app.services.http import get_client
+
+        # Reuse shared pooled client (SSRF guard, connection reuse) — per-request
+        # timeout keeps the robots fetch bounded. This replaces the previous
+        # per-call AsyncClient which leaked connections and bypassed the guard.
+        http_client = await get_client()
+        response = await http_client.get(robots_url, timeout=6, headers={"User-Agent": settings.http_user_agent})
         parser = RobotFileParser()
         parser.set_url(robots_url)
         if response.status_code == 200:

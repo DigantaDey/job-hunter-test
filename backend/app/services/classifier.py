@@ -54,7 +54,7 @@ Return JSON {{"size": "big|medium|small|startup", "confidence": 0-1, "reason": "
 JD: {safe_jd}"""
     from app.services.ai_client import chat_completion
 
-    data = await chat_completion("classify", prompt, temperature=0.1, ai_config=ai_config, db=db, user_id=user_id)
+    data = await chat_completion("classify", prompt, temperature=0.1, ai_config=ai_config, db=db, user_id=user_id, stream=True)
     size = str(data.get("size", "")).strip().lower()
     if size not in ("big", "medium", "small", "startup"):
         # The model answered but not with a usable category — that is an
