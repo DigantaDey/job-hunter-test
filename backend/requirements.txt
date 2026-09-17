@@ -1,6 +1,6 @@
 # Runtime dependencies (pinned). Install: pip install -r requirements.txt
 fastapi==0.141.1
-uvicorn[standard]==0.52.4
+uvicorn[standard]==0.53.0
 
 # Data layer — SQLAlchemy 2.x + Alembic migrations. PostgreSQL is the production
 # target; SQLite remains supported for single-user/self-host deployments.
