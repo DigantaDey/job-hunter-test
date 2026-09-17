@@ -303,7 +303,9 @@ def _build_google_url(cfg: Dict[str, Any], stream: bool = False) -> str:
     base = str(cfg.get("base_url") or "https://generativelanguage.googleapis.com").strip().rstrip("/")
     # Normalise base that may already contain /v1beta or /v1
     # For tests, allow localhost/127.0.0.1 as fake Google endpoint — do not override to real host
-    is_local = any(h in base for h in ("127.0.0.1", "localhost", "0.0.0.0"))
+    # nosec B104: this is URL host *matching* for the test-endpoint allowlist,
+    # not a socket bind — nothing here listens on an interface.
+    is_local = any(h in base for h in ("127.0.0.1", "localhost", "0.0.0.0"))  # nosec B104
     if "generativelanguage.googleapis.com" not in base and not is_local:
         # If user set provider=google but base_url is still openai style or empty, default to google host
         # Keep any explicit base (e.g. custom proxy) if it looks like a URL, otherwise default
@@ -327,7 +329,7 @@ def _build_google_url(cfg: Dict[str, Any], stream: bool = False) -> str:
         return f"{base}/models/{model}:{action}?alt=sse"
     return f"{base}/models/{model}:{action}"
 
-def _translate_to_google_payload(messages, system: str, temperature: float, max_tokens: int, json_mode: bool) -> Dict[str, Any]:
+def _translate_to_google_payload(messages, system: Optional[str], temperature: float, max_tokens: int, json_mode: bool) -> Dict[str, Any]:
     # Translate OpenAI messages -> Google contents
     contents = []
     system_instruction = None

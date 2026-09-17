@@ -710,6 +710,16 @@ def test_unmatched_urls_cannot_grow_the_path_label(client):
 
     assert metrics.series_count("jobhunter_http_requests_total") <= middleware._MAX_UNMATCHED_PATH_LABELS + 1
     assert len(middleware._path_labels) <= middleware._MAX_UNMATCHED_PATH_LABELS
+
+    # Unmatched GETs are claimed by the SPA catch-all, whose template label is
+    # one constant series, so the admission list only ever sees scopes with no
+    # route at all. Drive that fallback directly: the first
+    # _MAX_UNMATCHED_PATH_LABELS shapes keep their own series, everything after
+    # collapses to "other" — the invariant the registry cap relies on.
+    middleware._path_labels.clear()
+    for index in range(400):
+        path_label({}, f"/api/nope-{index}/and/{index}/more")
+    assert len(middleware._path_labels) == middleware._MAX_UNMATCHED_PATH_LABELS
     assert path_label({}, "/anything") == "other"
 
 

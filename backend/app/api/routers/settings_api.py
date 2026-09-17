@@ -183,7 +183,14 @@ def get_ai_config(user: CurrentUser, db: DbSession):
 @router.post("/ai/config")
 def update_ai_config(payload: Dict[str, Any], request: Request, user: CurrentUser, db: DbSession):
     """Configure a different base_url/model/key/provider per workflow (blank = inherit)."""
-    from app.services.user_settings import delete_workflow_override, read_workflow_override, write_workflow_override, _normalize_provider, _detect_provider_from_base_url, AI_PROVIDERS
+    from app.services.user_settings import (
+        AI_PROVIDERS,
+        _detect_provider_from_base_url,
+        _normalize_provider,
+        delete_workflow_override,
+        read_workflow_override,
+        write_workflow_override,
+    )
 
     normalized: Dict[str, Dict[str, str]] = {}
     for workflow, config in (payload or {}).items():
@@ -204,8 +211,9 @@ def update_ai_config(payload: Dict[str, Any], request: Request, user: CurrentUse
         if not cleaned["api_key"] and existing.get("api_key"):
             cleaned["api_key"] = existing["api_key"]
         # Preserve existing provider if not provided
-        if not cleaned.get("provider") and existing.get("provider"):
-            cleaned["provider"] = existing.get("provider")
+        existing_provider = existing.get("provider")
+        if not cleaned.get("provider") and existing_provider:
+            cleaned["provider"] = existing_provider
         # Empty check: provider alone does not create an override; need at least one of base_url/model/api_key
         if not any(cleaned.get(k) for k in ("base_url", "model", "api_key")):
             # If workflow had existing but now all blank, delete it
