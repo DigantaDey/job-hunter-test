@@ -213,7 +213,21 @@ export default function Resumes(){
         if(Array.isArray(data)) setLedger(data)
       }catch{}
     }
-    progressTimerRef.current = setInterval(pollProgress, 700)
+    // Pause the progress poll while the tab is hidden — the same
+    // visibilitychange pattern as Emails/Queues: a hidden tab polls nothing,
+    // and becoming visible re-reads at once instead of waiting out the 700 ms.
+    const startPoll = ()=>{
+      if(progressTimerRef.current) return
+      void pollProgress()
+      progressTimerRef.current = setInterval(pollProgress, 700)
+    }
+    const stopPoll = ()=>{
+      if(progressTimerRef.current) clearInterval(progressTimerRef.current)
+      progressTimerRef.current = null
+    }
+    const onVis = ()=>{ document.visibilityState === 'hidden' ? stopPoll() : startPoll() }
+    if(document.visibilityState !== 'hidden') startPoll()
+    document.addEventListener('visibilitychange', onVis)
     const fd=new FormData(); fd.append('file', file)
     try{
       const {data} = await client.post('/api/resume/upload', fd, {
@@ -261,7 +275,8 @@ export default function Resumes(){
       }
     }
     finally{
-      clearInterval(progressTimerRef.current)
+      stopPoll()
+      document.removeEventListener('visibilitychange', onVis)
       setUploading(false)
       e.target.value = ''
       // final ledger refresh after short delay (ledger commit)

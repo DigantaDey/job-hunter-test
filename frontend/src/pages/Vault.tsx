@@ -1,10 +1,17 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import client, { downloadVaultCsv } from '../api/client'
 import { Vault as VaultIcon, Download, Trash2, Shield, ExternalLink, KeyRound } from 'lucide-react'
 
 export default function Vault(){
   const [entries, setEntries]=useState<any[]>([])
-  const load=()=> client.get('/api/vault').then(r=>setEntries(r.data))
+  // cancelled-ref guard (same pattern as Dashboard): the async read below must
+  // never setState after the page has unmounted.
+  const mounted = useRef(true)
+  useEffect(()=>{
+    mounted.current = true
+    return ()=>{ mounted.current = false }
+  },[])
+  const load=()=> client.get('/api/vault').then(r=>{ if(mounted.current) setEntries(r.data) })
   useEffect(()=>{ load() },[])
 
   return (

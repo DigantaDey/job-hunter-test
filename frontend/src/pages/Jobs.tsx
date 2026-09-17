@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import client, { apiError, aiOutage, downloadResume, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
 import { AIOutageBanner } from '../components/AIBanner'
 import { EmptyBoardBanner } from '../components/EmptyBoardBanner'
@@ -38,6 +38,13 @@ export default function Jobs(){
   const [discoverMsg, setDiscoverMsg] = useState('')
   const [generating, setGenerating] = useState(false)
   const [generateMsg, setGenerateMsg] = useState('')
+  // cancelled-ref guard (same pattern as Dashboard): the async .then() reads
+  // below must never setState after the page has unmounted.
+  const mounted = useRef(true)
+  useEffect(()=>{
+    mounted.current = true
+    return ()=>{ mounted.current = false }
+  },[])
 
   /**
    * The live layer (v2.2.8). Every AI trigger on this page — Discover,
@@ -64,7 +71,7 @@ export default function Jobs(){
   useEffect(()=>{
     if(!applyFinished || !selected) return
     load()
-    client.get(`/api/jobs/${selected.id}`).then(r=>setSelected((prev:any)=> prev && prev.id===r.data.id ? r.data : prev)).catch(()=>{})
+    client.get(`/api/jobs/${selected.id}`).then(r=>{ if(mounted.current) setSelected((prev:any)=> prev && prev.id===r.data.id ? r.data : prev) }).catch(()=>{})
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[applyFinished])
   const discoverFinished = discoverRow && !discoverLive ? `${discoverRow.id}:${discoverRow.status}` : ''
@@ -92,7 +99,7 @@ export default function Jobs(){
     if(filter.q) p.q=filter.q
     if(filter.company) p.company=filter.company
     if(filter.funding) p.funding=filter.funding
-    client.get('/api/jobs',{params:p}).then(r=>setJobs(r.data))
+    client.get('/api/jobs',{params:p}).then(r=>{ if(mounted.current) setJobs(r.data) })
   }
   useEffect(()=>{ const sp=new URLSearchParams(window.location.search); const c=sp.get('company')||''; const f=sp.get('funding')||''; if(c||f) setFilter(s=>({...s, company:c, funding:f})); },[])
   useEffect(()=>{ load() },[filter.status, filter.source, filter.company, filter.funding])
@@ -107,9 +114,9 @@ export default function Jobs(){
     setIntelligence(null)
     setCompanyIntel(null)
     // Fetch intelligence breakdown
-    client.get(`/api/jobs/${id}/intelligence`, { timeout: AI_REQUEST_TIMEOUT_MS }).then(r=>setIntelligence(r.data)).catch(()=>{})
+    client.get(`/api/jobs/${id}/intelligence`, { timeout: AI_REQUEST_TIMEOUT_MS }).then(r=>{ if(mounted.current) setIntelligence(r.data) }).catch(()=>{})
     // Fetch company intel
-    client.get(`/api/company/${encodeURIComponent(data.company)}/intel`, { timeout: AI_REQUEST_TIMEOUT_MS }).then(r=>setCompanyIntel(r.data)).catch(()=>{})
+    client.get(`/api/company/${encodeURIComponent(data.company)}/intel`, { timeout: AI_REQUEST_TIMEOUT_MS }).then(r=>{ if(mounted.current) setCompanyIntel(r.data) }).catch(()=>{})
   }
 
   const discover = async()=>{
