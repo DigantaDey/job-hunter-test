@@ -6,7 +6,13 @@ import { Component, type ErrorInfo, type ReactNode } from 'react'
  * that wipes local auth state and reloads, so a corrupted token / bad response
  * can't leave the user stranded on a white screen.
  */
-type Props = { children: ReactNode; scope?: 'app' | 'route'; resetKey?: string }
+type Props = {
+  children: ReactNode
+  scope?: 'app' | 'route'
+  resetKey?: string
+  onReload?: () => void
+  onGoHome?: () => void
+}
 type State = { error: Error | null }
 
 /**
@@ -51,7 +57,37 @@ export class ErrorBoundary extends Component<Props, State> {
     } catch {
       /* ignore */
     }
-    window.location.href = '/login'
+    try {
+      window.location.href = '/login'
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private reload = () => {
+    this.setState({ error: null })
+    if (this.props.onReload) {
+      this.props.onReload()
+    } else {
+      try {
+        window.location.reload()
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  private goHome = () => {
+    this.setState({ error: null })
+    if (this.props.onGoHome) {
+      this.props.onGoHome()
+    } else {
+      try {
+        window.location.href = '/'
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   render() {
@@ -79,15 +115,21 @@ export class ErrorBoundary extends Component<Props, State> {
           )}
           <div className="mt-4 flex gap-2">
             <button
-              onClick={() => {
-                this.setState({ error: null })
-                window.location.reload()
-              }}
+              type="button"
+              onClick={this.reload}
               className="px-4 py-2 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm"
             >
               Reload
             </button>
             <button
+              type="button"
+              onClick={this.goHome}
+              className="px-4 py-2 rounded-xl border text-sm"
+            >
+              Go Home
+            </button>
+            <button
+              type="button"
               onClick={this.reset}
               className="px-4 py-2 rounded-xl border text-sm"
             >
