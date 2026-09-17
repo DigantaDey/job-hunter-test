@@ -19,6 +19,7 @@ import Interview from './pages/Interview'
 import Notifications from './pages/Notifications'
 import Personas from './pages/Personas'
 import { AuthProvider, useAuth } from './context/AuthContext'
+import { ErrorBoundary } from './components/ErrorBoundary'
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth()
@@ -30,38 +31,166 @@ function RequireAuth({ children }: { children: ReactNode }) {
   return <>{children}</>
 }
 
+export function AppRoutes() {
+  const location = useLocation()
+  return (
+    <ErrorBoundary scope="app" resetKey={location.pathname}>
+      <Routes>
+        <Route
+          path="/login"
+          element={
+            <ErrorBoundary scope="route" resetKey={location.pathname}>
+              <Login />
+            </ErrorBoundary>
+          }
+        />
+        <Route
+          element={
+            <RequireAuth>
+              <Layout />
+            </RequireAuth>
+          }
+        >
+          <Route
+            path="/"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Dashboard />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/jobs"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Jobs />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/queues"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Queues />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/personas"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Personas />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/resumes"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Resumes />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/emails"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Emails />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/funding"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Funding />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/vault"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Vault />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/interview"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Interview />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/analytics"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Analytics />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/notifications"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Notifications />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/billing"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Billing />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/pricing"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Pricing />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/settings"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Settings />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/account"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Account />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/logs"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Logs />
+              </ErrorBoundary>
+            }
+          />
+        </Route>
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </ErrorBoundary>
+  )
+}
+
 export default function App() {
   return (
     <AuthProvider>
       <BrowserRouter>
-        <Routes>
-          <Route path="/login" element={<Login />} />
-          <Route
-            element={
-              <RequireAuth>
-                <Layout />
-              </RequireAuth>
-            }
-          >
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/jobs" element={<Jobs />} />
-            <Route path="/queues" element={<Queues />} />
-            <Route path="/personas" element={<Personas />} />
-            <Route path="/resumes" element={<Resumes />} />
-            <Route path="/emails" element={<Emails />} />
-            <Route path="/funding" element={<Funding />} />
-            <Route path="/vault" element={<Vault />} />
-            <Route path="/interview" element={<Interview />} />
-            <Route path="/analytics" element={<Analytics />} />
-            <Route path="/notifications" element={<Notifications />} />
-            <Route path="/billing" element={<Billing />} />
-            <Route path="/pricing" element={<Pricing />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/account" element={<Account />} />
-            <Route path="/logs" element={<Logs />} />
-          </Route>
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <AppRoutes />
       </BrowserRouter>
     </AuthProvider>
   )
