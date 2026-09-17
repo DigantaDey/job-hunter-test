@@ -239,7 +239,7 @@ export default function Dashboard() {
   const pipeFailed = hasBuckets ? sumStatus('failed', 'dead') : (automation.failed ?? 0)
   const pipePaused = live ? live.counts.paused : hasBuckets ? sumStatus('paused') : 0
   const needsInputNow = live ? live.counts.needs_input : (automation.needs_input ?? 0)
-  const inFlight = live ? live.items.slice(0, 5) : []
+  const inFlight = live && Array.isArray(live.items) ? live.items.slice(0, 5) : []
   const autoNextIso: string | null = automation.next_run || null
   const autoNextMs = autoNextIso ? new Date(autoNextIso).getTime() : NaN
   // `next_run: null` is "no next run to promise": the switch is on but blocked
@@ -443,7 +443,7 @@ export default function Dashboard() {
           <div className="card p-5">
             <h3 className="font-medium text-sm flex items-center gap-2"><FileText className="w-4 h-4"/> Profile & resume</h3>
             <div className="mt-2 text-xs mono text-zinc-500">
-              {profile ? <><div>Skills: {profile.data.skills?.slice(0,6).join(', ')}</div><div className="mt-1">{profile.data.email}</div></> : 'No master resume uploaded yet.'}
+              {profile ? <><div>Skills: {Array.isArray(profile.data?.skills) ? profile.data.skills.slice(0,6).join(', ') : ''}</div><div className="mt-1">{profile.data?.email}</div></> : 'No master resume uploaded yet.'}
             </div>
             <div className="mt-3 flex gap-2">
               <div className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 mono flex items-center gap-1"><FileText className="w-3 h-3"/>{typeof summary.resumes === 'object' ? (summary.resumes.total ?? 0) : (summary.resumes ?? 0)} resumes</div>
