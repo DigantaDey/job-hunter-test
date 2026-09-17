@@ -16,11 +16,12 @@
  *   • when some reads fail, render everything that succeeded and show a
  *     non-blocking banner naming the failed sections with their messages,
  *     whose retry re-fetches exactly those sections — nothing else;
- *   • re-read the summary every 30 s while the tab is *visible* (same
- *     visibility-aware cadence as Settings' auto-mode card): nothing at all
+ *   • re-read the summary every 60 s while the tab is *visible* (same
+ *     visibility-aware cadence as Funding/Emails/Queues): nothing at all
  *     while hidden, an immediate re-read when it becomes visible, a failed
- *     tick keeps the last read, and the timer + listener are cleaned up on
- *     unmount.
+ *     tick keeps the last read, polling also auto-starts after an initial
+ *     failure so stats recover without a manual reload, and the timer +
+ *     listener are cleaned up on unmount.
  *
  * Same contract as `pages/__tests__/SettingsPolling.test.tsx` and
  * `pages/__tests__/QueuesPolling.test.tsx`.
@@ -266,16 +267,16 @@ describe('Dashboard summary poll (P1 #4)', () => {
     vi.useRealTimers()
   })
 
-  it('re-reads the summary every 30 s while the tab is visible — and only the summary', async () => {
+  it('re-reads the summary every 60 s while the tab is visible — and only the summary', async () => {
     render(<Dashboard />, { wrapper })
     await flush()
     expect(summaryCalls()).toBe(1)
 
-    await advance(29_000)
+    await advance(59_000)
     expect(summaryCalls()).toBe(1)
     await advance(1_000)
     expect(summaryCalls()).toBe(2)
-    await advance(30_000)
+    await advance(60_000)
     expect(summaryCalls()).toBe(3)
 
     // The other sections are mount reads, not polls.
@@ -290,7 +291,7 @@ describe('Dashboard summary poll (P1 #4)', () => {
 
     get.mockImplementation((url: string) =>
       url === '/api/dashboard/summary' ? Promise.resolve({ data: { ...SUMMARY, jobs: { ...SUMMARY.jobs, total: 57 } } }) : defaultOk(url))
-    await advance(30_000)
+    await advance(60_000)
     expect(screen.getByText('57')).toBeTruthy()
     expect(screen.queryByText('42')).toBeNull()
   })
@@ -308,8 +309,8 @@ describe('Dashboard summary poll (P1 #4)', () => {
     await flush()
     expect(summaryCalls()).toBe(2)
 
-    // …and the 30 s cadence resumes from there.
-    await advance(30_000)
+    // …and the 60 s cadence resumes from there.
+    await advance(60_000)
     expect(summaryCalls()).toBe(3)
   })
 
@@ -335,20 +336,33 @@ describe('Dashboard summary poll (P1 #4)', () => {
     expect(screen.getByText('42')).toBeTruthy()
 
     get.mockImplementation((url: string) => url === '/api/dashboard/summary' ? Promise.reject(new Error('boom')) : defaultOk(url))
-    await advance(30_000)
+    await advance(60_000)
 
     expect(screen.getByText('42')).toBeTruthy()
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('a summary that never loaded is not polled — the Retry button is the recovery path', async () => {
+  it('polling auto-arms after an initial summary failure so the hero stats recover without a manual reload', async () => {
+    // All five reads fail on mount → the catastrophic error card.
     get.mockImplementation(() => Promise.reject(new Error('network down')))
     render(<Dashboard />, { wrapper })
     await flush()
     expect(summaryCalls()).toBe(1)
+    expect(screen.getByText(/Couldn't load the dashboard/)).toBeTruthy()
 
-    await advance(120_000)
-    expect(summaryCalls()).toBe(1)
+    // The poll still ticks (at the 60 s cadence) — it's the recovery path
+    // P3 #14 asks for ("refreshes periodically without a manual page reload").
+    // Each failed tick is silent (no banner flip); once the backend is back
+    // the next tick fills in summary data.
+    get.mockImplementation((url: string) =>
+      url === '/api/dashboard/summary'
+        ? Promise.resolve({ data: { ...SUMMARY, jobs: { ...SUMMARY.jobs, total: 99 } } })
+        : Promise.reject(new Error('still down')))
+    await advance(60_000)
+    expect(summaryCalls()).toBe(2)
+    // Summary recovered — the page leaves the all-failed card for the partial
+    // banner naming the still-failing sections; the hero shows fresh data.
+    expect(screen.getByText('99')).toBeTruthy()
   })
 
   it('cleans up the timer and the visibility listener on unmount', async () => {
