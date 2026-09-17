@@ -5,7 +5,7 @@ uvicorn[standard]==0.52.4
 # Data layer — SQLAlchemy 2.x + Alembic migrations. PostgreSQL is the production
 # target; SQLite remains supported for single-user/self-host deployments.
 sqlalchemy==2.0.52
-alembic==1.19.2
+alembic==1.20.0
 psycopg2-binary==2.9.13
 
 # Validation / settings — email-validator is required by pydantic EmailStr.
