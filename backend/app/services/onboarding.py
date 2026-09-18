@@ -748,6 +748,7 @@ def status_document(db: Session, user: User, session: OnboardingSession) -> Dict
             "scheduled_at": _iso(job.scheduled_at),
         }
 
+    next_action: Dict[str, Any]
     if session.state == STATE_REVIEW:
         next_action = {
             "gate": "resume", "label": "Review your extracted profile",
@@ -1143,7 +1144,11 @@ async def handle_extraction_job(db: Session, item: PipelineJob) -> Dict[str, Any
     user = db.query(User).filter(User.id == item.user_id).first()
     if not user:
         raise RuntimeError("user_missing")
-    session = get_session(db, user.id)
+    # get_or_create (not get): a session row always exists for an in-flight
+    # extraction — it is created before the upload is enqueued — but if the
+    # row is somehow gone (manual tampering) the handler must still have a
+    # session to park its state in rather than crash-looping the item.
+    session = get_or_create_session(db, user)
     document = (
         db.query(ResumeDocument)
         .filter(ResumeDocument.id == payload.get("document_id"), ResumeDocument.user_id == user.id)
