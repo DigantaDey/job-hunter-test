@@ -1,0 +1,86 @@
+"""Shared domain contracts (the machine-readable half of ``docs/contracts/``).
+
+This package holds **names and shapes only** — no ORM, no HTTP, no I/O, no
+behaviour beyond three pure helpers. It exists so the API layer, the pipeline
+worker, the scheduler and the test suite can import one definition of a state
+name instead of each spelling their own, and so ``docs/contracts/*.md`` can be
+checked against code (``backend/tests/test_contracts_vocabulary.py``).
+
+The frontend mirror lives in ``frontend/src/lib/contracts.ts``; the drift test
+asserts the two agree, so a rename on one side fails CI instead of shipping a
+silently empty dashboard filter.
+"""
+from app.contracts.vocabulary import (  # noqa: F401
+    ACTION_KINDS,
+    ACTOR_TYPES,
+    AGGREGATE_TYPES,
+    AMBIGUITY_KINDS,
+    ANSWER_REUSE_SCOPES,
+    APPLICATION_BLOCKED_CODES,
+    APPLICATION_PHASES,
+    APPLICATION_STATE_PHASE,
+    APPLICATION_STATES,
+    APPLICATION_TERMINAL_STATES,
+    APPLICATION_USER_ACTION_STATES,
+    AUDIT_ACTIONS,
+    AUTOFILL_VALUE_SOURCES,
+    AUTOMATION_MODES,
+    AUTOMATION_SCOPES,
+    AUTOMATION_WORKFLOWS,
+    CONFIDENCE_BAND_THRESHOLDS,
+    CONFIDENCE_BANDS,
+    CONTRACT_VERSION,
+    DISCOVERY_AI_SKIP_REASONS,
+    DISCOVERY_RUN_STATES,
+    DISCOVERY_WHY_EMPTY,
+    EEO_FIELD_KEYS,
+    ERROR_CODES,
+    EVENT_TYPES,
+    EVIDENCE_KINDS,
+    EXTRACTION_STATES,
+    FIELD_RESOLUTIONS,
+    IDEMPOTENCY_HEADER,
+    JOB_STATUS_PROJECTION,
+    JOB_STATUSES,
+    LEGACY_PROFILE_EXTRACTION_SOURCES,
+    MAPPINGS,
+    MATCH_BANDS,
+    MATCH_STALENESS,
+    NOTIFICATION_CHANNELS,
+    NOTIFICATION_KINDS,
+    NOTIFICATION_PREFERENCE_KEYS,
+    NOTIFICATION_SEVERITIES,
+    NOTIFICATION_UNMUTABLE_KINDS,
+    ONBOARDING_GATE_STATES,
+    ONBOARDING_GATES,
+    ONBOARDING_STATES,
+    ONBOARDING_TERMINAL_STATES,
+    PROFILE_LINK_KINDS,
+    PROFILE_STATES,
+    PROVENANCE_SOURCES,
+    QUEUE_LIVE_STATUSES,
+    QUEUE_PIPELINES,
+    QUEUE_PROGRESS_STEPS,
+    QUEUE_STATUSES,
+    QUEUE_TERMINAL_STATUSES,
+    QUEUE_TRIGGERS,
+    RESTRICTED_FIELD_KEYS,
+    RESUME_ROLES,
+    RESUME_STATES,
+    REVIEW_ACTIONS,
+    REVIEW_STATUSES,
+    SCORE_SOURCES,
+    SENSITIVE_AUDIT_ACTIONS,
+    SENSITIVE_FIELD_KEYS,
+    SENSITIVE_FIELD_POLICIES,
+    SENSITIVITY_LEVELS,
+    SUBMISSION_CHANNELS,
+    VOCABULARY,
+    confidence_band,
+    is_terminal_application_state,
+    job_status_for,
+    requires_review,
+)
+from app.contracts.vocabulary import __all__ as _vocabulary_all
+
+__all__ = list(_vocabulary_all)

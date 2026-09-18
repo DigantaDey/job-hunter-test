@@ -207,7 +207,14 @@ class Job(Base):
     source: Mapped[str] = mapped_column(String, default="unknown", nullable=True)  # live source id or curated pool id
     external_id: Mapped[str] = mapped_column(String, default="", nullable=True)
     dedupe_key: Mapped[str] = mapped_column(String(300), default="", nullable=True)
-    status: Mapped[str] = mapped_column(String, default="discovered", nullable=True)  # discovered|queued|needs_input|applying|applied|failed|emailed|rejected
+    #: Board status. Vocabulary: :data:`app.contracts.JOB_STATUSES`
+    #: (``docs/contracts/07-application-state-machine.md`` §5) — discovered |
+    #: queued | preparing | needs_input | ready_to_apply | applied | rejected |
+    #: failed | skipped. ``applying`` and ``emailed`` were documented here but no
+    #: code path ever wrote them, while ``preparing``, ``ready_to_apply`` and
+    #: ``skipped`` (all written by ``services/apply_flow.py``) were missing — see
+    #: CHANGELOG 2.2.18.
+    status: Mapped[str] = mapped_column(String, default="discovered", nullable=True)
     score: Mapped[float] = mapped_column(Float, default=0.0, nullable=True)
     score_reason: Mapped[str] = mapped_column(Text, default="", nullable=True)
     #: Provenance of ``score``: "ai" (guardrail-verified), "pending" (AI offline,
@@ -266,7 +273,11 @@ class Email(Base):
     to_name: Mapped[str] = mapped_column(String, default="", nullable=True)
     subject: Mapped[str] = mapped_column(String, default="", nullable=True)
     body: Mapped[str] = mapped_column(Text, default="", nullable=True)
-    status: Mapped[str] = mapped_column(String, default="draft", nullable=True)  # draft|pending_approval|queued|sending|sent|failed|needs_otp|suppressed
+    #: Outreach status. draft | pending_approval | queued | sending | sent |
+    #: dry_run | opened | failed | needs_otp | suppressed — every value
+    #: ``services/outreach.py`` writes (``dry_run`` and ``opened`` were missing
+    #: from this comment; see CHANGELOG 2.2.18).
+    status: Mapped[str] = mapped_column(String, default="draft", nullable=True)
     job_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=True)
     company: Mapped[str] = mapped_column(String, default="", nullable=True)
     #: Denormalised job context so the approval bucket can show *which* posting

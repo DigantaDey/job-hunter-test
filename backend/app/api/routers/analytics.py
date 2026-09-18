@@ -16,6 +16,7 @@ from typing import Any, Dict
 from fastapi import APIRouter
 
 from app.api.deps import CurrentUser, DbSession
+from app.contracts import JOB_STATUSES
 from app.core.entitlements import enforce
 from app.models.models import AICreditLedger, Job
 
@@ -173,20 +174,35 @@ def performance_analytics(user: CurrentUser, db: DbSession):
 @router.get("/funnel")
 def funnel_analytics(user: CurrentUser, db: DbSession):
     jobs = db.query(Job).filter(Job.user_id == user.id).all()
-    stages = ["discovered", "queued", "needs_input", "applying", "applied", "failed", "emailed"]
+    # Stages come from the shared vocabulary instead of a hand-written list: the
+    # previous list bucketed on `applying`/`emailed` (never written by any code
+    # path, so those buckets were permanently 0) and omitted `preparing`,
+    # `ready_to_apply` and `skipped` (written by `services/apply_flow.py` and
+    # `api/routers/jobs.py`), which silently dropped those jobs from the funnel.
+    # See docs/contracts/07-application-state-machine.md §5 and CHANGELOG 2.2.18.
+    stages = list(JOB_STATUSES)
     funnel = dict.fromkeys(stages, 0)
+    unclassified = 0
     for job in jobs:
         if job.status in funnel:
             funnel[job.status] += 1
-    # Calculate conversion rates
-    discovered = funnel.get("discovered", 0) + funnel.get("queued", 0) + funnel.get("applied", 0) + funnel.get("failed", 0)
+        else:
+            unclassified += 1
+    # Conversion = applied / everything that entered the funnel. The shipped
+    # denominator was discovered + queued + applied + failed, i.e. it ignored
+    # jobs sitting in needs_input — a job waiting on the user is exactly the one
+    # that has not converted yet.
+    considered = sum(funnel.values())
     applied = funnel.get("applied", 0)
-    conversion = round(applied / max(1, discovered) * 100, 1)
+    conversion = round(applied / max(1, considered) * 100, 1)
 
     return {
         "funnel": funnel,
         "conversion_rate": conversion,
         "total": len(jobs),
+        # Rows whose status is not in the vocabulary (should be impossible; kept
+        # visible rather than silently dropped).
+        "unclassified": unclassified,
     }
 
 
