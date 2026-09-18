@@ -494,7 +494,8 @@ async def discover_for_user(
     for candidate in ranked[:batch_limit]:
         if _is_expired_candidate(candidate, seen_at):
             continue
-        raw_payload = candidate.get("raw") if isinstance(candidate.get("raw"), dict) else {}
+        incoming_raw = candidate.get("raw")
+        raw_payload: Dict[str, Any] = dict(incoming_raw) if isinstance(incoming_raw, dict) else {}
         job = Job(
             user_id=user.id,
             title=candidate["title"],
