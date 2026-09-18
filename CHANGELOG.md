@@ -4,6 +4,105 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.19] — 2026-09-18
+
+**Onboarding became resumable: the resume upload no longer holds an HTTP request
+hostage to the model.** The legacy `POST /api/resume/upload` did everything
+inside one blocking request — validate, store, extract text, call the AI, build
+search context — with progress in an in-process dict. A browser refresh, a
+deploy, a worker crash or a slow provider lost the work and left the user with
+an error and no record of what happened. This release ships the backend
+foundation of the resumable onboarding workflow specified in `docs/contracts/03`
+and `04`: a durable session, a preserved upload, versioned extraction attempts,
+and the AI extraction moved into the durable queue. The frontend, field-level
+profile review (contract 02) and the remaining onboarding gates (preferences,
+discovery, automation) are later deliverables — `completed_at` is deliberately
+never set by this scope.
+
+### Added
+
+- **Onboarding sessions (`onboarding_sessions`) — one durable row per user.**
+  `POST /api/onboarding/session` creates (idempotently) the session and returns
+  its id; `GET /api/onboarding/status`, `GET /api/onboarding/sessions/{id}`,
+  `POST /api/onboarding/resume` and `POST /api/onboarding/retry` all return the
+  *whole* status document, so a client never merges a partial state. The
+  persisted `state` is a **projection**: every read reconciles it against the
+  stored facts (document, extraction attempt, queue row), which is what makes a
+  refresh, a restart, a second device or a lost enqueue invisible to the user.
+  Scope states (from `ONBOARDING_STATES`): `awaiting_resume →
+  resume_processing → (extraction_blocked | profile_review_required)`.
+
+- **Durable uploads (`resume_documents`).** The original document is stored
+  once, content-hashed (`UNIQUE(user_id, sha256, role)`), and *preserved* —
+  replacement archives the old row and file, it never deletes either. A
+  re-upload of identical bytes is a no-op that re-attaches to the document's
+  current extraction. A different document supersedes any in-flight extraction
+  of the old one (the worker re-checks after the AI call and discards a
+  replaced result), and archives the old master `Resume` row.
+
+- **Versioned extraction attempts (`resume_extractions`).** One append-only row
+  per attempt (1-based per document), created *before* the model is called so a
+  crash leaves a recoverable row instead of nothing. Each row records extractor
+  id + version, prompt version, model, token counts (mirroring
+  `ai_credit_ledger`), latency, field count, output hash and a **sanitised**
+  error (`onboarding.safe_error_message` strips key-shaped tokens, bearer
+  headers and control characters before anything is stored — provider secrets
+  can never reach the database or the UI).
+
+- **Background extraction in the new `extraction` pipeline.** The queue gains a
+  sixth pipeline (`job_queue.PIPELINES`, handler in `services/onboarding.py`
+  behind `handlers.HANDLERS["extraction"]`), deduped per
+  `extract:{document_id}:{extractor_version}`. The upload request does *no AI
+  work*: it validates (same helpers as the legacy flow), stores, records rows,
+  enqueues and answers in `resume_processing`. Transient AI outages are raised
+  for the queue's `pause` machinery (no failure budget consumed; the watchdog
+  resumes when the provider is back); needs-action failures (no key, bad key,
+  quota) dead-letter and park the session in a non-retryable blocked state with
+  the fix.
+
+- **Reconciliation as a first-class path.** `GET /api/onboarding/status` repairs
+  a session whose queue row went terminal without bookkeeping (worker OOM,
+  deploy) into a *retryable* `extraction_blocked`, and re-enqueues an attempt
+  that lost its queue row (`trigger="recovery"`). `POST /api/onboarding/retry`
+  re-runs a retryable block (new attempt, recycled queue row, budgets reset);
+  guardrail/no-text rejections answer `409 {"code": "not_retryable"}` because
+  they need a different document, not another identical attempt.
+
+- **Idempotent extraction, end to end.** `Profile` gains
+  `source_extraction_id` — the upsert key that makes duplicate queue execution
+  a no-op (a replayed job returns the cached result and writes nothing), so
+  reprocessing a document can never create a second profile. The master
+  `Resume` row is likewise keyed on the document's storage path. The monthly
+  `resume_parses_per_month` counter is charged exactly once, on the attempt's
+  first success (quota itself is still enforced at upload time, like the legacy
+  flow); the AI call goes through the unchanged guardrailed
+  `ai_extract_profile`, so per-user credit tracking, budgets and the audit
+  trail apply as-is (`extraction.succeeded` audit rows included).
+
+- **User-visible events and notifications.** Every transition appends to
+  `onboarding_events` (append-only, monotonic per-session `sequence` — the
+  support timeline audit logs don't cover). Extraction success creates one
+  `profile_review_required` notification; failures create one
+  `onboarding_step_required` notification — both deduped per extraction in the
+  row's meta, so replays never re-notify.
+
+- **Erasure coverage.** Account deletion now sweeps the four new tables
+  (schema-derived plan) and the original upload file even when its extraction
+  never produced a `Resume` row.
+
+### Tests
+
+- `tests/test_onboarding_flow.py` (14 tests): session durability/idempotency,
+  non-blocking upload → queued extraction → reviewable state, refresh/resume
+  (same session id and state across reads, by-id fetch), transient outage →
+  paused → auto-resume, hard worker failure → retryable blocked → retry
+  recovers, non-retryable guardrail rejection refused, duplicate job execution
+  and duplicate byte-identical uploads create no rows and charge the quota
+  once, replacement archives + supersedes, cross-tenant session/document access
+  is a 404 (and anonymous a 401), provider secrets never surface in stored
+  errors, the original file survives failures, a dead worker is repaired on
+  read, and a lost queue row self-heals.
+
 ## [2.2.18] — 2026-09-18
 
 **Canonical domain contracts specified across backend, frontend, and architecture documentation.**

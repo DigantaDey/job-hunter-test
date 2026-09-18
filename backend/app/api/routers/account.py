@@ -50,6 +50,7 @@ from app.models.models import (
     PipelineJob,
     Profile,
     Resume,
+    ResumeDocument,
     ScheduledRun,
     SettingsModel,
     Subscription,
@@ -576,6 +577,15 @@ def _account_files(db: Session, user_id: int) -> List[str]:
     """
     paths: set[str] = set()
     for (filepath,) in db.execute(select(Resume.filepath).where(Resume.user_id == user_id)):
+        if not filepath:
+            continue
+        paths.add(filepath)
+        paths.add(os.path.splitext(filepath)[0] + ".pdf")
+
+    # Onboarding resume documents: the original upload is stored once and shared
+    # with its master Resume row, but an extraction that never finished has no
+    # Resume row — the document row is then the only record of the file.
+    for (filepath,) in db.execute(select(ResumeDocument.filepath).where(ResumeDocument.user_id == user_id)):
         if not filepath:
             continue
         paths.add(filepath)

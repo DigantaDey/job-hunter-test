@@ -21,6 +21,7 @@ from app.api.routers import (
     interview,
     jobs,
     notifications,
+    onboarding,
     ops,
     personas,
     resumes,
@@ -43,6 +44,7 @@ router.include_router(tracking.router)
 router.include_router(billing.router)
 router.include_router(analytics.router)
 router.include_router(notifications.router)
+router.include_router(onboarding.router)
 router.include_router(interview.router)
 router.include_router(personas.router)
 router.include_router(automation.router)

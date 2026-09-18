@@ -161,6 +161,7 @@ are available in Chrome and Apple Passwords CSV formats.
 | Area | Endpoints |
 |---|---|
 | Auth | `GET /api/auth/status`, `POST /api/auth/{bootstrap,register,login,refresh,logout}`, `GET /api/auth/me`, `POST /api/auth/password`, `GET/POST/DELETE /api/auth/api-keys` |
+| Onboarding | `POST /api/onboarding/session`, `GET /api/onboarding/status`, `GET /api/onboarding/sessions/{id}`, `POST /api/onboarding/resume` (non-blocking upload → background extraction), `POST /api/onboarding/retry` |
 | Account | `GET /api/account/{disclosures,consent,audit,export,runtime,billing-usage}`, `POST /api/account/consent`, `DELETE /api/account?confirm=<email>` |
 | Resumes | `POST /api/resume/upload`, `GET /api/profile/current`, `POST /api/resumes/generate`, `POST /api/resumes/{id}/{approve,reject}`, `GET /api/resumes/{id}/{preview,diff,download}`, `POST /api/resumes/{id}/polish`, `PUT /api/resumes/{id}/tags` |
 | Jobs | `POST /api/jobs/discover`, `GET /api/jobs/discovery/last-run`, `GET /api/jobs`, `POST /api/jobs/{id}/{apply,input,mark-applied,retry,skip}`, `GET /api/user-input-queue`, `POST /api/classify/company`, `GET /api/pipelines/{stats,jobs}` |
