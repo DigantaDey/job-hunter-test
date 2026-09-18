@@ -24,6 +24,7 @@ from app.api.routers import (
     onboarding,
     ops,
     personas,
+    profile_review,
     resumes,
     settings_api,
     tracking,
@@ -48,5 +49,6 @@ router.include_router(onboarding.router)
 router.include_router(interview.router)
 router.include_router(personas.router)
 router.include_router(automation.router)
+router.include_router(profile_review.router)
 
 __all__ = ["router", "search_context"]

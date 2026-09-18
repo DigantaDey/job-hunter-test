@@ -111,6 +111,115 @@ class Profile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
 
 
+# --------------------------------------------------------------------------- #
+# Candidate profile v2 — versioned document + field-level provenance/history
+# --------------------------------------------------------------------------- #
+# Contract 02-candidate-profile: versioned candidate_profiles document,
+# profile_field_provenance (path, value_hash, preview, origin, sensitivity,
+# confidence, band, evidence, extractor, ambiguity, review_status,
+# review_required, needs_answer_for), profile_field_history append-only,
+# persona overlays, state machine draft→review_required→active→superseded→archived.
+#
+# The legacy ``profiles`` table stays for backward compat; new code writes both
+# until the migration is complete. The new tables are the source of truth for
+# field-level confidence, evidence and correction audit.
+
+
+class CandidateProfile(Base):
+    """Versioned candidate document (contract 02)."""
+
+    __tablename__ = "candidate_profiles"
+    __table_args__ = (
+        UniqueConstraint("user_id", "persona_id", "version", name="uq_candidate_user_persona_version"),
+        Index("ix_candidate_user_current", "user_id", "persona_id", "is_current"),
+        Index("ix_candidate_user_state", "user_id", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    persona_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("personas.id"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    state: Mapped[str] = mapped_column(String(24), default="draft", nullable=False)  # draft|review_required|active|superseded|archived
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    document: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    document_sha256: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    source_document_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("resume_documents.id"), nullable=True)
+    source_extraction_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("resume_extractions.id"), nullable=True, index=True)
+    # review: {required, resolved, deferred, completed_at}
+    review: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    # completeness: {percent, required_filled, required_total, missing, uncertain, breakdown}
+    completeness: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    extraction_source: Mapped[str] = mapped_column(String(20), default="ai", nullable=True)
+    activated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    superseded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+class ProfileFieldProvenance(Base):
+    """Per-field provenance for a candidate profile (contract 02 § provenance)."""
+
+    __tablename__ = "profile_field_provenance"
+    __table_args__ = (
+        UniqueConstraint("user_id", "profile_id", "path", name="uq_provenance_user_profile_path"),
+        Index("ix_provenance_user_profile", "user_id", "profile_id"),
+        Index("ix_provenance_review_required", "review_required"),
+        Index("ix_provenance_path", "path"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    profile_id: Mapped[int] = mapped_column(Integer, ForeignKey("candidate_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    path: Mapped[str] = mapped_column(String(300), nullable=False)  # RFC6901 JSON Pointer
+    value_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    value_preview: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # null when sensitivity>=sensitive
+    origin: Mapped[str] = mapped_column(String(30), nullable=False)  # user|resume_extraction|ai_inferred|user_corrected|system
+    sensitivity: Mapped[str] = mapped_column(String(20), default="internal", nullable=False)  # public|internal|sensitive|restricted
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # null for user origin
+    confidence_band: Mapped[str] = mapped_column(String(10), default="none", nullable=False)  # high|medium|low|none
+    evidence: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)  # [{kind, quote, locator}]
+    extractor: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)  # {name, version, model, prompt_version}
+    source_document_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("resume_documents.id"), nullable=True)
+    source_extraction_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("resume_extractions.id"), nullable=True)
+    ambiguity: Mapped[str] = mapped_column(String(30), default="none", nullable=False)  # none|multiple_candidates|conflicting_sources|vague_text|missing_context
+    review_status: Mapped[str] = mapped_column(String(24), default="needs_review", nullable=False)  # auto_accepted|needs_review|confirmed|corrected|rejected|deferred
+    review_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    reviewed_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # user id or null for system
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    needs_answer_for: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+class ProfileFieldHistory(Base):
+    """Append-only audit of field changes (contract 02 § history)."""
+
+    __tablename__ = "profile_field_history"
+    __table_args__ = (
+        Index("ix_field_history_user_provenance", "user_id", "provenance_id"),
+        Index("ix_field_history_path", "path"),
+        Index("ix_field_history_occurred", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    provenance_id: Mapped[int] = mapped_column(Integer, ForeignKey("profile_field_provenance.id", ondelete="CASCADE"), nullable=False, index=True)
+    path: Mapped[str] = mapped_column(String(300), nullable=False)
+    previous_value_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    previous_value_preview: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    new_value_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    new_value_preview: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    origin_before: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    origin_after: Mapped[str] = mapped_column(String(30), nullable=False)
+    review_status_before: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    review_status_after: Mapped[str] = mapped_column(String(24), nullable=False)
+    actor_type: Mapped[str] = mapped_column(String(20), default="user", nullable=False)  # user|owner|system|ai
+    actor_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    event_id: Mapped[str] = mapped_column(String(36), nullable=False)  # UUID
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
 class Persona(Base):
     """
     A candidate *track* — e.g. "Data Analyst" and "Data Scientist" for the same
