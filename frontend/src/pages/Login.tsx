@@ -20,7 +20,7 @@ export default function Login() {
   // Send an already-authenticated visitor to the page they came from (or the
   // dashboard). This also performs the post-login redirect: a successful
   // sign-in sets `user`, which re-renders this route into the <Navigate>.
-  const from = (location.state as { from?: { pathname: string } } | null)?.from?.pathname || '/'
+  const from = (location.state as { from?: { pathname: string } } | null)?.from?.pathname || '/onboarding'
   if (!loading && user) return <Navigate to={from} replace />
 
   const bootstrapRequired = status?.bootstrap_required === true

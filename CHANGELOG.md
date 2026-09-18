@@ -2608,6 +2608,8 @@ opt-in (dry-run by default).
 
 ### Changed
 
+- Added a candidate-only, resumable `/onboarding` experience for resume upload and background extraction. It restores server-backed progress after refresh/navigation, keeps failures non-destructive, and never exposes owner/provider controls.
+
 - Dependency stack upgraded and audited: `pip-audit` reports no known
   vulnerabilities (up from 137 across 9 packages) and `npm audit` is clean.
 - `python-jose` replaced with `PyJWT` (drops the unmaintained `ecdsa`
