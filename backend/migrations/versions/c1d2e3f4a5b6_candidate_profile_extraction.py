@@ -9,7 +9,7 @@ Also preserves original evidence snippets, marks fields as confirmed/uncertain/m
 distinguishes resume-derived vs user-confirmed, allows corrections, completeness calculation.
 
 Revision ID: c1d2e3f4a5b6
-Revises: f6a7b8c9d0e1
+Revises: b8c9d0e1f2a3
 Create Date: 2026-09-18
 
 """
@@ -19,7 +19,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = 'c1d2e3f4a5b6'
-down_revision: Union[str, None] = 'f6a7b8c9d0e1'
+down_revision: Union[str, None] = 'b8c9d0e1f2a3'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -31,7 +31,25 @@ def _create_table(name: str, *columns, constraints: tuple = ()) -> None:
     op.create_table(name, *columns, *constraints)
 
 
+def _create_index_if_not_exists(index_name: str, table_name: str, columns: list) -> None:
+    bind = op.get_bind()
+    insp = sa.inspect(bind)
+    try:
+        existing = {idx["name"] for idx in insp.get_indexes(table_name)}
+    except Exception:
+        existing = set()
+    if index_name in existing:
+        return
+    op.create_index(index_name, table_name, columns)
+
+
 def upgrade() -> None:
+    bind = op.get_bind()
+    is_pg = bind.dialect.name == 'postgresql'
+    bool_false = sa.text('false') if is_pg else sa.text('0')
+    bool_true = sa.text('true') if is_pg else sa.text('1')
+    json_empty = sa.text("'{}'::json") if is_pg else sa.text("'{}'")
+
     _create_table(
         'candidate_profiles',
         sa.Column('id', sa.Integer(), nullable=False),
@@ -39,8 +57,8 @@ def upgrade() -> None:
         sa.Column('persona_id', sa.Integer(), nullable=True),
         sa.Column('version', sa.Integer(), nullable=False, server_default='1'),
         sa.Column('state', sa.String(length=24), nullable=False, server_default='draft'),
-        sa.Column('is_current', sa.Boolean(), nullable=False, server_default='false'),
-        sa.Column('document', sa.JSON(), nullable=False, server_default='{}'),
+        sa.Column('is_current', sa.Boolean(), nullable=False, server_default=bool_false),
+        sa.Column('document', sa.JSON(), nullable=False, server_default=json_empty),
         sa.Column('document_sha256', sa.String(length=64), nullable=False, server_default=''),
         sa.Column('source_document_id', sa.Integer(), nullable=True),
         sa.Column('source_extraction_id', sa.Integer(), nullable=True),
@@ -58,10 +76,10 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint('id'),
         sa.UniqueConstraint('user_id', 'persona_id', 'version', name='uq_candidate_user_persona_version'),
     )
-    op.create_index('ix_candidate_profiles_id', 'candidate_profiles', ['id'])
-    op.create_index('ix_candidate_profiles_user_id', 'candidate_profiles', ['user_id'])
-    op.create_index('ix_candidate_user_current', 'candidate_profiles', ['user_id', 'persona_id', 'is_current'])
-    op.create_index('ix_candidate_user_state', 'candidate_profiles', ['user_id', 'state'])
+    _create_index_if_not_exists('ix_candidate_profiles_id', 'candidate_profiles', ['id'])
+    _create_index_if_not_exists('ix_candidate_profiles_user_id', 'candidate_profiles', ['user_id'])
+    _create_index_if_not_exists('ix_candidate_user_current', 'candidate_profiles', ['user_id', 'persona_id', 'is_current'])
+    _create_index_if_not_exists('ix_candidate_user_state', 'candidate_profiles', ['user_id', 'state'])
 
     _create_table(
         'profile_field_provenance',
@@ -81,7 +99,7 @@ def upgrade() -> None:
         sa.Column('source_extraction_id', sa.Integer(), nullable=True),
         sa.Column('ambiguity', sa.String(length=30), nullable=False, server_default='none'),
         sa.Column('review_status', sa.String(length=24), nullable=False, server_default='needs_review'),
-        sa.Column('review_required', sa.Boolean(), nullable=False, server_default='true'),
+        sa.Column('review_required', sa.Boolean(), nullable=False, server_default=bool_true),
         sa.Column('reviewed_by', sa.Integer(), nullable=True),
         sa.Column('reviewed_at', sa.DateTime(), nullable=True),
         sa.Column('needs_answer_for', sa.JSON(), nullable=True),
@@ -94,11 +112,11 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint('id'),
         sa.UniqueConstraint('user_id', 'profile_id', 'path', name='uq_provenance_user_profile_path'),
     )
-    op.create_index('ix_profile_field_provenance_id', 'profile_field_provenance', ['id'])
-    op.create_index('ix_profile_field_provenance_user_id', 'profile_field_provenance', ['user_id'])
-    op.create_index('ix_provenance_user_profile', 'profile_field_provenance', ['user_id', 'profile_id'])
-    op.create_index('ix_provenance_review_required', 'profile_field_provenance', ['review_required'])
-    op.create_index('ix_provenance_path', 'profile_field_provenance', ['path'])
+    _create_index_if_not_exists('ix_profile_field_provenance_id', 'profile_field_provenance', ['id'])
+    _create_index_if_not_exists('ix_profile_field_provenance_user_id', 'profile_field_provenance', ['user_id'])
+    _create_index_if_not_exists('ix_provenance_user_profile', 'profile_field_provenance', ['user_id', 'profile_id'])
+    _create_index_if_not_exists('ix_provenance_review_required', 'profile_field_provenance', ['review_required'])
+    _create_index_if_not_exists('ix_provenance_path', 'profile_field_provenance', ['path'])
 
     _create_table(
         'profile_field_history',
@@ -123,11 +141,11 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(['provenance_id'], ['profile_field_provenance.id'], ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('id'),
     )
-    op.create_index('ix_profile_field_history_id', 'profile_field_history', ['id'])
-    op.create_index('ix_profile_field_history_user_id', 'profile_field_history', ['user_id'])
-    op.create_index('ix_field_history_user_provenance', 'profile_field_history', ['user_id', 'provenance_id'])
-    op.create_index('ix_field_history_path', 'profile_field_history', ['path'])
-    op.create_index('ix_field_history_occurred', 'profile_field_history', ['occurred_at'])
+    _create_index_if_not_exists('ix_profile_field_history_id', 'profile_field_history', ['id'])
+    _create_index_if_not_exists('ix_profile_field_history_user_id', 'profile_field_history', ['user_id'])
+    _create_index_if_not_exists('ix_field_history_user_provenance', 'profile_field_history', ['user_id', 'provenance_id'])
+    _create_index_if_not_exists('ix_field_history_path', 'profile_field_history', ['path'])
+    _create_index_if_not_exists('ix_field_history_occurred', 'profile_field_history', ['occurred_at'])
 
 
 def downgrade() -> None:

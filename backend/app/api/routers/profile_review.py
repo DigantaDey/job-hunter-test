@@ -12,7 +12,7 @@ All endpoints tenant-scoped.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -181,7 +181,7 @@ def get_completeness(user: CurrentUser, db: DbSession, profile_id: Optional[int]
         }
     # Fill missing definitions
     from app.services.candidate_profile import FIELD_DEFINITIONS
-    for k, defn in FIELD_DEFINITIONS.items():
+    for k, _defn in FIELD_DEFINITIONS.items():
         if k not in fields:
             fields[k] = {"value": None, "confidence": 0.0, "confidence_band": "none", "status": "missing", "review_required": True, "evidence": [], "evidence_quotes": []}
 

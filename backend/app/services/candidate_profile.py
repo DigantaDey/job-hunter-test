@@ -35,11 +35,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.contracts.vocabulary import (
-    CONFIDENCE_BAND_THRESHOLDS,
-    EVIDENCE_KINDS,
-    PROVENANCE_SOURCES,
-    REVIEW_STATUSES,
-    SENSITIVITY_LEVELS,
     confidence_band,
     requires_review,
 )
@@ -577,7 +572,7 @@ def _build_canonical_document(fields: Dict[str, Any]) -> Dict[str, Any]:
             for role, emp, date in zip(
                 get_val("roles") or [],
                 get_val("employers") or [],
-                get_val("dates") or [],
+                get_val("dates") or [], strict=False,
             )
         ] if get_val("roles") else [],
         "education": get_val("education") or [],
@@ -1197,7 +1192,7 @@ def correct_field(
                 "review_required": prov.review_required,
             }
         # Ensure all defined fields present
-        for k, d in FIELD_DEFINITIONS.items():
+        for k, _d in FIELD_DEFINITIONS.items():
             if k not in fields_for_comp:
                 fields_for_comp[k] = {"value": None, "confidence": 0.0, "confidence_band": "none", "status": "missing", "review_required": True}
 

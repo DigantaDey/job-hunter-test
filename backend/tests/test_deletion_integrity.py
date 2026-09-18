@@ -28,6 +28,7 @@ from app.models.models import (
     ApiKey,
     AuditLog,
     BillingEvent,
+    CandidateProfile,
     CompanyIntel,
     Email,
     EmailEvent,
@@ -45,6 +46,8 @@ from app.models.models import (
     Persona,
     PipelineJob,
     Profile,
+    ProfileFieldHistory,
+    ProfileFieldProvenance,
     RefreshToken,
     Resume,
     ResumeDocument,
@@ -96,6 +99,10 @@ CHILD_TABLES: dict[str, type] = {
     "onboarding_events": OnboardingEvent,
     "resume_documents": ResumeDocument,
     "resume_extractions": ResumeExtraction,
+    # Candidate profile extraction (v2.2.20): versioned document + provenance + history
+    "candidate_profiles": CandidateProfile,
+    "profile_field_provenance": ProfileFieldProvenance,
+    "profile_field_history": ProfileFieldHistory,
 }
 
 
@@ -185,6 +192,59 @@ def _seed_every_child_table(db, user: User) -> dict:
     job.applied_with_resume_id = resume.id
     email.persona_id = persona.id
     email.job_id = job.id
+    db.flush()
+
+    # Candidate profile v2 seed (must come before provenance/history because of FK)
+    cand_profile = CandidateProfile(
+        user_id=user.id,
+        persona_id=persona.id,
+        version=1,
+        state="active",
+        is_current=True,
+        document={"identity": {"full_name": "Test Candidate"}},
+        document_sha256="a" * 64,
+        review={"required": 0, "resolved": 0},
+        completeness={"percent": 100},
+        created_at=datetime.utcnow(),
+    )
+    db.add(cand_profile)
+    db.flush()
+    prov = ProfileFieldProvenance(
+        user_id=user.id,
+        profile_id=cand_profile.id,
+        path="/full_name",
+        value_hash="b" * 64,
+        value_preview="Test Candidate",
+        origin="resume_extraction",
+        sensitivity="public",
+        confidence=0.9,
+        confidence_band="high",
+        evidence=[{"kind": "text_span", "quote": "Test Candidate"}],
+        extractor={"name": "test"},
+        ambiguity="none",
+        review_status="confirmed",
+        review_required=False,
+        created_at=datetime.utcnow(),
+    )
+    db.add(prov)
+    db.flush()
+    hist = ProfileFieldHistory(
+        user_id=user.id,
+        provenance_id=prov.id,
+        path="/full_name",
+        previous_value_hash="c" * 64,
+        previous_value_preview="Old Name",
+        new_value_hash="b" * 64,
+        new_value_preview="Test Candidate",
+        origin_before="heuristic",
+        origin_after="resume_extraction",
+        review_status_before="needs_review",
+        review_status_after="confirmed",
+        actor_type="system",
+        event_id="00000000-0000-0000-0000-000000000001",
+        occurred_at=datetime.utcnow(),
+    )
+    db.add(hist)
     db.flush()
 
     for row in (

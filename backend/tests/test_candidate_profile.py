@@ -16,20 +16,19 @@ from __future__ import annotations
 
 import pytest
 
+from app.models.models import CandidateProfile, ProfileFieldHistory, ProfileFieldProvenance
 from app.services.candidate_profile import (
     FIELD_DEFINITIONS,
     REQUIRED_APPLICATION_FIELDS,
     build_completion_requirements,
     build_fields_from_legacy_profile,
     calculate_completeness,
-    correct_field,
-    safe_default_extraction,
     confirm_field,
-    persist_candidate_profile,
+    correct_field,
     get_current_profile,
+    persist_candidate_profile,
+    safe_default_extraction,
 )
-from app.models.models import CandidateProfile, ProfileFieldProvenance, ProfileFieldHistory
-
 
 # --------------------------------------------------------------------------- #
 # Helper: minimal resume text
@@ -63,7 +62,7 @@ def test_safe_default_extraction_all_missing():
     fields, doc, meta = safe_default_extraction("", source_document_id=None)
 
     # All fields should be missing
-    for key, defn in FIELD_DEFINITIONS.items():
+    for key, _defn in FIELD_DEFINITIONS.items():
         assert fields[key]["status"] == "missing"
         assert fields[key]["confidence"] == 0.0
         assert fields[key]["confidence_band"] == "none"
@@ -152,7 +151,7 @@ def test_completeness_calculation_weights():
 
     # All missing
     fields_missing = {}
-    for key, defn in FIELD_DEFINITIONS.items():
+    for key in FIELD_DEFINITIONS:
         fields_missing[key] = {
             "value": None,
             "confidence": 0.0,
@@ -168,7 +167,7 @@ def test_completeness_calculation_weights():
 def test_uncertain_extraction_low_confidence_cannot_populate_required():
     # Simulate low-confidence extraction for required field
     fields = {}
-    for key, defn in FIELD_DEFINITIONS.items():
+    for key, _defn in FIELD_DEFINITIONS.items():
         if key in REQUIRED_APPLICATION_FIELDS:
             fields[key] = {
                 "value": "some value",
@@ -201,7 +200,7 @@ def test_uncertain_extraction_low_confidence_cannot_populate_required():
 def test_conflicting_fields_detection():
     # Simulate conflicting evidence
     fields = {}
-    for key, defn in FIELD_DEFINITIONS.items():
+    for key, _defn in FIELD_DEFINITIONS.items():
         fields[key] = {
             "value": "Berlin" if key == "location" else None,
             "confidence": 0.5 if key == "location" else 0.0,
@@ -333,13 +332,12 @@ def test_api_review_endpoints(client, auth, owner):
     extraction_id = data["extraction"]["id"]
 
     # Run the extraction job synchronously
-    from tests.conftest import run_queue_item
+    # Need db session — use the app's SessionLocal
+    from app.db import SessionLocal
 
     # Find queue job
     from app.models.models import PipelineJob, ResumeExtraction
-
-    # Need db session — use the app's SessionLocal
-    from app.db import SessionLocal
+    from tests.conftest import run_queue_item
 
     db = SessionLocal()
     try:
