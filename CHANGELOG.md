@@ -4,6 +4,53 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.20] — 2026-09-18
+
+**Candidate profile extraction and review pipeline — every field now carries its own confidence, evidence, and audit trail.** The resume parser previously returned a flat JSON profile with no notion of how sure it was, where a value came from, or whether a human had confirmed it. Required application fields could be silently populated from low-confidence guesses, missing fields were invisible until an application failed, and a user correction erased the original AI evidence. This release implements the full extraction pipeline specified in contracts 02, 03 and 13: rich field-level provenance, structured completion requirements, safe defaults when AI is down, and a review API that preserves evidence forever.
+
+### Added
+
+- **Rich candidate profile extraction (`candidate_profile` service).** New module `app/services/candidate_profile.py` extracts and normalizes: roles/titles, employers, dates, skills, tools, industries, achievements, education, certifications, location, work authorization, sponsorship needs, remote preference, salary expectations, notice period, target roles. Each field returns `{value, confidence 0..1, confidence_band high≥0.85 medium≥0.60 low, evidence [{kind text_span, quote ≤500, locator {document_id, start, end}}], source, sensitivity, status confirmed/uncertain/missing/conflicting, review_required, value_hash, value_preview}`. Evidence quotes are verified against the source text where possible; missing evidence caps confidence to ≤0.6 (needs review). User-stated-only fields (work_auth, sponsorship, remote, salary, notice) are **never invented** from resume text — they are marked missing unless explicitly stated, with `ai_inferred` capped to 0.5 and forced to `needs_review`.
+
+- **Versioned `candidate_profiles` document (contract 02).** Table `candidate_profiles` with `version` monotonic per `(user_id, persona_id)`, `state` `draft → review_required → active → superseded → archived`, `is_current` unique per persona, `document` canonical JSON (identity/contact/summary/current_title/skills/tools/industries/experience/education/certifications/achievements/preferences/compensation/availability/eligibility/meta), `document_sha256`, `source_document_id`, `source_extraction_id`, `review {required,resolved,deferred,completed_at}`, `completeness {percent, required_filled, required_total, missing, uncertain, breakdown}`. Legacy `profiles` table stays for backward compat; new code writes both.
+
+- **Field-level provenance (`profile_field_provenance`).** Per-field row with `path` RFC6901 JSON Pointer, `value_hash` SHA256 canonical JSON, `value_preview` null when `sensitivity∈{sensitive,restricted}`, `origin` (`resume_extraction`, `ai_inferred`, `user_confirmed`, `user_corrected`, `heuristic`, etc.), `sensitivity` (`public`, `internal`, `sensitive`, `restricted`), `confidence` nullable for user origin, `confidence_band` derived via `confidence_band()`, `evidence` mandatory when confidence not null, `extractor {name,version,model,prompt_version}`, `ambiguity` (`none`, `multiple_candidates`, `conflicting_sources`, `vague_text`), `review_status` (`auto_accepted`, `needs_review`, `confirmed`, `corrected`, `rejected`, `deferred`), `review_required` indexed (`sensitivity∈{sensitive,restricted} OR band∈{low,none}`), `needs_answer_for`. `UNIQUE(user_id,profile_id,path)`. Bulk insert per version, update only via review/user edit appending history.
+
+- **Append-only field history (`profile_field_history`).** Every correction/confirmed/rejected appends a row with `previous_value_hash/preview`, `new_value_hash/preview`, `origin_before/after`, `review_status_before/after`, `actor_type` (`user`, `owner`, `system`, `ai`), `actor_id`, `reason`, `event_id` UUID, `occurred_at`. Values removed on erasure. Original evidence snippets are **never deleted** — they stay in history.
+
+- **Completeness calculation based on actual product needs.** Weights: core identity (name 10, email 10, location 5) 25%, work eligibility (work_auth 10, sponsorship 5) 15%, professional (roles 10, employers 5, dates 5, skills 15) 35%, additional (tools 2, industries 2, achievements 2, education 2, certs 2) 10%, preferences (remote 3, salary 4, notice 3, target_roles 5) 15%. Confirmed = full weight, uncertain/conflicting = 0.5/0.3, missing = 0. Tracks `required_filled`/`required_confirmed` for `REQUIRED_APPLICATION_FIELDS` (full_name, email, location, roles, employers, dates, skills, work_authorization, target_roles).
+
+- **Structured completion requirements.** `build_completion_requirements()` returns sorted list of `{field, label, type, required, status, confidence, band, evidence, candidates, message}` — required first, then missing > conflicting > uncertain. For conflicting, `candidates` holds distinct evidence quotes. Message is human: "X is missing and is required for applications" / "extracted with low confidence (0.42) and needs review" / "has conflicting values and needs resolution".
+
+- **Safe defaults when AI unavailable.** `safe_default_extraction()` returns all fields missing with `confidence 0.0 band none status missing review_required True`, completeness 0%, `safe_default True`, message "AI unavailable — all fields marked missing, manual input required." `ai_extract_candidate_profile()` raises `AIUnavailableError` on empty text; caller (API and onboarding) falls back to safe defaults, so no required field is ever invented. Uses existing `ai_client.chat_completion` with `db`+`user_id` for provider-reported usage accounting (`ai_credit_ledger`).
+
+- **Profile review API (`/api/profile`).** New router `profile_review.py`:
+  - `GET /api/profile` — current candidate profile document.
+  - `GET /api/profile/review?profile_id=&only_needs_review=&persona_id=` — whole-document return per contract 13 with `fields[] {provenance_id, path, value_masked, value_preview, value_hash, origin, sensitivity, confidence, band, evidence, review_status, review_required, ambiguity, needs_answer_for, candidates, used_by}`, `completeness`, `review`, `server_time`.
+  - `POST /api/profile/review/resolve` — `confirm | correct | reject | defer` per field (defer refused for restricted). Returns updated review doc + `invalidated_answers`.
+  - `POST /api/profile/review/correct` — shortcut for correction, preserves original evidence.
+  - `GET /api/profile/completeness` — completeness + completion_requirements + required_fields.
+  - `GET /api/profile/history?profile_id=&path=` — audit trail who changed field and when.
+  - `POST /api/profile/extract` — trigger extraction from text or `resume_document_id`, with safe-default fallback on AI outage.
+  All tenant-scoped, audited (`profile.created`, `profile.updated`, `profile.review_completed`).
+
+- **Onboarding integration.** `apply_extraction_success` now also builds v2 candidate fields from legacy profile + source text via `build_fields_from_legacy_profile()` (preserves evidence snippets, marks user-stated fields missing) and persists to `candidate_profiles` + provenance idempotently on `source_extraction_id`. Legacy `POST /api/resume/upload` does the same, so both upload paths create the new tables.
+
+- **Migration `c1d2e3f4a5b6_candidate_profile_extraction`.** Creates `candidate_profiles`, `profile_field_provenance`, `profile_field_history` with indexes and FKs, idempotent create-if-not-exists.
+
+- **Frontend Profile Review (`/profile-review`).** New page `ProfileReview.tsx` shows completeness percent with breakdown, structured completion requirements sorted required-first (missing/conflicting/uncertain with human messages and candidate chips), fields needing review with confidence bands (high/medium/low/none), evidence snippets with kind/locator, origin label (resume vs user-confirmed vs corrected), sensitivity badge with masking for sensitive/restricted, conflicting candidates as selectable corrections, actions confirm/correct/reject with inline edit preserving original evidence, history drawer showing who changed field and when (actor_type/id, reason, event_id). Route added in `App.tsx`, nav entry in `Layout.tsx`.
+
+### Changed
+
+- `GET /api/profile/current` still serves legacy `profiles` table, but new `GET /api/profile` serves v2 document. Both coexist until frontend migration.
+- Completeness now drives `candidate_profiles.state`: `review_required` when any field needs review, else `draft`, becomes `active` when all reviewed.
+
+### Tests
+
+- `tests/test_candidate_profile.py` (10 tests): safe defaults all missing with structured requirements; legacy conversion preserves evidence and never invents work_auth/salary; completeness 100% vs 0%; low-confidence required field stays uncertain and in requirements; conflicting detection with candidates; persist + correct preserves original evidence in history with actor audit; user_confirmed distinction (resume_extraction → user_confirmed); API review endpoints (GET review, resolve correct, history, completeness); safe default on scripted 503 outage; low-confidence cannot silently populate required (masked sensitive, needs_review).
+
+- Existing suites green: `test_onboarding_flow` 14, `test_resumes_and_scoring` 16, `test_ai_client_and_resume` 6.
+
 ## [2.2.19] — 2026-09-18
 
 **Onboarding became resumable: the resume upload no longer holds an HTTP request

@@ -18,6 +18,7 @@ import Analytics from './pages/Analytics'
 import Interview from './pages/Interview'
 import Notifications from './pages/Notifications'
 import Personas from './pages/Personas'
+import ProfileReview from './pages/ProfileReview'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
@@ -80,6 +81,14 @@ export function AppRoutes() {
             element={
               <ErrorBoundary scope="route" resetKey={location.pathname}>
                 <Personas />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/profile-review"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <ProfileReview />
               </ErrorBoundary>
             }
           />

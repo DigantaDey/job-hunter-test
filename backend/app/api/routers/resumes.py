@@ -295,6 +295,28 @@ async def upload_resume(request: Request, user: CurrentUser, db: DbSession, file
         db.commit()
         db.refresh(profile)
 
+        # Also create v2 candidate profile with provenance
+        try:
+            from app.services import candidate_profile as cp_service
+            fields, cand_doc, cand_meta = cp_service.build_fields_from_legacy_profile(
+                profile_data, source_text=text, source_document_id=None, meta=meta
+            )
+            # Check existing current and supersede
+            from app.models.models import CandidateProfile
+            existing_cand = db.query(CandidateProfile).filter(
+                CandidateProfile.user_id == user.id, CandidateProfile.is_current.is_(True)
+            ).first()
+            if existing_cand:
+                # Persist will handle superseding
+                pass
+            cp_service.persist_candidate_profile(
+                db, user.id, fields, cand_doc, cand_meta,
+                source_document_id=None, source_extraction_id=None, persona_id=None,
+            )
+            db.commit()
+        except Exception as exc:
+            log.warning("failed to create candidate profile v2 in legacy upload for user %s: %s", user.id, exc)
+
         invalidate_context(user.id)
         _set_progress(user.id, "context", "Building search context…", 95)
         context = await search_context(db, user.id, force_refresh=True)

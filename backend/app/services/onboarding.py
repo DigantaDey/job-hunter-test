@@ -957,12 +957,48 @@ def apply_extraction_success(
     Order matters: every durable write happens before the queue item is
     allowed to complete, and the guard at the top of the handler means this
     function runs at most once per extraction row.
+
+    Also creates the v2 candidate profile with field-level provenance.
     """
     profile_data = dict(profile_data or {})
     profile_data["raw_text"] = (text or "")[:20000]
 
     resume = _resume_upsert(db, user.id, document, profile_data, layout)
     profile = _profile_upsert(db, user.id, extraction, profile_data, layout, resume.id)
+
+    # --- v2 candidate profile with provenance ---
+    try:
+        from app.services import candidate_profile as cp_service
+
+        # Build rich fields from legacy data + source text
+        fields, cand_doc, cand_meta = cp_service.build_fields_from_legacy_profile(
+            profile_data, source_text=text, source_document_id=document.id, meta=meta
+        )
+        # Merge meta tokens/model from legacy extraction
+        cand_meta["model"] = cand_meta.get("model") or meta.get("model")
+        cand_meta["tokens"] = cand_meta.get("tokens") or meta.get("usage") or {}
+
+        # Check if candidate profile already exists for this extraction (idempotent)
+        from app.models.models import CandidateProfile
+
+        existing_cand = (
+            db.query(CandidateProfile)
+            .filter(CandidateProfile.user_id == user.id, CandidateProfile.source_extraction_id == extraction.id)
+            .first()
+        )
+        if not existing_cand:
+            cp_service.persist_candidate_profile(
+                db,
+                user.id,
+                fields,
+                cand_doc,
+                cand_meta,
+                source_document_id=document.id,
+                source_extraction_id=extraction.id,
+                persona_id=None,
+            )
+    except Exception as exc:  # pragma: no cover - candidate profile is additive, must not break legacy flow
+        log.warning("failed to create candidate profile v2 for extraction %s: %s", extraction.id, exc)
 
     output_json = json.dumps(profile_data, sort_keys=True, default=str)
     was_succeeded = extraction.state == "succeeded"
