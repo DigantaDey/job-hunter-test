@@ -20,7 +20,8 @@ from app.services.form_detector import detect_form_structure as _detect_form_str
 from app.services.sources import fetch_all, list_sources
 
 # Re-exported for backwards compatibility
-KNOWN_SOURCES = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "workday",
+KNOWN_SOURCES = ["greenhouse", "lever", "ashby", "workable", "recruitee", "smartrecruiters",
+                 "personio", "workday",
                  "remotive", "arbeitnow", "jobicy", "remoteok", "himalayas", "themuse",
                  "weworkremotely", "adzuna", "jooble", "usajobs",
                  "linkedin", "indeed", "naukri", "instahyre"]

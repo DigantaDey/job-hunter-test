@@ -30,6 +30,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -78,6 +79,80 @@ WHY_NO_FRESH_POSTINGS = "no_fresh_postings"
 #: no-op *by design* — not an outage, not a quiet market, and never an
 #: over-limit insert. The fix is delete jobs or upgrade the plan.
 WHY_JOBS_CAP_REACHED = "jobs_cap_reached"
+
+
+def _canonical_key(posting: Dict[str, Any]) -> str:
+    """Canonical job identity used to merge duplicates.
+
+    Prefer the adapter's ``canonical_id`` / ``dedupe_key`` (``source:external_id``
+    when the source has a stable id). Fall back to the historical
+    ``external_id`` / ``company|title`` shapes so a row written before this
+    release still matches a re-fetch of the same posting.
+    """
+    for candidate in (posting.get("canonical_id"), posting.get("dedupe_key")):
+        text = str(candidate or "").strip().lower()
+        if text:
+            return text[:280]
+    source = str(posting.get("source") or "").strip()
+    external = str(posting.get("external_id") or "").strip()
+    if external:
+        return (f"{source}:{external}" if source else external).lower()[:280]
+    company = str(posting.get("company") or "").strip()
+    title = str(posting.get("title") or "").strip()
+    return f"{company}|{title}".lower()[:280]
+
+
+def _lookup_keys(posting: Dict[str, Any]) -> List[str]:
+    """Canonical key plus the two historical shapes, for matching existing rows."""
+    canonical = _canonical_key(posting)
+    keys = [canonical]
+    external = str(posting.get("external_id") or "").strip().lower()[:280]
+    if external and external not in keys:
+        keys.append(external)
+    company = str(posting.get("company") or "").strip()
+    title = str(posting.get("title") or "").strip()
+    legacy = f"{company}|{title}".lower()[:280]
+    if legacy not in ("|", "") and legacy not in keys:
+        keys.append(legacy)
+    return keys
+
+
+def _is_expired_candidate(posting: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    if posting.get("expired"):
+        return True
+    expires_at = posting.get("expires_at")
+    if isinstance(expires_at, datetime) and expires_at <= (now or datetime.utcnow()):
+        return True
+    return False
+
+
+def _store_raw_payload(job: Job, candidate: Dict[str, Any]) -> None:
+    """Keep the compact source payload on the job, never inside ``extra``."""
+    raw = candidate.get("raw") if isinstance(candidate.get("raw"), dict) else None
+    if raw:
+        job.raw_payload = dict(raw)
+
+
+def _merge_existing_job(job: Job, candidate: Dict[str, Any], now: datetime) -> None:
+    """Update timestamps / description on a job we already have. Never rewrite first_seen."""
+    job.last_seen_at = now
+    job.last_verified_at = now
+    if _is_expired_candidate(candidate, now):
+        job.expired = True
+        job.expired_at = job.expired_at or now
+    elif job.expired:
+        job.expired = False
+        job.expired_at = None
+    incoming_description = str(candidate.get("description") or "")
+    if len(incoming_description) > len(job.description or ""):
+        job.description = incoming_description[:6000]
+    if candidate.get("url") and not job.url:
+        job.url = str(candidate["url"])[:1000]
+    if candidate.get("content_hash") and not job.content_hash:
+        job.content_hash = str(candidate["content_hash"])[:64]
+    if candidate.get("source_kind") and not job.source_kind:
+        job.source_kind = str(candidate["source_kind"])[:16]
+    _store_raw_payload(job, candidate)
 
 
 def _demo_pool_enabled() -> bool:
@@ -285,18 +360,31 @@ async def discover_for_user(
     # ---------------- de-duplicate within the batch ----------------
     unique: List[Dict[str, Any]] = []
     seen: set[str] = set()
+    seen_hash: set[str] = set()
     for posting in postings:
-        key = (posting.get("external_id") or f"{posting['company']}|{posting['title']}").lower()[:280]
+        key = _canonical_key(posting)
         posting["dedupe_key"] = key
+        posting.setdefault("canonical_id", key)
         if key in seen:
             continue
+        content_hash = str(posting.get("content_hash") or "")
+        if content_hash and content_hash in seen_hash:
+            continue
         seen.add(key)
+        if content_hash:
+            seen_hash.add(content_hash)
         unique.append(posting)
 
     # ---------------- freshness window ----------------
     cutoff = started - timedelta(hours=max(1, freshness_hours))
-    fresh = [p for p in unique if not p.get("posted_at") or p["posted_at"] >= cutoff]
-    older = [p for p in unique if p.get("posted_at") and p["posted_at"] < cutoff]
+    # Expired postings are never fresh matches, even if they still have a recent
+    # posted_at (a source can list a closed role).
+    live_unique = [p for p in unique if not _is_expired_candidate(p, started)]
+    expired_dropped = len(unique) - len(live_unique)
+    if expired_dropped:
+        report["expired_dropped"] = expired_dropped
+    fresh = [p for p in live_unique if not p.get("posted_at") or p["posted_at"] >= cutoff]
+    older = [p for p in live_unique if p.get("posted_at") and p["posted_at"] < cutoff]
     if len(fresh) < max(3, limit // 3) and older:
         shortfall = max(3, limit // 3) - len(fresh)
         for posting in older[:shortfall]:
@@ -310,12 +398,62 @@ async def discover_for_user(
     fresh.sort(key=lambda p: p.get("posted_at") or datetime.min, reverse=True)
     candidates = fresh[: max(limit * 2, 40)]
 
-    # Drop exact duplicates that already exist for this user.
+    # Merge postings we already have (update last_seen / last_verified) rather
+    # than presenting them as fresh matches. Look up by canonical key and by
+    # content hash so a cross-source duplicate does not become a second row.
     existing_keys = {
         row[0]
         for row in db.query(Job.dedupe_key).filter(Job.user_id == user.id, Job.dedupe_key != "").all()
     }
-    candidates = [c for c in candidates if c["dedupe_key"] not in existing_keys]
+    existing_hashes = {
+        row[0]
+        for row in db.query(Job.content_hash).filter(
+            Job.user_id == user.id, Job.content_hash != "", Job.content_hash.isnot(None),
+        ).all()
+        if row[0]
+    }
+    to_merge = [
+        c for c in candidates
+        if any(key in existing_keys for key in _lookup_keys(c))
+        or (c.get("content_hash") and c["content_hash"] in existing_hashes)
+    ]
+    candidates = [
+        c for c in candidates
+        if not any(key in existing_keys for key in _lookup_keys(c))
+        and not (c.get("content_hash") and c["content_hash"] in existing_hashes)
+    ]
+    if to_merge:
+        merge_keys = [key for c in to_merge for key in _lookup_keys(c)]
+        merge_hashes = [str(c.get("content_hash") or "") for c in to_merge if c.get("content_hash")]
+        clauses = [Job.dedupe_key.in_(merge_keys)]
+        if merge_hashes:
+            clauses.append(Job.content_hash.in_(merge_hashes))
+        rows = (
+            db.query(Job)
+            .filter(Job.user_id == user.id)
+            .filter(or_(*clauses))
+            .all()
+        )
+        by_key = {row.dedupe_key: row for row in rows}
+        by_hash = {row.content_hash: row for row in rows if row.content_hash}
+        merged_now = started
+        for candidate in to_merge:
+            job = None
+            for key in _lookup_keys(candidate):
+                job = by_key.get(key)
+                if job is not None:
+                    break
+            if job is None:
+                job = by_hash.get(str(candidate.get("content_hash") or ""))
+            if job is None:
+                continue
+            _merge_existing_job(job, candidate, merged_now)
+        try:
+            db.commit()
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.warning("discovery merge of existing jobs failed: %s", exc)
+        report["duplicates_merged"] = len(to_merge)
 
     # ---------------- score / classify ----------------
     # The batch slice gets exactly what the per-job path (``/intelligence``)
@@ -352,14 +490,20 @@ async def discover_for_user(
     # Clamp to the storage headroom (``None`` = unlimited): a nearly-full
     # board fills exactly its remaining slots and never overshoots jobs_max.
     batch_limit = limit if jobs_remaining is None else min(limit, jobs_remaining)
+    seen_at = datetime.utcnow()
     for candidate in ranked[:batch_limit]:
+        if _is_expired_candidate(candidate, seen_at):
+            continue
+        incoming_raw = candidate.get("raw")
+        raw_payload: Dict[str, Any] = dict(incoming_raw) if isinstance(incoming_raw, dict) else {}
         job = Job(
             user_id=user.id,
             title=candidate["title"],
             company=candidate["company"],
             # SQL-side company filter identity (see Job model / migration
             # e5f6a7b8c9d0) — stored at import time, not derived per query.
-            company_name_normalized=normalize_company_name(candidate["company"]),
+            company_name_normalized=candidate.get("company_name_normalized")
+            or normalize_company_name(candidate["company"]),
             location=candidate.get("location", ""),
             description=candidate.get("description", ""),
             url=candidate.get("url", ""),
@@ -380,6 +524,14 @@ async def discover_for_user(
             freshness_hours=freshness_hours,
             extra={"salary": candidate.get("salary", ""), "remote": candidate.get("remote", False),
                    "freshness_relaxed": candidate.get("freshness_relaxed", False), "forms": {}},
+            first_seen_at=seen_at,
+            last_seen_at=seen_at,
+            last_verified_at=seen_at,
+            expired=False,
+            source_kind=str(candidate.get("source_kind") or "")[:16],
+            content_hash=str(candidate.get("content_hash") or "")[:64],
+            title_normalized=str(candidate.get("title_normalized") or candidate["title"]).strip().lower()[:300],
+            raw_payload=dict(raw_payload),
         )
         db.add(job)
         try:

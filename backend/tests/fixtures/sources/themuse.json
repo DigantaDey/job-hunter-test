@@ -1,0 +1,12 @@
+{
+  "results": [{
+    "id": 44,
+    "name": "Backend Engineer",
+    "company": {"name": "MuseCo"},
+    "refs": {"landing_page": "https://www.themuse.com/jobs/44"},
+    "locations": [{"name": "Remote"}],
+    "contents": "<p>Python</p>",
+    "publication_date": "2024-05-01T00:00:00Z",
+    "levels": [{"name": "Senior"}]
+  }]
+}

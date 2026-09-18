@@ -142,6 +142,7 @@ SOURCE_API_DOMAINS: FrozenSet[str] = frozenset({
     "adzuna.com", "apollo.io", "arbeitnow.com", "ashbyhq.com", "clearbit.com",
     "crunchbase.com", "greenhouse.io", "himalayas.app", "hunter.io", "jobicy.com",
     "jooble.org", "lever.co", "myworkdaysite.com", "remoteok.com", "remotive.com",
+    "personio.com", "personio.de", "recruitee.com",
     "sec.gov", "smartrecruiters.com", "tavily.com", "themuse.com", "tracxn.io",
     "usajobs.gov", "weworkremotely.com", "workable.com",
 })

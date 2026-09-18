@@ -1,0 +1,8 @@
+[{
+  "id": "abc",
+  "text": "Senior Python Engineer",
+  "hostedUrl": "https://jobs.lever.co/acme/abc",
+  "createdAt": 1700000000000,
+  "descriptionPlain": "Python, Kubernetes",
+  "categories": {"location": "Remote", "team": "Platform", "commitment": "Full-time"}
+}]

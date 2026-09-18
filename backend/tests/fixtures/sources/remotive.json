@@ -1,0 +1,13 @@
+{
+  "jobs": [{
+    "id": 9,
+    "url": "https://remotive.com/jobs/9",
+    "title": "Python Developer",
+    "company_name": "Acme",
+    "candidate_required_location": "Anywhere",
+    "publication_date": "2024-05-01T00:00:00",
+    "description": "<p>python</p>",
+    "category": "Software Development",
+    "job_type": "full_time"
+  }]
+}

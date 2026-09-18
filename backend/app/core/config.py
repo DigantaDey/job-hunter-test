@@ -50,6 +50,8 @@ LIVE_SOURCES = (
     "ashby",
     "smartrecruiters",
     "workable",
+    "recruitee",
+    "personio",
     "arbeitnow",
     "himalayas",
     "jobicy",
@@ -202,7 +204,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------ #
     app_name: str = "JobHunter AI"
-    version: str = "2.2.20"
+    version: str = "2.2.21"
     environment: str = "development"
     debug: bool = False
     public_base_url: str = "http://localhost:8000"
@@ -454,7 +456,9 @@ class Settings(BaseSettings):
     lever_board_tokens: List[str] = Field(default_factory=list)
     ashby_board_tokens: List[str] = Field(default_factory=list)
     workable_board_tokens: List[str] = Field(default_factory=list)
+    recruitee_board_tokens: List[str] = Field(default_factory=list)
     smartrecruiters_board_tokens: List[str] = Field(default_factory=list)
+    personio_board_tokens: List[str] = Field(default_factory=list)
     #: "host|tenant|site" triples for the Workday union API.
     workday_board_tokens: List[str] = Field(default_factory=list)
 
@@ -618,7 +622,9 @@ class Settings(BaseSettings):
         "lever_board_tokens",
         "ashby_board_tokens",
         "workable_board_tokens",
+        "recruitee_board_tokens",
         "smartrecruiters_board_tokens",
+        "personio_board_tokens",
         mode="before",
     )
     @classmethod

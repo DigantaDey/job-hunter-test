@@ -395,12 +395,12 @@ async def test_discovery_batch_survives_one_failing_insert(client, auth, db, upl
     monkeypatch.setattr(source_registry, "fetch_all", fake_fetch_all)
 
     # Simulate the unique-constraint race: the insert of the ``bad1`` row
-    # loses to a concurrent writer and fails. Only that one row. (The
-    # candidate's ``dedupe_key`` is its lower-cased ``external_id``.)
+    # loses to a concurrent writer and fails. Only that one row. Canonical
+    # identity is ``source:external_id`` (``lever:bad1``).
     real_commit = db.commit
 
     def flaky_commit(*args, **kwargs):
-        if any(isinstance(o, Job) and getattr(o, "dedupe_key", "") == "bad1"
+        if any(isinstance(o, Job) and getattr(o, "dedupe_key", "") == "lever:bad1"
                for o in list(db.new)):
             raise IntegrityError("INSERT INTO jobs ...", {},
                                  sqlite3.IntegrityError("UNIQUE constraint failed: jobs.dedupe_key"))
@@ -424,13 +424,13 @@ async def test_discovery_batch_survives_one_failing_insert(client, auth, db, upl
     assert "why_empty" not in report
     # …and the bad one was recorded per row, not fatal to the run.
     assert len(report["insert_errors"]) == 1, report.get("insert_errors")
-    assert report["insert_errors"][0]["dedupe_key"] == "bad1"
+    assert report["insert_errors"][0]["dedupe_key"] == "lever:bad1"
     assert report["insert_errors"][0]["company"] == "PayCo"
     assert "UNIQUE constraint failed" in report["insert_errors"][0]["error"]
 
     db.expire_all()
     rows = db.query(Job).filter(Job.user_id == user.id).all()
-    assert {r.dedupe_key for r in rows} == {"good1", "good2"}
+    assert {r.dedupe_key for r in rows} == {"lever:good1", "lever:good2"}
 
     # The run report is what the empty-board read and the queue row surface —
     # it must not claim the bad job landed.

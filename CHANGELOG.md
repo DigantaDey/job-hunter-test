@@ -4,6 +4,58 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.21] — 2026-09-18
+
+**Job discovery talks to sources through one interface, and every posting is
+the same shape.** Adapters already fetched Greenhouse, Lever, Ashby, Workable,
+SmartRecruiters and the public job APIs, but identity, throttling, retries,
+freshness and errors were ad-hoc — a duplicate from two boards became two
+rows, a closed posting could still look fresh, and a noisy source could stall
+the rest of a run. This release wraps every adapter in a stable `Source`
+contract (identity, capabilities, fetch/pagination, rate limits, retry,
+freshness, canonicalization, error classification, health), stores the compact
+raw payload next to the normalised job (never in `jobs.extra`), and adds the
+public Recruitee and Personio ATS feeds. Gated boards (LinkedIn, Indeed,
+Naukri, Instahyre) stay unavailable with `code=gated`. A failing source still
+never stops the others.
+
+### Added
+
+- **Stable source interface** (`app/services/sources/base.py`): `Source`
+  identity + `SourceCapabilities`, `fetch` / `fetch_page`, `RateLimitPolicy`,
+  `RetryPolicy`, `FreshnessPolicy`, `Posting.canonical_id` /
+  `content_hash`, closed `SourceError.code` vocabulary, in-process health.
+- **Source-level throttle** (`throttle.py`) on top of per-host HTTP politeness,
+  so two Recruitee subdomains share one adapter budget.
+- **Recruitee and Personio board adapters.** Recruitee:
+  `GET https://{token}.recruitee.com/api/offers`. Personio:
+  `GET https://{company}.jobs.personio.de/xml` with `.com` fallback.
+  Config: `RECRUITEE_BOARD_TOKENS` / `PERSONIO_BOARD_TOKENS`.
+- **Job lifecycle columns** (migration `d2e3f4a5b6c7`): `first_seen_at` /
+  `last_seen_at` / `last_verified_at`, `expired` / `expired_at`, `source_kind`,
+  `content_hash`, `title_normalized`, `raw_payload` JSON. `discovered_at` stays
+  insert-only. Re-seen postings merge (update last seen / last verified,
+  un-expire if the source lists them again) instead of inserting a second row.
+- **Hermetic adapter fixtures** under `backend/tests/fixtures/sources/` and
+  `tests/test_source_adapters.py` — every adapter parses a recorded payload
+  with no network.
+
+### Changed
+
+- Discovery dedupes by canonical identity (`source:external_id`, else
+  `company:title`) and still matches historical `external_id` /
+  `company|title` keys so existing rows merge instead of duplicating.
+- Expired postings are never inserted as fresh matches (and are not counted
+  in `fresh`). `GET /api/jobs` is unchanged — expired rows are not hidden.
+- `LIVE_SOURCES`, `KNOWN_SOURCES` and `SOURCE_API_DOMAINS` include Recruitee
+  and Personio (`recruitee.com`, `personio.de`, `personio.com`).
+
+### Tests
+
+- Existing discovery / source suites still pass. New adapter tests assert the
+  shared `Posting` schema, canonical merge, expired-not-fresh, and that one
+  failing source leaves the others intact.
+
 ## [2.2.20] — 2026-09-18
 
 **Candidate profile extraction and review pipeline — every field now carries its own confidence, evidence, and audit trail.** The resume parser previously returned a flat JSON profile with no notion of how sure it was, where a value came from, or whether a human had confirmed it. Required application fields could be silently populated from low-confidence guesses, missing fields were invisible until an application failed, and a user correction erased the original AI evidence. This release implements the full extraction pipeline specified in contracts 02, 03 and 13: rich field-level provenance, structured completion requirements, safe defaults when AI is down, and a review API that preserves evidence forever.

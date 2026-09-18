@@ -1,0 +1,14 @@
+{
+  "results": [{
+    "id": "ad-1",
+    "title": "Python Developer",
+    "company": {"display_name": "AdzunaCo"},
+    "redirect_url": "https://www.adzuna.com/ad-1",
+    "location": {"display_name": "London"},
+    "description": "Python FastAPI",
+    "created": "2024-05-01T00:00:00Z",
+    "salary_min": 50000,
+    "salary_max": 70000,
+    "category": {"label": "IT"}
+  }]
+}

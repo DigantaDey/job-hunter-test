@@ -1,0 +1,23 @@
+{
+  "offers": [{
+    "id": 77,
+    "slug": "backend-engineer",
+    "title": "Backend Engineer",
+    "company_name": "Acme",
+    "city": "Amsterdam",
+    "country_code": "NL",
+    "description": "Python FastAPI",
+    "published_at": "2024-05-01T00:00:00Z",
+    "remote": true,
+    "status": "published",
+    "department": "Eng",
+    "careers_url": "https://acme.recruitee.com/o/backend-engineer"
+  }, {
+    "id": 78,
+    "title": "Closed Role",
+    "company_name": "Acme",
+    "description": "gone",
+    "published_at": "2024-05-01T00:00:00Z",
+    "status": "closed"
+  }]
+}

@@ -1,0 +1,12 @@
+{
+  "jobs": [{
+    "id": "jo-1",
+    "title": "Backend",
+    "company": "JoobleCo",
+    "link": "https://jooble.org/j/1",
+    "location": "Remote",
+    "snippet": "python",
+    "updated": "2024-05-01",
+    "salary": "80k"
+  }]
+}

@@ -1,0 +1,13 @@
+{
+  "data": [{
+    "slug": "x",
+    "title": "Backend Engineer",
+    "company_name": "Beta",
+    "location": "Berlin",
+    "url": "https://arbeitnow.com/x",
+    "remote": true,
+    "description": "<b>python</b>",
+    "created_at": 1700000000,
+    "tags": ["python"]
+  }]
+}

@@ -1,0 +1,12 @@
+{
+  "jobs": [{
+    "id": 101,
+    "title": "Backend Engineer",
+    "absolute_url": "https://boards.greenhouse.io/acme/jobs/101",
+    "location": {"name": "Remote"},
+    "content": "&lt;p&gt;Python and FastAPI&lt;/p&gt;",
+    "updated_at": "2024-05-01T10:00:00-04:00",
+    "company_name": "Acme",
+    "departments": [{"name": "Eng"}]
+  }]
+}

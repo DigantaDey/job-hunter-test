@@ -1,0 +1,12 @@
+[
+  {"legal": "notice"},
+  {
+    "id": "1",
+    "position": "Python Engineer",
+    "company": "Acme",
+    "url": "https://remoteok.com/1",
+    "description": "python",
+    "date": "2024-05-01T00:00:00",
+    "tags": ["python"]
+  }
+]
