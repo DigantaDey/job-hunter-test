@@ -177,10 +177,13 @@ export default function Jobs(){
           <option value="">All status</option>
           <option value="discovered">Discovered</option>
           <option value="queued">Queued</option>
+          <option value="preparing">Preparing</option>
           <option value="needs_input">Needs Input</option>
-          <option value="applying">Applying</option>
+          <option value="ready_to_apply">Ready to apply</option>
           <option value="applied">Applied</option>
+          <option value="rejected">Rejected</option>
           <option value="failed">Failed</option>
+          <option value="skipped">Skipped</option>
         </select>
         <select value={filter.source} onChange={e=>setFilter({...filter, source:e.target.value})} className="text-sm border rounded-full px-3 py-2 bg-white dark:bg-zinc-900 dark:border-zinc-700 min-h-[44px]">
           <option value="">All sources</option>

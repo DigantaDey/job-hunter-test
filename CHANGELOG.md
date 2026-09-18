@@ -4,6 +4,57 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [2.2.18] — 2026-09-18
+
+**Canonical domain contracts specified across backend, frontend, and architecture documentation.**
+The system's shared domain model was previously scattered across inline string literals in
+services, routers, and React components. A comprehensive contract specification (15 documents
+in `docs/contracts/` plus index), a machine-readable Python contract package (`app.contracts`),
+and a TypeScript frontend mirror (`frontend/src/lib/contracts.ts`) now establish single sources
+of truth for onboarding, candidate profiles, resume extractions, normalized job postings, match
+results, application lifecycle state machines, automation policies, background job execution,
+and domain events.
+
+### Fixed
+
+- **Funnel analytics no longer drops in-flight and skipped jobs.** `GET /api/analytics/funnel`
+  previously hard-coded stages `["discovered", "queued", "needs_input", "applying", "applied", "failed", "emailed"]`.
+  Because `applying` and `emailed` were never written to `Job.status` by any pipeline, their buckets
+  were permanently 0. Meanwhile, `preparing`, `ready_to_apply`, and `skipped` (all actively written
+  by `services/apply_flow.py` and `api/routers/jobs.py`) were omitted, causing active applications
+  and user-skipped postings to disappear entirely from funnel counts. The funnel now derives its
+  stages directly from `JOB_STATUSES`, tracks unclassified rows explicitly, and includes all
+  active stages in the conversion denominator.
+
+- **`models.py` status documentation updated to match reality.** Corrected stale inline comments
+  on `Job.status` (which referenced ghost states `applying` and `emailed` while omitting `preparing`,
+  `ready_to_apply`, and `skipped`) and `Email.status` (which omitted `dry_run` and `opened` written
+  by `services/outreach.py`).
+
+- **Jobs page filter dropdown aligned with backend status reality.** `frontend/src/pages/Jobs.tsx`
+  status select previously offered the dead option `applying` and lacked options for `preparing`,
+  `ready_to_apply`, `rejected`, and `skipped`. The dropdown now presents all valid status options.
+
+- **Application version synchronized.** Updated `backend/app/core/config.py` from drifted `2.2.15`
+  to `2.2.18`.
+
+### Added
+
+- **Shared domain contracts package (`backend/app/contracts/`).** Exports canonical vocabularies,
+  mappings, and pure helper functions (`confidence_band`, `requires_review`, `is_terminal_application_state`,
+  `job_status_for`) used by services, routers, and workers.
+
+- **Frontend contracts mirror (`frontend/src/lib/contracts.ts`).** Provides strictly-typed mirrors
+  of backend domain vocabularies, UI chip label mappings, error code descriptions, and queue progress steps.
+
+- **15 comprehensive contract design specifications (`docs/contracts/`).** Documents 01 through 15
+  defining entity ownership, tenant isolation, resumable operations, state machine transitions, AI
+  fact-checking/provenance standards, field ambiguity resolutions, audit logging, and migration paths.
+
+- **Automated contracts drift test suite (`backend/tests/test_contracts_vocabulary.py`).** Verifies
+  exact parity between Python and TypeScript vocabulary constants, documentation coverage, helper logic,
+  funnel analytics correctness, frontend filter alignment, and sensitive audit action coverage.
+
 ## [2.2.17] — 2026-09-16
 
 **The dashboard stopped failing silently — and its pipeline counters stopped

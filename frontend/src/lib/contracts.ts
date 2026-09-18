@@ -1,0 +1,1156 @@
+/**
+ * Canonical domain vocabulary — the frontend mirror of
+ * `backend/app/contracts/vocabulary.py` (`docs/contracts/`).
+ *
+ * These are *contract* strings: they are stored in the database, returned by
+ * the API and rendered here. Nothing in this file is derived, fetched or
+ * guessed, and nothing may be renamed on one side only —
+ * `backend/tests/test_contracts_vocabulary.py` parses this file and fails CI
+ * when the two lists disagree.
+ *
+ * Rule for the SPA: render a label from the maps below, and fall back to the
+ * raw string for a value this build has never seen. A backend that ships a new
+ * state must produce a readable chip, not a blank one and not a crash.
+ */
+
+/** Contract version of the backend vocabulary this file mirrors. */
+export const CONTRACT_VERSION = '1.0.0'
+
+/** Header the SPA sends on state-changing POSTs to make a retry safe. */
+export const IDEMPOTENCY_HEADER = 'Idempotency-Key'
+
+/** Who may initiate a transition. A transition with no actor is a bug. */
+export const ACTOR_TYPES = [
+  'user',
+  'owner',
+  'system_worker',
+  'system_scheduler',
+  'system_watchdog',
+  'system_api',
+  'external_source',
+  'external_portal',
+  'external_ai',
+  'external_smtp',
+  'external_provider',
+] as const
+export type ActorType = (typeof ACTOR_TYPES)[number]
+
+// ---------------------------------------------------------------------------
+// Provenance / confidence / sensitivity
+// ---------------------------------------------------------------------------
+
+export const PROVENANCE_SOURCES = [
+  'resume_extraction',
+  'document_text',
+  'user_provided',
+  'user_confirmed',
+  'user_corrected',
+  'ai_inferred',
+  'portal_html',
+  'ats_api',
+  'provider_api',
+  'heuristic',
+  'imported',
+  'derived',
+  'email_inferred',
+] as const
+export type ProvenanceSource = (typeof PROVENANCE_SOURCES)[number]
+
+/** `provenance.evidence[*].kind` — what the pointer points at. */
+export const EVIDENCE_KINDS = [
+  'text_span',
+  'url',
+  'document',
+  'provider_record',
+  'user_statement',
+  'portal_response',
+  'email_message',
+] as const
+export type EvidenceKind = (typeof EVIDENCE_KINDS)[number]
+
+export const CONFIDENCE_BANDS = ['high', 'medium', 'low', 'none'] as const
+export type ConfidenceBand = (typeof CONFIDENCE_BANDS)[number]
+
+export const CONFIDENCE_BAND_THRESHOLDS: Record<string, number> = {
+  high: 0.85,
+  medium: 0.6,
+  low: 0.0,
+}
+
+export const REVIEW_STATUSES = [
+  'unreviewed',
+  'needs_review',
+  'auto_accepted',
+  'confirmed',
+  'corrected',
+  'rejected',
+  'deferred',
+] as const
+export type ReviewStatus = (typeof REVIEW_STATUSES)[number]
+
+export const SENSITIVITY_LEVELS = ['public', 'internal', 'sensitive', 'restricted'] as const
+export type Sensitivity = (typeof SENSITIVITY_LEVELS)[number]
+
+export const SENSITIVE_FIELD_KEYS = [
+  'email',
+  'phone',
+  'location',
+  'address',
+  'dateOfBirth',
+  'salaryExpectation',
+  'currentCompensation',
+  'noticePeriod',
+  'availability',
+  'workAuthorization',
+  'sponsorshipRequired',
+  'relocationWilling',
+  'linkedin',
+  'github',
+] as const
+
+export const RESTRICTED_FIELD_KEYS = [
+  'governmentId',
+  'nationalId',
+  'passportNumber',
+  'visaNumber',
+  'portalPassword',
+  'otpCode',
+  'dateOfBirth',
+  'gender',
+  'race',
+  'ethnicity',
+  'veteranStatus',
+  'disabilityStatus',
+  'referenceContact',
+] as const
+
+/** Voluntary self-identification questions — default answer is always decline. */
+export const EEO_FIELD_KEYS = ['gender', 'race', 'ethnicity', 'veteranStatus', 'disabilityStatus'] as const
+
+/** The band label for a 0..1 confidence (`none` when there is no score). */
+export function confidenceBand(confidence?: number | null): ConfidenceBand {
+  if (confidence == null || Number.isNaN(Number(confidence))) return 'none'
+  const value = Number(confidence)
+  if (value >= CONFIDENCE_BAND_THRESHOLDS.high) return 'high'
+  if (value >= CONFIDENCE_BAND_THRESHOLDS.medium) return 'medium'
+  if (value >= CONFIDENCE_BAND_THRESHOLDS.low) return 'low'
+  return 'none'
+}
+
+/** Must a human review this value before automation may use it? */
+export function requiresReview(sensitivity: string, band: string): boolean {
+  if (sensitivity === 'sensitive' || sensitivity === 'restricted') return true
+  return band === 'low' || band === 'none'
+}
+
+// ---------------------------------------------------------------------------
+// Candidate profile
+// ---------------------------------------------------------------------------
+
+/** `candidate_profiles.state` — the profile is versioned, never edited in place. */
+export const PROFILE_STATES = [
+  'draft',
+  'review_required',
+  'active',
+  'superseded',
+  'archived',
+] as const
+export type ProfileState = (typeof PROFILE_STATES)[number]
+
+/** Frozen legacy values already stored in `candidate_profiles.extraction_source`. */
+export const LEGACY_PROFILE_EXTRACTION_SOURCES = [
+  'ai',
+  'user_edited',
+  'manual',
+  'imported',
+] as const
+
+/** `document.contact.links[*].kind`. */
+export const PROFILE_LINK_KINDS = [
+  'linkedin',
+  'github',
+  'portfolio',
+  'website',
+  'other',
+] as const
+
+/** What a human may do with a field that needs review. `defer` is refused for `restricted` values. */
+export const REVIEW_ACTIONS = [
+  'confirm',
+  'correct',
+  'reject',
+  'defer',
+] as const
+export type ReviewAction = (typeof REVIEW_ACTIONS)[number]
+
+// ---------------------------------------------------------------------------
+// Onboarding
+// ---------------------------------------------------------------------------
+
+export const ONBOARDING_STATES = [
+  'not_started',
+  'account_created',
+  'consents_required',
+  'awaiting_resume',
+  'resume_processing',
+  'extraction_blocked',
+  'profile_review_required',
+  'preferences_required',
+  'discovery_setup',
+  'automation_policy_optional',
+  'ready',
+  'abandoned',
+] as const
+export type OnboardingState = (typeof ONBOARDING_STATES)[number]
+
+export const ONBOARDING_TERMINAL_STATES = ['ready', 'abandoned'] as const
+
+export const ONBOARDING_GATE_STATES = [
+  'pending',
+  'in_progress',
+  'blocked',
+  'completed',
+  'skipped',
+] as const
+export type OnboardingGateState = (typeof ONBOARDING_GATE_STATES)[number]
+
+/** Gate keys, in the order the derived state walks them. */
+export const ONBOARDING_GATES = [
+  { key: 'account', label: 'Account created', required: true, blocking: true },
+  { key: 'consents', label: 'Terms & data processing accepted', required: true, blocking: true },
+  { key: 'resume', label: 'Master resume uploaded & extracted', required: true, blocking: true },
+  { key: 'profile_review', label: 'Extracted profile reviewed', required: true, blocking: true },
+  { key: 'preferences', label: 'Search & compensation preferences', required: true, blocking: true },
+  { key: 'discovery_setup', label: 'Job sources chosen', required: false, blocking: false },
+  { key: 'automation_policy', label: 'Automation mode chosen', required: false, blocking: false },
+] as const
+
+export const ONBOARDING_STATE_LABELS: Record<string, string> = {
+  not_started: 'Not started',
+  account_created: 'Account created',
+  consents_required: 'Consents needed',
+  awaiting_resume: 'Resume needed',
+  resume_processing: 'Reading your resume',
+  extraction_blocked: 'Extraction blocked',
+  profile_review_required: 'Review your profile',
+  preferences_required: 'Preferences needed',
+  discovery_setup: 'Choose job sources',
+  automation_policy_optional: 'Choose an automation mode',
+  ready: 'Ready',
+  abandoned: 'Paused',
+}
+
+// ---------------------------------------------------------------------------
+// Resume documents & extraction
+// ---------------------------------------------------------------------------
+
+export const RESUME_ROLES = ['master', 'tailored', 'polished', 'cover_letter', 'attachment'] as const
+export type ResumeRole = (typeof RESUME_ROLES)[number]
+
+export const RESUME_STATES = [
+  'uploading',
+  'stored',
+  'extracting',
+  'pending_approval',
+  'approved',
+  'rejected',
+  'archived',
+  'deleted',
+] as const
+export type ResumeState = (typeof RESUME_STATES)[number]
+
+export const EXTRACTION_STATES = [
+  'pending',
+  'running',
+  'succeeded',
+  'failed',
+  'rejected',
+  'superseded',
+] as const
+export type ExtractionState = (typeof EXTRACTION_STATES)[number]
+
+// ---------------------------------------------------------------------------
+// Application lifecycle
+// ---------------------------------------------------------------------------
+
+export const APPLICATION_PHASES = [
+  'intake',
+  'preparation',
+  'blocked',
+  'review',
+  'submission',
+  'tracking',
+  'closed',
+] as const
+export type ApplicationPhase = (typeof APPLICATION_PHASES)[number]
+
+export const APPLICATION_STATES = [
+  'not_started',
+  'queued',
+  'preparing',
+  'blocked_input',
+  'blocked_resume_approval',
+  'blocked_consent',
+  'blocked_credential',
+  'blocked_policy',
+  'blocked_quota',
+  'prepared',
+  'awaiting_approval',
+  'submitting',
+  'submitted',
+  'submitted_unverified',
+  'interview_scheduled',
+  'rejected_by_employer',
+  'offer_received',
+  'failed',
+  'withdrawn',
+  'expired',
+  'skipped',
+  'cancelled',
+] as const
+export type ApplicationState = (typeof APPLICATION_STATES)[number]
+
+export const APPLICATION_TERMINAL_STATES = [
+  'rejected_by_employer',
+  'offer_received',
+  'withdrawn',
+  'expired',
+  'skipped',
+  'cancelled',
+] as const
+
+/** States where the user owes the system something — the badge count. */
+export const APPLICATION_USER_ACTION_STATES = [
+  'blocked_input',
+  'blocked_resume_approval',
+  'blocked_consent',
+  'blocked_credential',
+  'awaiting_approval',
+] as const
+
+export const APPLICATION_BLOCKED_CODES = [
+  'missing_required_field',
+  'ambiguous_field',
+  'restricted_field_needs_choice',
+  'resume_pending_approval',
+  'resume_fact_guard_failed',
+  'consent_automation_missing',
+  'consent_outreach_missing',
+  'credential_missing',
+  'credential_unreadable',
+  'portal_domain_not_allowed',
+  'policy_company_blocked',
+  'policy_score_below_floor',
+  'policy_daily_limit',
+  'quota_exhausted',
+  'autofill_unavailable',
+  'portal_unreachable',
+] as const
+export type ApplicationBlockedCode = (typeof APPLICATION_BLOCKED_CODES)[number]
+
+export const SUBMISSION_CHANNELS = ['automation', 'manual_user', 'assisted_dry_run'] as const
+
+/**
+ * Canonical state → the legacy `jobs.status` the board still renders. Kept in
+ * sync with the backend projection so a board and an application drawer can
+ * never disagree about the same run.
+ */
+export const JOB_STATUS_PROJECTION: Record<string, string> = {
+  not_started: 'discovered',
+  queued: 'queued',
+  preparing: 'preparing',
+  blocked_input: 'needs_input',
+  blocked_resume_approval: 'needs_input',
+  blocked_consent: 'needs_input',
+  blocked_credential: 'needs_input',
+  blocked_policy: 'needs_input',
+  blocked_quota: 'needs_input',
+  prepared: 'ready_to_apply',
+  awaiting_approval: 'ready_to_apply',
+  submitting: 'preparing',
+  submitted: 'applied',
+  submitted_unverified: 'applied',
+  interview_scheduled: 'applied',
+  rejected_by_employer: 'rejected',
+  offer_received: 'applied',
+  failed: 'failed',
+  withdrawn: 'skipped',
+  expired: 'skipped',
+  skipped: 'skipped',
+  cancelled: 'skipped',
+}
+
+/** Canonical application state -> UI/queue phase (`APPLICATION_PHASES`). */
+export const APPLICATION_STATE_PHASE: Record<string, string> = {
+  not_started: 'intake',
+  queued: 'intake',
+  preparing: 'preparation',
+  blocked_input: 'blocked',
+  blocked_resume_approval: 'blocked',
+  blocked_consent: 'blocked',
+  blocked_credential: 'blocked',
+  blocked_policy: 'blocked',
+  blocked_quota: 'blocked',
+  prepared: 'review',
+  awaiting_approval: 'review',
+  submitting: 'submission',
+  submitted: 'submission',
+  submitted_unverified: 'submission',
+  interview_scheduled: 'tracking',
+  rejected_by_employer: 'tracking',
+  offer_received: 'tracking',
+  failed: 'closed',
+  withdrawn: 'closed',
+  expired: 'closed',
+  skipped: 'closed',
+  cancelled: 'closed',
+}
+
+/** The only values `jobs.status` may hold. */
+export const JOB_STATUSES = [
+  'discovered',
+  'queued',
+  'preparing',
+  'needs_input',
+  'ready_to_apply',
+  'applied',
+  'rejected',
+  'failed',
+  'skipped',
+] as const
+export type JobStatus = (typeof JOB_STATUSES)[number]
+
+export const APPLICATION_STATE_LABELS: Record<string, string> = {
+  not_started: 'Not started',
+  queued: 'Queued',
+  preparing: 'Preparing',
+  blocked_input: 'Needs your input',
+  blocked_resume_approval: 'Resume needs approval',
+  blocked_consent: 'Consent needed',
+  blocked_credential: 'Portal login needed',
+  blocked_policy: 'Stopped by your policy',
+  blocked_quota: 'Limit reached',
+  prepared: 'Ready to review',
+  awaiting_approval: 'Waiting for your approval',
+  submitting: 'Submitting',
+  submitted: 'Submitted',
+  submitted_unverified: 'Submitted (unconfirmed)',
+  interview_scheduled: 'Interview scheduled',
+  rejected_by_employer: 'Rejected',
+  offer_received: 'Offer received',
+  failed: 'Failed',
+  withdrawn: 'Withdrawn',
+  expired: 'Expired',
+  skipped: 'Skipped',
+  cancelled: 'Cancelled',
+}
+
+export const JOB_STATUS_LABELS: Record<string, string> = {
+  discovered: 'Discovered',
+  queued: 'Queued',
+  preparing: 'Preparing',
+  needs_input: 'Needs input',
+  ready_to_apply: 'Ready to apply',
+  applied: 'Applied',
+  rejected: 'Rejected',
+  failed: 'Failed',
+  skipped: 'Skipped',
+}
+
+// ---------------------------------------------------------------------------
+// Application field answers — ambiguity is explicit, never implied
+// ---------------------------------------------------------------------------
+
+export const AMBIGUITY_KINDS = [
+  'resolved',
+  'ambiguous_mapping',
+  'ambiguous_value',
+  'ambiguous_option',
+  'missing',
+  'out_of_scope',
+] as const
+export type AmbiguityKind = (typeof AMBIGUITY_KINDS)[number]
+
+export const FIELD_RESOLUTIONS = [
+  'profile',
+  'user_choice',
+  'user_typed',
+  'declined',
+  'policy_default',
+  'resume_file',
+  'vault_credential',
+  'unresolved',
+] as const
+export type FieldResolution = (typeof FIELD_RESOLUTIONS)[number]
+
+export const ANSWER_REUSE_SCOPES = [
+  'this_application',
+  'this_portal',
+  'this_company',
+  'global',
+  'never',
+] as const
+export type AnswerReuseScope = (typeof ANSWER_REUSE_SCOPES)[number]
+
+/** Frozen `value_source` vocabulary of the shipped autofill plan. */
+export const AUTOFILL_VALUE_SOURCES = [
+  'profile',
+  'resume_file',
+  'generated_cover_letter',
+  'vault',
+  'user_answer',
+  'unknown',
+] as const
+
+// ---------------------------------------------------------------------------
+// Match results
+// ---------------------------------------------------------------------------
+
+export const SCORE_SOURCES = [
+  'ai',
+  'preliminary',
+  'pending',
+  'rejected',
+  'insufficient_data',
+  'funding_context',
+  'unscored',
+] as const
+export type ScoreSource = (typeof SCORE_SOURCES)[number]
+
+export const MATCH_BANDS = ['strong', 'good', 'possible', 'weak', 'unknown'] as const
+export type MatchBand = (typeof MATCH_BANDS)[number]
+
+export const MATCH_STALENESS = [
+  'fresh',
+  'profile_changed',
+  'job_changed',
+  'expired',
+  'scorer_upgraded',
+] as const
+
+/**
+ * What each `score_source` means, in the user's words. The list must never
+ * present a keyword-overlap estimate as a model verdict.
+ */
+export const SCORE_SOURCE_LABELS: Record<string, string> = {
+  ai: 'AI verdict',
+  preliminary: 'Keyword estimate',
+  pending: 'Not scored yet (AI offline)',
+  rejected: 'AI answer rejected by the accuracy guard',
+  insufficient_data: 'Not enough text to score',
+  funding_context: 'Funding-radar posting (no job description)',
+  unscored: 'Not scored',
+}
+
+// ---------------------------------------------------------------------------
+// Discovery runs
+// ---------------------------------------------------------------------------
+
+export const DISCOVERY_RUN_STATES = [
+  'queued',
+  'running',
+  'paused',
+  'completed',
+  'completed_empty',
+  'failed',
+  'dead',
+  'cancelled',
+] as const
+export type DiscoveryRunState = (typeof DISCOVERY_RUN_STATES)[number]
+
+export const DISCOVERY_WHY_EMPTY = [
+  'no_sources_configured',
+  'all_sources_failed',
+  'no_fresh_postings',
+  'jobs_cap_reached',
+] as const
+export type DiscoveryWhyEmpty = (typeof DISCOVERY_WHY_EMPTY)[number]
+
+export const DISCOVERY_AI_SKIP_REASONS = ['no_profile', 'plan_free'] as const
+
+export const DISCOVERY_WHY_EMPTY_LABELS: Record<string, string> = {
+  no_sources_configured: 'No job sources were attempted — enable one in Settings.',
+  all_sources_failed: 'Every source that was tried failed — retry shortly.',
+  no_fresh_postings: 'Sources answered, nothing new inside the freshness window.',
+  jobs_cap_reached: 'Your board is full — delete jobs or upgrade the plan.',
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs
+// ---------------------------------------------------------------------------
+
+export const QUEUE_STATUSES = [
+  'queued',
+  'processing',
+  'paused',
+  'needs_input',
+  'done',
+  'failed',
+  'dead',
+  'cancelled',
+] as const
+export type QueueStatus = (typeof QUEUE_STATUSES)[number]
+
+export const QUEUE_LIVE_STATUSES = ['queued', 'processing', 'paused', 'needs_input'] as const
+export const QUEUE_TERMINAL_STATUSES = ['done', 'failed', 'dead', 'cancelled'] as const
+
+export const QUEUE_PIPELINES = [
+  'discovery',
+  'application',
+  'email',
+  'funding',
+  'ai',
+  'extraction',
+  'onboarding',
+] as const
+export type QueuePipeline = (typeof QUEUE_PIPELINES)[number]
+
+export const QUEUE_TRIGGERS = ['user', 'auto', 'retry', 'recovery', 'webhook', 'system'] as const
+
+// ---------------------------------------------------------------------------
+// Automation policy
+// ---------------------------------------------------------------------------
+
+export const AUTOMATION_WORKFLOWS = [
+  'discovery',
+  'funding',
+  'application_prep',
+  'application_submit',
+  'outreach',
+  'profile_refresh',
+] as const
+export type AutomationWorkflow = (typeof AUTOMATION_WORKFLOWS)[number]
+
+export const AUTOMATION_MODES = ['off', 'suggest', 'prepare', 'auto_submit'] as const
+export type AutomationMode = (typeof AUTOMATION_MODES)[number]
+
+export const AUTOMATION_SCOPES = ['global', 'persona', 'workflow', 'company', 'portal'] as const
+
+export const SENSITIVE_FIELD_POLICIES = [
+  'never_answer',
+  'ask_every_time',
+  'use_saved_answer',
+  'prefer_decline',
+] as const
+export type SensitiveFieldPolicy = (typeof SENSITIVE_FIELD_POLICIES)[number]
+
+export const AUTOMATION_MODE_LABELS: Record<string, string> = {
+  off: 'Off — never act for me',
+  suggest: 'Suggest — show candidates, do nothing',
+  prepare: 'Prepare — build everything, stop before anything is sent',
+  auto_submit: 'Auto-submit — apply within my limits',
+}
+
+// ---------------------------------------------------------------------------
+// Events & notifications
+// ---------------------------------------------------------------------------
+
+export const NOTIFICATION_SEVERITIES = [
+  'info',
+  'success',
+  'warning',
+  'error',
+  'action_required',
+] as const
+export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number]
+
+export const NOTIFICATION_KINDS = [
+  'high_match',
+  'funding_match',
+  'quota_exhausted',
+  'weekly_summary',
+  'automation_failed',
+  'action_required',
+  'onboarding_step_required',
+  'profile_review_required',
+  'resume_ready',
+  'application_submitted',
+  'application_outcome',
+  'email_reply',
+  'consent_expiring',
+  'security',
+] as const
+export type NotificationKind = (typeof NOTIFICATION_KINDS)[number]
+
+export const NOTIFICATION_CHANNELS = ['in_app', 'email'] as const
+
+/** Kinds the user cannot mute: switching off 'we could not apply for you' would make the product silently do nothing. */
+export const NOTIFICATION_UNMUTABLE_KINDS = [
+  'action_required',
+  'onboarding_step_required',
+  'profile_review_required',
+  'security',
+] as const
+
+/** `settings` keys under the `notifications` category. */
+export const NOTIFICATION_PREFERENCE_KEYS = [
+  'email_enabled',
+  'high_match',
+  'automation_failures',
+  'weekly_summary',
+  'new_replies',
+] as const
+
+/** Item kinds of `GET /api/actions/required` — the unified 'what do you owe us' read. */
+export const ACTION_KINDS = [
+  'application_input',
+  'resume_approval',
+  'profile_review',
+  'consent',
+  'credential',
+  'policy_override',
+  'submission_confirm',
+  'onboarding_gate',
+  'quota',
+  'security',
+] as const
+export type ActionKind = (typeof ACTION_KINDS)[number]
+
+/** `domain_events.aggregate_type`. Ordering is guaranteed per aggregate, never across them. */
+export const AGGREGATE_TYPES = [
+  'application',
+  'job',
+  'resume_document',
+  'profile',
+  'discovery_run',
+  'match_result',
+  'onboarding_session',
+  'automation_policy',
+  'email',
+  'notification',
+  'queue_job',
+  'persona',
+  'user',
+] as const
+export type AggregateType = (typeof AGGREGATE_TYPES)[number]
+
+/** The full backend event vocabulary. `RENDERED_EVENT_TYPES` below is the subset the SPA switches on; anything unknown must be ignored, not crashed on. */
+export const EVENT_TYPES = [
+  'onboarding.started',
+  'onboarding.gate_completed',
+  'onboarding.gate_skipped',
+  'onboarding.gate_blocked',
+  'onboarding.state_changed',
+  'onboarding.completed',
+  'onboarding.abandoned',
+  'onboarding.resumed',
+  'profile.created',
+  'profile.version_superseded',
+  'profile.field_extracted',
+  'profile.field_confirmed',
+  'profile.field_corrected',
+  'profile.field_rejected',
+  'profile.review_completed',
+  'profile.archived',
+  'extraction.started',
+  'extraction.succeeded',
+  'extraction.failed',
+  'extraction.rejected_by_guardrail',
+  'extraction.superseded',
+  'resume.uploaded',
+  'resume.generated',
+  'resume.pending_approval',
+  'resume.approved',
+  'resume.rejected',
+  'resume.polished',
+  'resume.archived',
+  'resume.deleted',
+  'discovery.run_queued',
+  'discovery.run_started',
+  'discovery.source_fetched',
+  'discovery.source_failed',
+  'discovery.run_checkpointed',
+  'discovery.run_completed',
+  'discovery.run_empty',
+  'discovery.run_cancelled',
+  'discovery.job_persisted',
+  'discovery.duplicate_skipped',
+  'match.computed',
+  'match.superseded',
+  'match.stale',
+  'match.high_score',
+  'application.created',
+  'application.queued',
+  'application.preparation_started',
+  'application.resume_selected',
+  'application.form_detected',
+  'application.fields_mapped',
+  'application.field_ambiguous',
+  'application.input_requested',
+  'application.input_provided',
+  'application.credential_created',
+  'application.credential_reused',
+  'application.plan_ready',
+  'application.approved',
+  'application.rejected_by_user',
+  'application.blocked',
+  'application.unblocked',
+  'application.submission_started',
+  'application.submitted',
+  'application.submission_unverified',
+  'application.submission_failed',
+  'application.dry_run_completed',
+  'application.marked_applied_manually',
+  'application.outcome_recorded',
+  'application.withdrawn',
+  'application.expired',
+  'application.cancelled',
+  'application.retried',
+  'application.dead_lettered',
+  'automation.policy_changed',
+  'automation.run_scheduled',
+  'automation.run_skipped',
+  'automation.quota_exhausted',
+  'job.enqueued',
+  'job.claimed',
+  'job.paused',
+  'job.resumed',
+  'job.progressed',
+  'job.checkpointed',
+  'job.completed',
+  'job.failed',
+  'job.reclaimed',
+  'job.dead_lettered',
+  'job.cancelled',
+  'account.created',
+  'account.exported',
+  'account.deleted',
+  'consent.accepted',
+  'consent.revoked',
+  'disclosure.version_changed',
+  'notification.created',
+  'notification.read',
+  'notification.dismissed',
+] as const
+export type EventType = (typeof EVENT_TYPES)[number]
+
+/** `audit_logs.action`. Shipped names first — they are already in rows and must never be renamed. */
+export const AUDIT_ACTIONS = [
+  'account.deleted',
+  'account.exported',
+  'ai.config_updated',
+  'ai.resume_requested',
+  'auth.api_key_created',
+  'auth.api_key_revoked',
+  'auth.bootstrap',
+  'auth.login',
+  'auth.login_failed',
+  'auth.logout',
+  'auth.password_changed',
+  'auth.refresh',
+  'auth.register',
+  'billing.canceled',
+  'billing.checkout_created',
+  'billing.downgraded',
+  'billing.upgraded',
+  'consent.accepted',
+  'consent.revoked',
+  'cover_letter.generated',
+  'email.approved',
+  'email.blocked',
+  'email.generate_queued',
+  'email.sent',
+  'email.unsubscribed',
+  'funding.processed',
+  'funding.refresh_queued',
+  'funding.scan',
+  'funding.scan_failed',
+  'job.applied',
+  'job.input_submitted',
+  'persona.activated',
+  'persona.created',
+  'persona.deleted',
+  'persona.reflected',
+  'persona.updated',
+  'resume.approved',
+  'resume.deleted',
+  'resume.downloaded',
+  'resume.generate_queued',
+  'resume.generated',
+  'resume.polished',
+  'resume.rejected',
+  'settings.updated',
+  'vault.credential_created',
+  'vault.deleted',
+  'vault.exported',
+  'vault.reveal_failed',
+  'vault.viewed',
+  'account.created',
+  'onboarding.started',
+  'onboarding.completed',
+  'onboarding.abandoned',
+  'onboarding.gate_skipped',
+  'onboarding.retried',
+  'profile.updated',
+  'profile.review_completed',
+  'profile.archived',
+  'extraction.succeeded',
+  'extraction.failed',
+  'resume.uploaded',
+  'discovery.run_triggered',
+  'discovery.run_cancelled',
+  'job.apply_queued',
+  'job.prepared',
+  'job.submit_approved',
+  'job.apply_failed',
+  'job.apply_retried',
+  'application.submitted',
+  'application.submitted_auto',
+  'application.submitted_unverified',
+  'application.cancelled',
+  'application.outcome_recorded',
+  'automation.policy_updated',
+  'automation.policy_deleted',
+  'automation.auto_submit_enabled',
+  'automation.auto_submit_disabled',
+] as const
+export type AuditAction = (typeof AUDIT_ACTIONS)[number]
+
+/** Prefixes/actions that are never dropped under load (superset of the backend's `SENSITIVE_ACTIONS`). */
+export const SENSITIVE_AUDIT_ACTIONS = [
+  'auth.',
+  'vault.',
+  'account.',
+  'consent.',
+  'resume.delete',
+  'email.send',
+  'application.submitted',
+  'application.submitted_auto',
+  'application.submitted_unverified',
+  'automation.auto_submit_enabled',
+  'onboarding.gate_skipped',
+  'profile.archived',
+] as const
+
+/**
+ * Event types the SPA may switch on. The backend list is longer (it includes
+ * events no screen renders); anything unknown here must be ignored, not
+ * crashed on — types are additive.
+ */
+export const RENDERED_EVENT_TYPES = [
+  'onboarding.state_changed',
+  'onboarding.gate_blocked',
+  'onboarding.completed',
+  'profile.field_extracted',
+  'profile.field_confirmed',
+  'profile.field_corrected',
+  'profile.review_completed',
+  'extraction.started',
+  'extraction.succeeded',
+  'extraction.failed',
+  'extraction.rejected_by_guardrail',
+  'resume.uploaded',
+  'resume.generated',
+  'resume.approved',
+  'resume.rejected',
+  'discovery.run_queued',
+  'discovery.run_started',
+  'discovery.run_completed',
+  'discovery.run_empty',
+  'discovery.source_failed',
+  'match.computed',
+  'match.high_score',
+  'application.created',
+  'application.queued',
+  'application.preparation_started',
+  'application.resume_selected',
+  'application.form_detected',
+  'application.fields_mapped',
+  'application.field_ambiguous',
+  'application.input_requested',
+  'application.input_provided',
+  'application.plan_ready',
+  'application.approved',
+  'application.blocked',
+  'application.unblocked',
+  'application.submission_started',
+  'application.submitted',
+  'application.submission_unverified',
+  'application.submission_failed',
+  'application.dry_run_completed',
+  'application.marked_applied_manually',
+  'application.outcome_recorded',
+  'application.withdrawn',
+  'application.expired',
+  'application.cancelled',
+  'application.retried',
+  'application.dead_lettered',
+  'automation.policy_changed',
+  'automation.run_skipped',
+  'automation.quota_exhausted',
+  'job.paused',
+  'job.resumed',
+  'job.failed',
+  'job.dead_lettered',
+  'job.cancelled',
+] as const
+
+// ---------------------------------------------------------------------------
+// Typed error codes (`detail.code`)
+// ---------------------------------------------------------------------------
+
+export const ERROR_CODES = [
+  'not_authenticated',
+  'credential_mismatch',
+  'forbidden',
+  'consent_required',
+  'upgrade_required',
+  'quota_exhausted',
+  'storage_cap_reached',
+  'rate_limited',
+  'validation_error',
+  'guardrail_failed',
+  'fact_guard_failed',
+  'ai_unavailable',
+  'ai_paused',
+  'ai_blocked',
+  'profile_missing',
+  'resume_missing',
+  'resume_referenced',
+  'job_not_found',
+  'application_not_found',
+  'application_already_submitted',
+  'application_not_submittable',
+  'idempotency_conflict',
+  'idempotency_replay',
+  'onboarding_not_started',
+  'onboarding_already_complete',
+  'gate_not_satisfied',
+  'field_needs_review',
+  'restricted_field',
+  'masked_api_key',
+  'invalid_provider',
+  'too_many_attempts',
+  'weak_password',
+  'unsupported_media_type',
+  'payload_too_large',
+  'internal_error',
+] as const
+export type ErrorCode = (typeof ERROR_CODES)[number]
+
+/**
+ * Human copy for an unknown-but-typed failure. Anything not listed here is
+ * rendered from `detail.message`, which the backend always sends.
+ */
+export const ERROR_CODE_LABELS: Record<string, string> = {
+  consent_required: 'A disclosure has to be accepted first.',
+  upgrade_required: 'Your plan does not include this.',
+  quota_exhausted: 'You have reached this limit for the period.',
+  storage_cap_reached: 'Your board is full — delete rows or upgrade.',
+  ai_paused: 'The AI provider is having an outage — this resumes on its own.',
+  ai_blocked: 'The AI provider needs attention (key, billing, model).',
+  profile_missing: 'Upload a master resume first.',
+  application_already_submitted: 'This application was already submitted.',
+  idempotency_replay: 'That request was already processed — showing the original result.',
+  field_needs_review: 'Confirm this field before automation may use it.',
+  restricted_field: 'This field is never filled in automatically.',
+}
+
+/** Progress step names per pipeline, in order. `progress.step` must come from this list. */
+export const QUEUE_PROGRESS_STEPS: Record<string, readonly string[]> = {
+  onboarding: [
+    'validating',
+    'stored',
+    'extracting_text',
+    'extracting_profile',
+    'guardrails',
+    'saving',
+    'building_context',
+    'done',
+  ] as const,
+  discovery: [
+    'resolving_config',
+    'fetching_sources',
+    'deduplicating',
+    'scoring',
+    'classifying',
+    'persisting',
+    'detecting_forms',
+    'done',
+  ] as const,
+  application: [
+    'choosing_resume',
+    'detecting_form',
+    'mapping_fields',
+    'preparing_credential',
+    'building_plan',
+    'awaiting_input',
+    'navigating',
+    'filling',
+    'submitting',
+    'verifying',
+    'done',
+  ] as const,
+  extraction: [
+    'parsing_document',
+    'extracting_fields',
+    'guardrails',
+    'scoring_confidence',
+    'writing_provenance',
+    'done',
+  ] as const,
+}
+
+/**
+ * Every vocabulary above, keyed the way the backend's `VOCABULARY` dict is.
+ * References the constants (never copies them), so this record cannot drift
+ * from the lists it summarises.
+ */
+export const VOCABULARY: Record<string, readonly string[]> = {
+  actor_types: ACTOR_TYPES,
+  provenance_sources: PROVENANCE_SOURCES,
+  confidence_bands: CONFIDENCE_BANDS,
+  review_statuses: REVIEW_STATUSES,
+  evidence_kinds: EVIDENCE_KINDS,
+  sensitivity_levels: SENSITIVITY_LEVELS,
+  sensitive_field_keys: SENSITIVE_FIELD_KEYS,
+  restricted_field_keys: RESTRICTED_FIELD_KEYS,
+  eeo_field_keys: EEO_FIELD_KEYS,
+  profile_states: PROFILE_STATES,
+  profile_link_kinds: PROFILE_LINK_KINDS,
+  review_actions: REVIEW_ACTIONS,
+  legacy_profile_extraction_sources: LEGACY_PROFILE_EXTRACTION_SOURCES,
+  onboarding_states: ONBOARDING_STATES,
+  onboarding_terminal_states: ONBOARDING_TERMINAL_STATES,
+  onboarding_gate_states: ONBOARDING_GATE_STATES,
+  resume_roles: RESUME_ROLES,
+  resume_states: RESUME_STATES,
+  extraction_states: EXTRACTION_STATES,
+  application_phases: APPLICATION_PHASES,
+  application_states: APPLICATION_STATES,
+  application_terminal_states: APPLICATION_TERMINAL_STATES,
+  application_user_action_states: APPLICATION_USER_ACTION_STATES,
+  application_blocked_codes: APPLICATION_BLOCKED_CODES,
+  submission_channels: SUBMISSION_CHANNELS,
+  job_statuses: JOB_STATUSES,
+  ambiguity_kinds: AMBIGUITY_KINDS,
+  field_resolutions: FIELD_RESOLUTIONS,
+  autofill_value_sources: AUTOFILL_VALUE_SOURCES,
+  answer_reuse_scopes: ANSWER_REUSE_SCOPES,
+  score_sources: SCORE_SOURCES,
+  match_bands: MATCH_BANDS,
+  match_staleness: MATCH_STALENESS,
+  discovery_run_states: DISCOVERY_RUN_STATES,
+  discovery_why_empty: DISCOVERY_WHY_EMPTY,
+  discovery_ai_skip_reasons: DISCOVERY_AI_SKIP_REASONS,
+  queue_statuses: QUEUE_STATUSES,
+  queue_live_statuses: QUEUE_LIVE_STATUSES,
+  queue_terminal_statuses: QUEUE_TERMINAL_STATUSES,
+  queue_pipelines: QUEUE_PIPELINES,
+  queue_triggers: QUEUE_TRIGGERS,
+  automation_workflows: AUTOMATION_WORKFLOWS,
+  automation_modes: AUTOMATION_MODES,
+  automation_scopes: AUTOMATION_SCOPES,
+  sensitive_field_policies: SENSITIVE_FIELD_POLICIES,
+  event_types: EVENT_TYPES,
+  aggregate_types: AGGREGATE_TYPES,
+  audit_actions: AUDIT_ACTIONS,
+  sensitive_audit_actions: SENSITIVE_AUDIT_ACTIONS,
+  notification_severities: NOTIFICATION_SEVERITIES,
+  notification_kinds: NOTIFICATION_KINDS,
+  notification_channels: NOTIFICATION_CHANNELS,
+  notification_unmutable_kinds: NOTIFICATION_UNMUTABLE_KINDS,
+  notification_preference_keys: NOTIFICATION_PREFERENCE_KEYS,
+  action_kinds: ACTION_KINDS,
+  error_codes: ERROR_CODES,
+}
