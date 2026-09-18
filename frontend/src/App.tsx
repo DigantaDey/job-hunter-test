@@ -19,6 +19,7 @@ import Interview from './pages/Interview'
 import Notifications from './pages/Notifications'
 import Personas from './pages/Personas'
 import ProfileReview from './pages/ProfileReview'
+import Onboarding from './pages/Onboarding'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
@@ -45,6 +46,7 @@ export function AppRoutes() {
             </ErrorBoundary>
           }
         />
+        <Route path="/onboarding" element={<RequireAuth><Onboarding /></RequireAuth>} />
         <Route
           element={
             <RequireAuth>
