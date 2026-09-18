@@ -40,7 +40,6 @@ from app.services.sources.adapters import (
     WorkdaySource,
 )
 from app.services.sources.base import Posting, SourceError, compact_raw, merge_postings
-from app.services.sources import health as source_health
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "sources"
 
