@@ -507,10 +507,21 @@ async def handle_ai(db: Session, item: PipelineJob) -> Dict[str, Any]:
     return {"status": "noop", "user": user.id if user else None}
 
 
+async def handle_extraction(db: Session, item: PipelineJob) -> Dict[str, Any]:
+    """Thin adapter so the onboarding handler lives with its domain service."""
+    from app.services.onboarding import handle_extraction_job
+
+    return await handle_extraction_job(db, item)
+
+
 HANDLERS = {
     "discovery": handle_discovery,
     "application": handle_application,
     "email": handle_email,
     "funding": handle_funding,
     "ai": handle_ai,
+    # Resumable onboarding resume extraction (app/services/onboarding.py) —
+    # the AI half of a resume upload, run here so the HTTP request never blocks
+    # on the model and a restart/retry can never lose or duplicate the work.
+    "extraction": handle_extraction,
 }

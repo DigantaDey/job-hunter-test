@@ -40,11 +40,15 @@ from app.models.models import (
     Job,
     JobEvent,
     Notification,
+    OnboardingEvent,
+    OnboardingSession,
     Persona,
     PipelineJob,
     Profile,
     RefreshToken,
     Resume,
+    ResumeDocument,
+    ResumeExtraction,
     ScheduledRun,
     SettingsModel,
     Subscription,
@@ -86,6 +90,12 @@ CHILD_TABLES: dict[str, type] = {
     "notifications": Notification,
     "interview_preps": InterviewPrep,
     "company_intel": CompanyIntel,
+    # Resumable onboarding (v2.2.19): the durable wizard state, the preserved
+    # upload, its extraction attempts and the append-only timeline.
+    "onboarding_sessions": OnboardingSession,
+    "onboarding_events": OnboardingEvent,
+    "resume_documents": ResumeDocument,
+    "resume_extractions": ResumeExtraction,
 }
 
 
@@ -136,6 +146,32 @@ def _seed_every_child_table(db, user: User) -> dict:
                        companies_found=1)
     for row in (persona, resume, derived, job, profile, email, funding, scan):
         db.add(row)
+    db.flush()
+
+    # The onboarding aggregates, wired the way the flow wires them: document →
+    # extraction → session, with the session's state pointing at the finished
+    # attempt (so erasure has to break references, not just delete children).
+    document = ResumeDocument(user_id=user.id, role="master", state="approved",
+                              filename="master.docx", display_name="master.docx",
+                              filepath=resume_path, content_type="application/pdf",
+                              size_bytes=2048, sha256=f"seed-sha-{user.id}",
+                              profile_snapshot={"name": "Test Candidate"})
+    db.add(document)
+    db.flush()  # id needed for the plain-FK wiring below (no relationships)
+    extraction = ResumeExtraction(user_id=user.id, resume_document_id=document.id, attempt=1,
+                                  state="succeeded", extractor_version="1.0.0",
+                                  profile_id=profile.id, trigger="user")
+    session_row = OnboardingSession(user_id=user.id, state="profile_review_required",
+                                    state_since=datetime.utcnow(),
+                                    resume_document_id=document.id,
+                                    extraction_id=extraction.id,
+                                    started_at=datetime.utcnow())
+    db.add_all([extraction, session_row])
+    db.flush()
+    db.add(OnboardingEvent(user_id=user.id, session_id=session_row.id, sequence=1,
+                           event_type="onboarding.started", actor_type="system_api",
+                           occurred_at=datetime.utcnow(), recorded_at=datetime.utcnow(),
+                           message="session created"))
     db.flush()
 
     # Then the cross-references — each one a leftover waiting to happen.
