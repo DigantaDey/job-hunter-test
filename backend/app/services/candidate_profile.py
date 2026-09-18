@@ -639,7 +639,7 @@ def calculate_completeness(fields: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     total_weight = sum(weights.values())
-    earned = 0
+    earned: float = 0.0
     breakdown: Dict[str, Any] = {}
     missing: List[str] = []
     uncertain: List[str] = []
@@ -834,7 +834,7 @@ def build_fields_from_legacy_profile(
 
     mapping["skills"] = legacy_data.get("skills") or []
     # Tools: try to extract from skills that look like tools, or from projects tech
-    tools = []
+    tools: List[str] = []
     projects = legacy_data.get("projects") or []
     for proj in projects:
         if isinstance(proj, dict):

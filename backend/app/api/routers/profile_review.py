@@ -124,8 +124,10 @@ def resolve_field(request: Request, user: CurrentUser, db: DbSession, body: Reso
     audit.audit(db, "profile.review_completed", user=user, target=body.path, request=request, detail={"action": body.action, "profile_id": body.profile_id})
 
     # Return updated review doc
-    profile, provenance_list = cp_service.get_profile_with_provenance(db, user.id, body.profile_id)
-    response = cp_service.build_review_response(profile, provenance_list)
+    updated_profile, provenance_list = cp_service.get_profile_with_provenance(db, user.id, body.profile_id)
+    if not updated_profile:
+        raise HTTPException(404, {"code": "profile_missing", "message": "Profile not found after update"})
+    response = cp_service.build_review_response(updated_profile, provenance_list)
     # Add invalidated answers per contract 13
     response["invalidated_answers"] = []  # would list application answers that depended on this field
     return response
@@ -146,8 +148,10 @@ def correct_field_endpoint(request: Request, user: CurrentUser, db: DbSession, b
     db.commit()
     audit.audit(db, "profile.updated", user=user, target=body.path, request=request, detail={"profile_id": body.profile_id, "field": body.path})
 
-    profile, provenance_list = cp_service.get_profile_with_provenance(db, user.id, body.profile_id)
-    return cp_service.build_review_response(profile, provenance_list)
+    updated_profile, provenance_list = cp_service.get_profile_with_provenance(db, user.id, body.profile_id)
+    if not updated_profile:
+        raise HTTPException(404, {"code": "profile_missing", "message": "Profile not found after update"})
+    return cp_service.build_review_response(updated_profile, provenance_list)
 
 
 @router.get("/completeness")
@@ -209,7 +213,7 @@ def get_history(user: CurrentUser, db: DbSession, profile_id: int, path: Optiona
         query = query.filter(ProfileFieldProvenance.path == path)
     provenances = query.all()
 
-    history_items = []
+    history_items: list[dict[str, Any]] = []
     for prov in provenances:
         hist = cp_service.get_field_history(db, user.id, prov.id)
         for h in hist:
@@ -231,7 +235,11 @@ def get_history(user: CurrentUser, db: DbSession, profile_id: int, path: Optiona
                 "occurred_at": h.occurred_at.isoformat() if h.occurred_at else None,
             })
 
-    history_items.sort(key=lambda x: x["occurred_at"] or "", reverse=True)
+    def _history_sort_key(item: dict[str, Any]) -> str:
+        occ = item.get("occurred_at")
+        return occ if isinstance(occ, str) else ""
+
+    history_items.sort(key=_history_sort_key, reverse=True)
     return {"profile_id": profile_id, "history": history_items}
 
 
