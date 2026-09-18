@@ -1,0 +1,11 @@
+{
+  "content": [{
+    "id": "sr-9",
+    "name": "Data Engineer",
+    "company": {"name": "Visa"},
+    "location": {"city": "London", "country": "UK"},
+    "releasedDate": "2024-05-01T00:00:00Z",
+    "department": {"label": "Data"},
+    "jobAd": {"sections": {"jobDescription": {"text": "SQL and Python"}}}
+  }]
+}

@@ -1,0 +1,15 @@
+{
+  "SearchResult": {
+    "SearchResultItems": [{
+      "MatchedObjectDescriptor": {
+        "PositionTitle": "IT Specialist",
+        "OrganizationName": "GSA",
+        "PositionURI": "https://www.usajobs.gov/job/1",
+        "PositionLocationDisplay": "Washington, DC",
+        "PositionID": "GSA-1",
+        "PublicationStartDate": "2024-05-01T00:00:00Z",
+        "UserArea": {"Details": {"JobSummary": "Python services", "MajorDuties": "APIs"}}
+      }
+    }]
+  }
+}

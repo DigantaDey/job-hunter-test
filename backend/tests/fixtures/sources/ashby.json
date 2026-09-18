@@ -1,0 +1,18 @@
+{
+  "jobs": [{
+    "id": "ash-1",
+    "title": "Staff Engineer",
+    "jobUrl": "https://jobs.ashbyhq.com/acme/ash-1",
+    "location": "Remote",
+    "descriptionPlainText": "TypeScript and Go",
+    "publishedAt": "2024-05-01T00:00:00Z",
+    "isRemote": true,
+    "isListed": true,
+    "department": "Eng",
+    "employmentType": "FullTime"
+  }, {
+    "id": "ash-hidden",
+    "title": "Hidden",
+    "isListed": false
+  }]
+}

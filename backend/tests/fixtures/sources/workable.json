@@ -1,0 +1,12 @@
+{
+  "name": "Acme",
+  "jobs": [{
+    "title": "Platform Engineer",
+    "shortcode": "PE1",
+    "city": "Berlin",
+    "country": "Germany",
+    "description": "Python services",
+    "published_on": "2024-05-01",
+    "telecommuting": true
+  }]
+}

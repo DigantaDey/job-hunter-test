@@ -186,7 +186,7 @@ def _install_sources(monkeypatch, count: int = CANDIDATES, *, no_descriptions: b
 
 def _strong_keys() -> set:
     """Dedupe keys of the candidates the pre-rank must put in the top slice."""
-    return {f"ext-{index}" for index in range(STRONG_COUNT)}
+    return {f"lever:ext-{index}" for index in range(STRONG_COUNT)}
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,14 @@
+{
+  "jobs": [{
+    "id": 3,
+    "jobTitle": "Remote Python Dev",
+    "companyName": "Gamma",
+    "url": "https://jobicy.com/3",
+    "jobGeo": "Anywhere",
+    "jobDescription": "python fastapi",
+    "pubDate": "2024-05-01T00:00:00",
+    "jobIndustry": "Software",
+    "jobLevel": "Senior",
+    "jobType": "full-time"
+  }]
+}

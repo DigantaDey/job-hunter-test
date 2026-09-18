@@ -301,6 +301,9 @@ class Job(Base):
         UniqueConstraint("user_id", "dedupe_key", name="uq_jobs_user_dedupe"),
         Index("ix_jobs_user_status", "user_id", "status"),
         Index("ix_jobs_user_company_norm", "user_id", "company_name_normalized"),
+        Index("ix_jobs_user_content_hash", "user_id", "content_hash"),
+        Index("ix_jobs_user_last_seen", "user_id", "last_seen_at"),
+        Index("ix_jobs_user_expired", "user_id", "expired"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -347,6 +350,20 @@ class Job(Base):
     extra: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)  # forms structure, questions, autofill plan…
     error: Mapped[str] = mapped_column(Text, default="", nullable=True)
     applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    #: First time this canonical job was seen for this user. Never rewritten
+    #: (``discovered_at`` stays the insert-only clock; this is the same instant
+    #: on a first insert and is left alone on a later merge).
+    first_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=utcnow, nullable=True)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=utcnow, nullable=True)
+    last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    expired: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    expired_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(16), default="", nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    title_normalized: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    #: Compact original source payload. Stored next to the normalised row so
+    #: ``extra`` (forms, autofill plan) never has to hold raw ATS JSON.
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
 
 
 class JobEvent(Base):
