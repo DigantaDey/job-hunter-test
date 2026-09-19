@@ -153,6 +153,9 @@ def _merge_existing_job(job: Job, candidate: Dict[str, Any], now: datetime) -> N
     if candidate.get("source_kind") and not job.source_kind:
         job.source_kind = str(candidate["source_kind"])[:16]
     _store_raw_payload(job, candidate)
+    attribution = (candidate.get("extra") or {}).get("search_discovery")
+    if attribution:
+        job.extra = {**(job.extra or {}), "search_discovery": attribution}
 
 
 def _demo_pool_enabled() -> bool:
@@ -351,6 +354,28 @@ async def discover_for_user(
             board_tokens=board_tokens,
         )
         postings.extend(posting.to_dict() for posting in fetched)
+        if settings.job_search_providers.strip():
+            from app.services.search import discover_search, preferences_for_user
+
+            try:
+                search_postings, search_report = await discover_search(
+                    db, user.id, preferences_for_user(db, user.id, persona_id),
+                    since_hours=freshness_hours, known_urls=[p.url for p in fetched],
+                )
+                postings.extend(p.to_dict() for p in search_postings)
+                report["search"] = search_report
+                source_report.setdefault("requested", []).append("search_discovery")
+                if search_report.get("errors") and not search_postings:
+                    source_report.setdefault("errors", {})["search_discovery"] = "search_provider_failed"
+                elif search_report.get("skipped"):
+                    source_report.setdefault("skipped", {})["search_discovery"] = search_report["skipped"]
+                else:
+                    source_report.setdefault("ok", {})["search_discovery"] = len(search_postings)
+                source_report["total"] = int(source_report.get("total", 0)) + len(search_postings)
+            except Exception:
+                # Search is supplementary. A provider/cache failure must never
+                # discard direct-adapter postings or leak provider exception text.
+                report["search"] = {"errors": [{"code": "unavailable"}], "validated": 0}
     report["sources"] = source_report
 
     if _demo_pool_enabled():
@@ -523,7 +548,9 @@ async def discover_for_user(
             posted_at=candidate.get("posted_at"),
             freshness_hours=freshness_hours,
             extra={"salary": candidate.get("salary", ""), "remote": candidate.get("remote", False),
-                   "freshness_relaxed": candidate.get("freshness_relaxed", False), "forms": {}},
+                   "freshness_relaxed": candidate.get("freshness_relaxed", False), "forms": {},
+                   **({"search_discovery": candidate["extra"]["search_discovery"]}
+                      if (candidate.get("extra") or {}).get("search_discovery") else {})},
             first_seen_at=seen_at,
             last_seen_at=seen_at,
             last_verified_at=seen_at,

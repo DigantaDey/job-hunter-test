@@ -263,3 +263,12 @@ No license file is included in this repository; treat it as proprietary until yo
 software automates actions on third-party sites — you are responsible for complying with each
 site's terms of service and with the anti-spam and privacy laws that apply where you and your
 contacts are located.
+
+### Search-engine job discovery
+
+Optional, privacy-minimized Brave Web Search discovery supplements direct ATS
+adapters. Results remain discovery leads until their source pages validate them;
+search snippets are never job descriptions. Disabled by default. See
+[Search discovery setup and operations](docs/SEARCH_DISCOVERY.md) for provider
+selection, storage-rights requirements, shared quotas/caching, and separate
+provider cost accounting.

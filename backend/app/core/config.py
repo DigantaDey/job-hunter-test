@@ -409,6 +409,21 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Job sources
     # ------------------------------------------------------------------ #
+    # Search is optional discovery, never an authoritative job source.
+    job_search_providers: str = ""  # ordered registry ids, e.g. brave
+    brave_search_api_key: str = ""
+    job_search_storage_rights: bool = False  # confirm provider contract before caching
+    job_search_queries_per_run: int = Field(default=3, ge=0, le=12)
+    job_search_results_per_query: int = Field(default=10, ge=1, le=20)
+    job_search_user_rpm: int = Field(default=6, ge=0)
+    job_search_global_rpm: int = Field(default=30, ge=0)
+    job_search_user_daily: int = Field(default=30, ge=0)
+    job_search_global_daily: int = Field(default=1000, ge=0)
+    job_search_cache_seconds: int = Field(default=3600, ge=60, le=86400)
+    job_search_fetch_limit: int = Field(default=12, ge=1, le=40)
+    job_search_timeout_seconds: int = Field(default=15, ge=1, le=30)
+    brave_search_cost_microusd: int = Field(default=5000, ge=0)
+
     live_scraping_enabled: bool = True
     respect_robots_txt: bool = True
     per_host_min_interval_seconds: float = 1.0
