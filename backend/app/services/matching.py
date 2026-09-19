@@ -427,8 +427,10 @@ def parse_job_signals(job: Job, now: Optional[datetime] = None) -> Dict[str, Any
     """
     now = now or datetime.utcnow()
     extra = dict(job.extra or {})
-    role = extra.get("role") if isinstance(extra.get("role"), dict) else {}
-    compensation = extra.get("compensation") if isinstance(extra.get("compensation"), dict) else {}
+    raw_role = extra.get("role")
+    role: Dict[str, Any] = raw_role if isinstance(raw_role, dict) else {}
+    raw_compensation = extra.get("compensation")
+    compensation: Dict[str, Any] = raw_compensation if isinstance(raw_compensation, dict) else {}
     jd = job.description or ""
     jd_lower = jd.lower()
     title = job.title or ""
@@ -558,7 +560,8 @@ def parse_job_signals(job: Job, now: Optional[datetime] = None) -> Dict[str, Any
         signals.append("fresh_posting")
 
     # ---- application friction (what we already know about the form) ----
-    forms = extra.get("forms") if isinstance(extra.get("forms"), dict) else {}
+    raw_forms = extra.get("forms")
+    forms: Dict[str, Any] = raw_forms if isinstance(raw_forms, dict) else {}
     friction: Dict[str, Any] = {
         "known": bool(forms),
         "requires_login": bool(forms.get("requires_login")),
@@ -1047,9 +1050,9 @@ def deterministic_score(
                                  reason="No preferred ('nice to have') skills stated."))
 
     # ---- relevant experience ----
-    value, reason, evidence = _years_score(candidate, signals, jd)
-    features.append(_feature("relevant_experience", "Relevant experience", value=value,
-                             reason=reason, evidence=evidence))
+    exp_value, exp_reason, exp_evidence = _years_score(candidate, signals, jd)
+    features.append(_feature("relevant_experience", "Relevant experience", value=exp_value,
+                             reason=exp_reason, evidence=exp_evidence))
 
     # ---- seniority ----
     jd_level = _SENIORITY_LEVELS.get(signals.get("seniority") or "unknown")
