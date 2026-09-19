@@ -52,9 +52,9 @@ async def _load(url: str) -> Optional[RobotFileParser]:
         return None
 
 
-async def can_fetch(url: str, user_agent: str | None = None) -> bool:
+async def can_fetch(url: str, user_agent: str | None = None, *, force: bool = False) -> bool:
     """True when the given user agent may fetch ``url``."""
-    if not settings.respect_robots_txt:
+    if not force and not settings.respect_robots_txt:
         return True
     host = urlparse(url).netloc
     if not host:

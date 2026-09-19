@@ -341,7 +341,9 @@ async def request(
     if should_check_robots:
         from app.services.robots import can_fetch
 
-        if not await can_fetch(url):
+        # An explicit per-request True must not be undone by the global default.
+        allowed = await can_fetch(url, force=True) if respect_robots is True else await can_fetch(url)
+        if not allowed:
             inc("jobhunter_http_blocked_total", reason="robots_txt", host=label)
             raise PermissionError(f"robots.txt disallows fetching {url}")
 

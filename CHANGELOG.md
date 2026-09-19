@@ -4,6 +4,34 @@ All notable changes to JobHunter AI are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Configurable search-provider abstraction for supplementary job discovery, with
+  an initial Brave Web Search adapter and ordered provider-failure fallback.
+  Evaluated DuckDuckGo and Google availability; neither introduces a new scraper
+  or Google Custom Search dependency. See `docs/SEARCH_DISCOVERY.md`.
+- Privacy-minimized, deterministic queries from active normalized candidate role
+  and remote preferences. Curated vocabulary rejects arbitrary text; resumes,
+  identity, contact details, eligibility and employment history are never sent.
+- Database-backed shared TTL/negative caching, cross-worker single-flight leases,
+  URL/result deduplication, per-run query budgets and atomic user/global minute
+  and daily quotas. Successful and empty identical queries are reused safely
+  across users. Provider storage-rights confirmation is required to enable search.
+- Discovery-lead attribution and explicit freshness metadata. A bounded career/
+  ATS URL traversal validates fetched structured JobPosting data through the
+  source normalization pipeline; snippets never become descriptions. SSRF,
+  redirect, robots, gated-source and expiry checks precede job persistence.
+- Separate `search_usage` request/cost-estimate ledger (not AI token accounting),
+  migration `e3f4a5b6c7d8`, account-erasure coverage, configuration examples and
+  mocked-only search tests. Search failures leave direct-source discovery intact.
+
+### Fixed
+
+- Explicit per-request robots enforcement now overrides a disabled global
+  default, so supplementary job-page validation cannot silently skip robots.
+
 ## [2.2.21] — 2026-09-18
 
 **Job discovery talks to sources through one interface, and every posting is

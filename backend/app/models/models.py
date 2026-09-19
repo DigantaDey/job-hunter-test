@@ -1044,3 +1044,42 @@ def _funding_name_key(value) -> str:
 @event.listens_for(FundingCompany, "before_update")
 def _sync_funding_name_normalized(_mapper, _connection, target: "FundingCompany") -> None:
     target.name_normalized = _funding_name_key(target.name)
+
+
+class SearchCache(Base):
+    """Shared, privacy-minimized query cache and cross-worker single-flight lease."""
+
+    __tablename__ = "search_cache"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+    lease_until: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    owner: Mapped[str] = mapped_column(String(36), nullable=False)
+
+
+class SearchBudget(Base):
+    """Atomic fixed-window counters; no query or candidate text."""
+
+    __tablename__ = "search_budgets"
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+
+
+class SearchUsage(Base):
+    """Provider request accounting, deliberately separate from model tokens.
+
+    Cost is a conservative estimate per attempted request, NOT a provider invoice.
+    A worker killed mid-request leaves outcome=started for reconciliation.
+    """
+
+    __tablename__ = "search_usage"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(40), nullable=False)
+    query_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    requests: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    estimated_cost_microusd: Mapped[int] = mapped_column(Integer, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(24), default="started", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True, nullable=False)
