@@ -1200,3 +1200,89 @@ class SearchUsage(Base):
     estimated_cost_microusd: Mapped[int] = mapped_column(Integer, nullable=False)
     outcome: Mapped[str] = mapped_column(String(24), default="started", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True, nullable=False)
+
+
+# --------------------------------------------------------------------------- #
+# Application packet — reviewable, versioned, grounded artifacts per job
+# --------------------------------------------------------------------------- #
+# Contract: one packet per (user, job, version). The packet is the *preparation*
+# result: tailored resume, cover note, short answers, outreach draft, checklist,
+# summary, evidence, emphasized facts, JD version, guardrail and token ledger.
+# No auto-submit: status stays pending_approval until the user approves. The
+# master profile is snapshotted at generation time and never mutated by
+# tailoring. Versions are retained, old current is superseded but never deleted.
+# Hallucination is blocked by FactLedger + schema checks before persistence.
+# --------------------------------------------------------------------------- #
+
+
+class ApplicationPacket(Base):
+    """Versioned, approval-gated application packet (no auto-submit)."""
+
+    __tablename__ = "application_packets"
+    __table_args__ = (
+        UniqueConstraint("user_id", "job_id", "version", name="uq_packet_user_job_version"),
+        Index("ix_packet_user_job_current", "user_id", "job_id", "is_current"),
+        Index("ix_packet_user_status", "user_id", "status"),
+        Index("ix_packet_user_job", "user_id", "job_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    persona_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("personas.id"), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # approval lifecycle: draft | pending_approval | approved | rejected | superseded | archived
+    status: Mapped[str] = mapped_column(String(24), default="pending_approval", nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # JD versioning: hash of the normalised JD text + snapshot
+    jd_hash: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    jd_text_snapshot: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    jd_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # Master profile preserved separately (never mutated)
+    master_profile_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    master_profile_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Tailored artifacts
+    tailored_resume: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    cover_note: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    short_answers: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    outreach_draft: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    checklist: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    evidence: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    emphasized_facts: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    # Guardrail + accounting
+    guardrail_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    token_usage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    # Derived display (denormalised for list views)
+    job_title: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    company: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    # Audit
+    generated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    superseded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    reviewed_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+class ApplicationPacketEvent(Base):
+    """Append-only audit for a packet (state transitions, edits, approvals)."""
+
+    __tablename__ = "application_packet_events"
+    __table_args__ = (
+        Index("ix_packet_events_packet_time", "packet_id", "occurred_at"),
+        Index("ix_packet_events_user", "user_id", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    packet_id: Mapped[int] = mapped_column(Integer, ForeignKey("application_packets.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)  # generated | edited | approved | rejected | superseded | stale_detected
+    from_status: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    to_status: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    detail: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    actor_type: Mapped[str] = mapped_column(String(20), default="user", nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)

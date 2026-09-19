@@ -20,6 +20,7 @@ import Notifications from './pages/Notifications'
 import Personas from './pages/Personas'
 import ProfileReview from './pages/ProfileReview'
 import Onboarding from './pages/Onboarding'
+import Packets from './pages/Packets'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
@@ -91,6 +92,14 @@ export function AppRoutes() {
             element={
               <ErrorBoundary scope="route" resetKey={location.pathname}>
                 <ProfileReview />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/packets"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Packets />
               </ErrorBoundary>
             }
           />

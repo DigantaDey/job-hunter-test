@@ -15,6 +15,7 @@ const nav = [
   {to:'/jobs', label:'Jobs', icon: Briefcase},
   {to:'/queues', label:'Queues', icon: Layers},
   {to:'/personas', label:'Personas', icon: Users},
+  {to:'/packets', label:'Packets', icon: FileText},
   {to:'/resumes', label:'Resume Studio', icon: FileText},
   {to:'/profile-review', label:'Profile Review', icon: BadgeCheck},
   {to:'/emails', label:'Email Bucket', icon: Mail},
