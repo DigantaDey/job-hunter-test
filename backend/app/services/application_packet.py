@@ -30,23 +30,16 @@ from app.models.models import (
     User,
 )
 from app.services.ai_guardrails import (
-    AIUnavailableError,
     FactLedger,
     FieldSpec,
-    GuardrailError,
-    GuardrailReport,
     SchemaSpec,
     build_fact_ledger,
-    check_grounded,
     run_guarded_task,
     strip_ai_artifacts,
 )
 from app.services.candidate_profile import (
     FIELD_DEFINITIONS,
     REQUIRED_APPLICATION_FIELDS,
-    RESUME_DERIVABLE_FIELDS,
-    USER_STATED_ONLY_FIELDS,
-    calculate_completeness,
 )
 
 log = get_logger("app.application_packet")
@@ -348,7 +341,6 @@ def build_evidence(document: Dict[str, Any], provenance: List[ProfileFieldProven
     Each entry: {field, path, value_preview, origin, confidence_band, evidence, locator}
     """
     evidence: List[Dict[str, Any]] = []
-    provenance_map = _confirmed_paths(provenance)
     if provenance:
         for row in provenance:
             if row.review_required and row.ambiguity != "none":
@@ -421,7 +413,6 @@ def build_emphasized_facts(document: Dict[str, Any], jd_text: str, provenance: L
                 continue
             # check if skill appears in JD (substring or token)
             if norm in jd_lower or any(tok in norm or norm in tok for tok in jd_tokens):
-                path = "/skills"
                 # Only emphasize if confirmed via provenance or legacy presence
                 if provenance_map:
                     row = provenance_map.get("/skills")
@@ -893,7 +884,7 @@ async def generate_packet(
                 matched_missing = True
                 break
         if not matched_missing:
-            for fname, item in checklist_fields.items():
+            for fname, _item in checklist_fields.items():
                 if fname in key:
                     matched_missing = True
                     break

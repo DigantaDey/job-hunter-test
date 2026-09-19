@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -12,9 +11,9 @@ from app.api.deps import CurrentUser, DbSession
 from app.core import audit
 from app.core.entitlements import enforce
 from app.core.logging import get_logger
-from app.models.models import ApplicationPacket, ApplicationPacketEvent, Job, User
-from app.services.ai_guardrails import AIUnavailableError, GuardrailError
+from app.models.models import ApplicationPacket, ApplicationPacketEvent, Job
 from app.services import application_packet as packet_service
+from app.services.ai_guardrails import AIUnavailableError, GuardrailError
 
 router = APIRouter(prefix="/applications", tags=["applications"])
 log = get_logger("app.applications")
