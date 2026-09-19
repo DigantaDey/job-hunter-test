@@ -8,6 +8,61 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ### Added
 
+- **Browser-assisted application sessions — human-in-the-loop, no solving, no
+  interception.** A new `application_sessions` table (migration
+  `i9j0k1l2m3n4`, alongside `application_actions` and `application_submissions`)
+  gives each `(user_id, job_id)` at most one live isolated browser run with an
+  explicit state machine (`created → launching → preparing → active →
+  awaiting_user|paused → resuming → completed`, plus `expired`/`failed`/
+  `cancelled`; `docs/contracts/07` §10, `docs/contracts/10` §10). The run fills
+  only fields a classifier cleared for `autofill` — a confirmed profile/plan
+  value or an answer the user gave for that exact field — and **stops at the
+  first human-required moment**: sign-in, MFA code, CAPTCHA, an unmapped field, an
+  ambiguous mapping, a sensitive/legal/EEO question, or an expired session. Each
+  pause creates an actionable `application_actions` row (kinds `login`, `mfa`,
+  `captcha`, `unknown_field`, `ambiguous_field`, `sensitive_field`,
+  `legal_question`, `session_expired`, `review_required`), deduped per
+  `(user_id, dedupe_key)` so re-observing a page bumps `occurrences` instead of
+  stacking items, and surfaced through `GET /api/application-sessions/actions`.
+  Passwords, MFA codes and CAPTCHA solutions are typed by the user **in the
+  browser**: a handoff mints a single-use, short-lived token (stored hashed) and
+  the completion endpoint refuses any payload carrying a secret-looking field
+  (`422 restricted_field`). Nothing is solved, relayed, intercepted or hidden —
+  no stealth user-agent, no proxy rotation, no access-control bypass — and the
+  shipped outbound-URL policy plus the session's own host/employer binding still
+  apply. New services `app/services/browser_session.py` (lifecycle, isolation,
+  checkpoint validation, encrypted opt-in persistence, expiry, at-most-once
+  submission ledger) and `app/services/assisted_fill.py` (structural
+  `OBSERVE_SCRIPT`, `PlaywrightDriver`, `RecordingDriver`, the bounded pass loop
+  and `enqueue_pass`), a new `browser_session` queue pipeline whose *pause is a
+  normal result*, a new field classifier
+  (`app/services/field_classifier.py`) with `classify_field`/`classify_form`
+  verdicts, and a new API surface
+  (`backend/app/api/routers/browser_sessions.py`: `POST /api/application-sessions`,
+  `…/observe`, `…/fills`, `…/pause`, `…/resume`, `…/reauthenticate`, `…/cancel`,
+  `…/pass`, `…/submit`, `…/actions/{id}/handoff|complete`, `GET …/actions`,
+  `…/stats`, `…/screenshots`). **Privacy:** a checkpoint keeps per-field status
+  and a value *fingerprint*, never a value; the session's working set is purged
+  when the run ends; an expired session cannot resume without re-authentication
+  (which discards persisted state); persisted cookies are opt-in, encrypted with
+  the per-user key and expiry-scoped; screenshots are off by default, retention
+  capped, and never taken on a login/MFA/bot-check screen. **Duplicate
+  submissions are impossible:** a partial unique index on `(user_id, job_id)` for
+  live submissions plus a per-attempt idempotency key mean a resume, a retry or a
+  replayed request is refused (`already_submitted`), and auto-submit stays behind
+  all four gates of the automation policy — off by default in this release.
+  Covered by `backend/tests/test_browser_sessions.py` (session expiration,
+  pause/resume without re-typing, duplicate prevention, field classification,
+  the queue path, and no-secret-in-a-payload/log/checkpoint assertions), plus
+  the frontend surface `frontend/src/pages/Assist.tsx` (`/assist`, nav
+  "Assisted Apply"): the queue of human steps with a handoff button and an
+  "I finished this step in the browser" confirmation, per-field answer boxes for
+  unmapped/ambiguous/sensitive/legal questions, session state with the
+  already-completed field names, and checkpoint-validated Resume /
+  Re-authenticate / Cancel controls (the Jobs drawer links into it with
+  "Assisted session"). `Assist.test.tsx` pins that a handoff completion sends a
+  *note* and never a value or the handoff token, and that a field answer is sent
+  under the field's own name.
 - **Application packet — reviewable, versioned, grounded artifacts per job.** A new `application_packets` table (migration `d3a4f5b6c7d8`) stores one versioned, approval-gated packet per `(user_id, job_id)` with `is_current` uniqueness, `jd_hash` + `jd_text_snapshot` so a later JD change is flagged `is_stale`, and `master_profile_snapshot` preserved verbatim (tailoring only reorders/restates). Each packet contains `tailored_resume` (reordered subset of confirmed skills/experience), `cover_note`, `short_answers` (with `needs_review` routed for missing/uncertain fields), `outreach_draft` (subject/body), `checklist` (missing-information list, unsupported fields clearly marked), `summary`, `evidence` (field → locator, provenance), `emphasized_facts` (which profile facts were emphasized for this JD), `guardrail_report` (existing AI guardrails), `token_usage` (provider-reported ledger, synthetic stub fallback in tests), `approval_state` (`pending_approval` → `approved`/`rejected`, edits allowed only before approval), `version` + `generated_at`. Service `app.services.application_packet` builds the packet under guardrails: `FactLedger` + `check_grounded` + never-invent categories (experience/employment/education/certifications/authorization), `build_checklist` routes ambiguous questions to user review, `build_evidence` and `build_emphasized_facts` are deterministic and JD-aware. API `backend/app/api/routers/packets.py` (`/api/packets/prepare`, `/api/packets`, `/api/packets/{id}`, `PATCH`, `POST approve/reject`, `GET events`) is preparation-only — no auto-submit. Frontend `Packets.tsx` (`/packets`) lets the user review every artifact, edit before use, see JD version/emphasized facts/checklist/evidence/token accounting, regenerate after profile correction (new version supersedes old, history retained), and see stale warning when the JD changes.
 - Multi-stage job matching optimized for interview potential, not application
   volume — no single opaque AI score. Stage 1 applies named hard filters

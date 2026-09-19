@@ -21,7 +21,7 @@ and adds the four things it is missing: **progress**, **checkpoints**,
 |---|---|---|
 | `id` ✓ | PK | the receipt the client keeps |
 | `user_id` ✓ | FK, index | tenant — a worker only ever touches the row's own tenant |
-| `pipeline` ✓ | String(20) | `QUEUE_PIPELINES`: `discovery` \| `application` \| `email` \| `funding` \| `ai` \| **`extraction`** \| **`onboarding`** |
+| `pipeline` ✓ | String(20) | `QUEUE_PIPELINES`: `discovery` \| `application` \| `email` \| `funding` \| `ai` \| **`extraction`** \| **`onboarding`** \| **`browser_session`** |
 | `task` **new** | String(40), nullable | the handler sub-kind (`generate_resume`, `tag_resume`, `extract_profile`). Today it lives in `payload.task`; it is promoted to a column because the live view, the metrics and the UI all read it |
 | `job_id` ✓ | FK `jobs.id`, nullable | |
 | `entity_type` / `entity_id` **new** | String(32) / Integer, nullable | the subject when it is not a job (`application`, `resume_document`, `discovery_run`, `onboarding_session`) — so a page can find its row without knowing the payload |

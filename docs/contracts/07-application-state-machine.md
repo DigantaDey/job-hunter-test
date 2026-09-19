@@ -321,3 +321,59 @@ is still alive.
     `restricted` field value ([01 §7](01-conventions.md)).
 11. An inferred tracking state always has `is_provisional = true` and non-empty
     `provisional_evidence`.
+
+---
+
+## 10. The browser session state machine (v2.2.21)
+
+An *assisted session* is the observable half of an application attempt: the
+browser run that fills a form and stops for a human. It is its own table
+(`application_sessions`) with its own state machine, because an application state
+answers "where is this application?" while a session answers "what is the browser
+doing right now, and who has to act next?".
+
+```
+created ──launching──▶ preparing ──▶ active ──▶ completed
+   │            │                      │  ▲
+   │            └──────────────┬───────┘  │ resume (checkpoint validated)
+   ▼                           ▼          │
+cancelled                awaiting_user / paused ──resuming──┘
+   ▲                           ▲
+   └──── expired ◀── TTL ──────┘        failed
+```
+
+| State | Phase | Meaning | Terminal |
+|---|---|---|---|
+| `created` | new | row exists, nothing opened | |
+| `launching` | starting | browser/context is being created | |
+| `preparing` | starting | page observed, plan/credential being resolved | |
+| `active` | running | the pass may type (only `autofill` verdicts) | |
+| `awaiting_user` | waiting | a human step is pending; a queue item exists | |
+| `paused` | waiting | the user paused it themselves | |
+| `resuming` | running | checkpoint validated, the next pass is starting | |
+| `completed` | done | every fillable field is done — **without** a submit | yes |
+| `expired` | expired | TTL passed; re-authentication required | yes |
+| `failed` | failed | the portal could not be driven | yes |
+| `cancelled` | cancelled | the user stopped the run | yes |
+
+Transition rules that matter:
+
+1. `created → awaiting_user` and `created → paused` are legal: the first page a
+   session sees can legitimately be a sign-in or bot-check screen, i.e. a pause
+   before any field exists.
+2. `awaiting_user`/`paused → resuming` **only** through checkpoint validation
+   (job, URL, employer, application identity, TTL); otherwise the session stays
+   where it is and `last_checkpoint_failure` records the code.
+3. `expired → resuming` is impossible: it goes through `reauthenticate`, which
+   drops the persisted browser state, grants a fresh TTL and issues a new `login`
+   handoff.
+4. No transition out of a terminal state. A second attempt on the same job is a
+   new session row, never a reopened one.
+5. One live session per `(user, job)`; `BROWSER_SESSION_MAX_LIVE` caps how many
+   one account may hold at once (`429 session_limit_reached` beyond it).
+6. Every state change appends to `checkpoint.steps` (bounded by
+   `MAX_SESSION_EVENTS`) and writes a `job_events` row, so the UI can show the
+   run without reading page content.
+7. `application_sessions.user_id` scopes every read and write: another tenant's
+   session is `404`, never a merge, and the on-disk profile reference is resolved
+   under the artifact root (a value that tries to escape it is refused).

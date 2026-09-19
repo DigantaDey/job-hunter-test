@@ -253,6 +253,43 @@ async def prepare_application(
     return result
 
 
+async def prepare_form_plan(db: Session, user: User, job: Job) -> Dict[str, Any]:
+    """
+    Detect the form and build the field plan for a job — no resume, no AI.
+
+    An assisted browser session needs the *form* facts (fields, portal, whether a
+    login is required, the domain its credentials would belong to) so the live
+    page can be compared against something. It deliberately does not choose or
+    generate a resume: a session that pauses for a human should not spend AI
+    budget before the human has even seen the form.
+    """
+    profile = latest_profile(db, user.id)
+    if not profile:
+        raise ValueError("profile_missing")
+
+    forms = dict((job.extra or {}).get("forms") or {})
+    if forms.get("detection_source") != "html" and (job.url or "").startswith("http"):
+        detected = await detect_form_structure(job.url, job.source)
+        if detected.get("detection_source") in ("html", "unavailable"):
+            forms = detected
+
+    plan = build_autofill_plan(schema=forms, profile=profile.data or {}, answers={})
+    extra = dict(job.extra or {})
+    extra["forms"] = forms
+    extra["autofill_plan"] = plan
+    job.extra = extra
+    if job.status in ("discovered", "queued"):
+        job.status = "preparing" if not plan["missing_required"] else "needs_input"
+    db.commit()
+    record_job_event(
+        db, user_id=user.id, job_id=job.id, stage="form_prepared", status="info",
+        message=f"Form detected ({forms.get('detection_source')}) — {plan['fillable']}/{plan['total_fields']} fields mapped",
+        meta={"portal": plan["portal_type"], "requires_login": plan["requires_login"],
+              "detection_source": forms.get("detection_source")},
+    )
+    return {"forms": forms, "plan": plan, "status": job.status}
+
+
 def company_domains(job: Job) -> List[str]:
     """
     The job's *independent* company metadata, for the autofill domain policy.

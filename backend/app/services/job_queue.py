@@ -59,7 +59,8 @@ log = get_logger("app.queue")
 #: ``extraction`` is the resumable onboarding resume-parse (see
 #: :mod:`app.services.onboarding`) — the AI half of a resume upload, moved out
 #: of the HTTP request so a refresh/restart never loses it.
-PIPELINES = ("discovery", "application", "email", "funding", "ai", "extraction")
+PIPELINES = ("discovery", "application", "email", "funding", "ai", "extraction",
+             "browser_session")
 
 
 def worker_id() -> str:

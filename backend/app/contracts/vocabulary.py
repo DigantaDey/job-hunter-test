@@ -404,6 +404,133 @@ APPLICATION_BLOCKED_CODES: Tuple[str, ...] = (
 SUBMISSION_CHANNELS: Tuple[str, ...] = ("automation", "manual_user", "assisted_dry_run")
 
 
+# --------------------------------------------------------------------------- #
+# Browser-assisted application sessions (human-in-the-loop)
+#
+# One ``application_sessions`` row is one isolated browser run for one
+# ``(user, job)``. Automation only ever types the values it is allowed to type;
+# everything else — a password, an MFA code, a CAPTCHA, an unknown or ambiguous
+# field, a legal/sensitive question — turns into an ``application_actions``
+# queue item and the session state becomes ``awaiting_user``.
+# --------------------------------------------------------------------------- #
+#: ``application_sessions.state`` — the lifecycle of one assisted browser run.
+APPLICATION_SESSION_STATES: Tuple[str, ...] = (
+    "created",         # the row exists; no browser context has been opened
+    "launching",       # an isolated context is starting for this user
+    "preparing",       # form detected and fields classified; nothing typed yet
+    "active",          # filling the fields this session is allowed to touch
+    "awaiting_user",   # a human step is required *in the browser* (login/MFA/CAPTCHA/field)
+    "paused",          # the user paused it; nothing runs until they resume
+    "resuming",        # checkpoint validation is in flight (identity re-check)
+    "completed",       # every fillable field is filled; submit only if policy allows
+    "expired",         # the TTL passed — re-authentication is required
+    "failed",
+    "cancelled",
+)
+
+#: ``application_sessions.phase`` — the UI grouping, stored so a board never has
+#: to re-derive it. Complete by construction; a test fails if a state is added
+#: without a phase.
+APPLICATION_SESSION_PHASE: Dict[str, str] = {
+    "created": "new",
+    "launching": "working",
+    "preparing": "working",
+    "active": "working",
+    "awaiting_user": "blocked",
+    "paused": "blocked",
+    "resuming": "working",
+    "completed": "done",
+    "expired": "closed",
+    "failed": "closed",
+    "cancelled": "closed",
+}
+
+#: No transition out of these.
+APPLICATION_SESSION_TERMINAL_STATES: Tuple[str, ...] = (
+    "completed", "expired", "failed", "cancelled",
+)
+
+#: States that mean "a human owes this session something" — what
+#: ``GET /api/application-sessions/actions`` surfaces.
+APPLICATION_SESSION_USER_ACTION_STATES: Tuple[str, ...] = ("awaiting_user",)
+
+#: ``application_actions.kind`` — what the human is being asked to do. The
+#: first three are browser handoffs (the user does it themselves, in the
+#: browser, and we never see the value); the rest are answer/question items.
+USER_ACTION_KINDS: Tuple[str, ...] = (
+    "login",            # sign in or create the portal account personally
+    "mfa",              # second factor / one-time code
+    "captcha",          # a bot check the human completes — never solved for them
+    "unknown_field",    # a field that could not be classified
+    "ambiguous_field",  # a field whose meaning is genuinely unclear
+    "sensitive_field",  # personal data we refuse to guess
+    "legal_question",   # attestation / consent / eligibility statement
+    "session_expired",  # the session must be re-authenticated to continue
+    "review_required",  # the plan is ready and wants a human look before submit
+)
+
+#: ``application_actions.status``.
+USER_ACTION_STATUSES: Tuple[str, ...] = (
+    "pending", "in_progress", "completed", "expired", "cancelled",
+)
+
+#: Why a resume was refused (``application_sessions.last_checkpoint_failure``).
+#: Never free text — a UI has to render the reason, and an operator has to
+#: grep for it.
+CHECKPOINT_FAILURES: Tuple[str, ...] = (
+    "session_expired",
+    "session_not_resumable",
+    "job_not_owned",
+    "job_reassigned",
+    "url_changed",
+    "employer_mismatch",
+    "application_identity_mismatch",
+    "portal_domain_not_allowed",
+)
+
+#: How a detected form field is classified before anything is typed.
+FIELD_CLASSIFICATIONS: Tuple[str, ...] = (
+    "canonical",   # mapped to a known profile key
+    "file",        # an attachment (resume/CV)
+    "voluntary",   # EEO self-identification — decline is the only safe default
+    "sensitive",   # personal data: eligible to fill from a confirmed value
+    "legal",       # attestation / eligibility statement — the user answers
+    "unknown",     # nothing we recognise: ask, never guess
+    "ambiguous",   # more than one plausible meaning: ask
+    "credential",  # password / passphrase — the user types it, in the browser
+    "mfa",         # one-time code — the user types it, in the browser
+    "captcha",     # bot check — the user completes it, never solved for them
+    "submit",      # a submit control — never clicked unless policy allows
+    "ignored",     # hidden/CSRF/search inputs we never touch
+)
+
+#: What the executor does with a classified field.
+FIELD_ACTIONS: Tuple[str, ...] = (
+    "autofill",   # safe to type from a confirmed profile value
+    "ask_user",   # create an action item and pause the session
+    "handoff",    # hand the browser step to the user (no value ever reaches us)
+    "skip",       # leave it alone, non-blocking
+    "never",      # forbid it outright
+)
+
+#: ``application_submissions.state`` — the at-most-once ledger.
+SUBMISSION_STATES: Tuple[str, ...] = (
+    "reserved", "submitted", "verified", "failed", "abandoned",
+)
+
+#: Why a submission was refused (``application_submissions.refusal_reason`` /
+#: the API's ``refused`` payload).
+SUBMISSION_REFUSALS: Tuple[str, ...] = (
+    "already_submitted",
+    "policy_disallows_submit",
+    "session_expired",
+    "checkpoint_invalid",
+    "action_required",
+    "no_session",
+)
+
+
+
 def is_terminal_application_state(state: str) -> bool:
     """True when no further transition is allowed out of *state*."""
     return state in APPLICATION_TERMINAL_STATES
@@ -603,7 +730,8 @@ QUEUE_LIVE_STATUSES: Tuple[str, ...] = ("queued", "processing", "paused", "needs
 QUEUE_TERMINAL_STATUSES: Tuple[str, ...] = ("done", "failed", "dead", "cancelled")
 
 #: ``pipeline_jobs.pipeline`` — the durable work kinds.
-QUEUE_PIPELINES: Tuple[str, ...] = ("discovery", "application", "email", "funding", "ai", "extraction", "onboarding")
+QUEUE_PIPELINES: Tuple[str, ...] = ("discovery", "application", "email", "funding", "ai", "extraction",
+                                     "onboarding", "browser_session")
 
 #: ``payload.trigger`` — why the work exists. ``auto`` is what makes an
 #: auto-mode run notify and charge differently from a clicked one.
@@ -621,6 +749,12 @@ QUEUE_PROGRESS_STEPS: Dict[str, Tuple[str, ...]] = {
                     "navigating", "filling", "submitting", "verifying", "done"),
     "extraction": ("parsing_document", "extracting_fields", "guardrails",
                    "scoring_confidence", "writing_provenance", "done"),
+    # One pass of a browser-assisted application session. ``awaiting_user`` is a
+    # step, not a failure: the pass stops at the first human-required moment
+    # (login, MFA, CAPTCHA, an unknown field) and the next pass resumes from the
+    # checkpoint.
+    "browser_session": ("opening", "observing", "filling", "awaiting_user",
+                        "resuming", "verifying_checkpoint", "done"),
 }
 
 
@@ -735,6 +869,18 @@ EVENT_TYPES: Tuple[str, ...] = (
     "application.cancelled",
     "application.retried",
     "application.dead_lettered",
+    # browser-assisted sessions (human-in-the-loop)
+    "application.session_started",
+    "application.session_paused",
+    "application.session_resumed",
+    "application.session_expired",
+    "application.session_completed",
+    "application.session_cancelled",
+    "application.action_required",
+    "application.action_completed",
+    "application.handoff_issued",
+    "application.observation_recorded",
+    "application.submission_refused",
     # automation policy & scheduling
     "automation.policy_changed",
     "automation.run_scheduled",
@@ -796,6 +942,11 @@ AUDIT_ACTIONS: Tuple[str, ...] = (
     "resume.generated", "resume.polished", "resume.rejected",
     "settings.updated",
     "vault.credential_created", "vault.deleted", "vault.exported", "vault.reveal_failed", "vault.viewed",
+    # new — browser-assisted sessions (human-in-the-loop)
+    "application.session_started", "application.session_paused", "application.session_resumed",
+    "application.session_expired", "application.session_completed", "application.session_cancelled",
+    "application.action_completed", "application.handoff_issued",
+    "application.submission_reserved", "application.submission_refused",
     # new — onboarding & profile
     "account.created",
     "onboarding.started", "onboarding.completed", "onboarding.abandoned",
@@ -895,6 +1046,9 @@ ERROR_CODES: Tuple[str, ...] = (
     "application_not_found",
     "application_already_submitted",
     "application_not_submittable",
+    "session_expired",
+    "action_required",
+    "checkpoint_failed",
     "idempotency_conflict",
     "idempotency_replay",
     "onboarding_not_started",
@@ -941,6 +1095,16 @@ VOCABULARY: Dict[str, Tuple[str, ...]] = {
     "application_user_action_states": APPLICATION_USER_ACTION_STATES,
     "application_blocked_codes": APPLICATION_BLOCKED_CODES,
     "submission_channels": SUBMISSION_CHANNELS,
+    "application_session_states": APPLICATION_SESSION_STATES,
+    "application_session_terminal_states": APPLICATION_SESSION_TERMINAL_STATES,
+    "application_session_user_action_states": APPLICATION_SESSION_USER_ACTION_STATES,
+    "user_action_kinds": USER_ACTION_KINDS,
+    "user_action_statuses": USER_ACTION_STATUSES,
+    "checkpoint_failures": CHECKPOINT_FAILURES,
+    "field_classifications": FIELD_CLASSIFICATIONS,
+    "field_actions": FIELD_ACTIONS,
+    "submission_states": SUBMISSION_STATES,
+    "submission_refusals": SUBMISSION_REFUSALS,
     "job_statuses": JOB_STATUSES,
     "ambiguity_kinds": AMBIGUITY_KINDS,
     "field_resolutions": FIELD_RESOLUTIONS,
@@ -985,6 +1149,7 @@ VOCABULARY: Dict[str, Tuple[str, ...]] = {
 MAPPINGS: Dict[str, Dict[str, str]] = {
     "application_state_phase": APPLICATION_STATE_PHASE,
     "job_status_projection": JOB_STATUS_PROJECTION,
+    "application_session_phase": APPLICATION_SESSION_PHASE,
 }
 
 __all__ = [
@@ -1009,6 +1174,11 @@ __all__ = [
     "QUEUE_TRIGGERS", "RESUME_ROLES", "RESUME_STATES", "RESTRICTED_FIELD_KEYS",
     "REVIEW_ACTIONS", "REVIEW_STATUSES", "SCORE_SOURCES", "SENSITIVE_AUDIT_ACTIONS",
     "SENSITIVE_FIELD_KEYS", "SENSITIVE_FIELD_POLICIES", "SENSITIVITY_LEVELS",
-    "SUBMISSION_CHANNELS", "VOCABULARY", "confidence_band", "is_terminal_application_state",
+    "SUBMISSION_CHANNELS", "SUBMISSION_REFUSALS", "SUBMISSION_STATES",
+    "USER_ACTION_KINDS", "USER_ACTION_STATUSES", "CHECKPOINT_FAILURES",
+    "FIELD_ACTIONS", "FIELD_CLASSIFICATIONS",
+    "APPLICATION_SESSION_PHASE", "APPLICATION_SESSION_STATES",
+    "APPLICATION_SESSION_TERMINAL_STATES", "APPLICATION_SESSION_USER_ACTION_STATES",
+    "VOCABULARY", "confidence_band", "is_terminal_application_state",
     "job_status_for", "requires_review",
 ]
