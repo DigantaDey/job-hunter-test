@@ -281,8 +281,8 @@ def _stub_packet(prompt: str = "") -> Dict[str, Any]:
         checklist_note = " Work authorization requires user review."
     summary = (
         f"Application for {job_title}: candidate with {', '.join(skills[:3]) if skills else 'relevant experience'} "
-        f"and experience at {', '.join([e.get('company','') for e in exps if isinstance(e, dict)][:2]) if exps else 'recorded roles'}. "
-        f"Emphasized {skills[0] if skills else 'key skills'} for this JD.{checklist_note}"
+        f"and experience at {', '.join([e.get('company','') for e in exps if isinstance(e, dict)][:2]) if exps else 'recorded roles'}"
+        f" — emphasized {skills[0] if skills else 'key skills'} for this JD.{checklist_note}"
     )
     outreach = {
         "subject": f"{job_title} — background in {skills[0] if skills else 'relevant stack'}",
