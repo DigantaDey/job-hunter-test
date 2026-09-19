@@ -217,6 +217,106 @@ def _stub_tailored() -> Dict[str, Any]:
     }
 
 
+def _stub_packet(prompt: str = "") -> Dict[str, Any]:
+    """Grounded application packet — every fact traceable to the master profile in prompt."""
+    import json as _json
+    import re as _re
+    # Try to extract master profile JSON from prompt
+    master = None
+    m = _re.search(r"Candidate master profile \(ground truth.*?\):\s*(\{.*?\})\s*\n\s*Evidence pack", prompt or "", _re.DOTALL)
+    if m:
+        try:
+            master = _json.loads(m.group(1))
+        except Exception:
+            master = None
+    if not isinstance(master, dict) or not master:
+        master = _stub_profile()
+    def _clean(v, limit=400):
+        import re as __re
+        return __re.sub(r"\s+", " ", str(v or "")).strip()[:limit]
+    skills = list(master.get("skills") or [])[:5]
+    exps = master.get("experience") or []
+    if not isinstance(exps, list):
+        exps = []
+    exps = exps[:2]
+    edu = master.get("education") or []
+    if not isinstance(edu, list):
+        edu = []
+    edu = edu[:1]
+    projects = master.get("projects") or []
+    if not isinstance(projects, list):
+        projects = []
+    projects = projects[:1]
+    tailored = {
+        "name": master.get("name", "Test Candidate"),
+        "email": master.get("email", "test.candidate@example.com"),
+        "phone": master.get("phone", ""),
+        "location": master.get("location", ""),
+        "links": list(master.get("links") or []),
+        "languages": list(master.get("languages") or []),
+        "certifications": list(master.get("certifications") or []),
+        "current_title": master.get("current_title", ""),
+        "summary": _clean(master.get("summary", ""))[:300] or "Experienced candidate with relevant background.",
+        "skills": skills,
+        "experience": exps,
+        "education": edu,
+        "projects": projects,
+    }
+    job_title = "Senior Backend Engineer"
+    company = "ExampleCo"
+    mj = _re.search(r"Job:\s*(.*?)\s+at\s+(.*?)\n", prompt or "")
+    if mj:
+        job_title = mj.group(1).strip()[:80] or job_title
+        company = mj.group(2).strip()[:80] or company
+    has_auth = bool(str(master.get("work_authorization") or master.get("authorization") or "").strip())
+    auth_line = " I am authorized to work in the region." if has_auth else ""
+    cover = (
+        f"Dear Hiring Manager,\n\n"
+        f"My background with {', '.join(skills[:3]) if skills else 'relevant skills'} aligns with the {job_title} role at {company}. "
+        f"{_clean(master.get('summary',''))[:200]}{auth_line}\n\n"
+        f"I would welcome a short call about how that experience maps to your team.\n\nRegards,\n{master.get('name','Test Candidate')}"
+    )
+    checklist_note = ""
+    if "work_authorization" in (prompt or "").lower() or not has_auth:
+        checklist_note = " Work authorization requires user review."
+    summary = (
+        f"Application for {job_title}: candidate with {', '.join(skills[:3]) if skills else 'relevant experience'} "
+        f"and experience at {', '.join([e.get('company','') for e in exps if isinstance(e, dict)][:2]) if exps else 'recorded roles'}"
+        f" — emphasized {skills[0] if skills else 'key skills'} for this JD.{checklist_note}"
+    )
+    outreach = {
+        "subject": f"{job_title} — background in {skills[0] if skills else 'relevant stack'}",
+        "body": (
+            f"Hi team,\n\nI saw the {job_title} opening and wanted to reach out. "
+            f"My experience with {', '.join(skills[:2]) if skills else 'the listed stack'} "
+            f"at {exps[0].get('company','') if exps and isinstance(exps[0], dict) else 'recent roles'} "
+            f"seems relevant to the payments platform scale described. Would you be open to a brief call?"
+        ),
+    }
+    short_answers = [
+        {"question": "Why are you interested in this role?", "answer": _clean(master.get('summary',''))[:200] or "Interested due to matching experience.", "source_field": "/summary", "needs_review": False, "confidence": "high"},
+    ]
+    if has_auth:
+        short_answers.append({"question": "Are you authorized to work in this location?", "answer": str(master.get("work_authorization") or master.get("authorization")), "source_field": "/work_authorization", "needs_review": False, "confidence": "high"})
+    else:
+        short_answers.append({"question": "Are you authorized to work in this location?", "answer": "", "source_field": "/work_authorization", "needs_review": True, "confidence": "low"})
+    emphasized = skills[:3] if skills else []
+    evidence = [
+        {"fact": skills[0] if skills else "Python", "source": "/skills", "locator": "document:skills"},
+    ]
+    if exps and isinstance(exps[0], dict) and exps[0].get("company"):
+        evidence.append({"fact": exps[0].get("company"), "source": "/experience/0/company", "locator": "document:experience"})
+    return {
+        "tailored_profile": tailored,
+        "cover_note": cover,
+        "short_answers": short_answers,
+        "outreach_draft": outreach,
+        "summary": summary,
+        "emphasized_facts": emphasized,
+        "evidence": evidence,
+    }
+
+
 def _stub_score() -> Dict[str, Any]:
     return {
         "score": 88,
@@ -412,6 +512,8 @@ def stub_ai_response(workflow: str, prompt: str) -> Dict[str, Any]:
         if "funding-extract-v1" in (prompt or ""):
             return _stub_funding_extract(prompt)
         return _stub_funding_scan(prompt)
+    if workflow == "packet_gen":
+        return _stub_packet(prompt)
     return {"ok": True}
 
 
@@ -889,6 +991,8 @@ def _scripted_answer(prompt_text: str) -> Any:
         return stub_ai_response("interview", prompt_text)
     if "form" in lowered and "json" in lowered:
         return stub_ai_response("form_detect", prompt_text)
+    if "application packet" in lowered or "tailored_profile" in lowered or "prepare the application packet" in lowered:
+        return stub_ai_response("packet_gen", prompt_text)
     return {"ok": True}
 
 
