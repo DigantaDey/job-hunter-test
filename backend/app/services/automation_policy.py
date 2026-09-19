@@ -245,7 +245,7 @@ def mode_ceilings(db: Session, user_id: int) -> ModeCeilings:
     return ModeCeilings(mode=ceiling, default_mode="prepare", allowed_modes=allowed)
 
 
-def _never_more_than(db: Session, user_id: int, workflow: str) -> Tuple[int, int]:
+def _never_more_than(db: Session, user_id: int, workflow: str) -> Tuple[Optional[int], Optional[int]]:
     """``(per_day, per_month)`` ceilings the plan may never exceed.
 
     ``None`` = no ceiling from the plan (still clamped by the policy row).
@@ -567,8 +567,9 @@ def update_policy(
     if workflow == SUBMIT_WORKFLOW:
         candidate = dict(before, **{k: normalize[k] for k in normalize})
         if candidate.get("mode") == "auto_submit":
-            override = plan_http_overrides(db, db.query(User).get(user_id))
-            if not override.http_allowed:
+            owner = db.query(User).get(user_id)
+            override = plan_http_overrides(db, owner) if owner is not None else None
+            if override is None or not override.http_allowed:
                 raise ValueError(
                     "auto_submit requires the automation disclosure and the "
                     "allow_auto_submit consent (the write was refused and no "
@@ -777,8 +778,9 @@ def resolve_policy(
     if global_row is not None:
         return global_row
     # Synthesized, unattached: read-only evaluation only. The instance is
-    # transient (never added), so ``expunge`` would raise; it is simply
-    # returned detached with no identity.
+    # transient (never added to the session) and its identity column is
+    # already ``None``, so it is returned detached as-is — no ``expunge``,
+    # no ``id`` assignment (both would be type/lifetime mistakes).
     synth = AutomationPolicy(
         user_id=user_id,
         workflow=workflow,
@@ -796,7 +798,6 @@ def resolve_policy(
         disclosure_version=disclosure_version(),
         version=1,
     )
-    synth.id = None
     return synth
 
 
