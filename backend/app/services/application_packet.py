@@ -862,7 +862,8 @@ async def generate_packet(
     outreach.setdefault("subject", "")
     outreach.setdefault("body", "")
     summary = str(parsed.get("summary") or "").strip()
-    short_answers = parsed.get("short_answers") if isinstance(parsed.get("short_answers"), list) else []
+    _raw_short_answers = parsed.get("short_answers")
+    short_answers: List[Any] = _raw_short_answers if isinstance(_raw_short_answers, list) else []
     # Post-process short answers: enforce checklist routing — if answer invented for missing field, blank it
     checklist_paths = {c["path"]: c for c in checklist}
     # Also map field name -> checklist for fuzzy match
@@ -931,7 +932,7 @@ async def generate_packet(
     # Prefer deterministic emphasized that is actually in profile; merge model suggestion filtered by ledger
     if isinstance(emphasized_from_model, list) and emphasized_from_model:
         # Filter model emphasized to only those grounded in raw
-        filtered = []
+        filtered: List[Any] = []
         for fact in emphasized_from_model:
             s = str(fact) if not isinstance(fact, dict) else str(fact.get("fact") or fact.get("value") or "")
             if not s:
@@ -941,9 +942,10 @@ async def generate_packet(
         if filtered:
             # Normalize to list of dicts if needed
             if filtered and isinstance(filtered[0], str):
-                emphasized = [{"fact": s, "field": "unknown", "path": "", "reason": "model emphasized and grounded", "jd_keyword": s.lower()} for s in filtered[:12]]
+                emphasized = [{"fact": s, "field": "unknown", "path": "", "reason": "model emphasized and grounded", "jd_keyword": str(s).lower()} for s in filtered[:12] if isinstance(s, str)]
             else:
-                emphasized = filtered[:12]
+                dict_filtered: List[Dict[str, Any]] = [f for f in filtered if isinstance(f, dict)]
+                emphasized = dict_filtered[:12]
 
     # 7. Token usage from ledger (provider-reported)
     token_usage = _latest_token_usage(db, user_id, "packet_gen")
@@ -1050,7 +1052,7 @@ async def generate_packet(
         summary=summary,
         evidence=evidence_from_model[:32] if isinstance(evidence_from_model, list) else evidence[:32],
         emphasized_facts=emphasized,
-        guardrail_report=report.to_dict() if hasattr(report, "to_dict") else dict(report or {}),
+        guardrail_report=report.to_dict() if hasattr(report, "to_dict") else {},
         token_usage=token_usage,
         job_title=job_title[:300],
         company=company[:200],

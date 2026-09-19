@@ -37,6 +37,8 @@ from app.models.models import (
     FundingCompany,
     FundingScan,
     FundingScanCompany,
+    ApplicationPacket,
+    ApplicationPacketEvent,
     InterviewPrep,
     Job,
     JobEvent,
@@ -112,6 +114,9 @@ CHILD_TABLES: dict[str, type] = {
     # Multi-stage matching: the versioned explained verdict + user feedback.
     "match_results": MatchResult,
     "match_feedback": MatchFeedback,
+    # Application packet (reviewable, versioned, grounded artifacts)
+    "application_packets": ApplicationPacket,
+    "application_packet_events": ApplicationPacketEvent,
 }
 
 
@@ -289,6 +294,48 @@ def _seed_every_child_table(db, user: User) -> dict:
         reason="good call", meta={}, scorer_version="1.0.0",
         created_at=datetime.utcnow(),
     ))
+    db.flush()
+
+    # Application packet seed (must come after job/persona, before erasure)
+    packet = ApplicationPacket(
+        user_id=user.id,
+        job_id=job.id,
+        persona_id=persona.id,
+        version=1,
+        status="pending_approval",
+        is_current=True,
+        jd_hash="a" * 64,
+        jd_text_snapshot="Python, FastAPI.",
+        jd_version=1,
+        master_profile_snapshot={"name": "Test Candidate"},
+        tailored_resume={"name": "Test Candidate"},
+        cover_note="Dear Hiring Manager, cover note.",
+        short_answers=[],
+        outreach_draft={"subject": "Hello", "body": "Hi"},
+        checklist=[],
+        summary="Summary tying facts to JD.",
+        evidence=[],
+        emphasized_facts=[],
+        guardrail_report={},
+        token_usage={},
+        job_title="Senior Backend Engineer",
+        company="FinCo",
+    )
+    db.add(packet)
+    db.flush()
+    db.add(
+        ApplicationPacketEvent(
+            user_id=user.id,
+            packet_id=packet.id,
+            job_id=job.id,
+            event_type="generated",
+            from_status=None,
+            to_status="pending_approval",
+            detail="Generated version 1",
+            meta={},
+            actor_type="system",
+        )
+    )
     db.flush()
 
     for row in (
