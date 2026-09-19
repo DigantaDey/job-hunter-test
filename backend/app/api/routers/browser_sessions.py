@@ -503,11 +503,15 @@ def submit(session_id: int, request: Request, user: CurrentUser, db: DbSession):
         code = "application_already_submitted" if decision["reason"] == "already_submitted" \
             else "application_not_submittable"
         audit.audit(db, "application.submission_refused", user=user, target=f"job:{job.id}",
-                    detail={"session_id": session.id, "reason": decision["reason"]}, request=request)
+                    detail={"session_id": session.id, "reason": decision["reason"],
+                            "policy_id": decision.get("policy_id"),
+                            "policy_version": decision.get("policy_version")},
+                    request=request)
         raise HTTPException(409, {"code": code, "message": decision["reason"], **decision})
     audit.audit(db, "application.submission_reserved", user=user, target=f"job:{job.id}",
                 detail={"session_id": session.id, "submission_id": row.id,
-                        "idempotency_key": row.idempotency_key, "dry_run": row.dry_run},
+                        "idempotency_key": row.idempotency_key, "dry_run": row.dry_run,
+                        "policy_id": row.policy_id, "policy_version": row.policy_version},
                 request=request)
     return {"reserved": True, "submission_id": row.id, "state": row.state, "dry_run": row.dry_run,
             "idempotency_key": row.idempotency_key, "decision": decision}

@@ -340,26 +340,58 @@ async def execute_application(
     user_allow_submit = bool(get_setting(db, user.id, "application", "allow_auto_submit", False))
     submit = bool(allow_submit and user_allow_submit and settings.autofill_allow_submit and not settings.autofill_dry_run)
 
+    # Evaluate the automation-policy engine (contracts/10 §5) *before* the
+    # browser is reached. ``allow_submit`` carries the queued intent; the engine
+    # decides whether this application may actually go out against the *live*
+    # policy, consent, confidence and quota (rule 2: evaluation happens twice —
+    # at trigger and at execution — so an intent queued before a consent was
+    # withdrawn still runs, but as a dry run, exactly as shipped).
+    from app.services import automation_policy as policy_engine
+
+    policy_decision: Dict[str, Any] = {"allowed": True, "mode": "prepare", "reason": "allowed",
+                                        "policy_id": None, "policy_version": None,
+                                        "consent_snapshot": {}, "downgrade": {}}
+    try:
+        policy_decision = policy_engine.evaluate_policy(
+            db, user=user, job=job, workflow=policy_engine.SUBMIT_WORKFLOW,
+            persona_id=job.persona_id, for_http=False,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("automation policy evaluation failed (%s) — treating as prepare-only", exc)
+
+    engine_submit = bool(
+        submit and policy_decision.get("allowed") and policy_decision.get("mode") == "auto_submit"
+    )
+
     result = await execute_autofill(
         url=job.url,
         plan=plan or {},
         credential=credential,
-        allow_submit=submit,
+        allow_submit=engine_submit,
         screenshot_path=screenshot if settings.autofill_enabled else None,
         # Independent company metadata: restricts where the browser may act.
         expected_domains=company_domains(job),
     )
 
+    extra["policy_decision"] = policy_decision
     extra["autofill_result"] = result
     job.extra = extra
 
-    if result["status"] == "submitted" and result.get("submitted"):
+    did_submit = _submit_result(result)
+    # The at-most-once ledger records the decision (contracts/10 §5 rule 3),
+    # whether this run submitted or was reduced to a dry run by the policy.
+    submission_id = _record_application_submission(db, user, job, policy_decision, did_submit)
+
+    if did_submit:
         job.status = "applied"
         job.applied_at = datetime.utcnow()
         job.error = ""
         record_job_event(db, user_id=user.id, job_id=job.id, stage="applied", status="success",
                          message=f"Application submitted automatically ({result['filled']} fields filled)",
-                         meta=result)
+                         meta={"submission_id": submission_id,
+                               "policy_id": policy_decision.get("policy_id"),
+                               "policy_version": policy_decision.get("policy_version"),
+                               **result})
         inc("jobhunter_applications_total", result="automated")
     elif result["status"] in ("dry_run", "filled"):
         job.status = "ready_to_apply"
@@ -367,9 +399,15 @@ async def execute_application(
         record_job_event(db, user_id=user.id, job_id=job.id, stage="ready_to_apply", status="info",
                          message=(f"Prefilled {result['filled']} field(s) in dry-run mode"
                                   + (" (Playwright not installed — plan only)" if result["status"] == "filled" else "")
-                                  + ". Review and submit, or enable automation."),
-                         meta=result)
-        inc("jobhunter_applications_total", result="dry_run")
+                                  + (". Review and submit, or enable automation."
+                                     if policy_decision.get("allowed")
+                                     else ".")),
+                         meta={"submission_id": submission_id,
+                               "policy_reason": policy_decision.get("reason"),
+                               "policy_downgrade": policy_decision.get("downgrade", {}),
+                               **result})
+        inc("jobhunter_applications_total",
+            result="dry_run" if policy_decision.get("allowed") else "blocked")
     else:
         job.status = "failed"
         job.error = result.get("reason") or "autofill unavailable"
@@ -386,6 +424,135 @@ async def execute_application(
         "vault_created": False,
         "message": result.get("reason") or result["status"],
     }
+
+
+def _submit_result(report: Dict[str, Any]) -> bool:
+    """Was the autofill run a real outbound submission?
+
+    ``execute_autofill`` could not always be trusted to return ``submitted``:
+    if the form was filled but the submit control never matched, the run was a
+    dry run with the submit withheld. An application is only ever ``applied``
+    when the click really happened — see the ledger below.
+    """
+    sent = bool(report.get("submitted") is True and report.get("status") == "submitted")
+    if sent:
+        diagnostics = report.get("diagnostics") or []
+        sent = any(step.get("step") == "submit" and step.get("outcome") == "matched"
+                   for step in diagnostics)
+    return sent
+
+
+def _record_application_submission(
+    db: Session,
+    user: User,
+    job: Job,
+    policy_decision: Dict[str, Any],
+    submitted: bool,
+) -> Optional[int]:
+    """Persist the decision on the at-most-once ledger (contracts/10 §5 rule 3).
+
+    A real submit records ``submitted``/``automation`` with the policy id,
+    version and consent snapshot the engine evaluated with; a dry run records
+    ``abandoned``/``assisted_dry_run`` so the *reason why it did not go out*
+    (``refusal_reason``) is also a fact — every attempt acted on carries what
+    it was decided under, never just the happy path.
+    """
+    try:
+        from app.core.audit import audit as write_audit
+        from app.models.models import ApplicationSubmission
+        from app.services.browser_session import submission_idempotency_key
+
+        live = (
+            db.query(ApplicationSubmission)
+            .filter(ApplicationSubmission.user_id == user.id,
+                    ApplicationSubmission.job_id == job.id,
+                    ApplicationSubmission.state.in_(("reserved", "submitted", "verified")))
+            .first()
+        )
+        key = submission_idempotency_key(job)
+        if live is not None and live.idempotency_key != key:
+            # A different attempt (e.g. an assisted session) already holds the
+            # slot — do not fight the ledger; the job status is the user's view.
+            return live.id
+        row = live or db.query(ApplicationSubmission).filter(
+            ApplicationSubmission.user_id == user.id, ApplicationSubmission.idempotency_key == key
+        ).first()
+        policy_id = policy_decision.get("policy_id")
+        policy_version = policy_decision.get("policy_version")
+        consent_snapshot = dict(policy_decision.get("inputs", {}).get("consents", {})
+                                or policy_decision.get("consent_snapshot") or {})
+        if submitted:
+            state, channel, refusal = "submitted", "automation", ""
+        else:
+            # A refusal is a *decision* worth recording; the daily counter never
+            # charges refusals toward the run limit.
+            state, channel = "abandoned", "assisted_dry_run"
+            refusal = str(policy_decision.get("reason") or "") if not policy_decision.get("allowed") else ""
+        if row is None:
+            row = ApplicationSubmission(
+                user_id=user.id,
+                job_id=job.id,
+                state=state,
+                channel=channel,
+                idempotency_key=key,
+                dry_run=not submitted,
+                refusal_reason=refusal[:40] or "",
+                policy_id=policy_id,
+                policy_version=policy_version,
+                consent_snapshot=consent_snapshot or None,
+            )
+            db.add(row)
+        else:
+            row.state = state if submitted or row.state != "submitted" else row.state
+            row.channel = channel if submitted else (row.channel or channel)
+            row.dry_run = not submitted
+            row.refusal_reason = (refusal[:40] or "") or row.refusal_reason
+            row.policy_id = policy_id if policy_id is not None else row.policy_id
+            row.policy_version = policy_version if policy_version is not None else row.policy_version
+            row.consent_snapshot = consent_snapshot or row.consent_snapshot
+        if submitted:
+            row.submitted_at = row.submitted_at or datetime.utcnow()
+            row.finished_at = datetime.utcnow()
+        _flush_then_counter(db, user, policy_decision, submitted)
+        write_audit(
+            db,
+            "application.submitted" if submitted else "application.submission_refused",
+            user=user,
+            target=f"job:{job.id}",
+            detail={
+                "submission_id": row.id,
+                "policy_id": policy_id,
+                "policy_version": policy_version,
+                "reason": policy_decision.get("reason"),
+                "downgrade": policy_decision.get("downgrade", {}),
+            },
+            commit=False,
+        )
+        return int(row.id) if row.id else None
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("could not record application submission for job %s: %s", job.id, exc)
+        return None
+
+
+def _flush_then_counter(
+    db: Session,
+    user: User,
+    policy_decision: Dict[str, Any],
+    submitted: bool,
+) -> None:
+    """Flush the ledger row, then charge (or not) the daily counter atomically.
+
+    Only real submissions count against the daily/metered budget; a dry run or a
+    refusal is recorded, never charged.
+    """
+    db.flush()
+    if submitted:
+        from app.services import automation_policy as policy_engine
+
+        policy_engine.record_outcome(
+            db, user_id=user.id, workflow=policy_engine.SUBMIT_WORKFLOW,
+            allowed=True, rejected=False, count=1, commit=False,
+        )
 
 
 def mark_applied(db: Session, user: User, job: Job, *, note: str = "") -> Dict[str, Any]:
