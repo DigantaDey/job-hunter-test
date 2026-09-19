@@ -20,6 +20,7 @@ from app.api.routers import (
     funding,
     interview,
     jobs,
+    matches,
     notifications,
     onboarding,
     ops,
@@ -36,6 +37,7 @@ router.include_router(auth.router)
 router.include_router(account.router)
 router.include_router(resumes.router)
 router.include_router(jobs.router)
+router.include_router(matches.router)
 router.include_router(vault.router)
 router.include_router(emails.router)
 router.include_router(funding.router)

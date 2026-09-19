@@ -284,6 +284,73 @@ def _stub_portrait(prompt: str = "") -> Dict[str, Any]:
     }
 
 
+def _stub_match_review(prompt: str) -> Dict[str, Any]:
+    """A contract-compliant stage-3 evidence review.
+
+    The stand-in obeys the same rules a real model is given by the guardrail:
+    the recommendation follows the deterministic band quoted in the prompt,
+    every strength is a skill actually present in the (minimized) candidate
+    block, every "explicit" requirement is phrased from the posting itself,
+    and nothing claims an interview probability.
+    """
+    import json as _json
+    import re as _re
+
+    band = "possible"
+    m = _re.search(r'"band":\s*"(\w+)"', prompt or "")
+    if m:
+        band = m.group(1)
+    recommendation = {"strong": "apply", "good": "apply_with_tailoring",
+                      "possible": "hold", "weak": "skip"}.get(band, "hold")
+
+    skills: List[str] = []
+    m = _re.search(r"Candidate \(minimized — no contact details\):\n(\{.*?\})\n", prompt or "", _re.DOTALL)
+    if m:
+        try:
+            skills = [str(s) for s in (_json.loads(m.group(1)).get("skills") or [])][:4]
+        except ValueError:
+            skills = []
+    titles: List[str] = []
+    if m:
+        try:
+            cand = _json.loads(m.group(1))
+            titles = [str(e.get("title") or "") for e in (cand.get("experience") or []) if e.get("title")][:2]
+        except ValueError:
+            titles = []
+
+    strengths = list(skills[:4])
+    if band in ("strong", "good") and len(strengths) < 3:
+        strengths.extend(t for t in titles if len(t) > 4)
+    strengths = strengths[:6] or ["Recorded relevant experience"]
+
+    jd = ""
+    m = _re.search(r'Job posting:\n"""(.*?)"""', prompt or "", _re.DOTALL)
+    if m:
+        jd = m.group(1)
+    first_word = next((w.strip(".,;:") for w in (jd or "").split() if len(w) > 3), "")
+
+    requirements: List[Dict[str, Any]] = []
+    if first_word:
+        requirements.append({"requirement": first_word, "basis": "explicit", "met": True,
+                             "evidence": first_word})
+    requirements.append({"requirement": "Comfortable working in a fast-moving product team",
+                         "basis": "inferred", "met": True, "evidence": ""})
+
+    return {
+        "recommendation": recommendation,
+        "recommendation_reason": (f"Follows the deterministic band '{band}': the recorded evidence "
+                                  "supports this recommendation."),
+        "strengths": strengths,
+        "requirements_review": requirements,
+        "risks": ["Posting does not state a salary range.",
+                  "Seniority alignment is inferred from the title only."],
+        "resume_emphasis": ([f"Lead with {skills[0]} delivery at scale."] if skills
+                            else ["Lead with the most relevant experience."]),
+        "application_action": ("Apply with a tailored resume emphasising the matched skills and "
+                               "address the listed gaps in the cover letter."),
+    }
+
+
 def _stub_tracks() -> Dict[str, Any]:
     return {"tracks": [
         {"name": "Backend Engineer", "target_role": "Senior Backend Engineer",
@@ -312,6 +379,8 @@ def stub_ai_response(workflow: str, prompt: str) -> Dict[str, Any]:
         return _stub_tailored()
     if workflow == "scoring":
         return _stub_score()
+    if workflow == "match_review":
+        return _stub_match_review(prompt)
     if workflow == "email_gen":
         # Company-agnostic on purpose: the guardrail flags any employer the
         # candidate did not work at, so the stand-in must not name one.

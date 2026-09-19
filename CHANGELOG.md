@@ -8,6 +8,28 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ### Added
 
+- Multi-stage job matching optimized for interview potential, not application
+  volume — no single opaque AI score. Stage 1 applies named hard filters
+  (location, work authorization, sponsorship, employment type, compensation
+  floor, seniority, required-skill exclusions, expired/duplicate postings);
+  stage 2 computes a deterministic score from 13 named, weighted features
+  (required/preferred skills, experience, seniority, industry, location,
+  compensation, remote preference, trajectory, freshness, hiring signal,
+  friction); stage 3 is an AI evidence review returning a recommendation,
+  evidence-backed strengths, missing requirements, inferred-vs-explicit
+  qualifications, risks, resume emphasis and application action. Every result
+  stores `score_source`, per-feature contributions, the rubric, matched and
+  missing skills with evidence, and the scorer version, so any past verdict can
+  be re-explained and future rubric changes are comparable. Scores are
+  "estimated fit", never a calibrated interview probability. Migration
+  `g7h8i9j0k1l2` adds `match_results` (versioned, idempotent, with
+  supersession) and `match_feedback` (relevant / not relevant / applied /
+  rejected / interview — the calibration dataset a future probability could be
+  built from, without claiming one today). `POST /api/jobs/{id}/match`,
+  `GET /api/jobs/{id}/match`, `POST /api/jobs/{id}/match/feedback`,
+  `GET /api/matches/summary`. Candidate data is minimized to the fields each
+  stage needs; stage 3 reuses the shared AI guardrails and credit accounting.
+  See `docs/MATCHING.md`.
 - Configurable search-provider abstraction for supplementary job discovery, with
   an initial Brave Web Search adapter and ordered provider-failure fallback.
   Evaluated DuckDuckGo and Google availability; neither introduces a new scraper

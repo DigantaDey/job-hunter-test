@@ -14,7 +14,7 @@
  */
 
 /** Contract version of the backend vocabulary this file mirrors. */
-export const CONTRACT_VERSION = '1.0.0'
+export const CONTRACT_VERSION = '1.2.0'
 
 /** Header the SPA sends on state-changing POSTs to make a retry safe. */
 export const IDEMPOTENCY_HEADER = 'Idempotency-Key'
@@ -527,6 +527,80 @@ export const MATCH_STALENESS = [
   'expired',
   'scorer_upgraded',
 ] as const
+
+/**
+ * The user's correction / outcome signal on a match recommendation. The first
+ * two judge the recommendation itself (`not_relevant` is the "this
+ * recommendation is wrong" correction); the last three are post-application
+ * outcomes — the only data a future calibrated interview probability could be
+ * built from (never claimed before enough exists).
+ */
+export const MATCH_FEEDBACK_KINDS = [
+  'relevant',
+  'not_relevant',
+  'applied',
+  'rejected',
+  'interview',
+] as const
+export type MatchFeedbackKind = (typeof MATCH_FEEDBACK_KINDS)[number]
+
+/** Feedback kinds that are application outcomes (calibration dataset). */
+export const MATCH_FEEDBACK_OUTCOME_KINDS = [
+  'applied',
+  'rejected',
+  'interview',
+] as const
+
+// ---------------------------------------------------------------------------
+// Multi-stage matching (v2.2.22): hard-filter check names, named score
+// features, AI review recommendations. Mirrors
+// backend/app/contracts/vocabulary.py exactly — the match UI renders these
+// keys and must not improvise labels for unknown ones.
+// ---------------------------------------------------------------------------
+
+/** Stage 1 hard-filter check names (see `match_result.hard_filters.checks`). */
+export const MATCH_FILTERS = [
+  'expired',
+  'duplicate',
+  'location_mismatch',
+  'work_authorization',
+  'sponsorship',
+  'employment_type_mismatch',
+  'compensation_below_minimum',
+  'seniority_mismatch',
+  'required_skills_missing',
+] as const
+export type MatchFilter = (typeof MATCH_FILTERS)[number]
+
+/** Stage 2 named features of the deterministic score (see `features[]`). */
+export const MATCH_FEATURES = [
+  'required_skills',
+  'preferred_skills',
+  'relevant_experience',
+  'seniority',
+  'industry',
+  'location',
+  'compensation',
+  'remote',
+  'career_trajectory',
+  'freshness',
+  'hiring_signal',
+  'application_friction',
+] as const
+export type MatchFeature = (typeof MATCH_FEATURES)[number]
+
+/** Stage 3 AI review recommendations (never a raw probability). */
+export const MATCH_RECOMMENDATIONS = [
+  'apply',
+  'apply_with_tailoring',
+  'hold',
+  'skip',
+] as const
+export type MatchRecommendation = (typeof MATCH_RECOMMENDATIONS)[number]
+
+/** How a stage-3 requirement was established (explicit in the JD vs inferred). */
+export const MATCH_REQUIREMENT_BASIS = ['explicit', 'inferred'] as const
+export type MatchRequirementBasis = (typeof MATCH_REQUIREMENT_BASIS)[number]
 
 /**
  * What each `score_source` means, in the user's words. The list must never
@@ -1130,6 +1204,12 @@ export const VOCABULARY: Record<string, readonly string[]> = {
   score_sources: SCORE_SOURCES,
   match_bands: MATCH_BANDS,
   match_staleness: MATCH_STALENESS,
+  match_feedback_kinds: MATCH_FEEDBACK_KINDS,
+  match_feedback_outcome_kinds: MATCH_FEEDBACK_OUTCOME_KINDS,
+  match_filters: MATCH_FILTERS,
+  match_features: MATCH_FEATURES,
+  match_recommendations: MATCH_RECOMMENDATIONS,
+  match_requirement_basis: MATCH_REQUIREMENT_BASIS,
   discovery_run_states: DISCOVERY_RUN_STATES,
   discovery_why_empty: DISCOVERY_WHY_EMPTY,
   discovery_ai_skip_reasons: DISCOVERY_AI_SKIP_REASONS,
