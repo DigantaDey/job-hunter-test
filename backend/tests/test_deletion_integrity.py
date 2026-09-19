@@ -26,6 +26,8 @@ from app.db import engine
 from app.models.models import (
     AICreditLedger,
     ApiKey,
+    ApplicationPacket,
+    ApplicationPacketEvent,
     AuditLog,
     BillingEvent,
     CandidateProfile,
@@ -37,8 +39,6 @@ from app.models.models import (
     FundingCompany,
     FundingScan,
     FundingScanCompany,
-    ApplicationPacket,
-    ApplicationPacketEvent,
     InterviewPrep,
     Job,
     JobEvent,
