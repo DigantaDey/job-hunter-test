@@ -33,7 +33,7 @@ from typing import Dict, Tuple
 #: Version of the contract set itself. Surfaced in docs and (proposed) in
 #: ``GET /api/meta`` so a client can detect a server that speaks a newer
 #: vocabulary than it does. Minor = additive, major = a rename/removal.
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.2.0"
 
 #: Header a client sends to make a state-changing POST safely retryable.
 #: See ``docs/contracts/01-conventions.md`` §Idempotency.
@@ -515,6 +515,56 @@ MATCH_BANDS: Tuple[str, ...] = ("strong", "good", "possible", "weak", "unknown")
 #: ``match_results.staleness`` — why a stored verdict may no longer hold.
 MATCH_STALENESS: Tuple[str, ...] = ("fresh", "profile_changed", "job_changed", "expired", "scorer_upgraded")
 
+#: ``match_feedback.kind`` — the user's correction / outcome signal on a
+#: recommendation. The first two judge the recommendation itself; the last
+#: three are post-application outcomes (the calibration dataset).
+MATCH_FEEDBACK_KINDS: Tuple[str, ...] = ("relevant", "not_relevant", "applied", "rejected", "interview")
+
+#: Feedback kinds that record an application *outcome* (applied → rejected /
+#: interview). Only these count toward calibration; ``relevant`` /
+#: ``not_relevant`` correct the recommendation, they are not outcomes.
+MATCH_FEEDBACK_OUTCOME_KINDS: Tuple[str, ...] = ("applied", "rejected", "interview")
+
+#: Stage-1 hard-filter check names (``match_results.hard_filters.checks[].name``).
+#: Names mirror the deterministic code in ``app.services.matching`` one-for-one.
+MATCH_FILTERS: Tuple[str, ...] = (
+    "expired",
+    "duplicate",
+    "location_mismatch",
+    "work_authorization",
+    "sponsorship",
+    "employment_type_mismatch",
+    "compensation_below_minimum",
+    "seniority_mismatch",
+    "required_skills_missing",
+)
+
+#: Stage-2 named features of the deterministic score
+#: (``match_results.features[].key``), in computation order.
+MATCH_FEATURES: Tuple[str, ...] = (
+    "required_skills",
+    "preferred_skills",
+    "relevant_experience",
+    "seniority",
+    "industry",
+    "location",
+    "compensation",
+    "remote",
+    "career_trajectory",
+    "freshness",
+    "hiring_signal",
+    "application_friction",
+)
+
+#: Stage-3 AI review recommendations (``review.recommendation``). Each band is
+#: only allowed to express the recommendations in
+#: ``app.services.matching.RECOMMENDATION_BY_BAND`` — the UI must never render a
+#: recommendation the guardrail could not have accepted.
+MATCH_RECOMMENDATIONS: Tuple[str, ...] = ("apply", "apply_with_tailoring", "hold", "skip")
+
+#: How a stage-3 requirement was established (``review.requirements_review[].basis``).
+MATCH_REQUIREMENT_BASIS: Tuple[str, ...] = ("explicit", "inferred")
+
 
 # --------------------------------------------------------------------------- #
 # Discovery runs (deliverable 4 + 11)
@@ -899,6 +949,12 @@ VOCABULARY: Dict[str, Tuple[str, ...]] = {
     "score_sources": SCORE_SOURCES,
     "match_bands": MATCH_BANDS,
     "match_staleness": MATCH_STALENESS,
+    "match_feedback_kinds": MATCH_FEEDBACK_KINDS,
+    "match_feedback_outcome_kinds": MATCH_FEEDBACK_OUTCOME_KINDS,
+    "match_filters": MATCH_FILTERS,
+    "match_features": MATCH_FEATURES,
+    "match_recommendations": MATCH_RECOMMENDATIONS,
+    "match_requirement_basis": MATCH_REQUIREMENT_BASIS,
     "discovery_run_states": DISCOVERY_RUN_STATES,
     "discovery_why_empty": DISCOVERY_WHY_EMPTY,
     "discovery_ai_skip_reasons": DISCOVERY_AI_SKIP_REASONS,
@@ -941,7 +997,10 @@ __all__ = [
     "DISCOVERY_RUN_STATES", "DISCOVERY_WHY_EMPTY", "EEO_FIELD_KEYS", "ERROR_CODES",
     "EVENT_TYPES", "EVIDENCE_KINDS", "EXTRACTION_STATES", "FIELD_RESOLUTIONS",
     "IDEMPOTENCY_HEADER", "JOB_STATUSES", "JOB_STATUS_PROJECTION",
-    "LEGACY_PROFILE_EXTRACTION_SOURCES", "MAPPINGS", "MATCH_BANDS", "MATCH_STALENESS",
+    "LEGACY_PROFILE_EXTRACTION_SOURCES", "MAPPINGS", "MATCH_BANDS",
+    "MATCH_FEATURES", "MATCH_FILTERS",
+    "MATCH_FEEDBACK_KINDS", "MATCH_FEEDBACK_OUTCOME_KINDS", "MATCH_RECOMMENDATIONS",
+    "MATCH_REQUIREMENT_BASIS", "MATCH_STALENESS",
     "NOTIFICATION_CHANNELS", "NOTIFICATION_KINDS", "NOTIFICATION_PREFERENCE_KEYS",
     "NOTIFICATION_SEVERITIES", "NOTIFICATION_UNMUTABLE_KINDS", "ONBOARDING_GATE_STATES",
     "ONBOARDING_GATES", "ONBOARDING_STATES", "ONBOARDING_TERMINAL_STATES",

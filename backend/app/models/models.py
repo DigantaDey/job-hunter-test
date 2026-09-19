@@ -366,6 +366,123 @@ class Job(Base):
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
 
 
+class MatchResult(Base):
+    """
+    One multi-stage match verdict — this job and this candidate, as they both
+    were at a moment in time, computed by a named, versioned scorer.
+
+    See ``docs/MATCHING.md`` and ``docs/contracts/06-match-result.md``. A match
+    is a *fact about a pair*, not a column on the job: the inputs (profile
+    version, JD text, scorer version) are recorded on the row, which is what
+    makes "why 78 on Monday and 61 now?" answerable and re-scoring cheap.
+
+    Append-only apart from ``is_current`` / ``staleness`` / ``superseded_by_id``:
+    a re-score inserts a new row and flips the previous current row, it never
+    edits a score in place. ``rubric`` carries the deterministic feature
+    contributions (stage 2) and ``ai_review`` the evidence review (stage 3) so
+    the explanation — why recommended, what evidence, what gaps, what risks —
+    is stored with the number, not reconstructed from memory.
+    """
+
+    __tablename__ = "match_results"
+    __table_args__ = (
+        UniqueConstraint("user_id", "job_id", "persona_id", "profile_sha256",
+                         "job_description_sha256", "scorer_version",
+                         name="uq_match_inputs"),
+        Index("ix_match_user_job_current", "user_id", "job_id", "is_current"),
+        Index("ix_match_user_persona_score", "user_id", "persona_id", "score"),
+        Index("ix_match_user_staleness", "user_id", "staleness"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    persona_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("personas.id"), nullable=True)
+    #: The profile *version* scored — ``candidate_profiles.id`` (legacy
+    #: ``profiles.id`` when the v2 document does not exist yet).
+    profile_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    profile_sha256: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    job_description_sha256: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+
+    #: deterministic | ai | hybrid — which scorer produced the stored number.
+    scorer: Mapped[str] = mapped_column(String(24), default="deterministic", nullable=False)
+    #: semver of the scoring code + rubric contract; a bump is what makes old
+    #: rows ``scorer_upgraded`` and future recalibration possible.
+    scorer_version: Mapped[str] = mapped_column(String(24), default="1.0.0", nullable=False)
+    #: provider model id for ``scorer in (ai, hybrid)``.
+    model: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+
+    #: 0..100 — the estimated fit. Deliberately *not* an interview probability.
+    score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    band: Mapped[str] = mapped_column(String(12), default="unknown", nullable=False)  # MATCH_BANDS
+    #: 0..1 — how much we trust the score itself (``null`` for insufficient_data).
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    #: SCORE_SOURCES — the provenance label the UI must render.
+    score_source: Mapped[str] = mapped_column(String(24), default="unscored", nullable=False)
+    reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+    #: Stage-1 report: hard filters, each with status/penalty/detail.
+    hard_filters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: Stage-2 rubric: weights + per-feature contributions + evidence.
+    rubric: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: ``[{name, required, evidence[], explicit|inferred}]``
+    matched_skills: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    #: ``[{name, required, severity, remediable}]``
+    missing_skills: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    #: Stage-3 AI evidence review (recommendation, strengths, gaps, risks,
+    #: resume emphasis, application action) or ``null`` when the model never
+    #: ran — a deterministic-only match is honest without it.
+    ai_review: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    guardrail_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: {plan_gated, ai_unavailable, hard_filtered, duplicate, evidence_gap, …}
+    flags: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+
+    #: Exactly one ``true`` per (user_id, job_id, persona_id).
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    staleness: Mapped[str] = mapped_column(String(20), default="fresh", nullable=False)  # MATCH_STALENESS
+    pipeline_job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    computed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    superseded_by_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("match_results.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class MatchFeedback(Base):
+    """
+    One user correction / outcome signal against a recommendation.
+
+    Kinds (``vocabulary.MATCH_FEEDBACK_KINDS``):
+
+    * ``relevant`` / ``not_relevant`` — the user judges the recommendation
+      itself. ``not_relevant`` is the "this recommendation is wrong" path:
+      the reason is stored and the match read surfaces the override so the
+      wrong call is visibly corrected, and the signal feeds recalibration.
+    * ``applied`` / ``rejected`` / ``interview`` — post-application outcomes.
+      They are the *only* data a future calibrated interview probability could
+      ever be built from; until enough exist per scorer version the product
+      must keep saying "estimated fit", never "X% chance of an interview"
+      (see :func:`app.services.matching.calibration_status`).
+    """
+
+    __tablename__ = "match_feedback"
+    __table_args__ = (
+        Index("ix_match_feedback_user_job", "user_id", "job_id", "created_at"),
+        Index("ix_match_feedback_user_kind", "user_id", "kind"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    match_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("match_results.id"), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)  # MATCH_FEEDBACK_KINDS
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: Correction detail: e.g. {"wrong_claim": "candidate does not know kafka"}.
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    scorer_version: Mapped[str] = mapped_column(String(24), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
 class JobEvent(Base):
     """Append-only state timeline for a job (per-job approval console)."""
 

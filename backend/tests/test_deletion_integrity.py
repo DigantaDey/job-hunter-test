@@ -40,6 +40,8 @@ from app.models.models import (
     InterviewPrep,
     Job,
     JobEvent,
+    MatchFeedback,
+    MatchResult,
     Notification,
     OnboardingEvent,
     OnboardingSession,
@@ -107,6 +109,9 @@ CHILD_TABLES: dict[str, type] = {
     "candidate_profiles": CandidateProfile,
     "profile_field_provenance": ProfileFieldProvenance,
     "profile_field_history": ProfileFieldHistory,
+    # Multi-stage matching: the versioned explained verdict + user feedback.
+    "match_results": MatchResult,
+    "match_feedback": MatchFeedback,
 }
 
 
@@ -249,6 +254,41 @@ def _seed_every_child_table(db, user: User) -> dict:
         occurred_at=datetime.utcnow(),
     )
     db.add(hist)
+    db.flush()
+
+    # Multi-stage matching seed: a verdict for the job (wired to the v2 profile
+    # version it was computed from) and a user feedback row against it.
+    match = MatchResult(
+        user_id=user.id,
+        job_id=job.id,
+        persona_id=persona.id,
+        profile_id=cand_profile.id,
+        profile_sha256="d" * 64,
+        job_description_sha256="e" * 64,
+        scorer="deterministic",
+        scorer_version="1.0.0",
+        score=88.0,
+        band="strong",
+        confidence=0.6,
+        score_source="preliminary",
+        reason="Estimated fit 88/100 from scored features.",
+        hard_filters={"status": "eligible", "checks": [], "total_penalty": 0},
+        rubric={"weights": {}, "criteria": [], "overall": 88.0, "band": "strong"},
+        matched_skills=[{"name": "python", "required": True, "evidence": []}],
+        missing_skills=[],
+        flags={},
+        is_current=True,
+        staleness="fresh",
+        computed_at=datetime.utcnow(),
+        created_at=datetime.utcnow(),
+    )
+    db.add(match)
+    db.flush()
+    db.add(MatchFeedback(
+        user_id=user.id, job_id=job.id, match_id=match.id, kind="relevant",
+        reason="good call", meta={}, scorer_version="1.0.0",
+        created_at=datetime.utcnow(),
+    ))
     db.flush()
 
     for row in (
