@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { LayoutDashboard, Briefcase, FileText, Mail, Vault, Settings, ScrollText, Layers, TrendingUp, Moon, Sun, Monitor, Circle, LogOut, UserCog, CreditCard, BarChart3, Brain, Bell, DollarSign, Users, BadgeCheck } from 'lucide-react'
+import { LayoutDashboard, Briefcase, FileText, Mail, Vault, Settings, ScrollText, Layers, TrendingUp, Moon, Sun, Monitor, Circle, LogOut, UserCog, CreditCard, BarChart3, Brain, Bell, DollarSign, Users, BadgeCheck, Hand } from 'lucide-react'
 import { useTheme } from '../hooks/useTheme'
 import client from '../api/client'
 import { useAuth } from '../context/AuthContext'
@@ -13,6 +13,7 @@ import { AIWorkChip } from './AIWorkChip'
 const nav = [
   {to:'/', label:'Dashboard', icon: LayoutDashboard},
   {to:'/jobs', label:'Jobs', icon: Briefcase},
+  {to:'/assist', label:'Assisted Apply', icon: Hand},
   {to:'/queues', label:'Queues', icon: Layers},
   {to:'/personas', label:'Personas', icon: Users},
   {to:'/packets', label:'Packets', icon: FileText},

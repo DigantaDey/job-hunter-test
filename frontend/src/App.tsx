@@ -21,6 +21,7 @@ import Personas from './pages/Personas'
 import ProfileReview from './pages/ProfileReview'
 import Onboarding from './pages/Onboarding'
 import Packets from './pages/Packets'
+import Assist from './pages/Assist'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
@@ -68,6 +69,14 @@ export function AppRoutes() {
             element={
               <ErrorBoundary scope="route" resetKey={location.pathname}>
                 <Jobs />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/assist"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Assist />
               </ErrorBoundary>
             }
           />

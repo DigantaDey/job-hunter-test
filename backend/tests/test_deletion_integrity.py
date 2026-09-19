@@ -26,8 +26,11 @@ from app.db import engine
 from app.models.models import (
     AICreditLedger,
     ApiKey,
+    ApplicationAction,
     ApplicationPacket,
     ApplicationPacketEvent,
+    ApplicationSession,
+    ApplicationSubmission,
     AuditLog,
     BillingEvent,
     CandidateProfile,
@@ -113,6 +116,11 @@ CHILD_TABLES: dict[str, type] = {
     "profile_field_history": ProfileFieldHistory,
     # Multi-stage matching: the versioned explained verdict + user feedback.
     "match_results": MatchResult,
+    # Browser-assisted applications (v2.2.21, docs/contracts/12): the session,
+    # its human-action queue and the duplicate-submission ledger.
+    "application_sessions": ApplicationSession,
+    "application_actions": ApplicationAction,
+    "application_submissions": ApplicationSubmission,
     "match_feedback": MatchFeedback,
     # Application packet (reviewable, versioned, grounded artifacts)
     "application_packets": ApplicationPacket,
@@ -374,6 +382,43 @@ def _seed_every_child_table(db, user: User) -> dict:
         ApiKey(user_id=user.id, name="ci", prefix="jh_test", key_hash=f"kh-{user.id}", scopes=["read"]),
     ):
         db.add(row)
+    db.flush()
+
+    # Browser-assisted application seed: the session (bound to the job), the
+    # action it paused on, and the submission ledger row for the same job.
+    app_session = ApplicationSession(
+        user_id=user.id,
+        job_id=job.id,
+        state="awaiting_user",
+        phase="waiting",
+        state_reason="captcha_detected",
+        isolation_key=f"u{user.id}-seed",
+        browser_profile_ref=f"u{user.id}/seed",
+        url_fingerprint="f" * 64,
+        expected_host="jobs.lever.co",
+        employer_fingerprint="e" * 64,
+        application_identity="ext:seed",
+        checkpoint={"fields": {"first_name": {"status": "filled"}}, "steps": []},
+        progress={"fields_total": 1, "filled": 1},
+        last_observation={"host": "jobs.lever.co", "markers": ["captcha"], "fields": []},
+        fill_values={"first_name": "Test"},
+        pause_kind="captcha",
+        pause_reason="captcha_detected",
+        expires_at=datetime.utcnow() + timedelta(minutes=30),
+    )
+    db.add(app_session)
+    db.flush()
+    db.add(ApplicationAction(
+        user_id=user.id, session_id=app_session.id, job_id=job.id, kind="captcha", status="pending",
+        title="Complete the bot check", instructions="Finish the check in the browser, then continue.",
+        reason="captcha_detected", fields=[{"name": "g-recaptcha-response", "label": "Verify you are human"}],
+        dedupe_key=f"captcha:{app_session.id}", occurrences=1,
+    ))
+    db.add(ApplicationSubmission(
+        user_id=user.id, job_id=job.id, session_id=app_session.id, state="reserved",
+        channel="automation", idempotency_key=f"sub:{user.id}:{job.id}:seed", dry_run=False,
+        reserved_at=datetime.utcnow(),
+    ))
     db.commit()
     vault = save_vault_entry(db, user.id, domain="jobs.lever.co", username="me@example.com",
                              password="correct-horse-battery", origin="manual")

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import client, { apiError, aiOutage, downloadResume, AI_REQUEST_TIMEOUT_MS, type AIOutage } from '../api/client'
 import { AIOutageBanner } from '../components/AIBanner'
 import { EmptyBoardBanner } from '../components/EmptyBoardBanner'
@@ -25,6 +26,7 @@ function SourceBadge({ source }: { source?: string }) {
 }
 
 export default function Jobs(){
+  const navigate = useNavigate()
   const [jobs, setJobs] = useState<any[]>([])
   const [filter, setFilter] = useState({status:'', source:'', q:'', company:'', funding:''})
   const [selected, setSelected] = useState<any>(null)
@@ -142,6 +144,24 @@ export default function Jobs(){
       else setGenerateMsg(apiError(e, 'Generation failed'))
     }
     finally{ setGenerating(false) }
+  }
+  /**
+   * Start (or rejoin) an assisted browser session for this job.
+   *
+   * Different contract from Auto-apply: nothing is submitted, the run stops at
+   * the first moment a human is required, and passwords/codes are typed by the
+   * user in the browser window — which is why it hands off to /assist rather
+   * than tracking a queue row here.
+   */
+  const assist = async()=>{
+    if(!selected) return
+    setBusy(true); setApplyMsg('')
+    try{
+      const {data}=await client.post('/api/application-sessions', {job_id: selected.id})
+      setApplyMsg(data.created ? 'Assisted session started — continuing to Assisted Apply…' : 'You already have a live session for this job.')
+      navigate('/assist')
+    }catch(e:any){ setApplyMsg(apiError(e, 'Could not start an assisted session')) }
+    finally{ setBusy(false) }
   }
   const apply = async()=>{
     if(!selected) return
@@ -328,6 +348,9 @@ export default function Jobs(){
                 </div>
                 <button onClick={apply} disabled={busy || applyLive} className="w-full min-h-[44px] py-2.5 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1">
                   {busy || applyLive ? <Loader2 className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} {applyLive ? 'Application in progress…' : selected.status==='needs_input' ? 'Re-queue application' : 'Auto-apply (vault + autofill)'}
+                </button>
+                <button onClick={assist} disabled={busy} className="w-full min-h-[44px] py-2 rounded-full border border-blue-300 dark:border-blue-800 text-blue-700 dark:text-blue-300 text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1">
+                  {busy ? <Loader2 className="w-4 h-4 animate-spin"/> : <Eye className="w-4 h-4"/>} Assisted session (you stay in the loop)
                 </button>
                 {/* Derived from the queue row — Queued → Preparing → Applying → Applied / Needs input — survives navigation and F5. */}
                 <WorkStatusLine row={applyRow} prefix="Auto-apply" testId="apply-status" onDismiss={()=>work.untrack(`apply:${selected.id}`)} />

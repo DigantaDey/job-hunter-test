@@ -556,6 +556,33 @@ class Settings(BaseSettings):
     screenshot_dir: str = "./artifacts/screenshots"
 
     # ------------------------------------------------------------------ #
+    # Browser-assisted application sessions (human-in-the-loop)
+    #
+    # These control *sessions*, not the legacy fire-and-forget autofill: an
+    # isolated browser run per user that pauses for a human whenever a step is
+    # not ours to take (login, MFA, CAPTCHA, unknown/ambiguous/legal field).
+    # ------------------------------------------------------------------ #
+    #: Per-user browser profile root. Profiles are never shared between users;
+    #: the session's ``browser_profile_ref`` is joined under this directory and
+    #: refused if it would escape it.
+    browser_profile_dir: str = "./artifacts/browser_sessions"
+    #: Hard session TTL. An expired session requires re-authentication — it is
+    #: never extended silently.
+    browser_session_ttl_minutes: int = 45
+    #: Maximum live (non-terminal) sessions per user.
+    browser_session_max_live: int = 2
+    #: Deployment default for encrypted session persistence (opt-in per user).
+    browser_session_persist: bool = False
+    #: How long a minted browser-handoff link stays valid.
+    browser_handoff_ttl_minutes: int = 20
+    #: Screenshots are off unless a deployment says otherwise *and* the user
+    #: opted in; they are never taken on login/MFA/CAPTCHA screens.
+    browser_screenshots_enabled: bool = False
+    #: Deployments may not retain screenshots longer than this (user requests are
+    #: clamped, never trusted).
+    browser_screenshot_max_retention_days: int = 30
+
+    # ------------------------------------------------------------------ #
     # Observability
     # ------------------------------------------------------------------ #
     log_level: str = "INFO"
@@ -707,7 +734,8 @@ class Settings(BaseSettings):
                 url = f"{scheme}:///{os.path.abspath(os.path.join(BACKEND_DIR, candidate))}"
         return url or "sqlite:///./jobhunter.db"
 
-    @field_validator("upload_dir", "generated_dir", "artifact_dir", "screenshot_dir", "backup_dir")
+    @field_validator("upload_dir", "generated_dir", "artifact_dir", "screenshot_dir", "backup_dir",
+                     "browser_profile_dir")
     @classmethod
     def _absolutise_data_dir(cls, value: str) -> str:
         """Same reason as the database: data dirs must not depend on the cwd."""
@@ -886,6 +914,10 @@ class Settings(BaseSettings):
     def backup_path(self) -> str:
         return os.path.abspath(os.path.join(BACKEND_DIR, self.backup_dir))
 
+    def browser_profile_path(self) -> str:
+        """Root of the per-user browser profiles (isolation lives under it)."""
+        return os.path.abspath(os.path.join(BACKEND_DIR, self.browser_profile_dir))
+
     def ensure_directories(self) -> None:
         for path in (
             self.upload_path(),
@@ -893,6 +925,7 @@ class Settings(BaseSettings):
             self.artifact_path(),
             self.screenshot_path(),
             self.backup_path(),
+            self.browser_profile_path(),
         ):
             os.makedirs(path, exist_ok=True)
 

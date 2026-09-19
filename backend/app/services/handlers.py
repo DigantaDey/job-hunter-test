@@ -270,6 +270,21 @@ async def handle_application(db: Session, item: PipelineJob) -> Dict[str, Any]:
     return {**prepared, **result}
 
 
+async def handle_browser_session(db: Session, item: PipelineJob) -> Dict[str, Any]:
+    """
+    Run one assist-pass for a browser application session.
+
+    Thin adapter: the policy lives in ``app.services.browser_session`` and the
+    loop in ``app.services.assisted_fill``. Two outcomes are *success* here — the
+    pass filled what it safely could and paused for a human, or it found nothing
+    to do because the user still has an open action. Neither is retried: the
+    queue item is done and the next pass is a new item.
+    """
+    from app.services.assisted_fill import run_queued_pass
+
+    return await run_queued_pass(db, item)
+
+
 async def handle_email(db: Session, item: PipelineJob) -> Dict[str, Any]:
     user = _user(db, item)
     if not user:
@@ -517,6 +532,9 @@ async def handle_extraction(db: Session, item: PipelineJob) -> Dict[str, Any]:
 HANDLERS = {
     "discovery": handle_discovery,
     "application": handle_application,
+    # Browser-assisted application sessions (docs/contracts/07 + 10): the pass
+    # stops at the first human-required step, so a pause is a normal result.
+    "browser_session": handle_browser_session,
     "email": handle_email,
     "funding": handle_funding,
     "ai": handle_ai,

@@ -17,6 +17,7 @@ from app.api.routers import (
     auth,
     automation,
     billing,
+    browser_sessions,
     emails,
     funding,
     interview,
@@ -56,5 +57,6 @@ router.include_router(automation.router)
 router.include_router(profile_review.router)
 router.include_router(applications.router)
 router.include_router(packets.router)
+router.include_router(browser_sessions.router)
 
 __all__ = ["router", "search_context"]

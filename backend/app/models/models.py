@@ -26,6 +26,9 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
 )
+from sqlalchemy import (
+    text as sa_text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -1286,3 +1289,201 @@ class ApplicationPacketEvent(Base):
     meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
     actor_type: Mapped[str] = mapped_column(String(20), default="user", nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+# --------------------------------------------------------------------------- #
+# Browser-assisted application sessions (human-in-the-loop)
+#
+# One row per isolated browser run for one (user, job). The row is the state
+# machine, the checkpoint, the (optional, encrypted) session persistence and the
+# audit of what the automation did and did not do. What it never holds: a
+# password, an MFA code, a CAPTCHA solution, or page content we did not need.
+# --------------------------------------------------------------------------- #
+class ApplicationSession(Base):
+    """A browser-assisted application run with explicit human-in-the-loop pauses.
+
+    Invariants (enforced in ``app.services.browser_session``, pinned by tests):
+
+    * ``user_id`` scopes every read/write; a session is never resumed by, or
+      merged into, another user's run.
+    * ``awaiting_user`` is always paired with a pending
+      :class:`ApplicationAction` — a pause nobody can see is a stall.
+    * ``storage_state_enc`` is only ever written when the user opted into
+      persistence, is encrypted with the *per-user* key, and is cleared on
+      expiry/cancel/erasure.
+    * ``checkpoint`` records which fields were filled (with a value
+      fingerprint, never the value), so a resume cannot duplicate work and
+      cannot silently re-type over the user's own input.
+    * ``fill_values`` is a *working set*, not an archive: it holds only values a
+      classifier verdict cleared for autofill and is purged when the session
+      ends.
+    """
+
+    __tablename__ = "application_sessions"
+    __table_args__ = (
+        Index("ix_app_sessions_user_state", "user_id", "state"),
+        Index("ix_app_sessions_user_job", "user_id", "job_id"),
+        Index("ix_app_sessions_job_live", "job_id", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    #: ``APPLICATION_SESSION_STATES``.
+    state: Mapped[str] = mapped_column(String(24), default="created", nullable=False)
+    #: ``APPLICATION_SESSION_PHASE[state]`` — stored so a board never re-derives it.
+    phase: Mapped[str] = mapped_column(String(16), default="new", nullable=False)
+    #: Machine-readable why (never free text the UI has to parse).
+    state_reason: Mapped[str] = mapped_column(String(60), default="", nullable=True)
+    #: Which actor moved the session last (``ACTOR_TYPES``).
+    actor_type: Mapped[str] = mapped_column(String(20), default="system_api", nullable=False)
+    #: Set only when a resume was refused (``CHECKPOINT_FAILURES``).
+    last_checkpoint_failure: Mapped[str] = mapped_column(String(40), default="", nullable=True)
+
+    portal_type: Mapped[str] = mapped_column(String(30), default="custom", nullable=True)
+    #: The host automation is bound to. A page on any other host is a mismatch.
+    portal_domain: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    #: Per-user isolation slot for the browser profile/context (never a shared dir).
+    isolation_key: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    #: Opaque reference to the on-disk profile dir (a name, not a path: the
+    #: service joins it under the artifact root, so a DB value can never escape).
+    browser_profile_ref: Mapped[str] = mapped_column(String(80), default="", nullable=True)
+
+    # Identity the session is bound to, as fingerprints/values that are not
+    # personal data. A resume re-checks all of them (checkpoint validation).
+    url_fingerprint: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    expected_host: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    employer_fingerprint: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    #: The posting/application identifier the portal itself gave us (a job's
+    #: ``external_id`` when it has one, otherwise the canonical URL digest).
+    application_identity: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+
+    #: Safe structured progress: per-field status + timestamps + value
+    #: fingerprints. Never a typed value (see ``FIELD_CHECKPOINT_KEYS``).
+    checkpoint: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: Counters the UI renders (detected/filled/skipped/awaiting/…), no content.
+    progress: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: Privacy-minimized last observation (host, markers, field names/types).
+    last_observation: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: The working set of values the *classifier* cleared for autofill — profile
+    #: or plan values, plus answers the user typed into the app for a named
+    #: field. Never a credential, a one-time code, a CAPTCHA token, a restricted
+    #: identifier or an unanswered legal/EEO question (no verdict reaches this
+    #: set through those branches), and dropped as soon as the session ends.
+    fill_values: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+
+    #: Playwright ``storage_state`` — opt-in, per-user encrypted, never logged.
+    storage_state_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    storage_state_saved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    storage_state_purged_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    #: Cookie/state retention: a persisted state older than this is refused.
+    storage_state_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    #: One-time handoff token (SHA-256 only — the raw token is returned once).
+    handoff_token_hash: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    handoff_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    handoff_action_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    #: Permitted screenshots only: [{action, path, sha256, captured_at, retention_days}].
+    screenshots: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    #: Why the last pause happened (a ``USER_ACTION_KINDS`` value or "").
+    pause_kind: Mapped[str] = mapped_column(String(30), default="", nullable=True)
+    pause_reason: Mapped[str] = mapped_column(String(80), default="", nullable=True)
+
+    resumed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_activity_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    #: Hard TTL. An expired session needs re-authentication — it is never extended
+    #: silently to keep an automation alive.
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+class ApplicationAction(Base):
+    """An actionable queue item: something only the human may do.
+
+    ``kind ∈ USER_ACTION_KINDS``. For ``login``/``mfa``/``captcha`` the value is
+    entered by the user in the browser — this row carries instructions, a
+    one-time handoff reference and an expiry, never a secret. For
+    ``unknown_field``/``ambiguous_field``/``sensitive_field``/``legal_question``
+    it carries the field metadata (label, type, options, why we stopped) so the
+    user can answer in the app.
+    """
+
+    __tablename__ = "application_actions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "dedupe_key", name="uq_application_actions_dedupe"),
+        Index("ix_app_actions_user_status", "user_id", "status"),
+        Index("ix_app_actions_session", "session_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=True, index=True)
+    session_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("application_sessions.id"), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    #: Machine-readable reason (e.g. ``captcha_detected``, ``unknown_field``).
+    reason: Mapped[str] = mapped_column(String(60), default="", nullable=True)
+    title: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    #: User-facing instructions. A builder guarantees no secret is ever rendered here.
+    instructions: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    #: Field metadata for answer-type asks; values are never stored here.
+    fields: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    #: {url, host, expires_at, requires, never: [...]} — no credentials, no codes.
+    handoff: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: Stable key so the same blocker cannot create duplicate queue items.
+    dedupe_key: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    #: How many times this blocker has been observed (a pause that repeats is a signal).
+    occurrences: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    acknowledged_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class ApplicationSubmission(Base):
+    """The at-most-once submission ledger.
+
+    A submission is reserved *before* anything is clicked, keyed by
+    ``(user_id, idempotency_key)``, so a retry, a double click, a replayed
+    request or a resumed session can never send the same application twice. The
+    partial unique index on ``(user_id, job_id)`` for a live
+    (``reserved``/``submitted``/``verified``) row is the database-level
+    backstop; the service also checks inside the writing transaction, which is
+    what carries on SQLite.
+    """
+
+    __tablename__ = "application_submissions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_application_submissions_key"),
+        Index("ix_application_submissions_user_job", "user_id", "job_id"),
+        Index(
+            "uq_application_submissions_live_job",
+            "user_id", "job_id",
+            unique=True,
+            sqlite_where=sa_text("state IN ('reserved', 'submitted', 'verified')"),
+            postgresql_where=sa_text("state IN ('reserved', 'submitted', 'verified')"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    session_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("application_sessions.id"), nullable=True)
+    #: ``SUBMISSION_STATES``.
+    state: Mapped[str] = mapped_column(String(16), default="reserved", nullable=False)
+    #: ``SUBMISSION_CHANNELS``.
+    channel: Mapped[str] = mapped_column(String(20), default="assisted_dry_run", nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    #: Why it was refused/abandoned (``SUBMISSION_REFUSALS``), "" when it went out.
+    refusal_reason: Mapped[str] = mapped_column(String(40), default="", nullable=True)
+    #: The portal's own receipt: {kind, external_id, observed_at, locator}.
+    receipt: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    reserved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)

@@ -115,6 +115,18 @@ def defaults() -> Dict[str, Dict[str, Any]]:
             "allow_auto_submit": False,
             "daily_application_limit": 25,
         },
+        "browser": {
+            # Assisted browser sessions are interactive and human-in-the-loop.
+            # Nothing here enables auto-submit: that stays on
+            # ``application.allow_auto_submit`` plus the server flags.
+            "persist_session": settings.browser_session_persist,
+            "session_ttl_minutes": settings.browser_session_ttl_minutes,
+            "max_live_sessions": settings.browser_session_max_live,
+            "handoff_ttl_minutes": settings.browser_handoff_ttl_minutes,
+            "screenshots_enabled": settings.browser_screenshots_enabled,
+            "screenshot_retention_days": min(7, settings.browser_screenshot_max_retention_days),
+            "pause_on_optional_unknown": True,
+        },
         "email": {
             "host": settings.email_smtp_host,
             "port": settings.email_smtp_port,
@@ -163,6 +175,8 @@ WRITABLE_KEYS: Dict[str, set] = {
                 "require_resume_approval", "reuse_similarity_threshold", "generate_min_score"},
     "application": {"auto_create_credentials", "notify_unknown_fields", "autofill_enabled",
                     "autofill_dry_run", "allow_auto_submit", "daily_application_limit"},
+    "browser": {"persist_session", "session_ttl_minutes", "max_live_sessions", "handoff_ttl_minutes",
+                 "screenshots_enabled", "screenshot_retention_days", "pause_on_optional_unknown"},
     "email": {"host", "port", "username", "password", "use_tls", "from_name", "postal_address",
               "daily_limit", "dry_run", "tracking_enabled"},
     "funding": {"context_notes", "industries", "freshness_days", "provider", "include_unverified"},

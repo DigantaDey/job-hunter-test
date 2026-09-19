@@ -264,3 +264,77 @@ decisions*, and this policy is the *input* to them. `overview()` gains
    `automation.run_skipped` with the reason (the shipped `skipped_*` states).
 9. Cross-tenant policy reads are `404`; a `scope_key` naming another tenant's
    persona/company is rejected at write time.
+
+---
+
+## 10. Assisted browser sessions (v2.2.21)
+
+Auto-apply is not the only shape this policy governs. A user may also drive an
+**assisted session**: a real browser, one isolated context per `(user, job)`,
+that types only what the user has already confirmed and *stops the moment a human
+is required*. The policy above is its ceiling; the session's own rules are
+narrower still.
+
+```
+POST /api/application-sessions                      start (one live session per job)
+POST /api/application-sessions/{id}/observe         fold a structural page observation in
+GET  /api/application-sessions/actions              the actionable queue
+POST /api/application-sessions/{id}/actions/{a}/handoff   mint a one-time handoff
+POST /api/application-sessions/{id}/actions/{a}/complete  the human finished that step
+POST /api/application-sessions/{id}/resume          checkpoint-validated resume
+POST /api/application-sessions/{id}/submit          reserve the at-most-once ledger slot
+```
+
+**States** (`APPLICATION_SESSION_STATES`, `docs/contracts/07` §10): `created →
+launching → preparing → active → awaiting_user | paused → resuming → completed`,
+with `expired` / `failed` / `cancelled` terminal.
+
+**Pauses** (`USER_ACTION_KINDS`). `awaiting_user` is always paired with a pending
+`application_actions` row — a pause nobody can see is a stall. The action's
+`kind` says who must act and where:
+
+| Kind | Who acts | Where |
+|---|---|---|
+| `login` | the user | in the browser; a handoff token opens a single-use window |
+| `mfa` | the user | in the browser; the code is never relayed |
+| `captcha` | the user | in the browser; never solved, never outsourced |
+| `unknown_field` / `ambiguous_field` | the user | answers in the app, then the pass continues |
+| `sensitive_field` / `legal_question` | the user | answers in the app; EEO defaults to `decline_to_answer` |
+| `session_expired` | the user | re-authenticate: fresh TTL, no reused state |
+| `review_required` | the user | anything the classifier could not clear |
+
+**What the assistant may do.** Type into fields whose verdict is `autofill`
+(`FIELD_ACTIONS`) — a confirmed profile/plan value, or an answer the user gave
+for that exact field. Nothing else. Unknown, ambiguous, restricted, legal and
+EEO fields have no path into a fill instruction, and credentials, one-time codes
+and CAPTCHA tokens have no path into the session row either: the checkpoint keeps
+a value *fingerprint*, the working set is purged when the session ends, and the
+API refuses a completion payload carrying a secret-looking field
+(`422 restricted_field`).
+
+**What it may never do.** Solve or relay a CAPTCHA; intercept, read or type an
+MFA code; type or store a password; take over a session established elsewhere;
+hide that it is automation (no stealth user-agent spoofing, no proxy rotation, no
+access-control bypass — the shipped outbound policy and host binding still
+apply). A bot check is a full stop, not an obstacle to route around.
+
+**Resuming** validates the checkpoint first: the job still exists and still
+belongs to the user, the posting URL and the posting's own application identity
+are unchanged, the page the user is looking at is the session's employer and
+portal host. Any mismatch is a refusal with the failing codes — the session does
+not resume on a stale assumption. Fields already `filled` (by the assistant) or
+`user_completed` (by the user in the browser) are never typed again, which is
+what makes "resume" safe to press twice.
+
+**Submitting** goes through the at-most-once ledger: a partial unique index on
+`(user_id, job_id)` for live rows plus a per-attempt idempotency key. Auto-submit
+requires all four gates of §3 — server `AUTOFILL_ALLOW_SUBMIT`/`DRY_RUN`, plan,
+the user's `application.allow_auto_submit` consent, and no pending action or
+failed checkpoint. In this release the default is *off*: a session fills and
+stops, and the human clicks submit.
+
+**Retention.** Persisted browser state (cookies only, never passwords or
+`localStorage` secrets) is opt-in, encrypted with the per-user key, expires with
+the session and is purged on expiry, cancel and account erasure. Screenshots are
+off by default, capped by `BROWSER_SCREENSHOT_MAX_RETENTION_DAYS`, and are never
+taken on a login, MFA or bot-check screen.

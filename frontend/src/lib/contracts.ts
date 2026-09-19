@@ -350,6 +350,107 @@ export type ApplicationBlockedCode = (typeof APPLICATION_BLOCKED_CODES)[number]
 
 export const SUBMISSION_CHANNELS = ['automation', 'manual_user', 'assisted_dry_run'] as const
 
+// ---------------------------------------------------------------------------
+// Browser-assisted application sessions (human-in-the-loop)
+// ---------------------------------------------------------------------------
+
+/**
+ * The lifecycle of one isolated browser run for one (user, job). Anything that
+ * needs a human — a password, an MFA code, a CAPTCHA, an unknown field, a legal
+ * question — moves the session to `awaiting_user` and creates an action item;
+ * it never gets "worked around".
+ */
+export const APPLICATION_SESSION_STATES = [
+  'created',
+  'launching',
+  'preparing',
+  'active',
+  'awaiting_user',
+  'paused',
+  'resuming',
+  'completed',
+  'expired',
+  'failed',
+  'cancelled',
+] as const
+export type ApplicationSessionState = (typeof APPLICATION_SESSION_STATES)[number]
+
+export const APPLICATION_SESSION_TERMINAL_STATES = [
+  'completed',
+  'expired',
+  'failed',
+  'cancelled',
+] as const
+
+/** States that mean a human owes the session something. */
+export const APPLICATION_SESSION_USER_ACTION_STATES = ['awaiting_user'] as const
+
+/** What the human is being asked to do. The first three are browser handoffs. */
+export const USER_ACTION_KINDS = [
+  'login',
+  'mfa',
+  'captcha',
+  'unknown_field',
+  'ambiguous_field',
+  'sensitive_field',
+  'legal_question',
+  'session_expired',
+  'review_required',
+] as const
+export type UserActionKind = (typeof USER_ACTION_KINDS)[number]
+
+export const USER_ACTION_STATUSES = [
+  'pending',
+  'in_progress',
+  'completed',
+  'expired',
+  'cancelled',
+] as const
+
+/** Why a resume was refused. Never free text. */
+export const CHECKPOINT_FAILURES = [
+  'session_expired',
+  'session_not_resumable',
+  'job_not_owned',
+  'job_reassigned',
+  'url_changed',
+  'employer_mismatch',
+  'application_identity_mismatch',
+  'portal_domain_not_allowed',
+] as const
+
+/** How a detected form field is classified before anything is typed. */
+export const FIELD_CLASSIFICATIONS = [
+  'canonical',
+  'file',
+  'voluntary',
+  'sensitive',
+  'legal',
+  'unknown',
+  'ambiguous',
+  'credential',
+  'mfa',
+  'captcha',
+  'submit',
+  'ignored',
+] as const
+
+/** What the executor does with a classified field. */
+export const FIELD_ACTIONS = ['autofill', 'ask_user', 'handoff', 'skip', 'never'] as const
+
+/** The at-most-once submission ledger. */
+export const SUBMISSION_STATES = ['reserved', 'submitted', 'verified', 'failed', 'abandoned'] as const
+
+/** Why a submission was refused. */
+export const SUBMISSION_REFUSALS = [
+  'already_submitted',
+  'policy_disallows_submit',
+  'session_expired',
+  'checkpoint_invalid',
+  'action_required',
+  'no_session',
+] as const
+
 /**
  * Canonical state → the legacy `jobs.status` the board still renders. Kept in
  * sync with the backend projection so a board and an application drawer can
@@ -403,6 +504,21 @@ export const APPLICATION_STATE_PHASE: Record<string, string> = {
   withdrawn: 'closed',
   expired: 'closed',
   skipped: 'closed',
+  cancelled: 'closed',
+}
+
+/** Session state -> UI phase. Complete by construction (backend pins it). */
+export const APPLICATION_SESSION_PHASE: Record<string, string> = {
+  created: 'new',
+  launching: 'working',
+  preparing: 'working',
+  active: 'working',
+  awaiting_user: 'blocked',
+  paused: 'blocked',
+  resuming: 'working',
+  completed: 'done',
+  expired: 'closed',
+  failed: 'closed',
   cancelled: 'closed',
 }
 
@@ -676,6 +792,9 @@ export const QUEUE_PIPELINES = [
   'ai',
   'extraction',
   'onboarding',
+  // Browser-assisted application sessions: one pass per item, stopping at the
+  // first human-required step (login / MFA / CAPTCHA / an unknown field).
+  'browser_session',
 ] as const
 export type QueuePipeline = (typeof QUEUE_PIPELINES)[number]
 
@@ -871,6 +990,17 @@ export const EVENT_TYPES = [
   'application.cancelled',
   'application.retried',
   'application.dead_lettered',
+  'application.session_started',
+  'application.session_paused',
+  'application.session_resumed',
+  'application.session_expired',
+  'application.session_completed',
+  'application.session_cancelled',
+  'application.action_required',
+  'application.action_completed',
+  'application.handoff_issued',
+  'application.observation_recorded',
+  'application.submission_refused',
   'automation.policy_changed',
   'automation.run_scheduled',
   'automation.run_skipped',
@@ -949,6 +1079,16 @@ export const AUDIT_ACTIONS = [
   'vault.exported',
   'vault.reveal_failed',
   'vault.viewed',
+  'application.session_started',
+  'application.session_paused',
+  'application.session_resumed',
+  'application.session_expired',
+  'application.session_completed',
+  'application.session_cancelled',
+  'application.action_completed',
+  'application.handoff_issued',
+  'application.submission_reserved',
+  'application.submission_refused',
   'account.created',
   'onboarding.started',
   'onboarding.completed',
@@ -1002,6 +1142,16 @@ export const SENSITIVE_AUDIT_ACTIONS = [
  * crashed on — types are additive.
  */
 export const RENDERED_EVENT_TYPES = [
+  'application.session_started',
+  'application.session_paused',
+  'application.session_resumed',
+  'application.session_expired',
+  'application.session_completed',
+  'application.session_cancelled',
+  'application.action_required',
+  'application.action_completed',
+  'application.handoff_issued',
+  'application.submission_refused',
   'onboarding.state_changed',
   'onboarding.gate_blocked',
   'onboarding.completed',
@@ -1085,6 +1235,9 @@ export const ERROR_CODES = [
   'application_not_found',
   'application_already_submitted',
   'application_not_submittable',
+  'session_expired',
+  'action_required',
+  'checkpoint_failed',
   'idempotency_conflict',
   'idempotency_replay',
   'onboarding_not_started',
@@ -1163,6 +1316,15 @@ export const QUEUE_PROGRESS_STEPS: Record<string, readonly string[]> = {
     'writing_provenance',
     'done',
   ] as const,
+  browser_session: [
+    'opening',
+    'observing',
+    'filling',
+    'awaiting_user',
+    'resuming',
+    'verifying_checkpoint',
+    'done',
+  ] as const,
 }
 
 /**
@@ -1196,6 +1358,16 @@ export const VOCABULARY: Record<string, readonly string[]> = {
   application_user_action_states: APPLICATION_USER_ACTION_STATES,
   application_blocked_codes: APPLICATION_BLOCKED_CODES,
   submission_channels: SUBMISSION_CHANNELS,
+  application_session_states: APPLICATION_SESSION_STATES,
+  application_session_terminal_states: APPLICATION_SESSION_TERMINAL_STATES,
+  application_session_user_action_states: APPLICATION_SESSION_USER_ACTION_STATES,
+  user_action_kinds: USER_ACTION_KINDS,
+  user_action_statuses: USER_ACTION_STATUSES,
+  checkpoint_failures: CHECKPOINT_FAILURES,
+  field_classifications: FIELD_CLASSIFICATIONS,
+  field_actions: FIELD_ACTIONS,
+  submission_states: SUBMISSION_STATES,
+  submission_refusals: SUBMISSION_REFUSALS,
   job_statuses: JOB_STATUSES,
   ambiguity_kinds: AMBIGUITY_KINDS,
   field_resolutions: FIELD_RESOLUTIONS,
