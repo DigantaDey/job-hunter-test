@@ -22,6 +22,10 @@ logger = get_logger("audit")
 # trail a security reviewer or a regulator will ask for.
 SENSITIVE_ACTIONS = (
     "auth.", "vault.", "account.", "consent.", "resume.delete", "email.send", "application.submitted",
+    # Auto-apply enablement is the highest-stakes consent-adjacent write the
+    # policy engine performs and must survive load shedding exactly like a
+    # consent or submission event (contracts/10 §7 P3).
+    "automation.auto_submit_enabled",
 )
 
 

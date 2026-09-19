@@ -33,7 +33,7 @@ from typing import Dict, Tuple
 #: Version of the contract set itself. Surfaced in docs and (proposed) in
 #: ``GET /api/meta`` so a client can detect a server that speaks a newer
 #: vocabulary than it does. Minor = additive, major = a rename/removal.
-CONTRACT_VERSION = "1.2.0"
+CONTRACT_VERSION = "1.3.0"
 
 #: Header a client sends to make a state-changing POST safely retryable.
 #: See ``docs/contracts/01-conventions.md`` §Idempotency.
@@ -784,6 +784,31 @@ SENSITIVE_FIELD_POLICIES: Tuple[str, ...] = (
     "never_answer", "ask_every_time", "use_saved_answer", "prefer_decline",
 )
 
+#: ``evaluate_policy`` decision reasons (contracts/10 §5). ``allowed`` when an
+#: automation attempt went through; every other value names the *first* gate
+#: that refused it, in the fixed evaluation order.
+AUTOMATION_POLICY_REASONS: Tuple[str, ...] = (
+    "allowed",
+    "server_disabled",
+    "plan_locked",
+    "consent_missing",
+    "consent_withdrawn",
+    "disclosure_version_changed",
+    "policy_off",
+    "daily_limit",
+    "monthly_limit",
+    "quota_exhausted",
+    "quiet_hours",
+    "company_blocked",
+    "portal_not_allowed",
+    "keyword_blocked",
+    "location_excluded",
+    "score_below_floor",
+    "compensation_below_floor",
+    "review_required",
+    "expired",
+)
+
 
 # --------------------------------------------------------------------------- #
 # Events & notifications (deliverables 7 & 10)
@@ -1131,6 +1156,7 @@ VOCABULARY: Dict[str, Tuple[str, ...]] = {
     "automation_modes": AUTOMATION_MODES,
     "automation_scopes": AUTOMATION_SCOPES,
     "sensitive_field_policies": SENSITIVE_FIELD_POLICIES,
+    "automation_policy_reasons": AUTOMATION_POLICY_REASONS,
     "event_types": EVENT_TYPES,
     "aggregate_types": AGGREGATE_TYPES,
     "audit_actions": AUDIT_ACTIONS,
@@ -1158,6 +1184,7 @@ __all__ = [
     "APPLICATION_STATES", "APPLICATION_STATE_PHASE", "APPLICATION_TERMINAL_STATES",
     "APPLICATION_USER_ACTION_STATES", "AUDIT_ACTIONS", "AUTOFILL_VALUE_SOURCES",
     "AUTOMATION_MODES", "AUTOMATION_SCOPES", "AUTOMATION_WORKFLOWS", "CONFIDENCE_BANDS",
+    "AUTOMATION_POLICY_REASONS",
     "CONFIDENCE_BAND_THRESHOLDS", "CONTRACT_VERSION", "DISCOVERY_AI_SKIP_REASONS",
     "DISCOVERY_RUN_STATES", "DISCOVERY_WHY_EMPTY", "EEO_FIELD_KEYS", "ERROR_CODES",
     "EVENT_TYPES", "EVIDENCE_KINDS", "EXTRACTION_STATES", "FIELD_RESOLUTIONS",

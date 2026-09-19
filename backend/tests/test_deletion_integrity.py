@@ -32,6 +32,9 @@ from app.models.models import (
     ApplicationSession,
     ApplicationSubmission,
     AuditLog,
+    AutomationPolicy,
+    AutomationPolicyRevision,
+    AutomationSubmissionCounter,
     BillingEvent,
     CandidateProfile,
     CompanyIntel,
@@ -125,6 +128,11 @@ CHILD_TABLES: dict[str, type] = {
     # Application packet (reviewable, versioned, grounded artifacts)
     "application_packets": ApplicationPacket,
     "application_packet_events": ApplicationPacketEvent,
+    # Automation policy (v2.2.22, docs/contracts/10): the versioned permission
+    # rows, their append-only revision history and the atomic daily counters.
+    "automation_policies": AutomationPolicy,
+    "automation_policy_revisions": AutomationPolicyRevision,
+    "automation_submission_counters": AutomationSubmissionCounter,
 }
 
 
@@ -418,6 +426,35 @@ def _seed_every_child_table(db, user: User) -> dict:
         user_id=user.id, job_id=job.id, session_id=app_session.id, state="reserved",
         channel="automation", idempotency_key=f"sub:{user.id}:{job.id}:seed", dry_run=False,
         reserved_at=datetime.utcnow(),
+        policy_id=None, policy_version=None, consent_snapshot={},
+    ))
+    db.commit()
+
+    # Automation policy seed: one versioned permission row, one revision, and
+    # one atomic daily counter — wired the way the policy API wires them.
+    policy = AutomationPolicy(
+        user_id=user.id, scope="global", scope_key="*", workflow="application_submit",
+        enabled=True, mode="prepare", mode_chosen_at=datetime.utcnow(),
+        min_match_score=60.0, max_runs_per_day=10, max_runs_per_month=50,
+        require_review_before_submit=True, require_resume_approval=True,
+        sensitive_field_policy="ask_every_time", eeo_policy="prefer_decline",
+        credential_policy="create_on_demand",
+        allowed_portals=["lever"], blocked_portals=[], blocked_keywords=[],
+        consents_required=["data_processing"], consent_snapshot={},
+        disclosure_version="development.1",
+        version=1, updated_by="system_api", effective_from=datetime.utcnow(),
+    )
+    db.add(policy)
+    db.flush()
+    db.add(AutomationPolicyRevision(
+        user_id=user.id, policy_id=policy.id, version=1,
+        document={"scope": "global", "scope_key": "*", "workflow": "application_submit",
+                  "mode": "prepare", "version": 1},
+        changed_keys=[], actor_type="system_api", actor_id=None, reason="policy_created",
+    ))
+    db.add(AutomationSubmissionCounter(
+        user_id=user.id, workflow="application_submit",
+        period=datetime.utcnow().strftime("%Y-%m-%d"), record=1, rejected=0,
     ))
     db.commit()
     vault = save_vault_entry(db, user.id, domain="jobs.lever.co", username="me@example.com",

@@ -14,7 +14,7 @@
  */
 
 /** Contract version of the backend vocabulary this file mirrors. */
-export const CONTRACT_VERSION = '1.2.0'
+export const CONTRACT_VERSION = '1.3.0'
 
 /** Header the SPA sends on state-changing POSTs to make a retry safe. */
 export const IDEMPOTENCY_HEADER = 'Idempotency-Key'
@@ -827,6 +827,30 @@ export const SENSITIVE_FIELD_POLICIES = [
 ] as const
 export type SensitiveFieldPolicy = (typeof SENSITIVE_FIELD_POLICIES)[number]
 
+/** `evaluate_policy` decision reasons — `allowed`, or the first gate that refused. */
+export const AUTOMATION_POLICY_REASONS = [
+  'allowed',
+  'server_disabled',
+  'plan_locked',
+  'consent_missing',
+  'consent_withdrawn',
+  'disclosure_version_changed',
+  'policy_off',
+  'daily_limit',
+  'monthly_limit',
+  'quota_exhausted',
+  'quiet_hours',
+  'company_blocked',
+  'portal_not_allowed',
+  'keyword_blocked',
+  'location_excluded',
+  'score_below_floor',
+  'compensation_below_floor',
+  'review_required',
+  'expired',
+] as const
+export type AutomationPolicyReason = (typeof AUTOMATION_POLICY_REASONS)[number]
+
 export const AUTOMATION_MODE_LABELS: Record<string, string> = {
   off: 'Off — never act for me',
   suggest: 'Suggest — show candidates, do nothing',
@@ -1394,6 +1418,7 @@ export const VOCABULARY: Record<string, readonly string[]> = {
   automation_modes: AUTOMATION_MODES,
   automation_scopes: AUTOMATION_SCOPES,
   sensitive_field_policies: SENSITIVE_FIELD_POLICIES,
+  automation_policy_reasons: AUTOMATION_POLICY_REASONS,
   event_types: EVENT_TYPES,
   aggregate_types: AGGREGATE_TYPES,
   audit_actions: AUDIT_ACTIONS,

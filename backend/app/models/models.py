@@ -1482,8 +1482,148 @@ class ApplicationSubmission(Base):
     refusal_reason: Mapped[str] = mapped_column(String(40), default="", nullable=True)
     #: The portal's own receipt: {kind, external_id, observed_at, locator}.
     receipt: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+
+    # --- automation-policy provenance (contracts/10 §5 rule 3) ------------- #
+    #: The ``automation_policies`` row this submission was decided under, plus
+    #: the version and the consent snapshot in force *at decision time* — the
+    #: three columns that make an automatic submission reconstructible.
+    policy_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    policy_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    consent_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+
     reserved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+# --------------------------------------------------------------------------- #
+# Automation policy — the persisted, versioned "what may run for this user"
+#
+# ``docs/contracts/10-automation-policy.md`` §2. One row per
+# ``(user_id, scope, scope_key, workflow)``; every account owns exactly one
+# ``global``/``*`` row per workflow (created lazily here, with the plan's
+# defaults) and narrower rows override it. Every change writes one append-only
+# ``AutomationPolicyRevision`` so "who turned auto-submit on, and when?" is
+# answerable without reading audit prose — the revision freezes the limits, the
+# submission row freezes the consent snapshot.
+# --------------------------------------------------------------------------- #
+class AutomationPolicy(Base):
+    __tablename__ = "automation_policies"
+    __table_args__ = (
+        UniqueConstraint("user_id", "scope", "scope_key", "workflow",
+                         name="uq_automation_policy_identity"),
+        Index("ix_automation_policy_owner_workflow", "user_id", "workflow", "enabled"),
+        Index("ix_automation_policy_resolution", "user_id", "workflow", "scope", "scope_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    #: ``AUTOMATION_SCOPES``: global | persona | workflow | company | portal.
+    scope: Mapped[str] = mapped_column(String(16), nullable=False, default="global")
+    #: The persona id, workflow name, ``company_name_normalized`` or portal
+    #: domain; ``*`` for the ``global`` row.
+    scope_key: Mapped[str] = mapped_column(String(200), nullable=False, default="*")
+    #: ``AUTOMATION_WORKFLOWS``.
+    workflow: Mapped[str] = mapped_column(String(28), nullable=False)
+
+    #: Master switch for this row.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    #: ``AUTOMATION_MODES``: off | suggest | prepare | auto_submit.
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="off")
+    #: null = inherited plan default, not an explicit choice
+    #: (the onboarding gate needs the difference, contracts/10 §2).
+    mode_chosen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # --- limits & gates ------------------------------------------------------ #
+    min_match_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_runs_per_day: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    max_runs_per_month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    require_review_before_submit: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    require_resume_approval: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # --- source/company/location constraints --------------------------------- #
+    allowed_portals: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    blocked_portals: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    allowed_companies: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    blocked_companies: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    blocked_keywords: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    allowed_locations: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    require_remote: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    require_onsite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    compensation_floor: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+
+    # --- field-answer policy ------------------------------------------------- #
+    sensitive_field_policy: Mapped[str] = mapped_column(String(20), nullable=False, default="ask_every_time")
+    eeo_policy: Mapped[str] = mapped_column(String(20), nullable=False, default="prefer_decline")
+    credential_policy: Mapped[str] = mapped_column(String(20), nullable=False, default="create_on_demand")
+
+    # --- schedule & notifications -------------------------------------------- #
+    schedule: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    notify: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+
+    # --- consent binding ------------------------------------------------------ #
+    consents_required: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    consent_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    disclosure_version: Mapped[str] = mapped_column(String(24), default="", nullable=False)
+
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # --- audit --------------------------------------------------------------- #
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    updated_by: Mapped[str] = mapped_column(String(20), default="system_api", nullable=False)
+    effective_from: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+class AutomationPolicyRevision(Base):
+    """Append-only history of one policy row's changes (contracts/10 §2.1)."""
+
+    __tablename__ = "automation_policy_revisions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "policy_id", "version", name="uq_automation_revision_version"),
+        Index("ix_automation_revision_owner_policy", "user_id", "policy_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    #: Not an FK on purpose: the revision must outlive a deleted (scoped) row,
+    #: because every past submission still resolves against it.
+    policy_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The whole row as it stood after the change.
+    document: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    changed_keys: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+    actor_type: Mapped[str] = mapped_column(String(20), default="system_api", nullable=False)
+    actor_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    request_id: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class AutomationSubmissionCounter(Base):
+    """Atomic daily window of auto-submissions (the daily-limit backstop).
+
+    Kept separate from ``application_submissions`` so the daily check is a
+    precise, atomic ``SELECT … FOR UPDATE``/insert on a tiny table; the ledger
+    itself stays the complete audit record. ``period`` is the UTC day
+    (``YYYY-MM-DD``); ``rejected`` counts policy/inspection refusals, which are
+    recorded but never charged toward the run limits.
+    """
+
+    __tablename__ = "automation_submission_counters"
+    __table_args__ = (
+        UniqueConstraint("user_id", "period", name="uq_automation_counter_user_period"),
+        Index("ix_automation_counter_owner_period", "user_id", "period"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    workflow: Mapped[str] = mapped_column(String(28), nullable=False, default="application_submit")
+    period: Mapped[str] = mapped_column(String(10), nullable=False)  # YYYY-MM-DD (UTC)
+    record: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # submissions acted on
+    rejected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # refusals recorded (unmetered)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)

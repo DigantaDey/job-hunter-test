@@ -1958,6 +1958,7 @@ def submission_decision(
     job: Job,
     session: Optional[ApplicationSession] = None,
     policy: Optional[SessionPolicy] = None,
+    explicit_policy: bool = False,
 ) -> Dict[str, Any]:
     """
     Pure-ish decision: may this job be submitted right now?
@@ -1965,7 +1966,17 @@ def submission_decision(
     Duplicate prevention is the first check and it is answered from the ledger
     (and the job's own ``applied`` status), not from the session: a session that
     was deleted, expired or resumed cannot make a second submission legal.
+
+    The submission *gate* is the automation-policy engine (contracts/10 §5):
+    the same explicit, source-specific decision the legacy autofill path
+    consumes. When a caller hands in its own ``SessionPolicy`` with
+    ``allow_submit=True`` (``explicit_policy=True``), that is the internal
+    "gates are open" override — workers and tests use it to exercise the
+    session-level checks below — and the engine is left to the request path,
+    where it is authoritative.
     """
+    from app.services import automation_policy as policy_engine
+
     policy = policy or effective_policy(db, user.id)
     existing = existing_submission(db, user.id, job.id)
     if existing is not None:
@@ -1974,12 +1985,33 @@ def submission_decision(
     if (job.status or "") == "applied":
         return {"allowed": False, "reason": "already_submitted", "submission_id": None,
                 "state": "submitted", "channel": "manual_user"}
-    if not policy.allow_submit:
-        return {"allowed": False, "reason": "policy_disallows_submit", "submission_id": None,
-                "server": {"autofill_enabled": settings.autofill_enabled,
-                           "autofill_dry_run": settings.autofill_dry_run,
-                           "autofill_allow_submit": settings.autofill_allow_submit},
-                "user_consent": bool(get_setting(db, user.id, "application", "allow_auto_submit", False))}
+
+    decision: Dict[str, Any] = {}
+    if not (explicit_policy and policy.allow_submit):
+        decision = policy_engine.evaluate_policy(
+            db,
+            user=user,
+            job=job,
+            workflow=policy_engine.SUBMIT_WORKFLOW,
+            persona_id=job.persona_id if job else None,
+            for_http=True,
+        )
+        if not decision["allowed"]:
+            # The submission surface speaks the refusal vocabulary
+            # (``SUBMISSION_REFUSALS``); the engine's finer reason travels
+            # nested under ``policy`` so nothing is lost.
+            decision.setdefault("server", {
+                "autofill_enabled": settings.autofill_enabled,
+                "autofill_dry_run": settings.autofill_dry_run,
+                "autofill_allow_submit": settings.autofill_allow_submit,
+            })
+            decision.setdefault("user_consent",
+                                bool(get_setting(db, user.id, "application", "allow_auto_submit", False)))
+            return {"allowed": False, "reason": "policy_disallows_submit", "submission_id": None,
+                    "policy_id": decision.get("policy_id"),
+                    "policy_version": decision.get("policy_version"),
+                    "policy": decision}
+
     if session is None:
         return {"allowed": False, "reason": "no_session", "submission_id": None}
     if is_expired(session):
@@ -1993,8 +2025,22 @@ def submission_decision(
     if failures:
         return {"allowed": False, "reason": "checkpoint_invalid", "submission_id": None,
                 "failures": failures}
-    return {"allowed": True, "reason": "allowed", "submission_id": None,
-            "dry_run": policy.dry_run, "channel": "automation"}
+
+    allow_submit = bool(
+        (explicit_policy and policy.allow_submit)
+        or (decision.get("mode") == "auto_submit" and policy.allow_submit)
+    )
+    return {
+        "allowed": True,
+        "reason": "allowed",
+        "submission_id": None,
+        "dry_run": bool(policy.dry_run or not allow_submit),
+        "channel": "automation" if allow_submit else "assisted_dry_run",
+        "policy_id": decision.get("policy_id") if decision else None,
+        "policy_version": decision.get("policy_version") if decision else None,
+        "consent_snapshot": (decision.get("inputs", {}).get("consents", {}) if decision else {}),
+        "policy": decision,
+    }
 
 
 def reserve_submission(
@@ -2014,23 +2060,35 @@ def reserve_submission(
     the user. A unique constraint on ``(user_id, job_id)`` for live rows is the
     database-level backstop, and an ``IntegrityError`` is mapped back to the
     same refusal rather than a 500.
+
+    The policy decision is stored on the row (``policy_id`` / ``policy_version`` /
+    ``consent_snapshot``, contracts/10 §5 rule 3), so the attempt is
+    reconstructible even if the policy changes (or is deleted) afterwards.
+    ``policy`` is ``None`` on the HTTP path (the engine decides); callers that
+    pass a policy with ``allow_submit=True`` are the internal override.
     """
-    decision = submission_decision(db, user=user, job=job, session=session, policy=policy)
+    explicit_policy = bool(policy is not None and policy.allow_submit)
+    decision = submission_decision(db, user=user, job=job, session=session, policy=policy,
+                                   explicit_policy=explicit_policy)
     if not decision["allowed"]:
         inc("jobhunter_application_submissions_total", result="refused",
             reason=str(decision["reason"]))
         return None, decision
 
     policy = policy or effective_policy(db, user.id)
+    resolved_channel = str(decision.get("channel") or channel)
     row = ApplicationSubmission(
         user_id=user.id,
         job_id=job.id,
         session_id=session.id if session else None,
         state="reserved",
-        channel=channel,
+        channel=resolved_channel,
         idempotency_key=submission_idempotency_key(job, session),
-        dry_run=bool(policy.dry_run),
+        dry_run=bool(decision.get("dry_run", policy.dry_run)),
         reserved_at=_now(),
+        policy_id=decision.get("policy_id"),
+        policy_version=decision.get("policy_version"),
+        consent_snapshot=dict(decision.get("consent_snapshot") or {}),
     )
     db.add(row)
     try:
@@ -2046,6 +2104,7 @@ def reserve_submission(
         return None, decision
     db.refresh(row)
     inc("jobhunter_application_submissions_total", result="reserved")
+    decision["submission_id"] = row.id
     return row, decision
 
 
