@@ -19,12 +19,34 @@ same table shape and adds the five things a timeline needs.
 | `application_events` | one application | the product timeline the user reads | prunable after `event_retention_days`, except state-changing rows |
 | `job_events` *(shipped)* | one job | board-level log; kept, and written **in addition** for one minor version so nothing that reads it breaks | as today |
 | `domain_events` ([12](12-events-and-notifications.md)) | tenant | the integration/audit bus: notifications, analytics, webhooks | as today |
+| `application_tracking_events` ✓ shipped | one tracking record | the lifecycle/outcome timeline on `/tracking`: who claimed the fact (`origin`), and whether it amended an earlier one | append-only while the record lives; deleted with the account |
 | `audit_logs` *(shipped)* | tenant | security-relevant actions, append-only, survives erasure detached | as today |
 
 One application transition writes **one** `application_events` row, and — via the
 same call — one `domain_events` row and, when the action is in
 `audit.SENSITIVE_ACTIONS`, one `audit_logs` row. Three rows, one transaction, one
 `event_id` shared by all three so they can be correlated.
+
+`application_tracking_events` (v2.2.22, [07 §11](07-application-state-machine.md))
+is the same discipline on a different subject: it records the *life of the
+application* rather than the run of the automation. Three differences are
+deliberate.
+
+1. **One row per fact, not per (fact, state change).** A tracking event carries
+   `state_from`/`state_to` on the row itself, so
+   `application.interview_reported` *is* the state-change record — the
+   "`state_changed` plus the specific event" rule of §2 in
+   [12](12-events-and-notifications.md) is satisfied by one row that holds both.
+   `application.state_changed` remains the event type for the two moves that have
+   no story of their own (`not_applied`, `applied`).
+2. **An `origin` column on every row** (`system_observed`, `user_reported`,
+   `email_inferred`, `verified_integration`). This table is the only place where
+   "the product saw it" and "the person said it" must stay distinguishable,
+   because the report groups by it.
+3. **A nullable `dedupe_key` naming the fact** (`trk:{id}:{event_type}:{state}:{minute}`),
+   with a unique constraint. Replays answer `duplicate: true` instead of
+   appending; the key is nullable because free-form notes have no identity to
+   dedupe on and must always append.
 
 ---
 

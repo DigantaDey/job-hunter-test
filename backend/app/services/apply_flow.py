@@ -392,6 +392,12 @@ async def execute_application(
                                "policy_id": policy_decision.get("policy_id"),
                                "policy_version": policy_decision.get("policy_version"),
                                **result})
+        # The tracking timeline records this as *system-observed*: our own
+        # machinery sent it and saw the receipt, which is a different claim from
+        # the user remembering that they did (contracts/07 §11). Best-effort —
+        # a tracking write must never fail a submission that already went out.
+        _observe_tracking(db, user, job, channel="automation", trigger="auto",
+                          submission_id=submission_id, receipt=result.get("receipt"))
         inc("jobhunter_applications_total", result="automated")
     elif result["status"] in ("dry_run", "filled"):
         job.status = "ready_to_apply"
@@ -555,6 +561,44 @@ def _flush_then_counter(
         )
 
 
+def _observe_tracking(db: Session, user: User, job: Job, *, channel: str, trigger: str,
+                      origin: str = "system_observed", actor_type: str = "system_worker",
+                      note: Optional[str] = None, submission_id: Optional[int] = None,
+                      receipt: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Mirror a submission onto the tracking timeline (best-effort, never fatal).
+
+    The tracking layer is a *record*, not a participant: if it cannot be written
+    (a schema problem, a lock, a bug) the application flow carries on and the
+    queue's own ``job_events`` row is still the record of the run.
+    """
+    try:
+        from app.services import application_tracking as tracking
+
+        outcome = tracking.observe_submission(
+            db, user=user, job=job, channel=channel, actor_type=actor_type, trigger=trigger,
+            origin=origin, receipt=receipt if isinstance(receipt, dict) else None,
+            submission_id=submission_id,
+        )
+        if outcome is None:
+            log.debug("submission for job %s was already on the tracking timeline", job.id)
+        if note:
+            record = tracking.for_job(db, int(user.id), int(job.id))
+            if record is not None:
+                # The words the user typed on the way in are theirs, and they are
+                # appended whether or not the state change was a fresh one.
+                tracking.add_note(db, user=user, record=record, note=note, actor_type="user")
+        row = tracking.for_job(db, int(user.id), int(job.id))
+        return int(row.id) if row is not None else None
+    except Exception as exc:  # noqa: BLE001 - the submission is the thing that matters
+        try:
+            db.rollback()
+        except Exception:  # pragma: no cover - defensive
+            pass
+        log.warning("could not mirror job %s onto the tracking timeline: %s: %s",
+                    job.id, type(exc).__name__, exc)
+        return None
+
+
 def mark_applied(db: Session, user: User, job: Job, *, note: str = "") -> Dict[str, Any]:
     """User-confirmed submission (the honest path when automation is off)."""
     job.status = "applied"
@@ -563,5 +607,11 @@ def mark_applied(db: Session, user: User, job: Job, *, note: str = "") -> Dict[s
     db.commit()
     record_job_event(db, user_id=user.id, job_id=job.id, stage="applied", status="success",
                      message=note or "Marked as applied by the user", meta={"confirmed_by": "user"})
+    # The user is the one asserting this, so the timeline says ``user_reported``
+    # even though our endpoint wrote the row — origin is about the *claim*, not
+    # about which process held the pen.
+    tracking_id = _observe_tracking(db, user, job, channel="manual_user", trigger="user",
+                                    origin="user_reported", actor_type="user", note=note or None)
     inc("jobhunter_applications_total", result="manual")
-    return {"status": job.status, "applied_at": job.applied_at.isoformat()}
+    return {"status": job.status, "applied_at": job.applied_at.isoformat(),
+            "tracking_id": tracking_id}

@@ -14,7 +14,7 @@
  */
 
 /** Contract version of the backend vocabulary this file mirrors. */
-export const CONTRACT_VERSION = '1.3.0'
+export const CONTRACT_VERSION = '1.4.0'
 
 /** Header the SPA sends on state-changing POSTs to make a retry safe. */
 export const IDEMPOTENCY_HEADER = 'Idempotency-Key'
@@ -349,6 +349,254 @@ export const APPLICATION_BLOCKED_CODES = [
 export type ApplicationBlockedCode = (typeof APPLICATION_BLOCKED_CODES)[number]
 
 export const SUBMISSION_CHANNELS = ['automation', 'manual_user', 'assisted_dry_run'] as const
+
+// ---------------------------------------------------------------------------
+// Application tracking — the lightweight outcome layer
+//
+// `docs/contracts/07-application-state-machine.md` §11. Not the submission state
+// machine above: this is what happened *after* an application went out (a reply,
+// an interview, a rejection, a withdrawal), kept as an append-only timeline so
+// "how many applications became interviews, from which source, at which match
+// score, with which artefact version?" is a query and not a guess.
+// ---------------------------------------------------------------------------
+
+/** Board/report grouping for the tracking layer. */
+export const TRACKING_PHASES = [
+  'pre_application',
+  'applied',
+  'in_conversation',
+  'interviewing',
+  'closed',
+] as const
+export type TrackingPhase = (typeof TRACKING_PHASES)[number]
+
+/** `application_tracking.state` — one row per (user, job). */
+export const APPLICATION_TRACKING_STATES = [
+  'not_applied',
+  'applied',
+  'recruiter_response',
+  'interview_scheduled',
+  'interview_completed',
+  'offer_received',
+  'rejected_by_employer',
+  'withdrawn',
+] as const
+export type ApplicationTrackingState = (typeof APPLICATION_TRACKING_STATES)[number]
+
+export const TRACKING_STATE_PHASE: Record<string, string> = {
+  not_applied: 'pre_application',
+  applied: 'applied',
+  recruiter_response: 'in_conversation',
+  interview_scheduled: 'interviewing',
+  interview_completed: 'interviewing',
+  offer_received: 'closed',
+  rejected_by_employer: 'closed',
+  withdrawn: 'closed',
+}
+
+/** No transition out of these; a mistake is fixed with a correction event. */
+export const TRACKING_TERMINAL_STATES = ['rejected_by_employer', 'withdrawn'] as const
+
+/** Reaching any of these counts as an interview in the conversion report. */
+export const TRACKING_INTERVIEW_STATES = [
+  'interview_scheduled',
+  'interview_completed',
+  'offer_received',
+] as const
+
+/** Projection onto the legacy `jobs.status` board column. */
+export const TRACKING_JOB_STATUS_PROJECTION: Record<string, string> = {
+  not_applied: 'discovered',
+  applied: 'applied',
+  recruiter_response: 'applied',
+  interview_scheduled: 'applied',
+  interview_completed: 'applied',
+  offer_received: 'applied',
+  rejected_by_employer: 'rejected',
+  withdrawn: 'skipped',
+}
+
+/**
+ * `application_tracking_events.origin` — who is asserting this happened. The
+ * timeline renders it on every row: a system observation and a user's memory are
+ * not the same claim.
+ */
+export const TRACKING_ORIGINS = [
+  'system_observed',
+  'user_reported',
+  'email_inferred',
+  'verified_integration',
+] as const
+export type TrackingOrigin = (typeof TRACKING_ORIGINS)[number]
+
+/**
+ * Origins that may move a record into a `TRACKING_TRUSTED_ONLY_STATES` state.
+ * `email_inferred` is absent on purpose: an interview is never inferred from a
+ * parsed email.
+ */
+export const TRACKING_TRUSTED_ORIGINS = [
+  'system_observed',
+  'user_reported',
+  'verified_integration',
+] as const
+
+/** The only state an `email_inferred` event may propose (and it stays provisional). */
+export const EMAIL_INFERRED_TRACKING_STATES = ['recruiter_response'] as const
+
+/** States that require a trusted origin — `422 origin_not_trusted` otherwise. */
+export const TRACKING_TRUSTED_ONLY_STATES = [
+  'interview_scheduled',
+  'interview_completed',
+  'offer_received',
+  'rejected_by_employer',
+] as const
+
+/** `application_tracking.artifact_kind` — what was attached, snapshotted. */
+export const TRACKING_ARTIFACT_KINDS = ['packet', 'resume_document', 'resume', 'none'] as const
+
+/** Attribution values that are not a job-board id (the ones the user picks). */
+export const TRACKING_MANUAL_SOURCES = [
+  'referral',
+  'company_site',
+  'linkedin',
+  'recruiter_inbound',
+  'job_fair',
+  'newsletter',
+  'other',
+] as const
+
+/** `payload.format` of an `application.interview_reported` event. */
+export const INTERVIEW_FORMATS = [
+  'phone',
+  'video',
+  'onsite',
+  'take_home',
+  'assessment',
+  'panel',
+  'other',
+] as const
+export type InterviewFormat = (typeof INTERVIEW_FORMATS)[number]
+
+/** `payload.channel` of an `application.response_received` event. */
+export const RESPONSE_CHANNELS = [
+  'email',
+  'phone',
+  'linkedin',
+  'portal',
+  'sms',
+  'in_person',
+  'other',
+] as const
+export type ResponseChannel = (typeof RESPONSE_CHANNELS)[number]
+
+/**
+ * `payload.self_assessment` of an `application.interview_completed` event — the
+ * user's own read on how it went. Feedback about the process, never a prediction.
+ */
+export const INTERVIEW_SELF_ASSESSMENTS = [
+  'went_well',
+  'mixed',
+  'went_poorly',
+  'unknown',
+] as const
+export type InterviewSelfAssessment = (typeof INTERVIEW_SELF_ASSESSMENTS)[number]
+
+export const INTERVIEW_FORMAT_LABELS: Record<string, string> = {
+  phone: 'Phone',
+  video: 'Video call',
+  onsite: 'On site',
+  take_home: 'Take-home',
+  assessment: 'Assessment',
+  panel: 'Panel',
+  other: 'Other',
+}
+
+export const INTERVIEW_SELF_ASSESSMENT_LABELS: Record<string, string> = {
+  went_well: 'Went well',
+  mixed: 'Mixed',
+  went_poorly: 'Went poorly',
+  unknown: 'Not sure yet',
+}
+
+/** Human copy. An unknown value renders as itself — never a blank chip. */
+export const TRACKING_STATE_LABELS: Record<string, string> = {
+  not_applied: 'Not applied',
+  applied: 'Applied',
+  recruiter_response: 'Recruiter responded',
+  interview_scheduled: 'Interview scheduled',
+  interview_completed: 'Interview done',
+  offer_received: 'Offer received',
+  rejected_by_employer: 'Rejected',
+  withdrawn: 'Withdrawn',
+}
+
+export const TRACKING_PHASE_LABELS: Record<string, string> = {
+  pre_application: 'Before applying',
+  applied: 'Applied',
+  in_conversation: 'In conversation',
+  interviewing: 'Interviewing',
+  closed: 'Closed',
+}
+
+export const TRACKING_ORIGIN_LABELS: Record<string, string> = {
+  system_observed: 'System observed',
+  user_reported: 'You reported',
+  email_inferred: 'Inferred from email — unconfirmed',
+  verified_integration: 'Verified integration',
+}
+
+export const TRACKING_EVENT_LABELS: Record<string, string> = {
+  'application.tracking_opened': 'Tracking started',
+  'application.state_changed': 'Status changed',
+  'application.state_corrected': 'Correction',
+  'application.interview_reported': 'Interview reported',
+  'application.interview_completed': 'Interview completed',
+  'application.response_received': 'Recruiter response',
+  'application.rejection_received': 'Rejection',
+  'application.offer_received': 'Offer',
+  'application.note_added': 'Note',
+  'application.follow_up_scheduled': 'Follow-up set',
+  'application.follow_up_completed': 'Follow-up done',
+  'application.attribution_updated': 'Source attribution',
+  'application.snapshot_recorded': 'Snapshot',
+  'application.suggestion_recorded': 'Suggestion (unconfirmed)',
+  'application.withdrawn': 'Withdrawn',
+  'application.submitted': 'Submitted',
+  'application.marked_applied_manually': 'Applied manually',
+}
+
+/** Chip colour per state — the one place the board and the timeline agree. */
+export const TRACKING_STATE_CHIP: Record<string, string> = {
+  not_applied: 'bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300',
+  applied: 'bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300',
+  recruiter_response: 'bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-300',
+  interview_scheduled: 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300',
+  interview_completed: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300',
+  offer_received: 'bg-emerald-600 text-white',
+  rejected_by_employer: 'bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300',
+  withdrawn: 'bg-zinc-200 text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300',
+}
+
+export function trackingStateLabel(state?: string | null): string {
+  if (!state) return 'Unknown'
+  return TRACKING_STATE_LABELS[state] || state
+}
+
+export function trackingPhaseFor(state?: string | null): string {
+  return TRACKING_STATE_PHASE[state || ''] || 'pre_application'
+}
+
+export function trackingJobStatusFor(state?: string | null): string {
+  return TRACKING_JOB_STATUS_PROJECTION[state || ''] || 'discovered'
+}
+
+export function isTerminalTrackingState(state?: string | null): boolean {
+  return TRACKING_TERMINAL_STATES.includes(state as (typeof TRACKING_TERMINAL_STATES)[number])
+}
+
+export function countsAsInterview(state?: string | null): boolean {
+  return TRACKING_INTERVIEW_STATES.includes(state as (typeof TRACKING_INTERVIEW_STATES)[number])
+}
 
 // ---------------------------------------------------------------------------
 // Browser-assisted application sessions (human-in-the-loop)
@@ -883,6 +1131,7 @@ export const NOTIFICATION_KINDS = [
   'resume_ready',
   'application_submitted',
   'application_outcome',
+  'application_follow_up',
   'email_reply',
   'consent_expiring',
   'security',
@@ -1014,6 +1263,20 @@ export const EVENT_TYPES = [
   'application.cancelled',
   'application.retried',
   'application.dead_lettered',
+  'application.tracking_opened',
+  'application.state_changed',
+  'application.state_corrected',
+  'application.interview_reported',
+  'application.interview_completed',
+  'application.response_received',
+  'application.rejection_received',
+  'application.offer_received',
+  'application.note_added',
+  'application.follow_up_scheduled',
+  'application.follow_up_completed',
+  'application.attribution_updated',
+  'application.snapshot_recorded',
+  'application.suggestion_recorded',
   'application.session_started',
   'application.session_paused',
   'application.session_resumed',
@@ -1137,6 +1400,10 @@ export const AUDIT_ACTIONS = [
   'application.submitted_unverified',
   'application.cancelled',
   'application.outcome_recorded',
+  'application.tracking_opened',
+  'application.status_updated',
+  'application.interview_recorded',
+  'application.state_corrected',
   'automation.policy_updated',
   'automation.policy_deleted',
   'automation.auto_submit_enabled',
@@ -1223,6 +1490,20 @@ export const RENDERED_EVENT_TYPES = [
   'application.cancelled',
   'application.retried',
   'application.dead_lettered',
+  'application.tracking_opened',
+  'application.state_changed',
+  'application.state_corrected',
+  'application.interview_reported',
+  'application.interview_completed',
+  'application.response_received',
+  'application.rejection_received',
+  'application.offer_received',
+  'application.note_added',
+  'application.follow_up_scheduled',
+  'application.follow_up_completed',
+  'application.attribution_updated',
+  'application.snapshot_recorded',
+  'application.suggestion_recorded',
   'automation.policy_changed',
   'automation.run_skipped',
   'automation.quota_exhausted',
@@ -1259,6 +1540,11 @@ export const ERROR_CODES = [
   'application_not_found',
   'application_already_submitted',
   'application_not_submittable',
+  'tracking_not_found',
+  'invalid_state_transition',
+  'origin_not_trusted',
+  'correction_reason_required',
+  'duplicate_event',
   'session_expired',
   'action_required',
   'checkpoint_failed',
@@ -1382,6 +1668,19 @@ export const VOCABULARY: Record<string, readonly string[]> = {
   application_user_action_states: APPLICATION_USER_ACTION_STATES,
   application_blocked_codes: APPLICATION_BLOCKED_CODES,
   submission_channels: SUBMISSION_CHANNELS,
+  application_tracking_states: APPLICATION_TRACKING_STATES,
+  tracking_phases: TRACKING_PHASES,
+  tracking_terminal_states: TRACKING_TERMINAL_STATES,
+  tracking_interview_states: TRACKING_INTERVIEW_STATES,
+  tracking_origins: TRACKING_ORIGINS,
+  tracking_trusted_origins: TRACKING_TRUSTED_ORIGINS,
+  email_inferred_tracking_states: EMAIL_INFERRED_TRACKING_STATES,
+  tracking_trusted_only_states: TRACKING_TRUSTED_ONLY_STATES,
+  tracking_artifact_kinds: TRACKING_ARTIFACT_KINDS,
+  tracking_manual_sources: TRACKING_MANUAL_SOURCES,
+  interview_formats: INTERVIEW_FORMATS,
+  response_channels: RESPONSE_CHANNELS,
+  interview_self_assessments: INTERVIEW_SELF_ASSESSMENTS,
   application_session_states: APPLICATION_SESSION_STATES,
   application_session_terminal_states: APPLICATION_SESSION_TERMINAL_STATES,
   application_session_user_action_states: APPLICATION_SESSION_USER_ACTION_STATES,

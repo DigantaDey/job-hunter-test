@@ -6,6 +6,7 @@ import { EmptyBoardBanner } from '../components/EmptyBoardBanner'
 import { useDiscoveryLastRun } from '../hooks/useDiscoveryLastRun'
 import { useAIWork } from '../context/AIWorkContext'
 import { WorkStatusLine } from '../components/AIWorkChip'
+import TrackingPanel from '../components/TrackingPanel'
 import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader2, Wand2, CheckCircle, AlertCircle, Eye, Brain, Target, MapPin, DollarSign, GraduationCap, Zap, TrendingUp, FileText } from 'lucide-react'
 
 /**
@@ -359,6 +360,15 @@ export default function Jobs(){
                   Prepare → Review → Confirm → Execute. For Workday/Lever: auto-creates vault credential. Unknown fields → User Input Needed queue. Never silently fails.
                 </div>
               </div>
+
+              {/* The application's own history (contracts/07 §11): status changes,
+                  the interview the user reported, notes, corrections — with the
+                  origin of every row. Writing here also refreshes the board row,
+                  because the tracking layer projects onto `jobs.status`. */}
+              <TrackingPanel jobId={selected.id} onTracked={()=>{
+                load()
+                client.get(`/api/jobs/${selected.id}`).then(r=>{ if(mounted.current) setSelected((prev:any)=> prev && prev.id===r.data.id ? r.data : prev) }).catch(()=>{})
+              }} />
 
               {selected.error && <div className="text-xs mono p-2 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300">{selected.error}</div>}
               <div className="space-y-2 text-xs mono">

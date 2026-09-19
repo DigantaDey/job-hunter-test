@@ -1499,6 +1499,227 @@ class ApplicationSubmission(Base):
 
 
 # --------------------------------------------------------------------------- #
+# Application tracking — the lightweight outcome layer (contracts/07 §11)
+#
+# One ``application_tracking`` row per ``(user_id, job_id)``: the *current*
+# outcome state plus the snapshots that make a later report honest (which source
+# the job came from, which match score we believed at the time, which artefact
+# version was attached). One ``application_tracking_events`` row per thing that
+# happened — append-only, so a status change never overwrites the history that
+# explains it, and a manual correction is a *new* event that names the one it
+# corrects.
+#
+# Deliberately not a CRM: no contacts table, no email threads, no per-company
+# pipelines, no activity logging. It answers four questions — what happened, who
+# says so, what did we send, and what is due next — and stops there.
+# --------------------------------------------------------------------------- #
+class ApplicationTracking(Base):
+    """The outcome record for one ``(user, job)`` application.
+
+    Invariants (enforced in :mod:`app.services.application_tracking`, pinned by
+    ``backend/tests/test_application_tracking.py``):
+
+    * ``state`` is a **projection** of the append-only timeline, never the
+      source of truth: every write goes through the service, which validates the
+      transition and appends the event in the same transaction.
+    * ``state_origin`` says who asserted the current state — a system
+      observation and the user's memory are different claims, and the report
+      keeps them apart (``TRACKING_ORIGINS``).
+    * ``is_provisional`` is set only by an ``email_inferred`` suggestion, which
+      may never be an interview: the user confirms or dismisses it
+      (``TRACKING_TRUSTED_ONLY_STATES``).
+    * The snapshot columns (``source``, ``match_*``, ``artifact_*``,
+      ``role_family``) are frozen when tracking opens. Refreshing one writes an
+      ``application.snapshot_recorded`` / ``application.attribution_updated``
+      event, so "which resume version got the interview?" stays answerable after
+      the artefact is regenerated or deleted — which is why ``artifact_id`` and
+      ``match_id`` are plain integers, **not** FKs (the
+      ``automation_policy_revisions.policy_id`` pattern).
+    """
+
+    __tablename__ = "application_tracking"
+    __table_args__ = (
+        UniqueConstraint("user_id", "job_id", name="uq_application_tracking_user_job"),
+        Index("ix_app_tracking_user_state", "user_id", "state"),
+        Index("ix_app_tracking_user_source", "user_id", "source"),
+        Index("ix_app_tracking_user_applied", "user_id", "applied_at"),
+        Index("ix_app_tracking_user_follow_up", "user_id", "follow_up_at"),
+        Index("ix_app_tracking_user_artifact", "user_id", "artifact_kind", "artifact_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id: Mapped[int] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    persona_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("personas.id"), nullable=True)
+
+    #: ``APPLICATION_TRACKING_STATES`` — the current outcome state.
+    state: Mapped[str] = mapped_column(String(28), default="not_applied", nullable=False)
+    #: ``TRACKING_STATE_PHASE[state]`` — stored so a board/report groups without a map lookup.
+    phase: Mapped[str] = mapped_column(String(20), default="pre_application", nullable=False)
+    #: ``TRACKING_ORIGINS`` — who asserted the current state.
+    state_origin: Mapped[str] = mapped_column(String(24), default="user_reported", nullable=False)
+    #: ``ACTOR_TYPES`` — the actor behind that assertion (never null, never "unknown").
+    state_actor_type: Mapped[str] = mapped_column(String(20), default="user", nullable=False)
+    #: True only for an ``email_inferred`` suggestion awaiting the user's verdict.
+    is_provisional: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    #: ``Provenance`` for a provisional state (contracts/01 §6).
+    provisional_evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+
+    # --- attribution & snapshots (frozen; a refresh is an event) ----------- #
+    #: Where the job/application came from: the job's own board id, or a
+    #: ``TRACKING_MANUAL_SOURCES`` value the user attributed.
+    source: Mapped[str] = mapped_column(String(60), default="unknown", nullable=False)
+    #: ``SUBMISSION_CHANNELS`` — how the application went out ("" until it did).
+    channel: Mapped[str] = mapped_column(String(20), default="", nullable=True)
+    #: Normalised role family for reporting, from
+    #: :func:`app.services.role_family.role_family` — the same function the
+    #: analytics page uses, so "Backend Engineer" means one thing everywhere.
+    role_family: Mapped[str] = mapped_column(String(80), default="", nullable=True)
+    #: The job title/company as they were when tracking opened (a later rename of
+    #: the job row must not rewrite the history the report groups by).
+    job_title_snapshot: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    company_snapshot: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    #: Match-score snapshot: the number, its band, the ``match_results`` row it
+    #: came from and the scorer version — so a rubric change cannot silently
+    #: re-grade last month's conversion rate.
+    match_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    match_band: Mapped[str] = mapped_column(String(12), default="", nullable=True)
+    match_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    score_source: Mapped[str] = mapped_column(String(24), default="", nullable=True)
+    scorer_version: Mapped[str] = mapped_column(String(24), default="", nullable=True)
+    #: Artefact snapshot: what was attached (``TRACKING_ARTIFACT_KINDS``).
+    artifact_kind: Mapped[str] = mapped_column(String(20), default="none", nullable=False)
+    artifact_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    artifact_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    artifact_label: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+
+    # --- business timestamps (never inferred from ``updated_at``) ---------- #
+    applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    first_response_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    interview_scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    #: When the interview happens/happened (the calendar slot the user typed).
+    interview_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    interview_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # --- the follow-up promise ------------------------------------------- #
+    #: When the user wants to be reminded. ``NULL`` = nothing is due.
+    follow_up_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    follow_up_note: Mapped[str] = mapped_column(String(400), default="", nullable=True)
+    #: Set when the reminder notification was written — the dedupe marker that
+    #: makes a repeated sweep (or a restart) notify once, not once per pass.
+    follow_up_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    follow_up_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    #: The user's latest note, denormalised for list views. The prose history is
+    #: in the events; this is the one a card renders without a second read.
+    note: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    #: Timeline bookkeeping: ``sequence`` of the last event, and how many rows
+    #: were corrections (a report can show how much of its input was revised).
+    last_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    event_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    correction_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: Idempotency keys already applied to this record, so a replayed request is
+    #: a no-op instead of a second event (``{key: event_id}``, bounded).
+    applied_idempotency_keys: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+class ApplicationTrackingEvent(Base):
+    """One append-only row of an application's timeline.
+
+    The lightweight sibling of ``application_events`` (contracts/09): the same
+    rules — a gapless per-record ``sequence``, a mandatory actor, a typed
+    payload, ``occurred_at`` vs ``recorded_at``, an ``event_id`` a retry can be
+    deduped on — without the submission-side columns (plans, checkpoints,
+    credentials) this layer has no use for.
+
+    **Append-only.** Nothing updates or deletes a row except account erasure. A
+    correction is a new row with ``is_correction = true`` and
+    ``correction_of_event_id`` pointing at the row it revises; the wrong row
+    stays, because "we thought X, the user corrected it to Y" *is* the history.
+    """
+
+    __tablename__ = "application_tracking_events"
+    __table_args__ = (
+        UniqueConstraint("user_id", "tracking_id", "sequence", name="uq_app_tracking_event_sequence"),
+        UniqueConstraint("user_id", "event_id", name="uq_app_tracking_event_uuid"),
+        # NULLs are distinct in a unique index on both SQLite and PostgreSQL, so
+        # only rows that *asked* to be deduped collide — which is the point.
+        UniqueConstraint("user_id", "dedupe_key", name="uq_app_tracking_event_dedupe"),
+        Index("ix_app_tracking_events_user_type", "user_id", "event_type", "occurred_at"),
+        Index("ix_app_tracking_events_job_time", "user_id", "job_id", "occurred_at"),
+        Index("ix_app_tracking_events_follow_up", "user_id", "follow_up_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    #: UUIDv4, so a writer in another process can dedupe on it (contracts/09 §4).
+    event_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    tracking_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("application_tracking.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("jobs.id"), nullable=True, index=True)
+    #: 1-based, gapless per ``(user_id, tracking_id)``; ordering never depends on
+    #: ``occurred_at``, which has second granularity.
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    #: ``EVENT_TYPES`` — ``application.<past_tense_verb>``.
+    event_type: Mapped[str] = mapped_column(String(60), nullable=False)
+    state_from: Mapped[Optional[str]] = mapped_column(String(28), nullable=True)
+    #: ``NULL`` for a non-transition event (a note, a follow-up, a snapshot).
+    state_to: Mapped[Optional[str]] = mapped_column(String(28), nullable=True)
+    phase: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
+    #: ``TRACKING_ORIGINS`` — system-observed vs user-reported vs inferred.
+    origin: Mapped[str] = mapped_column(String(24), default="user_reported", nullable=False)
+    #: ``ACTOR_TYPES`` — never null, never "unknown" (contracts/09 §7).
+    actor_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    actor_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    actor_label: Mapped[str] = mapped_column(String(320), default="", nullable=False)
+    #: ``QUEUE_TRIGGERS`` — a click, a schedule, a recovery?
+    trigger: Mapped[str] = mapped_column(String(16), default="user", nullable=False)
+
+    #: True when the user revised a previously recorded fact.
+    is_correction: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    correction_of_event_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    correction_reason: Mapped[str] = mapped_column(String(400), default="", nullable=True)
+    #: An ``email_inferred`` suggestion the user has not confirmed.
+    is_provisional: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    #: ``NOTIFICATION_SEVERITIES`` — drives the chip colour.
+    severity: Mapped[str] = mapped_column(String(20), default="info", nullable=False)
+    #: One human sentence, safe to render as-is (no ids the user cannot see).
+    message: Mapped[str] = mapped_column(String(400), default="", nullable=False)
+    #: The user's own prose. A note is never a field answer and is never fed to
+    #: automation (contracts/09 §3 rule 1).
+    note: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    #: Typed per event type (contracts/09 §3); immutable once written.
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: ``[{kind, locator, captured_at}]`` — pointers, never content.
+    evidence: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=True)
+
+    #: The follow-up date this event promised (mirrored onto the record).
+    follow_up_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    #: Stable key so the same fact cannot be recorded twice (a double click, a
+    #: replayed webhook, a re-run sweep). ``NULL`` when the event is unique by
+    #: nature (a note).
+    dedupe_key: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    #: When it happened (the user's typed date for a backfilled interview).
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    #: When we stored it. ``recorded_at > occurred_at`` is meaningful: it means
+    #: the fact was reported after the event, which the timeline shows.
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+# --------------------------------------------------------------------------- #
 # Automation policy — the persisted, versioned "what may run for this user"
 #
 # ``docs/contracts/10-automation-policy.md`` §2. One row per

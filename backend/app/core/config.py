@@ -323,6 +323,22 @@ class Settings(BaseSettings):
     auto_scheduler_interval_seconds: float = 300.0
 
     # ------------------------------------------------------------------ #
+    # Application tracking — follow-up reminders
+    # ------------------------------------------------------------------ #
+    #: How far ahead a promised follow-up counts as "due" (hours). A reminder
+    #: fires at the start of the window rather than exactly on the minute,
+    #: because the sweep is periodic and "follow up on the 12th" should not
+    #: arrive on the 13th. ``0`` means "only when the moment has passed".
+    tracking_follow_up_lookahead_hours: int = Field(default=12, ge=0, le=168)
+    #: Minimum minutes between two follow-up sweeps in the scheduler's
+    #: maintenance pass. Independent of ``auto_scheduler_interval_seconds``:
+    #: a reminder the user asked for is owed whether or not they enabled auto
+    #: mode, so the pass runs for every account, not just auto-mode ones.
+    tracking_follow_up_sweep_minutes: int = Field(default=15, ge=1, le=1440)
+    #: Records considered per sweep (bounded, oldest due first).
+    tracking_follow_up_sweep_limit: int = Field(default=200, ge=1, le=2000)
+
+    # ------------------------------------------------------------------ #
     # Defaults used when a user has not saved their own settings
     # ------------------------------------------------------------------ #
     #: Intentionally empty. Search keywords are *extracted from the user's own

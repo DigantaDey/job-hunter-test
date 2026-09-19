@@ -22,6 +22,7 @@ import ProfileReview from './pages/ProfileReview'
 import Onboarding from './pages/Onboarding'
 import Packets from './pages/Packets'
 import Assist from './pages/Assist'
+import Tracking from './pages/Tracking'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
@@ -149,6 +150,14 @@ export function AppRoutes() {
             element={
               <ErrorBoundary scope="route" resetKey={location.pathname}>
                 <Interview />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path="/tracking"
+            element={
+              <ErrorBoundary scope="route" resetKey={location.pathname}>
+                <Tracking />
               </ErrorBoundary>
             }
           />
