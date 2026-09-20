@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.models import Job, Profile, Resume
+from app.services.reliability import count, duration
 from app.services.resume_generator import build_docx, build_pdf, hash_jd, professional_filename
 
 log = get_logger("app.resume_service")
@@ -89,8 +91,29 @@ def build_and_save_resume(
     docx_path = os.path.join(settings.generated_dir, f"{stem}.docx")
     pdf_path = os.path.join(settings.generated_dir, f"{stem}.pdf")
 
-    build_docx(tailored_profile, profile.data or {}, profile.layout or {}, docx_path)
-    build_pdf(tailored_profile, profile.data or {}, pdf_path)
+    # Artifact generation is counted per format: a DOCX renderer regression and
+    # a PDF one are different incidents with different symptoms, and the pair of
+    # counters is what separates them.
+    # Each entry closes over its own renderer, so the loop body calls one
+    # uniform signature instead of two different ones.
+    renders = (
+        ("resume_docx",
+         lambda path: build_docx(tailored_profile, profile.data or {}, profile.layout or {}, path),
+         docx_path),
+        ("resume_pdf",
+         lambda path: build_pdf(tailored_profile, profile.data or {}, path),
+         pdf_path),
+    )
+    for artifact, render, target in renders:
+        started = time.perf_counter()
+        try:
+            render(target)
+        except Exception:
+            count("jobhunter_artifact_generation_total", artifact=artifact, outcome="failed")
+            raise
+        duration("jobhunter_artifact_generation_seconds", time.perf_counter() - started,
+                 artifact=artifact)
+        count("jobhunter_artifact_generation_total", artifact=artifact, outcome="ok")
 
     display_name = professional_filename(tailored_profile or profile.data or {}, job, "pdf")
     resume = Resume(

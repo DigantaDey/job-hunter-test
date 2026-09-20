@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.models import CandidateProfile
+from app.services.reliability import count, duration, note_dedupe
 from app.services.search.providers import SearchRequest, SearchResult, configured_providers
 from app.services.search.queries import SearchPreferences, generate_queries
 from app.services.search.store import BudgetExceeded, SearchStore
@@ -41,6 +43,7 @@ async def discover_search(db: Session, user_id: int, preferences: SearchPreferen
               "validated": 0, "estimated_cost_microusd": 0}
     if not settings.job_search_providers.strip():
         report["skipped"] = "disabled"
+        count("jobhunter_search_provider_requests_total", provider="other", outcome="skipped")
         return [], report
     if not settings.job_search_storage_rights:
         report["skipped"] = "storage_rights_required"
@@ -68,10 +71,18 @@ async def discover_search(db: Session, user_id: int, preferences: SearchPreferen
             owner, payload = store.claim(key)
             if owner == "busy":
                 report["coalesced"] += 1
+                # Two runs asked for the same query at the same moment: the
+                # second one waits on the first instead of paying twice.
+                note_dedupe("search_cache")
+                count("jobhunter_search_provider_requests_total", provider=provider.id,
+                      outcome="coalesced")
                 # Do not bypass an in-flight primary with a paid fallback.
                 break
             if owner == "hit":
                 report["cache_hits"] += 1
+                note_dedupe("search_cache")
+                count("jobhunter_search_provider_requests_total", provider=provider.id,
+                      outcome="cached")
             else:
                 if report["attempts"] >= settings.job_search_queries_per_run:
                     store.finish(key, owner, {}, 0)
@@ -82,17 +93,26 @@ async def discover_search(db: Session, user_id: int, preferences: SearchPreferen
                 except BudgetExceeded:
                     store.finish(key, owner, {}, 0)
                     report["budget_exhausted"] = True
+                    count("jobhunter_search_provider_requests_total", provider=provider.id,
+                          outcome="budget_exceeded")
                     break
                 report["attempts"] += 1
                 report["estimated_cost_microusd"] += provider.cost_microusd
+                count("jobhunter_search_provider_cost_microusd_total",
+                      value=float(provider.cost_microusd), provider=provider.id)
+                call_started = time.perf_counter()
                 try:
                     rows = await asyncio.wait_for(provider.search(request), settings.job_search_timeout_seconds)
+                    duration("jobhunter_search_provider_duration_seconds",
+                             time.perf_counter() - call_started, provider=provider.id)
                     retrieved = datetime.utcnow().isoformat()
                     payload = {"results": [{"url": r.url, "page_date": r.page_date.isoformat() if r.page_date else None}
                                            for r in rows[:request.count] if isinstance(r, SearchResult)],
                                "retrieved_at": retrieved}
                     store.outcome(usage_id, "success")
                     store.finish(key, owner, payload, settings.job_search_cache_seconds)
+                    count("jobhunter_search_provider_requests_total", provider=provider.id,
+                          outcome="success")
                 except Exception as exc:
                     # Never persist exception text (may contain API keys, query,
                     # provider response bodies); short negative cache prevents
@@ -101,6 +121,10 @@ async def discover_search(db: Session, user_id: int, preferences: SearchPreferen
                     payload = {"error": code}
                     store.outcome(usage_id, code)
                     store.finish(key, owner, payload, 30)
+                    duration("jobhunter_search_provider_duration_seconds",
+                             time.perf_counter() - call_started, provider=provider.id)
+                    count("jobhunter_search_provider_requests_total", provider=provider.id,
+                          outcome="error")
             if payload.get("error"):
                 report["errors"].append({"provider": provider.id, "code": payload["error"]})
                 continue  # next configured provider; direct sources always survive

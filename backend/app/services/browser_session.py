@@ -78,6 +78,11 @@ from app.services.field_classifier import (
     is_captcha_marker,
 )
 from app.services.form_detector import VAULT_DOMAINS
+from app.services.reliability import (
+    note_dedupe,
+    note_user_action_outcome,
+    note_user_action_pause,
+)
 from app.services.user_settings import get_setting
 
 log = get_logger("app.browser_session")
@@ -1147,6 +1152,10 @@ def pause_session(
         db.add(action)
         db.flush()
     else:
+        # The same blocker again: bump the existing item instead of adding a
+        # second one the user has to dismiss. Counted, because a queue that
+        # silently stops deduping is indistinguishable from a busy week.
+        note_dedupe("action")
         action.occurrences = int(action.occurrences or 0) + 1
         action.status = "pending" if action.status != "completed" else action.status
         action.fields = field_payload or action.fields
@@ -1174,6 +1183,9 @@ def pause_session(
                              "handoff_ttl_minutes": policy.handoff_ttl_minutes}},
         )
     inc("jobhunter_application_session_pauses_total", kind=kind)
+    # The cross-workflow view: every place the product stops and hands a step to
+    # the human, whatever raised it. ``kind`` is a USER_ACTION_KINDS value.
+    note_user_action_pause(kind)
     return action
 
 
@@ -1349,6 +1361,9 @@ def complete_action(
             meta={"session_id": session.id, "action_id": action.id, "kind": action.kind},
         )
     inc("jobhunter_application_actions_total", kind=action.kind, result="completed")
+    waited = ((action.completed_at - action.created_at).total_seconds()
+              if action.completed_at and action.created_at else None)
+    note_user_action_outcome(action.kind, "completed", waited_seconds=waited)
     return action
 
 
@@ -1472,6 +1487,9 @@ def expire_session(db: Session, session: ApplicationSession, *, reason: str = "t
     for action in open_actions:
         action.status = "expired"
         action.completed_at = _now()
+        waited = ((action.completed_at - action.created_at).total_seconds()
+                  if action.created_at else None)
+        note_user_action_outcome(action.kind, "expired", waited_seconds=waited)
     if commit:
         db.commit()
     record_job_event(

@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,6 +74,7 @@ from app.services.ai_guardrails import (
     run_guarded_task,
     strip_ai_artifacts,
 )
+from app.services.reliability import count, duration
 from app.services.scoring import _detect_seniority, cosine_sim, tf, tokenize
 
 log = get_logger("app.matching")
@@ -1561,7 +1563,49 @@ SCORE_SOURCE_LABELS: Dict[str, str] = {
 }
 
 
+#: ``compute_match`` result → the bounded ``scoring_path`` label for the
+#: latency histogram. A reused row is its own path because it costs milliseconds while a
+#: hybrid run costs an AI call: averaging them together would report a number
+#: that describes neither.
+def _match_path(result: Dict[str, Any]) -> str:
+    if result.get("reused"):
+        return "cached"
+    if result.get("score_source") == "insufficient_data":
+        return "insufficient_data"
+    scorer = str(result.get("scorer") or "deterministic")
+    return scorer if scorer in ("hybrid", "deterministic", "ai") else "deterministic"
+
+
 async def compute_match(
+    db: Session,
+    user_id: int,
+    job: Job,
+    *,
+    ai: bool = True,
+    persona: Optional[Persona] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """
+    Compute (or replay) one match, recording how long the path took.
+
+    Thin wrapper over :func:`_compute_match`: the duration histogram is written
+    on the success *and* the exception path, so a scoring run that died inside
+    the model call is in the latency series rather than missing from it.
+    """
+    started = time.perf_counter()
+    # The path is only knowable from the result, so a run that raised is
+    # recorded against the deterministic path: it never reached the model.
+    scoring_path = "deterministic"
+    try:
+        result = await _compute_match(db, user_id, job, ai=ai, persona=persona, force=force)
+        scoring_path = _match_path(result)
+        return result
+    finally:
+        duration("jobhunter_match_generation_seconds", time.perf_counter() - started,
+                 scoring_path=scoring_path)
+
+
+async def _compute_match(
     db: Session,
     user_id: int,
     job: Job,
@@ -1844,6 +1888,12 @@ def _insert_match(
         pass
     db.commit()
     db.refresh(row)
+    # The "high-fit recommendation count" metric, written at the one funnel
+    # every persisted match passes through — so a band count can never disagree
+    # with the rows in ``match_results``. ``source`` keeps the provenance
+    # visible: a board of ``preliminary`` estimates is not a board of AI
+    # verdicts, and the two must not be counted together.
+    count("jobhunter_high_fit_matches_total", band=row.band, source=row.score_source)
     return row
 
 

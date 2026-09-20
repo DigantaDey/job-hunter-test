@@ -47,6 +47,7 @@ import csv
 import hashlib
 import io
 import json
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -73,6 +74,7 @@ from app.models.models import (
     PipelineJob,
 )
 from app.services.application_tracking import artifact_label
+from app.services.reliability import count, duration
 from app.services.role_family import role_family
 from app.utils.timefmt import coerce_datetime, iso_utc
 
@@ -897,6 +899,38 @@ def build_report(
     now: Optional[datetime] = None,
     include_comparisons: bool = True,
 ) -> Dict[str, Any]:
+    """The full outcome report for one tenant, with its build time recorded.
+
+    A report is read on a page load and by the weekly notification, so its
+    latency is a user-facing number. ``empty`` is counted separately from
+    ``ok``: a week with nothing in it is the common case and must not look like
+    a slow build.
+    """
+    started = time.perf_counter()
+    try:
+        report = _build_report(db, user_id, range_key=range_key, since=since, until=until,
+                               timezone_name=timezone_name, now=now,
+                               include_comparisons=include_comparisons)
+    except Exception:
+        count("jobhunter_reports_total", kind="window", outcome="failed")
+        raise
+    duration("jobhunter_report_generation_seconds", time.perf_counter() - started, kind="window")
+    submitted = int(((report.get("totals") or {}).get("applications_submitted")) or 0)
+    count("jobhunter_reports_total", kind="window", outcome="ok" if submitted else "empty")
+    return report
+
+
+def _build_report(
+    db: Session,
+    user_id: int,
+    *,
+    range_key: str = "last_30_days",
+    since: Any = None,
+    until: Any = None,
+    timezone_name: Optional[str] = None,
+    now: Optional[datetime] = None,
+    include_comparisons: bool = True,
+) -> Dict[str, Any]:
     """The full outcome report for one tenant.
 
     Tenant-scoped by construction: ``user_id`` is the only identity this
@@ -1286,6 +1320,27 @@ def weekly_summary(
     timezone_name: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
+    """The user-facing weekly summary, counted as its own report kind."""
+    started = time.perf_counter()
+    try:
+        summary = _weekly_summary(db, user_id, range_key=range_key, timezone_name=timezone_name,
+                                  now=now)
+    except Exception:
+        count("jobhunter_reports_total", kind="summary", outcome="failed")
+        raise
+    duration("jobhunter_report_generation_seconds", time.perf_counter() - started, kind="summary")
+    count("jobhunter_reports_total", kind="summary", outcome="ok")
+    return summary
+
+
+def _weekly_summary(
+    db: Session,
+    user_id: int,
+    *,
+    range_key: str = "last_7_days",
+    timezone_name: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
     """The week in outcomes: applications, responses, interviews — and whether
     the week was better than the last one, or whether there is not enough data
     to say. Always returns a sentence; never returns a fabricated rate."""
@@ -1375,6 +1430,16 @@ _METRIC_COLUMNS = ("key", "label", "value", "unit", "provenance", "sufficiency",
 
 
 def csv_export(report: Dict[str, Any]) -> str:
+    """The CSV the user downloads, counted as an artifact."""
+    started = time.perf_counter()
+    text = _csv_export(report)
+    duration("jobhunter_report_generation_seconds", time.perf_counter() - started, kind="export_csv")
+    count("jobhunter_artifact_generation_total", artifact="report", outcome="ok")
+    count("jobhunter_reports_total", kind="export_csv", outcome="ok")
+    return text
+
+
+def _csv_export(report: Dict[str, Any]) -> str:
     """The report as CSV: methodology header, metric rows, then comparisons.
 
     One tenant's numbers and nothing else — the caller must pass the report the

@@ -23,6 +23,12 @@ from app.models.models import Job, Profile, Resume, User, UserInputRequest
 from app.services.autofill import build_autofill_plan, execute_autofill
 from app.services.events import record_job_event
 from app.services.form_detector import detect_form_structure
+from app.services.reliability import (
+    autofill_failure_reason,
+    count,
+    note_dedupe,
+    note_user_action_pause,
+)
 from app.services.resume_generator import generate_tailored_profile
 from app.services.resume_service import build_and_save_resume, fact_guard_check
 from app.services.scoring import jd_similarity
@@ -156,6 +162,36 @@ async def prepare_application(
     answers: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
+    Preparation, with the outcome counted.
+
+    Wrapper over :func:`_prepare_application`. ``ready`` means the plan is
+    complete and a submission could go out; ``needs_input`` means it parked for
+    the human (and is therefore *not* a failure — see the
+    ``jobhunter_user_action_pauses_total`` pair); ``failed`` means it raised.
+    """
+    try:
+        result = await _prepare_application(
+            db, user, job, resume_choice=resume_choice, resume_id=resume_id, answers=answers)
+    except Exception:
+        count("jobhunter_application_prep_total", outcome="failed")
+        raise
+    outcome = "needs_input" if result.get("status") == "needs_input" else "ready"
+    count("jobhunter_application_prep_total", outcome=outcome)
+    if outcome == "needs_input":
+        note_user_action_pause("review_required")
+    return result
+
+
+async def _prepare_application(
+    db: Session,
+    user: User,
+    job: Job,
+    *,
+    resume_choice: str = "auto",
+    resume_id: Optional[int] = None,
+    answers: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
     Everything that must happen before an application can be submitted:
     resume choice, credential, form schema, field mapping, user-input gate.
     """
@@ -233,6 +269,9 @@ async def prepare_application(
             .first()
         )
         if existing:
+            # The same blocker already has an open question: reuse it rather
+            # than stacking a second one on the user's attention queue.
+            note_dedupe("action")
             request = existing
         else:
             request = UserInputRequest(
@@ -399,6 +438,7 @@ async def execute_application(
         _observe_tracking(db, user, job, channel="automation", trigger="auto",
                           submission_id=submission_id, receipt=result.get("receipt"))
         inc("jobhunter_applications_total", result="automated")
+        count("jobhunter_auto_submit_total", outcome="success", channel="automation")
     elif result["status"] in ("dry_run", "filled"):
         job.status = "ready_to_apply"
         job.error = ""
@@ -414,12 +454,20 @@ async def execute_application(
                                **result})
         inc("jobhunter_applications_total",
             result="dry_run" if policy_decision.get("allowed") else "blocked")
+        # A policy downgrade is a *refusal*, and it is the outcome an operator
+        # has to be able to count: "auto-submit is enabled but nothing is going
+        # out" is a consent/quota question, not a bug.
+        count("jobhunter_auto_submit_total",
+              outcome="dry_run" if policy_decision.get("allowed") else "refused",
+              channel="assisted_dry_run")
     else:
         job.status = "failed"
         job.error = result.get("reason") or "autofill unavailable"
         record_job_event(db, user_id=user.id, job_id=job.id, stage="failed", status="error",
                          message=f"Autofill could not run: {job.error}", meta=result)
         inc("jobhunter_applications_total", result="failed")
+        count("jobhunter_auto_submit_total", outcome="failure", channel="automation")
+        autofill_failure_reason(result)
 
     db.commit()
     return {
@@ -479,6 +527,10 @@ def _record_application_submission(
         if live is not None and live.idempotency_key != key:
             # A different attempt (e.g. an assisted session) already holds the
             # slot — do not fight the ledger; the job status is the user's view.
+            # This is the database-level backstop against a double submission,
+            # so the refusal is counted rather than swallowed.
+            note_dedupe("submission")
+            count("jobhunter_auto_submit_total", outcome="duplicate", channel="other")
             return live.id
         row = live or db.query(ApplicationSubmission).filter(
             ApplicationSubmission.user_id == user.id, ApplicationSubmission.idempotency_key == key

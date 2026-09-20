@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
@@ -50,6 +51,7 @@ from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger
 from app.core.metrics import inc
+from app.core.redaction import SECRET_PATTERNS
 from app.models.models import (
     OnboardingEvent,
     OnboardingSession,
@@ -60,6 +62,7 @@ from app.models.models import (
     ResumeExtraction,
     User,
 )
+from app.services.reliability import count, duration, note_dedupe
 from app.services.resume_service import render_profile_text
 
 log = get_logger("app.onboarding")
@@ -116,14 +119,11 @@ _PROGRESS_PERCENT = {
 # --------------------------------------------------------------------------- #
 # Error sanitisation — provider secrets never reach the database
 # --------------------------------------------------------------------------- #
-_SECRET_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = (
-    # Provider key shapes: sk-…, Bearer …, key=…/token=…
-    (re.compile(r"sk-[A-Za-z0-9_\-]{6,}"), "sk-***"),
-    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+"), "Bearer ***"),
-    (re.compile(r"(?i)\b(api[_-]?key|apikey|token|secret|password|authorization)\b\s*[:=]\s*\S+"),
-     r"\1 ***"),
-    (re.compile(r"(?i)\b(eyJ[A-Za-z0-9_\-]{20,})"), "***"),  # JWT-shaped
-)
+#: Canonical shapes from :mod:`app.core.redaction` (shared with the audit trail,
+#: the log formatters and the AI prompt boundary), applied with their own
+#: shape-preserving replacements so a stored error still says *what* leaked
+#: (``sk-***``, ``Bearer ***``) without keeping the secret.
+_SECRET_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = SECRET_PATTERNS
 
 
 def safe_error_message(raw: Any, *, limit: int = 500) -> str:
@@ -195,6 +195,7 @@ def get_or_create_session(db: Session, user: User, *, request_id: str = "") -> O
     audit.audit(db, "onboarding.started", user=user, user_id=user.id,
                 target=f"session:{session.id}", detail={"session_id": session.id})
     inc("jobhunter_onboarding_sessions_total")
+    count("jobhunter_onboarding_total", stage="session", outcome="started")
     return session
 
 
@@ -298,6 +299,13 @@ def _set_state(db: Session, session: OnboardingSession, new_state: str, *,
         payload=payload or {},
     )
     inc("jobhunter_onboarding_state_transitions_total", from_state=previous, to_state=new_state)
+    # The resume gate's two terminal-for-this-scope outcomes, counted once at
+    # the single funnel every transition passes through (see
+    # ``docs/OBSERVABILITY.md`` — onboarding funnel).
+    if new_state == STATE_REVIEW:
+        count("jobhunter_onboarding_total", stage="session", outcome="completed")
+    elif new_state == STATE_BLOCKED:
+        count("jobhunter_onboarding_total", stage="session", outcome="blocked")
     return True
 
 
@@ -353,6 +361,10 @@ def register_upload(
             existing.error_message = None
             db.commit()
             db.refresh(existing)
+        # Re-uploading identical bytes is a no-op, not a second extraction:
+        # counted here so the boundary is verifiable rather than assumed.
+        note_dedupe("upload")
+        count("jobhunter_onboarding_total", stage="upload", outcome="skipped")
         return existing, False
 
     # Archive every other active master — exactly one current master per user.
@@ -410,6 +422,7 @@ def register_upload(
                           "size_bytes": document.size_bytes},
                  message=f"Uploaded {document.filename}")
     db.commit()
+    count("jobhunter_onboarding_total", stage="upload", outcome="completed")
     return document, True
 
 
@@ -1154,7 +1167,49 @@ def record_extraction_rejected(
 # --------------------------------------------------------------------------- #
 # The queue handler — runs in the worker, never in the request
 # --------------------------------------------------------------------------- #
+#: ``result.status`` → the bounded outcome label for the extraction metrics.
+#: A rejection is *blocked*, not failed: the user has to act, and the queue does
+#: not retry it (see ``docs/OBSERVABILITY.md``, "resume extraction").
+_EXTRACTION_OUTCOMES = {
+    "succeeded": "ok",
+    "rejected": "blocked",
+    "superseded": "duplicate",
+    "noop": "duplicate",
+}
+
+
 async def handle_extraction_job(db: Session, item: PipelineJob) -> Dict[str, Any]:
+    """
+    Instrumented entry point for the ``extraction`` pipeline.
+
+    The duration histogram is recorded on **both** paths — success and
+    exception — because a latency series that only samples the runs that
+    finished reports the easy cases and hides the slow failure that caused the
+    incident. The counter mirrors the onboarding funnel: ``started`` when the
+    worker picks the item up, then exactly one of ``completed`` / ``failed`` /
+    ``blocked``.
+    """
+    count("jobhunter_onboarding_total", stage="extraction", outcome="started")
+    started = time.perf_counter()
+    outcome = "failed"
+    try:
+        result = await _run_extraction_job(db, item)
+        payload = result if isinstance(result, dict) else {}
+        outcome = _EXTRACTION_OUTCOMES.get(str(payload.get("status") or ""), "ok")
+        if payload.get("duplicate") or outcome == "duplicate":
+            # A replayed queue item that found its work already done: the
+            # idempotency guard firing is the thing being counted.
+            note_dedupe("extraction")
+        return result
+    finally:
+        duration("jobhunter_resume_extraction_seconds", time.perf_counter() - started,
+                 outcome=outcome)
+        count("jobhunter_onboarding_total", stage="extraction",
+              outcome={"ok": "completed", "blocked": "blocked", "duplicate": "completed"}
+              .get(outcome, "failed"))
+
+
+async def _run_extraction_job(db: Session, item: PipelineJob) -> Dict[str, Any]:
     """``extraction`` pipeline handler: drive one extraction attempt.
 
     Idempotency contract (acceptance: "duplicate job execution is idempotent"):

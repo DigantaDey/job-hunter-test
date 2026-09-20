@@ -222,6 +222,11 @@ usage on the uploads/generated volumes, `jobhunter_edge_forwarded_for_total{reas
 rising (proxy trust boundary not configured — §3.1), and `edge.registry.evicted` on
 `GET /api/ops/status` rising (something is labelling metrics on unbounded data).
 
+The background workflows have their own alert set, with a runbook per alert:
+[`docs/OBSERVABILITY.md`](OBSERVABILITY.md) §7 and the ready-to-load rules in
+[`ops/prometheus/alerts.yml`](../ops/prometheus/alerts.yml) (not referenced by
+any compose file — add it to your Prometheus `rule_files:` if you run one).
+
 ### Metric cardinality
 
 The registry is in-process and a label value is a **permanent series**, so every label comes from a
@@ -234,6 +239,7 @@ bounded set — this is a memory property, not a tidiness one:
 | `jobhunter_http_*` (outbound client) | `host`, `status`/`kind`/`reason` | `host` is collapsed to the organisation-level domain of endpoints this deployment *intends* to call (`SOURCE_API_DOMAINS` + `OUTBOUND_ALLOWED_HOSTS` + the AI/funding endpoints); every host pulled out of a job feed counts as `other`. Per-source detail lives on `jobhunter_source_fetch_total{source=…}` |
 | `jobhunter_rate_limited_total` | `path` | bounded as above |
 | `jobhunter_edge_forwarded_for_total` | `reason` | four fixed reasons |
+| background-workflow metrics (`jobhunter_job_failures_total`, `jobhunter_onboarding_total`, `jobhunter_*_seconds`, …) | `pipeline`, `kind`, `code`, `source`, `provider`, `band`, `artifact`, … | declared once in `services/reliability.METRIC_CATALOG` and enforced at write time: a value outside the declared vocabulary is recorded as `other`. Source names come from the adapter registry, action kinds from `USER_ACTION_KINDS`, notification kinds from `NOTIFICATION_KINDS`, bands from `MATCH_BANDS` — never from a user, a job or a URL. Full table: [`docs/OBSERVABILITY.md`](OBSERVABILITY.md) §2 |
 
 As a backstop, each metric name keeps at most `METRICS_MAX_SERIES_PER_METRIC` (512) series and evicts
 the least recently updated one beyond that; `edge.registry` on `GET /api/ops/status` reports series

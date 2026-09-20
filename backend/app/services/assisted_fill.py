@@ -29,6 +29,7 @@ What a driver may never do, at any layer
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
@@ -45,6 +46,7 @@ from app.services import net_guard
 from app.services.autofill import autofill_available
 from app.services.field_classifier import classify_form
 from app.services.form_detector import VAULT_DOMAINS
+from app.services.reliability import duration
 
 log = get_logger("app.assisted")
 
@@ -381,7 +383,43 @@ def report_queue_progress(db: Session, item: Any, step: str, **extra: Any) -> No
     db.commit()
 
 
+#: Queue-result → the bounded ``outcome`` label for the pass-duration histogram.
+def _pass_outcome(result: Dict[str, Any]) -> str:
+    payload = result if isinstance(result, dict) else {}
+    if payload.get("noop"):
+        return "noop"
+    if payload.get("pause") or payload.get("status") in ("awaiting_user", "paused"):
+        return "awaiting_user"
+    if payload.get("status") in ("error", "failed"):
+        return "failed"
+    return "completed"
+
+
 async def run_queued_pass(
+    db: Session,
+    item: Any,
+    *,
+    driver: Optional[BrowserDriver] = None,
+) -> Dict[str, Any]:
+    """
+    Queue handler for one assist pass, timed on every path.
+
+    A browser pass is the slowest and least predictable thing the worker does —
+    a portal that renders slowly is indistinguishable from a hung driver unless
+    the duration of the *failed* and *no-op* runs is recorded too. Both are.
+    """
+    started = time.perf_counter()
+    outcome = "failed"
+    try:
+        result = await _run_queued_pass(db, item, driver=driver)
+        outcome = _pass_outcome(result)
+        return result
+    finally:
+        duration("jobhunter_browser_session_passes_seconds", time.perf_counter() - started,
+                 outcome=outcome)
+
+
+async def _run_queued_pass(
     db: Session,
     item: Any,
     *,

@@ -6,6 +6,110 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added — reliability, operational visibility and recovery for the background workflows (v2.4.0)
+
+The background half of the product — onboarding workers, resume extraction,
+discovery runs, search-provider calls, matching, artifact generation, browser
+sessions, the user-action-required queues, application submission, notifications
+and reports — now has one reliability contract, one metric catalog and one
+recovery story. Documented in `docs/OBSERVABILITY.md`, with alert rules in
+`ops/prometheus/alerts.yml`.
+
+**Retry classification for every background job (`services/reliability.py`).**
+The worker used to have exactly one rule — "is it an AI error?" — and everything
+else fell through to `fail(retryable=True)`. That is wrong in both directions: a
+`RuntimeError("job_missing")` retried three times is noise that hides a bug, and
+a genuine connection reset dead-lettered on the first try is a lost run. One
+classifier now maps every exception onto four outcomes — `transient` (pause, no
+attempt spent) / `retryable` (backoff) / `permanent` (dead-letter at once,
+visible to the user) / `user_action` (`needs_input`, **never retried**) — with a
+bounded `code` from a closed vocabulary of 21 reasons. Handlers can state their
+own intent with `PermanentJobError` / `UserActionRequired`. Each decision is
+counted on `jobhunter_job_failures_total{pipeline,kind,code}` and stored on the
+row as `payload.failure`, so "what fraction of failures are permanent?" is a
+query instead of a log-reading exercise.
+
+**26 new metrics, all bounded at write time.** Onboarding
+started/completed/failed, resume-extraction duration, discovery jobs found and
+run duration, discovery source failure rate, search-provider usage + latency +
+spend, match-generation duration, high-fit recommendation counts by band *and*
+provenance, artifact generation, application-preparation outcomes, autofill
+failure reasons, CAPTCHA/MFA pauses, user-action wait time, auto-submit
+outcomes, duplicate prevention and interview events. Every metric is declared in
+`reliability.METRIC_CATALOG` with the only label values it may carry, and
+`bounded_label()` enforces that at the call site: an unmapped value is recorded
+as `other`, so no caller can mint a series from request data. **No metric in the
+product carries a user, job, session or tenant identifier** — and one that did
+(`jobhunter_queue_reclaim_age_seconds{job_id=…}`, a series per reclaimed row)
+has had that label removed.
+
+**Log redaction (`core/redaction.py`).** The logging formatters were the one
+outbound channel with no secret masking — they escaped control characters and
+nothing else. Both the JSON and the text formatter now redact every rendered
+message and every `extra=` field: provider keys, `Bearer`/`Basic` credentials,
+`key=value` secrets, JWTs, email addresses, formatted phone numbers, SSNs and
+Luhn-valid card numbers, plus any field whose *name* is sensitive. The pattern
+list is now canonical and shared with the three boundaries that already had one
+(audit detail, stored error messages, AI prompts), so a new secret shape is
+masked on every channel at once. Deliberately not masked: user/job/request ids,
+IPv4 literals, dates and non-card digit runs — a redacted timestamp during an
+incident costs more than it protects.
+
+**Every user-action-required state expires safely.** A run parked for the user is
+never retried and no longer waits forever. The deadline is written onto the row
+when it is parked (`payload.user_action.expires_at`), so a restart, a redeploy
+and a second worker all read the same moment. The worker's new sweep
+(`USER_ACTION_TTL_MINUTES`, default 7 days; `USER_ACTION_SWEEP_INTERVAL_SECONDS`)
+closes `needs_input` rows, pending `user_input_requests` and expired
+`application_actions`, notifies the user, and delegates session TTLs to the
+browser-session module. Expiry uses a new `job_queue.close_expired` rather than
+`fail`, because a user who did not answer in time is not the work breaking: it
+spends no failure budget. Drafted artifacts (a resume, a packet, an email draft)
+are deliberately *not* expired — those are the user's work, not a blocking
+state.
+
+**Restart and duplicate safety, now measured.** The durable queue already gave
+leases, CAS reclaim, checkpoints and the at-most-once submission ledger; what
+was missing was evidence. Duplicate refusals are counted at every boundary that
+prevents one (`jobhunter_dedupe_hits_total{scope}`: queue, submission, action,
+search cache, notification, upload, extraction, event), so a dedupe key that
+stops matching is an alert rather than a second application. A new
+`JobHunterDedupeStopped` alert fires when those counters go quiet under load.
+
+**Cardinality is now observable, not just capped.** The registry capped each
+metric at `METRICS_MAX_SERIES_PER_METRIC` and reported evictions on
+`/api/ops/status`, but nothing was published as a metric — so "which metric is
+growing?" needed a human reading JSON. Two gauges now go out on every scrape,
+labelled only with the metric name: `jobhunter_registry_series{metric}` and
+`jobhunter_registry_evicted_series{metric}`, both documented in
+`docs/OBSERVABILITY.md` §2 and both wired to the `JobHunterMetricsCardinality`
+alert.
+
+**Tests (`tests/test_background_reliability.py`):** 56 new tests covering the
+classifier's four outcomes, the bounded-label contract (including that no metric
+declares an identifier label), every required metric family being both declared
+and wired into the module that owns the work, user-action expiry (stored
+deadline, no retry, notification, idempotent sweep), restart recovery, duplicate
+refusals, registry self-metrics, and log redaction across both formats.
+
+### Fixed — the exposition typed only the metrics it could describe (v2.4.0)
+
+`render_prometheus()` wrote a `# TYPE` line only for names present in the
+`_HELP` table. Every metric emitted anywhere else went out **untyped** — 62 of
+the 104 metric names in the product, including `jobhunter_queue_dead_total`,
+`jobhunter_queue_reclaim_age_seconds` and the whole `jobhunter_worker_*`
+family. A histogram scraped as an untyped series leaves
+`histogram_quantile()` with nothing to work on, and Prometheus cannot tell a
+gauge from a counter.
+
+The type is now derived from the store the samples actually came from, with an
+explicit catalog declaration winning over both the store and the suffix, and
+histogram > gauge > counter when a name has samples in more than one store — so
+the answer never depends on iteration order and a new metric cannot go out
+untyped by being undescribed. All 104 emitted metric names now carry a correct
+`# TYPE`, asserted by `TestExpositionTyping`.
+
+
 ### Security — cross-system privacy and safety review (v2.3.1)
 
 A cross-cutting review of the onboarding, discovery, matching, browser-assisted

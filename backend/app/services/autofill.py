@@ -53,6 +53,7 @@ from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.services import net_guard
 from app.services.form_detector import VAULT_DOMAINS as ATS_VAULT_DOMAINS
+from app.services.reliability import autofill_failure_reason
 
 log = get_logger("app.autofill")
 
@@ -320,6 +321,10 @@ def _blocked_result(*, url: str, code: str, reason: str, dry_run: bool,
     """A run that was refused before (or during) navigation — never a fake apply."""
     inc("jobhunter_autofill_navigation_blocked_total", reason=code)
     inc("jobhunter_autofill_runs_total", result="blocked")
+    # Every refusal funnels through here, so this is the one place the
+    # "autofill did not complete" rate can be counted honestly. The reason is
+    # mapped to a bounded label — ``code`` names a host, a label may not.
+    autofill_failure_reason({"code": code, "reason": reason, "status": "blocked"})
     log.warning("autofill refused to run on %s (%s): %s", url, code, reason)
     return {
         "status": "blocked",
@@ -358,6 +363,7 @@ async def execute_autofill(
     """
     availability = autofill_available()
     if not availability["available"]:
+        autofill_failure_reason({"status": "unavailable", "reason": availability["reason"]})
         return {"status": "unavailable", "reason": availability["reason"], "filled": 0, "submitted": False}
 
     dry_run = settings.autofill_dry_run or not allow_submit
@@ -502,6 +508,8 @@ async def execute_autofill(
         log.warning("autofill execution failed for %s: %s", url, error)
 
     inc("jobhunter_autofill_runs_total", result=("error" if error else ("dry_run" if dry_run else "submitted")))
+    if error:
+        autofill_failure_reason({"reason": error, "status": "error"})
     return {
         "status": "error" if error else ("dry_run" if dry_run else ("submitted" if submitted else "filled")),
         "reason": error,

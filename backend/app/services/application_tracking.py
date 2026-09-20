@@ -90,6 +90,7 @@ from app.models.models import (
     ResumeDocument,
     User,
 )
+from app.services import reliability
 from app.services.matching import band_for
 from app.services.role_family import role_family
 from app.utils.timefmt import coerce_datetime, iso_utc
@@ -977,6 +978,12 @@ def _apply_state_side_effects(record: ApplicationTracking, job: Optional[Job], s
     if state == "recruiter_response" and record.first_response_at is None:
         record.first_response_at = moment
     if state == "interview_scheduled":
+        # A second ``interview_scheduled`` is a reschedule, not a duplicate
+        # (see the module's repeat rule): the metric keeps them apart so
+        # "interviews booked" cannot be inflated by one moved slot.
+        reliability.count("jobhunter_interview_events_total",
+              event="rescheduled" if record.interview_scheduled_at is not None else "scheduled",
+              outcome="ok")
         if record.interview_scheduled_at is None:
             record.interview_scheduled_at = moment
         if interview_at is not None:
@@ -984,6 +991,7 @@ def _apply_state_side_effects(record: ApplicationTracking, job: Optional[Job], s
             # a reschedule *does* move it (it is the next one, not the first).
             record.interview_at = interview_at
     if state == "interview_completed":
+        reliability.count("jobhunter_interview_events_total", event="completed", outcome="ok")
         record.interview_completed_at = moment
         if interview_at is not None and record.interview_at is None:
             record.interview_at = interview_at

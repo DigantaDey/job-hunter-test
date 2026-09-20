@@ -69,6 +69,15 @@ def worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
 
+def _note_dedupe(scope: str) -> None:
+    """Count one duplicate the queue refused to run twice.
+
+    ``scope`` is always a literal written at the call site (never request data),
+    so the label set stays bounded without a lookup table.
+    """
+    inc("jobhunter_dedupe_hits_total", scope=scope)
+
+
 def enqueue(
     db: Session,
     *,
@@ -106,6 +115,10 @@ def enqueue(
         )
         if existing:
             if existing.status in ("queued", "processing", "needs_input", "paused"):
+                # Duplicate work refused. Counted, not silent: a dedupe key that
+                # stops matching looks exactly like a quiet week right up until
+                # the second application is submitted.
+                _note_dedupe("queue")
                 return None  # identical work is already in flight (paused = waiting on AI)
             existing.pipeline = pipeline
             existing.job_id = job_id
@@ -143,6 +156,7 @@ def enqueue(
         # Lost a race against another worker on the same dedupe key — the other
         # enqueue already created the row, so behave like the dedupe path.
         db.rollback()
+        _note_dedupe("queue")
         return (
             db.query(PipelineJob)
             .filter(PipelineJob.user_id == user_id, PipelineJob.dedupe_key == dedupe_key)
@@ -379,14 +393,60 @@ def needs_input(db: Session, item: PipelineJob, *, reason: str = "",
     ``missing_fields`` and ``input_request_id``. It is stored like a completed
     run's result so the live layer can say *which* fields are missing on any
     route and after a refresh, instead of only "needs input".
+
+    A parked item is **never retried** and it does not sit there forever: the
+    expiry deadline is written into the row here, and the worker's user-action
+    sweep (:func:`app.services.reliability.expire_user_actions`) closes the row
+    with a reason once that deadline passes. Storing the deadline in the row —
+    rather than computing it from "now + TTL" at sweep time — is what makes a
+    restart, a redeploy and a second worker agree on the same moment.
     """
     item.status = "needs_input"
     item.error = reason[:2000]
     item.locked_by = ""
     item.lease_expires_at = None
+    payload = dict(item.payload or {})
     if result is not None:
-        item.payload = {**(item.payload or {}), "result": result}
+        payload["result"] = result
+    moment = datetime.utcnow()
+    action = dict(payload.get("user_action") or {})
+    action.setdefault("since", moment.isoformat(timespec="seconds") + "Z")
+    action["kind"] = str((result or {}).get("action_kind") or action.get("kind")
+                         or "review_required")
+    if not action.get("expires_at"):
+        action["expires_at"] = (
+            moment + timedelta(seconds=_user_action_ttl_seconds())
+        ).isoformat(timespec="seconds") + "Z"
+    payload["user_action"] = action
+    item.payload = payload
     db.commit()
+    inc("jobhunter_queue_needs_input_total", pipeline=item.pipeline)
+
+
+def _user_action_ttl_seconds() -> int:
+    """The configured wait window, with a floor so a mis-set env cannot expire instantly."""
+    return max(60, int(getattr(settings, "user_action_ttl_minutes", 10080)) * 60)
+
+
+def close_expired(db: Session, item: PipelineJob, error: str) -> str:
+    """
+    Finish a row whose user-action window elapsed.
+
+    Deliberately **not** :func:`fail`: ``attempts`` counts handler failures, and
+    a user who did not answer in time is not the work breaking. Expiry is a
+    decision — terminal, visible, and never a retry — so it writes the terminal
+    state directly and leaves every budget exactly as it found it.
+    """
+    item.status = "dead"
+    item.error = (error or "user_action_expired")[:2000]
+    item.finished_at = datetime.utcnow()
+    item.lease_expires_at = None
+    item.locked_by = ""
+    item.updated_at = datetime.utcnow()
+    db.commit()
+    inc("jobhunter_queue_dead_total", pipeline=item.pipeline)
+    log.info("queue item %s closed: %s", item.id, item.error)
+    return "dead"
 
 
 def recover_stalled(
@@ -578,11 +638,14 @@ def recover_stalled(
                     outcome="requeued",
                 )
                 inc("jobhunter_queue_reclaim_total", pipeline=item.pipeline)
-                # Extra per-job metric for operators
+                # Per-pipeline, never per-job: a series per reclaimed row is a
+                # series per incident, and the registry keeps series for the
+                # life of the process. The row's own id, age and budget are in
+                # the log line above — that is where an operator looks for one
+                # specific job.
                 set_gauge(
                     "jobhunter_queue_reclaim_age_seconds",
                     age_seconds,
-                    job_id=str(item.id),
                     pipeline=item.pipeline,
                 )
 

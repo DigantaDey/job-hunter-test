@@ -45,7 +45,6 @@ from app.core.logging import LogContext, configure_logging, get_logger
 from app.core.metrics import inc, set_gauge
 from app.db import SessionLocal, init_db
 from app.metrics_server import start_metrics_server
-from app.services.ai_client import is_ai_error, is_transient_ai_error
 from app.services.ai_watchdog import AIWatchdog
 from app.services.auto_scheduler import AutoScheduler
 from app.services.handlers import HANDLERS
@@ -56,10 +55,10 @@ from app.services.job_queue import (
     complete,
     fail,
     needs_input,
-    pause,
     recover_stalled,
     worker_id,
 )
+from app.services.reliability import apply_failure, expire_user_actions
 
 log = get_logger("app.worker")
 
@@ -91,6 +90,12 @@ class Worker:
             else float(getattr(settings, "worker_reaper_safety_seconds", 300.0))
         )
         self._last_reap = time.monotonic()  # start interval from now
+        # User-action expiry (contracts/11 §2): a run parked for the user is
+        # never retried, and it must not wait forever either. The sweep runs on
+        # its own interval — a 7-day default TTL does not need a 60s clock.
+        self.user_action_interval = float(
+            getattr(settings, "user_action_sweep_interval_seconds", 900.0))
+        self._last_user_action_sweep = 0.0  # run once at boot, then on interval
         # Subscription expiry is maintenance work, not a user-triggered queue
         # item.  Run it at boot and at most once per day from the worker so it
         # still happens when auto mode is disabled or no user has enabled it.
@@ -241,10 +246,43 @@ class Worker:
             except Exception as exc:  # pragma: no cover - DB hiccup
                 db.rollback()
                 log.warning("subscription expiry pass failed: %s: %s", type(exc).__name__, exc)
+            # A worker that restarts must not resurrect state nobody is waiting
+            # on any more: close out the user-action-required rows whose window
+            # passed while the process was down (contracts/11 §2). Same session
+            # as the passes above, for the same reason — startup keeps one
+            # connection and one session shape.
+            try:
+                expire_user_actions(db)
+                self._last_user_action_sweep = time.monotonic()
+            except Exception as exc:  # pragma: no cover - DB hiccup
+                db.rollback()
+                log.warning("user-action expiry pass failed: %s: %s", type(exc).__name__, exc)
         finally:
             db.close()
         # Start the periodic interval from now, after the boot sweep.
         self._last_reap = time.monotonic()
+
+    def _should_expire_user_actions(self) -> bool:
+        """Shared timer across loop slots, like :meth:`_should_reap`."""
+        now = time.monotonic()
+        if now - self._last_user_action_sweep >= self.user_action_interval:
+            self._last_user_action_sweep = now
+            return True
+        return False
+
+    async def _expire_user_actions(self) -> None:
+        """Close user-action-required states whose waiting window has passed."""
+        from app.services.reliability import expire_user_actions
+
+        db = SessionLocal()
+        try:
+            expire_user_actions(db)
+        except Exception as exc:  # pragma: no cover - DB hiccup
+            db.rollback()
+            log.warning("user-action expiry sweep failed: %s: %s", type(exc).__name__, exc)
+        finally:
+            db.close()
+        self._last_user_action_sweep = time.monotonic()
 
     def _should_reap(self) -> bool:
         # Shared across loop slots: first slot to hit the interval reaps.
@@ -290,23 +328,24 @@ class Worker:
                 try:
                     result = await handler(db, item)
                 except Exception as exc:  # noqa: BLE001 - pipeline failures must not kill the worker
-                    if is_ai_error(exc):
-                        # AI is a hard dependency — but the *kind* of failure
-                        # decides the outcome. A transient outage (timeout /
-                        # unreachable / 429 / 5xx / breaker / budget) pauses
-                        # the item with backoff: it is re-queued (not failed,
-                        # not completed) and the watchdog resumes it when the
-                        # availability signal is green. A needs-action failure
-                        # (no/invalid key, quota, …) is dead-lettered at once
-                        # — retrying a blocked account is pointless.
-                        if is_transient_ai_error(exc):
-                            outcome = pause(db, item, str(exc))
-                        else:
-                            outcome = fail(db, item, str(exc), retryable=False)
-                        log.warning("item %s -> %s (ai)", item.id, outcome)
-                        return
-                    outcome = fail(db, item, f"{type(exc).__name__}: {exc}")
-                    log.warning("item %s -> %s", item.id, outcome)
+                    # Every exception goes through one classifier
+                    # (``services/reliability``), which decides between the
+                    # four outcomes and labels the failure with a bounded
+                    # reason:
+                    #
+                    # * a transient AI outage (timeout / unreachable / 429 /
+                    #   5xx / breaker / budget) *pauses* the item — re-queued
+                    #   with backoff, no attempt spent, resumed by the watchdog
+                    #   when the availability signal is green;
+                    # * anything retryable (a reset connection, a pool
+                    #   exhaustion, an upstream 5xx) is re-queued with backoff
+                    #   against the failure budget;
+                    # * anything permanent (a deleted row, a rejected key, a
+                    #   ``TypeError``) is dead-lettered at once so the user
+                    #   sees it instead of waiting through three retries;
+                    # * anything the human must answer parks the item in
+                    #   ``needs_input`` — never retried, and it expires.
+                    apply_failure(db, item, exc)
                     return
             if item.status == "processing":
                 if isinstance(result, dict) and result.get("status") == "needs_input":
@@ -339,6 +378,8 @@ class Worker:
             # first slot to hit the interval does the reap (CAS-safe).
             if self._should_reap():
                 await self._do_reap()
+            if self._should_expire_user_actions():
+                await self._expire_user_actions()
 
             db = SessionLocal()
             try:
