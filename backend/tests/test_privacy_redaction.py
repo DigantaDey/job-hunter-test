@@ -349,8 +349,9 @@ class TestVaultIsolation:
         assert ct1 != ct2
 
     def test_cross_user_decryption_fails(self):
-        from app.core.security import decrypt_secret, encrypt_secret
         from cryptography.fernet import InvalidToken
+
+        from app.core.security import decrypt_secret, encrypt_secret
 
         ct = encrypt_secret("my-password", "user:1:vault")
         with pytest.raises(InvalidToken):
@@ -374,8 +375,8 @@ class TestConsentEnforcement:
 
     def test_automation_consent_required_for_submit(self, client, auth, db):
         """Automation consent must be accepted before auto-submit is possible."""
-        from app.services.automation_policy import plan_http_overrides
         from app.models.models import User
+        from app.services.automation_policy import plan_http_overrides
 
         user = db.query(User).order_by(User.id).first()
         overrides = plan_http_overrides(db, user)

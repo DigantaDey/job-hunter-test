@@ -16,7 +16,7 @@ passes credentials, but a future one cannot silently leak them either.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional
 
 from sqlalchemy.orm import Session
 
