@@ -20,21 +20,40 @@ rate" instead of showing a fabricated one.
 
 from __future__ import annotations
 
+import contextlib
+import json
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
-from typing import Any, Dict
+from typing import Any, Dict, Iterator, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import CurrentUser, DbSession, client_ip
 from app.contracts import JOB_STATUSES, TRACKING_INTERVIEW_STATES
+from app.core import audit
 from app.core.entitlements import enforce
 from app.models.models import AICreditLedger, ApplicationTracking, Job
 from app.services.application_tracking import REPORT_DISCLAIMER
 from app.services.application_tracking import report as tracking_report
+from app.services.outcome_report import (
+    ReportError,
+    build_report,
+    csv_export,
+    export_privacy,
+    weekly_summary,
+)
 from app.services.role_family import role_family
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+
+@contextlib.contextmanager
+def _reporting() -> Iterator[None]:
+    """Translate a report refusal into the contract's error payload."""
+    try:
+        yield
+    except ReportError as exc:
+        raise HTTPException(exc.http_status, exc.payload()) from exc
 
 
 @router.get("/performance")
@@ -272,3 +291,135 @@ def cost_analytics(user: CurrentUser, db: DbSession):
         "by_workflow": {k: {"tokens": v["tokens"], "cost_usd": round(v["cost"], 4), "count": v["count"]} for k, v in by_workflow.items()},
         "average_cost_per_application": round(total_cost / max(1, db.query(Job).filter(Job.user_id == user.id, Job.status == "applied").count()), 4),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Outcome reporting — interviews and meaningful outcomes, not activity volume
+# --------------------------------------------------------------------------- #
+# ``docs/REPORTING.md``. Three reads, all tenant-scoped by construction: the
+# handlers pass ``user.id`` and nothing else, so there is no parameter a caller
+# could use to widen the scope. Every number carries its provenance (observed /
+# user_reported / derived / estimated) and its sample size; comparisons below
+# the minimum sample are labelled instead of rendered as a percentage.
+
+
+@router.get("/outcomes")
+def outcome_report(
+    user: CurrentUser,
+    db: DbSession,
+    range: str = Query("last_30_days",
+                       description="last_7_days | last_30_days | last_90_days | this_week | last_week | custom"),
+    since: Optional[str] = Query(None, description="ISO date or timestamp (inclusive)"),
+    until: Optional[str] = Query(None, description="ISO date or timestamp (date = whole local day, exclusive as an instant)"),
+    timezone: Optional[str] = Query(None, description="IANA zone; defaults to the account's timezone"),
+):
+    """The outcome report: the funnel, the rates, and what backs each number.
+
+    Free accounts get the same numbers as paid ones — measuring your own
+    outcomes is not an upsell — but the comparison *groups* are truncated for
+    the free tier, exactly as the performance read already does.
+    """
+    with _reporting():
+        report = build_report(
+            db, int(user.id), range_key=range, since=since, until=until,
+            timezone_name=timezone or getattr(user, "timezone", None) or "UTC",
+        )
+    # The export block is computed from the document that would be exported, so
+    # the SPA never offers a download the privacy gate would refuse.
+    report["export"] = export_privacy(report)
+    try:
+        enforce(db, user.id, "can_access_analytics")
+        is_pro = True
+    except Exception:
+        is_pro = False
+    if not is_pro:
+        # Truncate the comparisons, never the headline numbers or their labels.
+        for block in report["comparisons"].values():
+            block["groups"] = block["groups"][:3]
+            block["truncated"] = True
+        report["upgrade_hint"] = (
+            "Upgrade to Pro for every comparison group, artefact-level performance "
+            "and longer ranges."
+        )
+    report["is_pro"] = is_pro
+    return report
+
+
+@router.get("/outcomes/weekly")
+def outcome_weekly(
+    user: CurrentUser,
+    db: DbSession,
+    range: str = Query("last_7_days", description="last_7_days | this_week"),
+    timezone: Optional[str] = Query(None, description="IANA zone; defaults to the account's timezone"),
+):
+    """The weekly summary: what happened this week, and whether it beat last week.
+
+    Deliberately one request — the SPA renders the sentence at the top of the
+    dashboard, and a summary that needs three round trips to assemble is a
+    summary nobody reads.
+    """
+    if range not in ("last_7_days", "this_week"):
+        raise HTTPException(422, {"code": "validation_error",
+                                  "message": "The weekly summary covers last_7_days or this_week.",
+                                  "field": "range", "allowed": ["last_7_days", "this_week"]})
+    with _reporting():
+        return weekly_summary(
+            db, int(user.id), range_key=range,
+            timezone_name=timezone or getattr(user, "timezone", None) or "UTC",
+        )
+
+
+@router.get("/outcomes/export")
+def outcome_export(
+    request: Request,
+    user: CurrentUser,
+    db: DbSession,
+    format: str = Query("csv", description="csv | json"),
+    range: str = Query("last_30_days"),
+    since: Optional[str] = Query(None),
+    until: Optional[str] = Query(None),
+    timezone: Optional[str] = Query(None),
+):
+    """Download the report — only because the privacy requirements are met.
+
+    The gate is re-checked against the document itself (:func:`export_privacy`),
+    the export is audited *before* the body is produced, and the payload is one
+    tenant's own rows: no other accounts, no cross-tenant aggregates and no free
+    text. If a requirement is ever unmet the endpoint refuses rather than
+    shipping a file that violates it.
+    """
+    if format not in ("csv", "json"):
+        raise HTTPException(422, {"code": "validation_error",
+                                  "message": "Unsupported export format.",
+                                  "field": "format", "allowed": ["csv", "json"]})
+    with _reporting():
+        report = build_report(
+            db, int(user.id), range_key=range, since=since, until=until,
+            timezone_name=timezone or getattr(user, "timezone", None) or "UTC",
+        )
+        privacy = export_privacy(report)
+        if not privacy["allowed"]:
+            raise ReportError("Export is disabled while a privacy requirement is unmet.",
+                              code="export_not_allowed", http_status=403,
+                              unmet=privacy["unmet"])
+        # The body is rendered here so the audit row below is written before
+        # anything can be sent; the type is decided by the format, not guessed.
+        body: Any = csv_export(report) if format == "csv" else _json_bytes(report)
+
+    audit.audit(db, "analytics.report_exported", user=user, request=request,
+                ip=client_ip(request),
+                detail={"format": format, "range": range, "window_start": report["window"]["start_utc"],
+                        "window_end": report["window"]["end_utc"],
+                        "calculation_id": report["calculation_id"]})
+
+    stamp = (report["window"]["start_date"] or "").replace("-", "")
+    end = (report["window"]["end_date"] or "").replace("-", "")
+    filename = f"jobhunter-outcomes-{stamp}-{end}.{format}"
+    media = "text/csv; charset=utf-8" if format == "csv" else "application/json"
+    return Response(content=body,
+                    media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+def _json_bytes(payload: Dict[str, Any]) -> bytes:
+    return json.dumps(payload, indent=2, sort_keys=True, default=str).encode("utf-8")

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.contracts.vocabulary import HIGH_FIT_SCORE
 from app.models.models import (
     ApplicationPacket,
     ApplicationTracking,
@@ -32,6 +33,7 @@ from app.models.models import (
     PipelineJob,
     Profile,
     Resume,
+    User,
     UserInputRequest,
 )
 from app.services.application_tracking import (
@@ -40,7 +42,9 @@ from app.services.application_tracking import (
 )
 
 #: Match score at which a discovery is called a "strong match" in user language.
-STRONG_MATCH_SCORE = 75.0
+#: One constant, shared with the outcome report, so "high fit" cannot mean 75 on
+#: the dashboard and 80 on the report page (``app.contracts.vocabulary``).
+STRONG_MATCH_SCORE = HIGH_FIT_SCORE
 
 #: How long after applying with no response the dashboard suggests a follow-up.
 FOLLOW_UP_SUGGESTION_DAYS = 7
@@ -472,68 +476,84 @@ def interview_activity(db: Session, user_id: int, limit: int = 3) -> Dict[str, A
 
 
 def weekly_outcome_report(db: Session, user_id: int) -> Dict[str, Any]:
-    """
-    The week in *outcomes* — applications, responses, interviews — never token
-    accounting. The headline number is interviews; applications and responses
-    give the funnel that produced them.
-    """
-    now = datetime.utcnow()
-    week_ago = now - timedelta(days=7)
-    prev_week_ago = week_ago - timedelta(days=7)
+    """The week in *outcomes* — applications, responses, interviews — never token
+    accounting.
 
-    def _count(model, *filters):  # tiny local helper — SQL count with filters
-        return db.query(model).filter(model.user_id == user_id, *filters).count()
+    One calculation, shared with ``GET /api/analytics/outcomes/weekly``: the same
+    window (whole local days in the account's timezone), the same definition of
+    an application, the same minimum-sample rule and the same observation that an
+    interview is a recorded fact. Two surfaces that computed "this week"
+    differently would eventually disagree in front of the user, which is exactly
+    the class of bug the contract set exists to prevent.
 
-    applications = _count(Job, Job.applied_at.is_not(None), Job.applied_at >= week_ago)
-    prev_applications = _count(Job, Job.applied_at.is_not(None), Job.applied_at >= prev_week_ago,
-                               Job.applied_at < week_ago)
-    new_matches = _count(Job, Job.status == "discovered", Job.discovered_at >= week_ago)
+    The keys the dashboard has always rendered are preserved; ``timezone``,
+    ``window``, ``sufficiency`` and ``trend_direction`` are what the UI now uses
+    to say *how much* the numbers are worth.
+    """
+    from app.services import outcome_report as reporting
+
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    stored_zone = getattr(user, "timezone", None)
+    timezone_name = stored_zone if isinstance(stored_zone, str) and stored_zone else "UTC"
+    try:
+        summary = reporting.weekly_summary(db, user_id, range_key="last_7_days",
+                                           timezone_name=timezone_name)
+    except reporting.ReportError:
+        # A stored timezone a future release no longer recognises must not blank
+        # the dashboard: fall back to UTC and say so in the window block.
+        summary = reporting.weekly_summary(db, user_id, range_key="last_7_days",
+                                           timezone_name="UTC")
+        timezone_name = "UTC"
+
+    totals = summary["totals"]
+    trend_metrics = summary["trend"]["metrics"]
+    previous_applications = (trend_metrics.get("applications_submitted") or {}).get("previous") or 0
+
     strong_matches = db.query(Job).filter(
         Job.user_id == user_id, Job.score >= STRONG_MATCH_SCORE,
         Job.status.notin_(("skipped", "failed")),
     ).count()
-    responses = _count(ApplicationTracking,
-                       ApplicationTracking.first_response_at.is_not(None),
-                       ApplicationTracking.first_response_at >= week_ago)
-    interviews = _count(ApplicationTracking,
-                        ApplicationTracking.interview_scheduled_at.is_not(None),
-                        ApplicationTracking.interview_scheduled_at >= week_ago)
-    rejections = _count(ApplicationTracking,
-                        ApplicationTracking.state == "rejected_by_employer",
-                        ApplicationTracking.outcome_at >= week_ago)
-    emails_sent = _count(Email, Email.status == "sent", Email.created_at >= week_ago)
+    emails_sent = db.query(Email).filter(
+        Email.user_id == user_id, Email.status == "sent",
+        Email.created_at >= _as_datetime(summary["range"]["start_utc"]),
+    ).count()
     replies = db.query(Email).filter(
-        Email.user_id == user_id, Email.opens > 0, Email.created_at >= week_ago
+        Email.user_id == user_id, Email.opens > 0,
+        Email.created_at >= _as_datetime(summary["range"]["start_utc"]),
     ).count()
 
     top = top_matches(db, user_id, limit=1)
-    top_line = ""
-    if applications:
-        top_line = f"You submitted {applications} application{'s' if applications != 1 else ''} this week."
-        if responses:
-            top_line += f" {responses} responded."
-        if interviews:
-            top_line += f" {interviews} interview{'s' if interviews != 1 else ''} — nice work."
-    elif new_matches:
-        top_line = f"{new_matches} new match{'es' if new_matches != 1 else ''} this week — pick one and prepare an application."
-    else:
-        top_line = "No new outcomes this week yet — run discovery and review your top matches."
-
     return {
-        "week_started_at": _iso(week_ago),
-        "generated_at": _iso(now),
-        "applications_submitted": applications,
-        "applications_prev_week": prev_applications,
-        "responses": responses,
-        "interviews": interviews,
-        "rejections": rejections,
-        "new_matches": new_matches,
+        "week_started_at": summary["range"]["start_utc"],
+        "generated_at": summary["server_time"],
+        "timezone": timezone_name,
+        "window": summary["range"],
+        "previous_window": summary["previous_range"],
+        "applications_submitted": totals["applications_submitted"],
+        "applications_prev_week": previous_applications,
+        "applications_tracked": totals["applications_tracked"],
+        "responses": totals["responses"],
+        "interviews": totals["interviews"],
+        "rejections": totals["rejections"],
+        "interview_rate": totals["interview_rate"],
+        "new_matches": totals["jobs_discovered"],
         "strong_matches_open": strong_matches,
         "outreach_sent": emails_sent,
         "outreach_replies": replies,
-        "headline": top_line,
+        "headline": summary["headline"],
+        "next_step": summary["next_step"],
+        "trend_direction": summary["trend"]["direction"],
+        "trend_headline": summary["trend"]["headline"],
+        "sufficiency": summary["sufficiency"],
         "top_match": top[0] if top else None,
     }
+
+
+def _as_datetime(value: Any) -> datetime:
+    """A wire timestamp back to the naive-UTC form the columns hold."""
+    from app.utils.timefmt import coerce_datetime
+
+    return coerce_datetime(value) or datetime.utcnow()
 
 
 def follow_up_reminders(db: Session, user_id: int, limit: int = 5) -> Dict[str, Any]:

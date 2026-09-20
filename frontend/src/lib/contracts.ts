@@ -14,7 +14,7 @@
  */
 
 /** Contract version of the backend vocabulary this file mirrors. */
-export const CONTRACT_VERSION = '1.4.0'
+export const CONTRACT_VERSION = '1.5.0'
 
 /** Header the SPA sends on state-changing POSTs to make a retry safe. */
 export const IDEMPOTENCY_HEADER = 'Idempotency-Key'
@@ -1158,6 +1158,67 @@ export const NOTIFICATION_PREFERENCE_KEYS = [
 ] as const
 
 /** Item kinds of `GET /api/actions/required` — the unified 'what do you owe us' read. */
+// ---------------------------------------------------------------------------
+// Outcome reporting — interviews and meaningful outcomes, not activity volume
+// ---------------------------------------------------------------------------
+// Mirror of `docs/REPORTING.md` / `contracts/07 §11.7`. The SPA renders the
+// provenance and sufficiency labels from these; it must never compute a rate,
+// downgrade an `estimated` number to a fact, or turn `not_enough_data` into 0%.
+
+/** What kind of claim a reported number is. */
+export const REPORT_PROVENANCE_KINDS = [
+  'observed',
+  'user_reported',
+  'derived',
+  'estimated',
+] as const
+export type ReportProvenance = (typeof REPORT_PROVENANCE_KINDS)[number]
+
+/** How much data backs a number. `insufficient` means the number is withheld. */
+export const REPORT_SUFFICIENCY = [
+  'sufficient',
+  'insufficient',
+  'not_applicable',
+] as const
+export type ReportSufficiency = (typeof REPORT_SUFFICIENCY)[number]
+
+/** The direction of a period-over-period comparison. `not_enough_data` ≠ flat. */
+export const REPORT_TRENDS = [
+  'improving',
+  'declining',
+  'flat',
+  'not_enough_data',
+] as const
+export type ReportTrend = (typeof REPORT_TRENDS)[number]
+
+/** Named report windows. `custom` means the caller supplied since/until. */
+export const REPORT_RANGES = [
+  'last_7_days',
+  'last_30_days',
+  'last_90_days',
+  'this_week',
+  'last_week',
+  'custom',
+] as const
+export type ReportRange = (typeof REPORT_RANGES)[number]
+
+/** What a report may be grouped by when comparing interview rates. */
+export const REPORT_COMPARISON_DIMENSIONS = [
+  'source',
+  'score_band',
+  'score_range',
+  'role_family',
+  'artifact',
+] as const
+export type ReportComparisonDimension = (typeof REPORT_COMPARISON_DIMENSIONS)[number]
+
+/**
+ * A job is "high fit" at or above this score — one number, one place, shared
+ * with the backend's `HIGH_FIT_SCORE` and the dashboard's strong-match
+ * threshold. It is an *estimate*: the UI labels it as one.
+ */
+export const HIGH_FIT_SCORE = 75.0
+
 export const ACTION_KINDS = [
   'application_input',
   'resume_approval',
@@ -1408,6 +1469,7 @@ export const AUDIT_ACTIONS = [
   'automation.policy_deleted',
   'automation.auto_submit_enabled',
   'automation.auto_submit_disabled',
+  'analytics.report_exported',
 ] as const
 export type AuditAction = (typeof AUDIT_ACTIONS)[number]
 
@@ -1728,5 +1790,10 @@ export const VOCABULARY: Record<string, readonly string[]> = {
   notification_unmutable_kinds: NOTIFICATION_UNMUTABLE_KINDS,
   notification_preference_keys: NOTIFICATION_PREFERENCE_KEYS,
   action_kinds: ACTION_KINDS,
+  report_provenance_kinds: REPORT_PROVENANCE_KINDS,
+  report_sufficiency: REPORT_SUFFICIENCY,
+  report_trends: REPORT_TRENDS,
+  report_ranges: REPORT_RANGES,
+  report_comparison_dimensions: REPORT_COMPARISON_DIMENSIONS,
   error_codes: ERROR_CODES,
 }

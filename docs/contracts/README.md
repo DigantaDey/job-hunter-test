@@ -30,6 +30,11 @@ Read it in this order:
 | — | [14-migration-strategy.md](14-migration-strategy.md) | expand → migrate → contract, backfills, dual-write, rollback, erasure | migration |
 | — | [15-entity-ownership.md](15-entity-ownership.md) | every entity: single writer, readers, lifecycle, retention, deletion | ownership |
 
+> **Reporting methodology** lives in [`docs/REPORTING.md`](../REPORTING.md) —
+> windows and timezones, the metric definitions, minimum sample sizes, the
+> calibration refusal and the export privacy gate. §11.7 of contract 07 is its
+> normative summary.
+
 ---
 
 ## 1. The eleven rules every implementer follows

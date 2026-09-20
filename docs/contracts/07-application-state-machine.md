@@ -555,3 +555,59 @@ sweep notification and completion; the projection rules including the
 queue-owned-status guard; report grouping across all eight dimensions with
 correct denominators and `null` rates; per-tenant isolation; and deletion
 integrity for both tables.
+
+### 11.7 Outcome reporting (v2.4)
+
+`docs/REPORTING.md` is the methodology; this section is the contract other
+implementations must satisfy.
+
+**Reads.** `GET /api/analytics/outcomes` (a full report),
+`GET /api/analytics/outcomes/weekly` (`last_7_days` | `this_week` only) and
+`GET /api/analytics/outcomes/export` (`csv` | `json`). The dashboard's
+`weekly_report` block (`GET /api/me/dashboard`) is the same calculation as
+`/outcomes/weekly`, so the two surfaces cannot disagree about "this week".
+
+**Windows.** Whole local calendar days in the account's timezone, half-open
+(`start_utc ≤ t < end_utc`), echoed back with local dates and the boundary rule.
+A date-only `until` means "through the end of that local day". Named ranges come
+from `REPORT_RANGES`; an unknown range or timezone is a `422`, never a silent
+fallback.
+
+**Provenance.** Every metric carries `provenance ∈ REPORT_PROVENANCE_KINDS`:
+`observed` (counted from a row), `user_reported` (the user asserted it),
+`derived` (arithmetic) or `estimated` (a model's opinion — the match score). No
+surface may render an `estimated` number as a counted fact.
+
+**Sufficiency.** Every ratio carries a `sample` (`n`, `minimum`, `state`,
+`label`) and is `null` when the sample is below `MIN_SAMPLE_SIZES`; the state is
+one of `REPORT_SUFFICIENCY`. The thresholds ship in the response
+(`definitions.minimum_sample_sizes`), so a reader can check the rule that gated a
+number.
+
+**Trend.** `REPORT_TRENDS` — `improving` | `declining` | `flat` |
+`not_enough_data`, with `not_enough_data` distinct from `flat`. A direction
+requires the minimum sample in both periods.
+
+**Calibration.** `calibration.available` is false and
+`calibration.interview_probability` is `null` until the recorded outcomes and a
+registered calibrated model version satisfy the gate; `interview_probability()`
+raises while they do not. A match score is never a probability.
+
+**Privacy.** Every query is scoped by the authenticated identity; no endpoint
+accepts a tenant parameter. `privacy.scope` is `self_only`, and export — whose
+requirements are re-checked against the document at call time
+(`export_privacy`) — writes an `analytics.report_exported` audit row before the
+body is produced.
+
+**Reproducibility.** `report_version` versions the calculations;
+`calculation_id` hashes the inputs that can change the answer; group ordering is
+deterministic. Identical inputs, identical output apart from `generated_at`.
+
+**Invariants (tests).** `backend/tests/test_outcome_reporting.py` covers date
+ranges and half-open boundaries, timezone day boundaries and DST, empty data,
+minimum-sample labelling, observed-vs-estimated provenance, the calibration
+refusal, the trend directions, the failure/correction/coverage metrics,
+reproducibility and stable ordering, per-tenant scoping of both the report and
+the export, and the export's privacy gate. The SPA side is pinned by
+`frontend/src/lib/__tests__/reporting.test.ts` and
+`frontend/src/components/__tests__/OutcomeReport.test.tsx`.
