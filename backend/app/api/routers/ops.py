@@ -286,7 +286,9 @@ def dashboard(user: CurrentUser, db: DbSession):
 
 @router.get("/ops/status")
 async def ops_status(request: Request, user: CurrentUser, db: DbSession):
-    """Single pane of glass for the Ops page."""
+    """Single pane of glass for the Ops page. Owner-only — worker, cache and
+    edge internals are infrastructure status, not user-facing product."""
+    require_owner(user)
     db_health = check_db_health()
     ai = await ping(timeout=3, db=db, user_id=user.id) if is_configured(db=db, user_id=user.id) else {"online": False, "reason": "no_api_key"}
     depths = queue_stats(db, user_id=None)

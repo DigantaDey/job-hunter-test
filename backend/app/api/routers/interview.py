@@ -46,6 +46,14 @@ def list_sessions(user: CurrentUser, db: DbSession):
 
 @router.post("/generate")
 async def generate_session(payload: GenerateRequest, user: CurrentUser, db: DbSession):
+    from app.services.flags import is_enabled
+
+    if not is_enabled(db, "assistant.interview_prep"):
+        raise HTTPException(
+            403,
+            {"code": "feature_disabled",
+             "message": "Interview practice is turned off for this workspace. The owner can enable it in the admin console."},
+        )
     enforce(db, user.id, "can_use_interview_prep")
     enforce(db, user.id, "interview_sessions_per_month")
 

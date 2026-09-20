@@ -2,7 +2,7 @@
  * Settings page polling cadence — visibility-aware, like the rest of the app.
  *
  * The page owns two live reads: the auto-mode schedule (`GET /api/automation`)
- * and the AI status badge (`GET /api/settings/ai/status`). They used to sit on a
+ * and the AI status badge (`GET /api/me/assistant`). They used to sit on a
  * bare `setInterval(…, 30_000)` that ran whether or not anyone was looking, so
  * every background tab burned ~2 requests a minute forever. After the fix the
  * page should:
@@ -35,6 +35,10 @@ const get = client.get as unknown as Mock
 
 vi.mock('../../components/AIBanner', () => ({ AIStatusBanner: () => null }))
 
+vi.mock('../../context/AuthContext', () => ({
+  useAuth: () => ({ user: { id: 1, email: 'owner@example.com', name: 'Owner', role: 'owner', is_owner: true } }),
+}))
+
 /* ── fixtures ───────────────────────────────────────────────────────── */
 /** `GET /api/settings` — every category the form reads on first paint. */
 const SETTINGS = {
@@ -52,7 +56,7 @@ const SETTINGS = {
   _meta: { writable: { scraping: ['keywords'] } },
 }
 
-const AI_STATUS = { online: true, latency_ms: 120, model: 'gpt-4o-mini', configured: true, remaining: 60, rpm: 60, probe: 'models', key_preview: '***abc', key_source: 'user', is_owner: true }
+const ASSISTANT = { configured: true, state: 'online', online: true, reason: null, hint: null, paused_items: 0, message: 'Your assistant is ready to help.' }
 
 /** `GET /api/automation` — the card's schedule, quota and history. */
 const automation = (used = 3) => ({
@@ -82,7 +86,7 @@ async function flush(rounds = 12) {
 
 const callsTo = (url: string) => get.mock.calls.filter((c: any[]) => c[0] === url).length
 const autoCalls = () => callsTo('/api/automation')
-const statusCalls = () => callsTo('/api/settings/ai/status')
+const statusCalls = () => callsTo('/api/me/assistant')
 
 /* ── suite ──────────────────────────────────────────────────────────── */
 describe('Settings page polling', () => {
@@ -92,8 +96,7 @@ describe('Settings page polling', () => {
     get.mockReset()
     get.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve({ data: SETTINGS })
-      if (url === '/api/ai/config') return Promise.resolve({ data: { overrides: {} } })
-      if (url === '/api/settings/ai/status') return Promise.resolve({ data: AI_STATUS })
+      if (url === '/api/me/assistant') return Promise.resolve({ data: ASSISTANT })
       if (url === '/api/context/keywords') return Promise.resolve({ data: { keywords: ['python'], source: 'ai' } })
       if (url === '/api/automation') return Promise.resolve({ data: automation() })
       return Promise.resolve({ data: {} })
@@ -125,7 +128,7 @@ describe('Settings page polling', () => {
     render(<Settings />, { wrapper })
     await flush()
     // A visible tab arms the timer without an immediate tick: `load()` has just
-    // read `/api/automation` and `/api/settings/ai/status` a moment ago.
+    // read `/api/automation` and `/api/me/assistant` a moment ago.
     expect(autoCalls()).toBe(1)
     expect(statusCalls()).toBe(1)
 
@@ -189,18 +192,18 @@ describe('Settings page polling', () => {
     await flush()
     expect(screen.getByText(/Automation runs this month/)).toBeTruthy()
     expect(document.body.textContent).toContain('3/10')
-    expect(document.body.textContent).toContain('AI online • 120ms')
+    expect(document.body.textContent).toContain('Your assistant is ready to help.')
 
     // The next tick brings a new quota and a slower probe; both are on screen.
     get.mockImplementation((url: string) => {
       if (url === '/api/automation') return Promise.resolve({ data: automation(7) })
-      if (url === '/api/settings/ai/status') return Promise.resolve({ data: { ...AI_STATUS, latency_ms: 940 } })
+      if (url === '/api/me/assistant') return Promise.resolve({ data: { ...ASSISTANT } })
       return Promise.resolve({ data: {} })
     })
     await act(async () => { vi.advanceTimersByTime(30_000) })
     await flush()
     expect(document.body.textContent).toContain('7/10')
-    expect(document.body.textContent).toContain('AI online • 940ms')
+    expect(document.body.textContent).toContain('Your assistant is ready to help.')
   })
 
   it('cleans up on unmount — no leaked timer or listener', async () => {
@@ -224,7 +227,7 @@ describe('Settings page polling', () => {
 
     get.mockImplementation((url: string) => {
       if (url === '/api/automation') return Promise.reject(new Error('boom'))
-      if (url === '/api/settings/ai/status') return Promise.reject(new Error('boom'))
+      if (url === '/api/me/assistant') return Promise.reject(new Error('boom'))
       return Promise.resolve({ data: {} })
     })
     await act(async () => { vi.advanceTimersByTime(30_000) })
@@ -232,6 +235,6 @@ describe('Settings page polling', () => {
 
     // Still the previous schedule and status — the poll is a refresh, never a reset.
     expect(document.body.textContent).toContain('3/10')
-    expect(document.body.textContent).toContain('AI online • 120ms')
+    expect(document.body.textContent).toContain('Your assistant is ready to help.')
   })
 })

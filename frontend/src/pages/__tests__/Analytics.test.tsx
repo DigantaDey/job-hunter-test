@@ -15,6 +15,10 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import client from '../../api/client'
 import Analytics from '../Analytics'
 
+vi.mock('../../context/AuthContext', () => ({
+  useAuth: () => ({ user: { id: 1, email: 'owner@example.com', name: 'Owner', role: 'owner', is_owner: true } }),
+}))
+
 vi.mock('../../api/client', () => {
   const get = vi.fn()
   return { default: { get }, apiError: (_e: unknown, fb?: string) => fb ?? 'error' }

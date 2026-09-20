@@ -171,8 +171,22 @@ RequireConsent = require_consent
 
 
 def require_owner(user: CurrentUser) -> User:
+    """
+    Owner-only access.
+
+    The owner/admin surface (AI provider configuration, source & queue health,
+    usage and cost, plan/entitlement controls, global flags, cross-user audit)
+    is enforced here — on the server, not by hiding links in the SPA. The JSON
+    detail carries a stable ``code`` so the frontend can show the right screen.
+    """
     if (user.role or "").lower() != "owner":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner role required")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "owner_required",
+                "message": "This area is only available to the workspace owner.",
+            },
+        )
     return user
 
 

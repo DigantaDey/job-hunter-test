@@ -1,6 +1,8 @@
 import { AlertTriangle, PauseCircle, ShieldAlert, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import type { AIOutage } from '../api/client'
+import { useAuth } from '../context/AuthContext'
+import { isOwner } from '../lib/role'
 
 function fmtHint(seconds?: number | null): string | null {
   if (!seconds || seconds <= 0) return null
@@ -27,6 +29,8 @@ export function AIOutageBanner({ outage, what = 'nothing was generated', onDismi
   what?: string
   onDismiss?: () => void
 }) {
+  const { user } = useAuth()
+  const owner = isOwner(user)
   const paused = outage.status === 'ai_paused' || outage.state === 'transient_outage'
   const blocked = outage.status === 'ai_blocked' || outage.state === 'blocked_needs_action'
   const tone = paused
@@ -67,8 +71,11 @@ export function AIOutageBanner({ outage, what = 'nothing was generated', onDismi
           {outage.fix && (
             <div className={`text-xs mono mt-1 ${subTone}`}>
               <strong>Fix:</strong> {outage.fix}{' '}
-              {(blocked || !paused) && (
-                <Link to="/settings#ai" className="underline font-medium">Settings → AI API</Link>
+              {(blocked || !paused) && owner && (
+                <Link to="/admin" className="underline font-medium">Admin console → AI providers</Link>
+              )}
+              {(blocked || !paused) && !owner && (
+                <span className="underline font-medium">ask the workspace owner to check the AI connection</span>
               )}
             </div>
           )}
@@ -97,11 +104,14 @@ export function AIOutageBanner({ outage, what = 'nothing was generated', onDismi
  *   automatically; offers one-click resume for the impatient.
  * * blocked_needs_action — red: retrying is pointless until the user acts.
  */
-export function AIStatusBanner({ status, resuming, onResume }: {
+export function AIStatusBanner({ status, resuming, onResume, owner }: {
   status: { state?: string, reason?: string | null, hint?: string | null, paused_count?: number, retry_after_hint?: number | null } | null
   resuming?: boolean
   onResume?: () => void
+  owner?: boolean
 }) {
+  const { user } = useAuth()
+  const isOwnerUser = owner ?? isOwner(user)
   const state = status?.state
   if (state !== 'transient_outage' && state !== 'blocked_needs_action') return null
   const paused = state === 'transient_outage'
@@ -143,10 +153,15 @@ export function AIStatusBanner({ status, resuming, onResume }: {
           {resuming ? 'Resuming…' : 'Resume now'}
         </button>
       )}
-      {!paused && (
-        <Link to="/settings#ai" className="text-xs mono font-medium px-2.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white shrink-0">
-          Open AI settings
+      {!paused && isOwnerUser && (
+        <Link to="/admin" className="text-xs mono font-medium px-2.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white shrink-0">
+          Fix in admin console
         </Link>
+      )}
+      {!paused && !isOwnerUser && (
+        <span className="text-xs mono text-red-700 dark:text-red-300 shrink-0">
+          Ask the workspace owner to check the connection
+        </span>
       )}
     </div>
   )

@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.api.deps import CurrentUser, DbSession
 from app.core import audit
+from app.core.auth import require_owner
 from app.core.config import settings
 from app.core.rate_limiter import rate_limiter
 from app.services.ai_client import (
@@ -23,17 +24,54 @@ from app.services.user_settings import WRITABLE_KEYS, apply_updates, grouped
 router = APIRouter(tags=["settings"])
 
 
+def _is_owner(user) -> bool:
+    return (getattr(user, "role", "") or "").lower() == "owner"
+
+
+def _sanitize_settings_for_member(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strip owner-level material from the settings document.
+
+    AI provider configuration (base URL, model, API-key material, rate limits,
+    token budgets) is the workspace owner's concern — an ordinary account gets
+    only the one bit the product needs: whether the assistant is connected.
+    This is defence in depth behind ``PUT /settings`` refusing member writes to
+    the ``ai`` category; the SPA renders its user-facing settings from the same
+    sanitized document.
+    """
+    data["ai"] = {"configured": is_configured(db=data.pop("_db_marker", None) or None, user_id=None)
+                  } if False else {"configured": data.get("ai", {}).get("configured", False)}
+    writable = {
+        category: keys for category, keys in data.get("_meta", {}).get("writable", {}).items()
+        if category != "ai"
+    }
+    if "_meta" in data:
+        data["_meta"]["writable"] = writable
+    return data
+
+
 @router.get("/settings")
 def get_settings(user: CurrentUser, db: DbSession):
     data = grouped(db, user)
     data["ai"]["configured"] = is_configured(db=db, user_id=user.id)
     data["_meta"] = {"writable": {category: sorted(keys) for category, keys in WRITABLE_KEYS.items()},
                      "environment": settings.environment}
+    if not _is_owner(user):
+        data = _sanitize_settings_for_member(data)
     return data
 
 
 @router.put("/settings")
 def put_settings(payload: Dict[str, Any], request: Request, user: CurrentUser, db: DbSession):
+    # Authorisation, not UX: the AI provider category is owner-configured. A
+    # member writing *any* other category is fine; the moment the payload
+    # touches "ai" the request is refused before anything is applied.
+    if "ai" in (payload or {}) and not _is_owner(user):
+        raise HTTPException(
+            403,
+            {"code": "owner_required",
+             "message": "AI provider settings are managed by the workspace owner."},
+        )
     result = apply_updates(db, user, payload)
     if "ai" in payload and "rpm" in (payload["ai"] or {}):
         try:
@@ -46,7 +84,8 @@ def put_settings(payload: Dict[str, Any], request: Request, user: CurrentUser, d
 
 
 @router.get("/settings/runtime")
-def runtime(user: CurrentUser, db: DbSession):
+def runtime(user: CurrentUser, db: DbSession, _owner: None = Depends(require_owner)):
+    """Platform internals (sources, providers, flags-of-record). Owner-only."""
     from app.services.autofill import autofill_available
     from app.services.funding_sources import provider_status
     from app.services.sources import list_sources
@@ -61,7 +100,8 @@ def runtime(user: CurrentUser, db: DbSession):
 
 
 @router.get("/settings/ai/status")
-async def ai_status(user: CurrentUser, db: DbSession):
+async def ai_status(user: CurrentUser, db: DbSession, _owner: None = Depends(require_owner)):
+    """Provider URL, key material, model, usage — owner-only diagnostics."""
     # Per-user ping with owner fallback
     health = await ping(db=db, user_id=user.id)
     stats = rate_limiter.stats()
@@ -157,8 +197,8 @@ async def resume_ai(user: CurrentUser, db: DbSession, request: Request):
 
 
 @router.get("/ai/config")
-def get_ai_config(user: CurrentUser, db: DbSession):
-    """Per-workflow AI overrides (API keys are never returned in full)."""
+def get_ai_config(user: CurrentUser, db: DbSession, _owner: None = Depends(require_owner)):
+    """Per-workflow AI overrides (API keys are never returned in full). Owner-only."""
     from app.services.user_settings import read_workflow_override
 
     result: Dict[str, Any] = {}
@@ -181,7 +221,8 @@ def get_ai_config(user: CurrentUser, db: DbSession):
 
 
 @router.post("/ai/config")
-def update_ai_config(payload: Dict[str, Any], request: Request, user: CurrentUser, db: DbSession):
+def update_ai_config(payload: Dict[str, Any], request: Request, user: CurrentUser, db: DbSession,
+                     _owner: None = Depends(require_owner)):
     """Configure a different base_url/model/key/provider per workflow (blank = inherit)."""
     from app.services.user_settings import (
         AI_PROVIDERS,
@@ -232,7 +273,8 @@ def update_ai_config(payload: Dict[str, Any], request: Request, user: CurrentUse
 
 
 @router.delete("/ai/config/{workflow}")
-def clear_ai_config(workflow: str, user: CurrentUser, db: DbSession):
+def clear_ai_config(workflow: str, user: CurrentUser, db: DbSession,
+                    _owner: None = Depends(require_owner)):
     from app.services.user_settings import delete_workflow_override
 
     if workflow not in WORKFLOWS:

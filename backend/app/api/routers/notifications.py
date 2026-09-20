@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession
@@ -113,7 +113,15 @@ def create_notification(db: Session, user_id: int, kind: str, title: str, body: 
 
 @router.post("/generate-summary")
 def generate_weekly_summary(user: CurrentUser, db: DbSession):
-    """Generate weekly summary notification — Pro feature for advanced alerts."""
+    """Generate the weekly outcome report — the user-facing weekly summary."""
+    from app.services.flags import is_enabled
+
+    if not is_enabled(db, "assistant.weekly_report"):
+        raise HTTPException(
+            403,
+            {"code": "feature_disabled",
+             "message": "The weekly outcome report is turned off for this workspace. The owner can enable it in the admin console."},
+        )
     try:
         enforce(db, user.id, "advanced_alerts")
     except Exception:

@@ -6,6 +6,141 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed — two surfaces, one product: the end-user dashboard and the owner console (v2.3.0)
+
+The app previously showed one surface to everyone: a job seeker's dashboard that
+led with AI-credit meters and "command center" links, and a Settings page whose
+first card was the OpenAI-compatible provider form. This release splits the
+experience into a **product surface** (every account) and an **owner/admin
+surface** (the workspace owner), with the boundary enforced by the server —
+hiding links in the SPA is explicitly not the mechanism.
+
+**Backend authorization (the enforcement half):**
+
+- `require_owner` now returns a structured 403 (`{"code": "owner_required"}`)
+  and guards, at minimum: `GET /api/settings/ai/status`, `GET|POST|DELETE
+  /api/ai/config`, `GET /api/settings/runtime`, `GET /api/ops/status`,
+  `GET /api/analytics/costs` and the entire `/api/admin/*` router (router-level
+  `dependencies=[Depends(require_owner)]`, so no handler can run without it).
+- `PUT /api/settings` refuses the `ai` category from members (403
+  `owner_required`) while every other category stays user-writable;
+  `GET /api/settings` returns a **sanitized** document to members — the `ai`
+  category collapses to `{"configured": bool}` and `_meta.writable` drops the
+  category, so provider URLs, models, key material, RPM and token budgets never
+  leave the server for an ordinary account.
+- Token budgets moved to the owner surface (they used to be editable by paid
+  tiers): `ai.max_input_tokens` / `max_output_tokens` / `timeout` / `rpm` /
+  `max_retries` are owner-console settings, and `get_user_ai_config` now falls
+  back to the owner's values for retries/timeout/rate exactly as it already did
+  for keys and budgets — members inherit the platform defaults, they do not
+  configure them. The free-tier `upgrade_required` gate still applies to the
+  owner's own writes.
+- `POST /api/settings/ai/resume` stays available to every user: it drains *that
+  user's* paused work (the impatient path next to the watchdog's automatic
+  drain).
+
+**New owner/admin API (`backend/app/api/routers/admin.py`):**
+
+- `GET /api/admin/overview` — one pane: source health (job sources, funding
+  providers, outbound caches), queue health (all-pipeline depths, totals,
+  pipeline failure rate, AI breakers), usage & cost (30-day tokens/cost/ops/
+  failures + per-workflow month table), failure rates (pipeline / application /
+  AI), application-automation health (active users, in-flight, failure rate)
+  and the account/plan mix.
+- `GET /api/admin/audit` — the cross-user audit trail with `action`,
+  `action_prefix` and `user_id` filters (the self-scoped
+  `GET /api/account/audit` is unchanged and stays available to every user).
+- `GET|PUT /api/admin/flags` — global feature flags backed by a new
+  `global_settings` table (migration `l3m4n5o6p7q8`). Flags are a real registry
+  (`app/services/flags.py`: key, default, label, description) consulted by
+  product code: `discovery.live_sources` (AND-ed into live job-board fetching),
+  `assistant.interview_prep` (generation returns a friendly 403
+  `feature_disabled` when off) and `assistant.weekly_report`. Every flip is
+  audited (`admin.flag_updated`); unknown keys are a 400.
+- `GET /api/admin/users`, `PUT /api/admin/users/{id}/plan`,
+  `PUT /api/admin/users/{id}/role` — plan/entitlement controls (manual
+  entitlement through the same service the webhooks use) and owner-role
+  management, with the last owner unable to demote themselves.
+
+**New end-user API (`backend/app/api/routers/me.py`, service
+`app/services/user_dashboard.py`):**
+
+- `GET /api/me/dashboard` — the aggregate the user home page renders: profile
+  completeness (weighted fields + what is missing, in user language), discovery
+  status (idle/running/paused/attention/results with human detail), top matches
+  **with the reasons behind each one** (match reason, rubric recommendation and
+  contributions, matched skills, AI-review strengths — plus required-skill
+  gaps), jobs requiring review, applications in progress with human stage
+  labels, the user-action-required queue (pending questions, packet approvals,
+  resume approvals, email approvals — prioritised), interview activity
+  (upcoming and completed from the tracking timeline, practice-session counts),
+  the weekly outcome report (applications, responses, interviews, rejections,
+  new matches, replies — **outcomes, never tokens**) and follow-up reminders
+  (the user's own promises via the tracking layer, plus gentle derived
+  suggestions for applications quiet for 7+ days). Every query is
+  tenant-scoped.
+- `GET /api/me/assistant` — the user-safe assistant signal: a **whitelist** of
+  `state / online / reason / hint / retry_after_hint` over the central
+  availability probe plus `configured` and paused-item count. Provider URL,
+  model id, key preview/source, usage and breakers are deliberately absent —
+  those stay on the owner-only status endpoint.
+
+**Frontend:**
+
+- New user home (`pages/Dashboard.tsx`): outcome-first stats, the attention
+  queue, top matches with per-match "why" bullets and gaps, applications with
+  stage chips, interview activity, follow-up reminders, the weekly outcome
+  report and profile-completeness meter. Loading skeleton, per-section empty
+  states with next actions, a retrying error card, and an honest offline state
+  (`useOnline`) — a failed background refresh keeps the last good read on
+  screen. No token, cost or provider vocabulary anywhere on the surface.
+- Settings (`pages/Settings.tsx`) is the user's own product setup: search
+  keywords, freshness, funding focus, resume/email preferences, workflow
+  toggles, auto mode — plus a plain-language "Your assistant" card (state,
+  paused-work resume button, and for members an explanation that the workspace
+  owner manages providers). The provider form, per-workflow overrides and token
+  budget inputs moved out entirely.
+- New owner surface under `/admin` (mounted only behind the `RequireOwner`
+  route guard; members are redirected before any admin read fires): the admin
+  console (AI provider configuration incl. per-workflow overrides and token
+  budgets, source health, queue health with recover/retry-dead, usage & cost,
+  failure rates, automation health, global feature flags), the cross-user audit
+  log and plans & users (plan + role controls).
+- The sidebar now has two sections: the user nav and, for the owner only, an
+  "Owner" section (admin console, audit log, plans & users). The assistant
+  signal in the chrome comes from the sanitized `/api/me/assistant` (no RPM
+  meters), and the AI banners speak user language — members are told to ask the
+  workspace owner rather than being sent to provider settings.
+- Shared surface components (`components/states.tsx`: loading, skeleton,
+  empty, error+retry, offline) so all four states render consistently.
+
+**Tests:**
+
+- `backend/tests/test_role_separation.py` — the boundary from both directions:
+  unauthenticated 401, member 403 `owner_required` on every owner endpoint
+  (including admin writes to provider settings, per-workflow keys and queue
+  admin actions), owner keeps full access, member settings payloads carry no
+  provider fields, sanitized assistant read, flags flipping end-to-end (with
+  the product effect and the audit row), plan/role controls, and the dashboard
+  aggregate (actionable work, match "why", tenancy isolation, empty-state
+  guidance, and an assertion that no token/cost vocabulary leaks).
+- `frontend/src/pages/__tests__/RoleSeparation.test.tsx` — route protection
+  (member → `/admin` redirects to `/` before the admin page mounts; owner
+  mounts it; unauthenticated → login), navigation (no admin links for members;
+  the owner section for the owner), Settings surface separation (no provider
+  fields for members) and the admin console fetching owner endpoints.
+- `frontend/src/pages/__tests__/UserDashboard.test.tsx` — loading skeleton,
+  data rendering (attention queue, match "why", stage labels, weekly outcomes),
+  empty-state guidance, error card + retry recovery, offline card and banner,
+  60-second visibility-aware polling, stale-data retention on a failed tick,
+  and the no-token-vocabulary rule.
+- Existing suites updated for the new policy: token-budget tests now document
+  that budgets are owner-level (a paying member is refused; the owner keeps
+  control; the owner's knobs are the platform defaults members inherit), the
+  owner-key-fallback test asserts via the sanitized member read, and the
+  Settings polling test follows the page to `/api/me/assistant`.
+
+
 ### Added
 
 - **Application tracking — the lifecycle and outcome-feedback layer (v1,

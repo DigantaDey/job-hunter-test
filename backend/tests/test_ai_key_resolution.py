@@ -212,7 +212,7 @@ def test_key_whitespace_is_trimmed(client, auth, provider):
 
 
 def test_owner_key_is_fallback_for_member(client, auth, provider, db):
-    """Member without own key uses the owner's key — and the status says where it comes from."""
+    """Member without own key uses the owner's key — the user-safe assistant read says AI is live."""
     from app.models.models import User
 
     _save_key(client, auth, provider)
@@ -221,9 +221,10 @@ def test_owner_key_is_fallback_for_member(client, auth, provider, db):
     login = client.post("/api/auth/login", json={"email": "member@example.com", "password": "member-password-123"})
     member_auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
 
-    status = client.get("/api/settings/ai/status", headers=member_auth).json()
-    assert status["online"] is True
-    assert status["key_source"] == "owner"
+    # The member-facing assistant read: online, and free of provider detail.
+    status = client.get("/api/me/assistant", headers=member_auth).json()
+    assert status["state"] == "online", status
+    assert "base_url" not in status and "key_preview" not in status and "user_config" not in status
     assert db.query(User).filter(User.email == "member@example.com").count() == 1
 
 
