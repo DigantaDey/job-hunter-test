@@ -141,6 +141,73 @@ hiding links in the SPA is explicitly not the mechanism.
   Settings polling test follows the page to `/api/me/assistant`.
 
 
+### Added — outcome reporting: interviews and outcomes, never activity volume
+
+A job search is not improved by doing more things, so the report leads with what
+happened *to applications* — interviews, responses, rejections and the rate
+between them — rather than with jobs scanned, applications queued or tokens
+spent. Those are infrastructure, and when they are a metric at all they belong
+to the owner console, not to the person looking for work.
+
+- `GET /api/analytics/outcomes` — the full report: jobs discovered, high-fit jobs
+  found, applications prepared, applications submitted, recruiter responses,
+  interviews, interview rate, rejection rate, user correction rate, application
+  failure rate, time from posting to application and outcome-data coverage, plus
+  comparisons by source, score band, score range, role family and artefact
+  (`resume`/`packet` snapshot version). `GET /api/analytics/outcomes/weekly` is
+  the one-screen weekly summary — the *same* calculation as the dashboard's
+  `weekly_report` block, so the two surfaces cannot disagree about "this week" —
+  and `GET /api/analytics/outcomes/export?format=csv|json` writes the report out.
+- **Observed is not estimated.** Every metric carries `provenance`
+  (`REPORT_PROVENANCE_KINDS`: observed / user_reported / derived / estimated);
+  "high-fit jobs" is the one estimated number and is labelled as such, while
+  interviews are counted only when a tracking row says one happened — nothing is
+  inferred from email or from a match score.
+- **No interview probability until the data supports one.** `calibration`
+  reports the gate and what is still missing (recorded interviews, score bands
+  with outcomes, verified-outcome share, a calibrated model version), and
+  `interview_probability()` raises while it is unmet, so no surface can print
+  one. A match score stays an estimated fit.
+- **Minimum sample sizes before any comparison.** Every ratio carries `sample`
+  (`n`, minimum, state, label) and is `null` with `sufficiency: "insufficient"`
+  below the threshold — never rendered as `0%`. A "best" group is only named when
+  at least two groups are comparable, and the thresholds ship in the response
+  (`definitions.minimum_sample_sizes`) so the rule that gated a number is
+  checkable. `REPORT_SUFFICIENCY` / `REPORT_TRENDS` distinguish "not enough data"
+  from "flat".
+- **Every window carries its timezone.** Whole local calendar days in the
+  account's timezone, half-open (`start_utc ≤ t < end_utc`), echoed back with
+  local dates and the boundary rule; date-only `custom` bounds mean whole local
+  days; an unknown range or timezone is a 422 rather than a silent UTC answer.
+- **Reproducible.** `REPORT_VERSION` versions the calculations and
+  `calculation_id` hashes exactly the inputs that can change the answer; the same
+  rows and window produce the same document apart from `generated_at`, with
+  deterministic group ordering.
+- **Tenant-safe, including the export.** Every query is scoped by the
+  authenticated identity and no endpoint accepts a tenant parameter; the payload
+  carries no other-user rows, cross-tenant aggregates, contacts or free-text
+  notes. Export re-checks its privacy requirements against the document it would
+  write (`self_only`, no other tenants, no third-party personal data, no
+  free-text notes) and audits `analytics.report_exported` *before* the body is
+  produced; an unmet requirement makes the endpoint a 403 rather than a leak.
+- Frontend: `frontend/src/components/OutcomeReport.tsx` renders the report first
+  on the Analytics page — range selector, provenance chips, sample labels, trend
+  chip, calibration refusal and the gated export link — over the wire types and
+  formatting helpers in `frontend/src/lib/reporting.ts`, where a withheld rate
+  renders `—` and never `0%`. Contract vocabulary bumps to 1.5.0 with the
+  `REPORT_*` vocabularies, `HIGH_FIT_SCORE` (the same 75 the dashboard's "strong
+  match" uses, so "high fit" cannot mean two things) and the
+  `analytics.report_exported` action. Methodology:
+  `docs/REPORTING.md` and contract 07 §11.7.
+- Tests: `backend/tests/test_outcome_reporting.py` — date ranges and half-open
+  boundaries, timezone day boundaries, empty data, minimum-sample labelling,
+  observed-vs-estimated provenance, the calibration refusal, trend directions,
+  the failure/correction/coverage metrics, reproducibility and stable ordering,
+  per-tenant scoping of the report *and* the export, the export privacy gate and
+  its audit row — plus `frontend/src/lib/__tests__/reporting.test.ts` and
+  `frontend/src/components/__tests__/OutcomeReport.test.tsx`.
+
+
 ### Added
 
 - **Application tracking — the lifecycle and outcome-feedback layer (v1,

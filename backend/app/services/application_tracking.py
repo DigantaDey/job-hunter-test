@@ -107,6 +107,7 @@ __all__ = [
     "add_note",
     "allowed_transitions",
     "append_event",
+    "artifact_label",
     "change_state",
     "complete_follow_up",
     "complete_interview",
@@ -2074,11 +2075,20 @@ def _score_bucket(score: Optional[float]) -> str:
     return "unscored"
 
 
-def _artifact_label(record: ApplicationTracking) -> str:
+def artifact_label(record: ApplicationTracking) -> str:
+    """The artefact snapshot as a group key (``packet:v3``, ``resume``, ``none``).
+
+    Public because the outcome report groups by the same string: "which version
+    of my resume got the interview?" has to mean one thing on both pages.
+    """
     if record.artifact_kind == "none" or not record.artifact_kind:
         return "none"
     version = record.artifact_version
     return f"{record.artifact_kind}:v{version}" if version is not None else f"{record.artifact_kind}:unversioned"
+
+
+#: Backwards-compatible alias for the call sites that predate the public name.
+_artifact_label = artifact_label
 
 
 def _group_value(record: ApplicationTracking, group_by: str) -> str:

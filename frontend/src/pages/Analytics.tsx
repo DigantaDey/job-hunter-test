@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import client from '../api/client'
 import { BarChart3, TrendingUp, Target, DollarSign, History } from 'lucide-react'
 import { conversionText, groupLabel, rateText, type TrackingTally } from '../lib/tracking'
+import OutcomeReport from '../components/OutcomeReport'
 import { useAuth } from '../context/AuthContext'
 import { isOwner } from '../lib/role'
 
@@ -43,6 +44,9 @@ export default function Analytics() {
   return (
     <div className="space-y-6">
       <h1 className="text-xl font-semibold flex items-center gap-2"><BarChart3 className="w-5 h-5"/> Application Intelligence & Performance</h1>
+
+      {/* Outcomes first: what happened, what backs it, and how big the sample is. */}
+      <OutcomeReport timezone={(user as { timezone?: string } | null)?.timezone} />
 
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
         <div className="card p-4"><div className="text-xs text-zinc-500 mono">Total Jobs</div><div className="text-2xl font-bold mono">{perf.summary.total_jobs}</div></div>

@@ -33,7 +33,7 @@ from typing import Dict, Tuple
 #: Version of the contract set itself. Surfaced in docs and (proposed) in
 #: ``GET /api/meta`` so a client can detect a server that speaks a newer
 #: vocabulary than it does. Minor = additive, major = a rename/removal.
-CONTRACT_VERSION = "1.4.0"
+CONTRACT_VERSION = "1.5.0"
 
 #: Header a client sends to make a state-changing POST safely retryable.
 #: See ``docs/contracts/01-conventions.md`` §Idempotency.
@@ -1153,6 +1153,9 @@ AUDIT_ACTIONS: Tuple[str, ...] = (
     "application.interview_recorded", "application.state_corrected",
     "automation.policy_updated", "automation.policy_deleted",
     "automation.auto_submit_enabled", "automation.auto_submit_disabled",
+    # new — outcome reporting (contracts/07 §11.7). Downloading a report takes
+    # the tenant's own outcome data off the platform, so it is audited.
+    "analytics.report_exported",
 )
 
 #: Prefixes/actions that must never be dropped under load. Superset of the
@@ -1205,6 +1208,59 @@ NOTIFICATION_UNMUTABLE_KINDS: Tuple[str, ...] = (
 NOTIFICATION_PREFERENCE_KEYS: Tuple[str, ...] = (
     "email_enabled", "high_match", "automation_failures", "weekly_summary", "new_replies",
 )
+
+# --------------------------------------------------------------------------- #
+# Outcome reporting — interviews and meaningful outcomes, not activity volume
+# --------------------------------------------------------------------------- #
+# ``docs/REPORTING.md`` and ``docs/contracts/07-application-state-machine.md``
+# §11.7. Four vocabularies, and each one exists because a report without it
+# starts lying:
+#
+# * provenance — is this number *observed*, *reported by the user*, *derived*
+#   from those, or *estimated* by a model? A dashboard that prints a model
+#   output next to a counted fact without saying which is which is the bug this
+#   whole file exists to prevent.
+# * sufficiency — a comparison on 2 applications is noise. Groups below the
+#   minimum sample are labelled, not quietly rendered as a percentage.
+# * trend — "is this working?" is a comparison against the previous window, and
+#   "not enough data" is a first-class answer (never a 0% improvement).
+# * ranges — the named windows the report can be asked for, so a client cannot
+#   invent a window that the methodology does not describe.
+
+#: Which kind of claim a reported number is.
+REPORT_PROVENANCE_KINDS: Tuple[str, ...] = (
+    "observed",       # counted from a row we hold (a job, a submission, an event)
+    "user_reported",  # the user said it happened (an interview, a rejection)
+    "derived",        # arithmetic over the two above (every rate, average, delta)
+    "estimated",      # a model's opinion (the match score, "high fit")
+)
+
+#: How much data backs a number. ``insufficient`` means the number is withheld.
+REPORT_SUFFICIENCY: Tuple[str, ...] = ("sufficient", "insufficient", "not_applicable")
+
+#: The direction of a period-over-period comparison. ``not_enough_data`` is not
+#: ``flat``: "we cannot tell yet" and "nothing changed" are different answers.
+REPORT_TRENDS: Tuple[str, ...] = ("improving", "declining", "flat", "not_enough_data")
+
+#: Named report windows. ``custom`` means the caller supplied since/until.
+REPORT_RANGES: Tuple[str, ...] = (
+    "last_7_days", "last_30_days", "last_90_days", "this_week", "last_week", "custom",
+)
+
+#: What a report may be grouped by when comparing interview rates. Superset of
+#: ``REPORT_GROUP_KEYS`` in the tracking service: the outcome report groups by
+#: score band *and* score range, because "which band converts" and "which score
+#: range converts" are two different questions about the same column.
+REPORT_COMPARISON_DIMENSIONS: Tuple[str, ...] = (
+    "source", "score_band", "score_range", "role_family", "artifact",
+)
+
+#: A job is "high fit" at or above this score. One number, one place: the
+#: dashboard's ``STRONG_MATCH_SCORE`` reads this too, so "high fit" cannot mean
+#: 75 on one page and 80 on another. The score is an **estimate** — the report
+#: labels it as such and never turns it into an interview probability.
+HIGH_FIT_SCORE: float = 75.0
+
 
 #: ``GET /api/actions/required`` item kinds — the unified "what do you owe us"
 #: read. See ``docs/contracts/13-api-response-shapes.md`` §6.
@@ -1354,6 +1410,11 @@ VOCABULARY: Dict[str, Tuple[str, ...]] = {
     "notification_unmutable_kinds": NOTIFICATION_UNMUTABLE_KINDS,
     "notification_preference_keys": NOTIFICATION_PREFERENCE_KEYS,
     "action_kinds": ACTION_KINDS,
+    "report_provenance_kinds": REPORT_PROVENANCE_KINDS,
+    "report_sufficiency": REPORT_SUFFICIENCY,
+    "report_trends": REPORT_TRENDS,
+    "report_ranges": REPORT_RANGES,
+    "report_comparison_dimensions": REPORT_COMPARISON_DIMENSIONS,
     "error_codes": ERROR_CODES,
 }
 
@@ -1398,6 +1459,8 @@ __all__ = [
     "REVIEW_ACTIONS", "REVIEW_STATUSES", "SCORE_SOURCES", "SENSITIVE_AUDIT_ACTIONS",
     "SENSITIVE_FIELD_KEYS", "SENSITIVE_FIELD_POLICIES", "SENSITIVITY_LEVELS",
     "SUBMISSION_CHANNELS", "SUBMISSION_REFUSALS", "SUBMISSION_STATES",
+    "REPORT_PROVENANCE_KINDS", "REPORT_SUFFICIENCY", "REPORT_TRENDS", "REPORT_RANGES",
+    "REPORT_COMPARISON_DIMENSIONS", "HIGH_FIT_SCORE",
     "USER_ACTION_KINDS", "USER_ACTION_STATUSES", "CHECKPOINT_FAILURES",
     "FIELD_ACTIONS", "FIELD_CLASSIFICATIONS",
     "APPLICATION_SESSION_PHASE", "APPLICATION_SESSION_STATES",
