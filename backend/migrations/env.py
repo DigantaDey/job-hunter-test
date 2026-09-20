@@ -1,6 +1,7 @@
 """Alembic environment — wired to the application's settings and metadata."""
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from logging.config import fileConfig
@@ -16,7 +17,25 @@ from app.models import models  # noqa: F401,E402  (register tables)
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # fileConfig replaces the root logger's handlers, which destroys any handler
+    # a caller has already installed (pytest's caplog is the common victim — a
+    # migration test that runs fileConfig would silently empty caplog for every
+    # test that follows in the same process). Save and restore the root handlers
+    # so the migration run gets alembic's own formatting without side effects.
+    _root = logging.getLogger()
+    _saved_handlers = list(_root.handlers)
+    _saved_level = _root.level
+    try:
+        fileConfig(config.config_file_name, disable_existing_loggers=False)
+    finally:
+        # Restore whatever the caller had — caplog, configure_logging, etc.
+        for handler in list(_root.handlers):
+            if handler not in _saved_handlers:
+                _root.removeHandler(handler)
+        for handler in _saved_handlers:
+            if handler not in _root.handlers:
+                _root.addHandler(handler)
+        _root.setLevel(_saved_level)
 
 target_metadata = Base.metadata
 

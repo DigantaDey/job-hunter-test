@@ -6,6 +6,57 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security — cross-system privacy and safety review (v2.3.1)
+
+A cross-cutting review of the onboarding, discovery, matching, browser-assisted
+application and submission flows produced a data-flow and threat-model document
+(`docs/PRIVACY_REVIEW.md`) and three defence-in-depth fixes:
+
+**Audit detail sanitisation (`core/audit.py`):** `sanitize_audit_detail()` walks
+every detail dict at the audit boundary and masks values matching known secret
+shapes (API keys, bearer tokens, password/token assignments, JWTs) plus
+unconditionally masks values under sensitive key names (`password`, `secret`,
+`api_key`, `token`, `mfa_code`, `otp`, `ssn`, `credit_card`, …). No current
+caller passes credentials, but a future one cannot silently leak them into the
+append-only audit trail.
+
+**AI prompt secret scrubbing (`services/ai_client.py`):** `_scrub_prompt_secrets()`
+runs the same secret patterns over every outgoing prompt before it reaches the
+AI provider. If a match is found, the secret is replaced with `***`, a metric is
+incremented (`jobhunter_ai_prompt_secrets_scrubbed_total`) and a warning is
+logged. No current workflow includes credentials in prompts — this is the
+defence-in-depth boundary.
+
+**Browser action payload sanitisation (`services/browser_session.py`):**
+`sanitize_action_payload()` strips credential/PII values from action payloads
+when the field is classified as a password, SSN, credit card, MFA code or other
+sensitive category. The checkpoint already stores only fingerprints — this is
+the secondary safety net for any future path that might include a raw value.
+
+**Tests (`tests/test_privacy_redaction.py`):** 45 new tests covering every
+redaction boundary: `safe_error_message` secret masking, audit detail
+sanitisation, prompt secret scrubbing, action payload sanitisation, log value
+sanitisation, search query privacy (only curated role vocabulary, no PII),
+vault encryption isolation, consent enforcement, browser session privacy
+(no values in checkpoints, sensitive handoff kinds never screenshotted), and
+deletion coverage of browser state, onboarding, candidate profiles, automation
+policy and application tracking tables.
+
+**Alembic `fileConfig` handler leak (`migrations/env.py`):** the migration
+environment's `fileConfig(alembic.ini)` was replacing the root logger's handlers
+on every run, which silently destroyed pytest's `caplog` handler for the rest of
+the process. Any test file that ran a migration (e.g. `test_search_discovery.py`'s
+`test_search_migration_round_trip`) would cause every subsequent `caplog`
+assertion in the suite to fail. The fix saves and restores the root logger's
+handlers around the `fileConfig` call so migration runs get alembic's formatting
+without side effects on the test harness.
+
+**Documentation (`docs/PRIVACY_REVIEW.md`):** data-flow map for every sensitive
+data path, threat model with mitigations and status, user-facing consent
+language reference, source-specific policy table (LinkedIn/Indeed/Naukri/
+Instahyre gated per their ToS), limitation acknowledgements, retention period
+summary and test coverage matrix.
+
 ### Changed — two surfaces, one product: the end-user dashboard and the owner console (v2.3.0)
 
 The app previously showed one surface to everyone: a job seeker's dashboard that

@@ -5,10 +5,18 @@ Every action that touches user data, credentials, money-adjacent data or
 outbound communication is written to ``audit_logs``. The table is append-only
 from the application's point of view: nothing updates or deletes audit rows
 except the GDPR eraser, which keeps the entry but detaches the owner.
+
+Secret sanitisation
+-------------------
+``sanitize_audit_detail`` walks the detail dict and masks values that match
+known secret shapes (API keys, bearer tokens, passwords, MFA codes) before
+the row is persisted. This is a defence-in-depth boundary: no current caller
+passes credentials, but a future one cannot silently leak them either.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional, Union
 
 from sqlalchemy.orm import Session
 
@@ -17,6 +25,62 @@ from app.core.middleware import resolve_client_ip
 from app.models.models import AuditLog
 
 logger = get_logger("audit")
+
+# --------------------------------------------------------------------------- #
+# Secret masking for audit detail — defence in depth
+# --------------------------------------------------------------------------- #
+_AUDIT_SECRET_VALUE_PATTERNS: tuple = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{6,}"),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+"),
+    re.compile(r"(?i)\b(api[_\-]?key|apikey|token|secret|password|authorization)\b\s*[:=]\s*\S+"),
+    re.compile(r"(?i)\b(eyJ[A-Za-z0-9_\-]{20,})"),  # JWT-shaped
+)
+
+#: Key names whose values are always masked, regardless of content.
+_SENSITIVE_KEY_NAMES = frozenset({
+    "password", "secret", "api_key", "apikey", "token", "mfa_code", "otp",
+    "authorization", "credential", "ssn", "credit_card",
+})
+
+_MASK = "***"
+
+
+def _mask_value(value: str) -> str:
+    """Mask any known secret shape inside a string value."""
+    for pattern in _AUDIT_SECRET_VALUE_PATTERNS:
+        value = pattern.sub(_MASK, value)
+    return value
+
+
+def sanitize_audit_detail(detail: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Return *detail* with secret-shaped values masked.
+
+    Walks nested dicts and lists. Key names in :data:`_SENSITIVE_KEY_NAMES` have
+    their values unconditionally replaced with ``***``. String values elsewhere
+    are checked against known secret patterns. Non-string, non-container values
+    pass through unchanged.
+    """
+    if not detail:
+        return {}
+    return _walk(detail)  # type: ignore[return-value]
+
+
+def _walk(value: Any) -> Any:
+    if isinstance(value, dict):
+        result: Dict[str, Any] = {}
+        for key, val in value.items():
+            key_lower = str(key).lower().replace("-", "_")
+            if key_lower in _SENSITIVE_KEY_NAMES:
+                result[key] = _MASK
+            else:
+                result[key] = _walk(val)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_walk(item) for item in value]
+    if isinstance(value, str):
+        return _mask_value(value)
+    return value
 
 # Actions that must never be dropped, even under load: they are the evidence
 # trail a security reviewer or a regulator will ask for.
@@ -52,7 +116,10 @@ def audit(
     actor = getattr(user, "email", "") if user is not None else "system"
 
     client_ip = ip
-    resolved_detail: Dict[str, Any] = dict(detail or {})
+    # Defence in depth: mask any secret-shaped values in the detail dict
+    # before they reach the database. No current caller passes credentials,
+    # but a future one cannot silently leak them either.
+    resolved_detail: Dict[str, Any] = sanitize_audit_detail(detail)
     if request is not None:
         try:
             # Same trust boundary the rate limiter uses: a forwarded address is
