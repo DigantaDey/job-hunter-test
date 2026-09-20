@@ -63,7 +63,7 @@ def sanitize_audit_detail(detail: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     if not detail:
         return {}
-    return _walk(detail)  # type: ignore[return-value]
+    return _walk(detail)
 
 
 def _walk(value: Any) -> Any:
