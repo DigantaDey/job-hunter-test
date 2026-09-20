@@ -94,16 +94,20 @@ def build_and_save_resume(
     # Artifact generation is counted per format: a DOCX renderer regression and
     # a PDF one are different incidents with different symptoms, and the pair of
     # counters is what separates them.
-    for artifact, build, target in (
-        ("resume_docx", build_docx, docx_path),
-        ("resume_pdf", build_pdf, pdf_path),
-    ):
+    # Each entry closes over its own renderer, so the loop body calls one
+    # uniform signature instead of two different ones.
+    renders = (
+        ("resume_docx",
+         lambda path: build_docx(tailored_profile, profile.data or {}, profile.layout or {}, path),
+         docx_path),
+        ("resume_pdf",
+         lambda path: build_pdf(tailored_profile, profile.data or {}, path),
+         pdf_path),
+    )
+    for artifact, render, target in renders:
         started = time.perf_counter()
         try:
-            if artifact == "resume_docx":
-                build(tailored_profile, profile.data or {}, profile.layout or {}, target)
-            else:
-                build(tailored_profile, profile.data or {}, target)
+            render(target)
         except Exception:
             count("jobhunter_artifact_generation_total", artifact=artifact, outcome="failed")
             raise

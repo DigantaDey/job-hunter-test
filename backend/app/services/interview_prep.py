@@ -15,8 +15,12 @@ import time
 from typing import Any, Dict, List, Optional
 
 from app.core.logging import get_logger
+
+# ``reliability`` is imported module-qualified, not as ``from ... import count``:
+# ``generate_interview_questions`` takes a ``count`` parameter, which would
+# shadow the helper inside its own body.
+from app.services import reliability
 from app.services.ai_client import fit_prompt_part, input_budget_chars
-from app.services.reliability import count, duration
 
 log = get_logger("app.interview")
 
@@ -53,13 +57,13 @@ async def generate_interview_questions(
         questions = await _generate_interview_questions(
             profile, job_title, company, job_description, count, db=db, user_id=user_id)
     except Exception:
-        count("jobhunter_artifact_generation_total", artifact="interview_prep", outcome="failed")
-        count("jobhunter_interview_events_total", event="prep_generated", outcome="failed")
+        reliability.count("jobhunter_artifact_generation_total", artifact="interview_prep", outcome="failed")
+        reliability.count("jobhunter_interview_events_total", event="prep_generated", outcome="failed")
         raise
-    duration("jobhunter_artifact_generation_seconds", time.perf_counter() - started,
+    reliability.duration("jobhunter_artifact_generation_seconds", time.perf_counter() - started,
              artifact="interview_prep")
-    count("jobhunter_artifact_generation_total", artifact="interview_prep", outcome="ok")
-    count("jobhunter_interview_events_total", event="prep_generated", outcome="ok")
+    reliability.count("jobhunter_artifact_generation_total", artifact="interview_prep", outcome="ok")
+    reliability.count("jobhunter_interview_events_total", event="prep_generated", outcome="ok")
     return questions
 
 
@@ -150,9 +154,9 @@ async def generate_feedback(
         feedback = await _generate_feedback(question, user_answer, profile, job_description,
                                             db=db, user_id=user_id)
     except Exception:
-        count("jobhunter_interview_events_total", event="feedback_generated", outcome="failed")
+        reliability.count("jobhunter_interview_events_total", event="feedback_generated", outcome="failed")
         raise
-    count("jobhunter_interview_events_total", event="feedback_generated", outcome="ok")
+    reliability.count("jobhunter_interview_events_total", event="feedback_generated", outcome="ok")
     return feedback
 
 

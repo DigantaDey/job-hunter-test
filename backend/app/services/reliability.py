@@ -587,10 +587,11 @@ class Span:
         self._started = time.perf_counter()
         return self
 
-    def __exit__(self, *_exc: object) -> bool:
+    def __exit__(self, *_exc: object) -> None:
+        # ``None``, not ``False``: returning a bool would tell the type checker
+        # this context manager may swallow exceptions. It never does.
         self.elapsed = time.perf_counter() - self._started
         duration(self.metric, self.elapsed, **self.labels)
-        return False
 
 
 # --------------------------------------------------------------------------- #
