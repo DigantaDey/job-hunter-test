@@ -440,6 +440,41 @@ def sanitize_observation(observation: Mapping[str, Any]) -> Dict[str, Any]:
     return clean
 
 
+#: Field classifications / names whose values must be stripped from action
+#: payloads. A credential, SSN or card number must never survive into an
+#: action row — the checkpoint already stores only fingerprints.
+_SENSITIVE_ACTION_FIELD_NAMES = frozenset({
+    "password", "passwd", "pwd", "pass",
+    "ssn", "social_security", "social_security_number",
+    "credit_card", "card_number", "cvv", "cvc", "security_code",
+    "mfa_code", "otp", "totp", "verification_code", "2fa_code",
+    "pin",
+})
+
+
+def sanitize_action_payload(payload: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Strip credential/PII values from an action payload before persistence.
+
+    The checkpoint already stores only fingerprints (``value_fingerprint``),
+    never the value itself. Action payloads are a secondary record of what
+    happened — and this function ensures that if a raw value is included
+    (a field value from a user answer, a driver observation), it is
+    replaced with ``***`` when the field is classified as sensitive.
+    """
+    if not payload:
+        return {}
+    result = dict(payload)
+    field_name = str(result.get("field") or result.get("name") or "").lower().replace("-", "_")
+    classification = str(result.get("classification") or "").lower()
+    is_sensitive = (
+        field_name in _SENSITIVE_ACTION_FIELD_NAMES
+        or classification in ("credential", "password", "sensitive_pii", "mfa", "captcha")
+    )
+    if is_sensitive and "value" in result:
+        result["value"] = "***"
+    return result
+
+
 def detect_challenges(observation: Mapping[str, Any]) -> List[str]:
     """
     Which human-only steps the page is asking for, most urgent first.
@@ -2335,6 +2370,7 @@ __all__ = [
     "record_user_answers",
     "reserve_submission",
     "resume_session",
+    "sanitize_action_payload",
     "sanitize_observation",
     "screenshot_decision",
     "session_detail",

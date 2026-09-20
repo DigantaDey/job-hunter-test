@@ -63,6 +63,8 @@ maintaining SPF/DKIM/DMARC for the sending domain.
   SmartRecruiters, Workday, Remotive, Arbeitnow, Jobicy, RemoteOK, Himalayas, The Muse,
   WeWorkRemotely) are queried politely: `robots.txt` is honoured (`RESPECT_ROBOTS_TXT=true`), a
   minimum interval per host is enforced, responses are cached, and no authentication is bypassed.
+  Workday's public job board availability varies by tenant configuration — the adapter queries
+  only the public endpoints that tenants opt into exposing; no scraping is performed.
 * Automated **application submission** is off by default. The automation consent text states
   plainly that some portals prohibit automated submissions and that accounts may be limited as a
   result. Enabling `AUTOFILL_ENABLED`/`AUTOFILL_ALLOW_SUBMIT` is an operator decision with that
@@ -87,3 +89,11 @@ user, and no third-party analytics. See `docs/SECURITY.md` for the full model.
    are used to fulfil it.
 6. Whether automated application submission is offered at all, and if so with what disclosures.
 7. Incident-response contact and a breach notification procedure (72 hours under GDPR).
+
+---
+
+## See also
+
+- [`docs/PRIVACY_REVIEW.md`](PRIVACY_REVIEW.md) — data-flow map, threat model, source-policy
+  table, retention periods and test coverage for every redaction boundary.
+- [`docs/SECURITY.md`](SECURITY.md) — authentication, encryption, transport and SSRF model.

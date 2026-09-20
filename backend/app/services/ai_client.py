@@ -1331,7 +1331,8 @@ async def chat_completion(
             input_truncated = input_truncated or _system_truncated
             messages.append({"role": "system", "content": safe_system})
         safe_prompt, _prompt_truncated = fit_prompt_part(
-            prompt.replace("SYSTEM:", "").replace("Ignore previous", ""), input_budget_chars_val,
+            _scrub_prompt_secrets(prompt.replace("SYSTEM:", "").replace("Ignore previous", "")),
+            input_budget_chars_val,
             label=f"{workflow}.prompt")
         input_truncated = input_truncated or _prompt_truncated
         messages.append({"role": "user", "content": safe_prompt})
@@ -2050,6 +2051,37 @@ def _key_preview(key: str) -> str:
     if len(key) <= 12:
         return f"{key[:3]}***"
     return f"{key[:6]}…{key[-4:]}"
+
+
+# --------------------------------------------------------------------------- #
+# Prompt secret scrubbing — defence in depth at the AI boundary
+# --------------------------------------------------------------------------- #
+_PROMPT_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{6,}"),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+"),
+    re.compile(r"(?i)\b(api[_\-]?key|apikey|token|secret|password|authorization)\b\s*[:=]\s*\S+"),
+    re.compile(r"(?i)\b(eyJ[A-Za-z0-9_\-]{20,})"),  # JWT-shaped
+)
+
+
+def _scrub_prompt_secrets(text: Optional[str]) -> str:
+    """Mask any known secret shape in a prompt before it reaches an AI provider.
+
+    No current workflow includes credentials in prompts, but this is the
+    defence-in-depth boundary: if a caller accidentally embeds a vault
+    password, API key or bearer token in a prompt, it is masked before the
+    request is sent, and a metric is incremented for visibility.
+    """
+    if not text:
+        return ""
+    result = text
+    for pattern in _PROMPT_SECRET_PATTERNS:
+        new_result = pattern.sub("***", result)
+        if new_result != result:
+            inc("jobhunter_ai_prompt_secrets_scrubbed_total")
+            log.warning("AI prompt contained a secret-shaped value — masked before sending")
+        result = new_result
+    return result
 
 
 def _provider_error(response: Optional[httpx.Response]) -> str:
