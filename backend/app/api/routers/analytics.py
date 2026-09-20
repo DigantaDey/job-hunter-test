@@ -1,10 +1,21 @@
 """
 Application intelligence & performance analytics.
 
-Turns application tracking into useful insights:
-- 42 applications, 7 interviews, 16.7% interview rate
+Turns the tracking timeline into useful insights:
+- 42 applications, 7 interviews, 16.7% application→interview conversion
 - Backend Engineer performs 2.3x better
 - Strongest skill: Python, weakest: Kubernetes
+
+**Where the interview number comes from.** It used to be invented: every applied
+job with ``score >= 75`` was counted as an interview, and the UI rendered the
+result as "Interviews (est)". That is exactly the guess-dressed-as-a-fact the
+contract set exists to prevent, and it made the rate a function of the scorer
+rather than of the user's life. Since the tracking layer
+(:mod:`app.services.application_tracking`) exists, an interview is counted only
+when a timeline row says one happened — recorded by the user or by our own
+submission machinery. With no tracking rows the answer is ``0`` plus
+``interview_data = "none"``, and the SPA says "record outcomes to see a real
+rate" instead of showing a fabricated one.
 """
 
 from __future__ import annotations
@@ -16,9 +27,12 @@ from typing import Any, Dict
 from fastapi import APIRouter
 
 from app.api.deps import CurrentUser, DbSession
-from app.contracts import JOB_STATUSES
+from app.contracts import JOB_STATUSES, TRACKING_INTERVIEW_STATES
 from app.core.entitlements import enforce
-from app.models.models import AICreditLedger, Job
+from app.models.models import AICreditLedger, ApplicationTracking, Job
+from app.services.application_tracking import REPORT_DISCLAIMER
+from app.services.application_tracking import report as tracking_report
+from app.services.role_family import role_family
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -35,53 +49,59 @@ def performance_analytics(user: CurrentUser, db: DbSession):
 
     jobs = db.query(Job).filter(Job.user_id == user.id).all()
     total = len(jobs)
-    applied = [j for j in jobs if j.status == "applied"]
     failed = [j for j in jobs if j.status == "failed"]
     discovered = [j for j in jobs if j.status == "discovered"]
     needs_input = [j for j in jobs if j.status == "needs_input"]
 
-    # Interview tracking — for now, we infer from job events or status
-    # If job has been applied and then manually marked? We'll use a heuristic:
-    # Jobs with score >= 80 that are applied are considered interview candidates
-    # Real interview tracking would be a separate field; for now, calculate from applied + high score
-    interviews = [j for j in applied if j.score >= 75]
-    interview_rate = round(len(interviews) / max(1, len(applied)) * 100, 1) if applied else 0.0
+    # --- interviews: read from the tracking timeline, never inferred -------- #
+    # ``tracked`` is keyed by job id so the per-role loop below stays O(1) per
+    # job instead of re-querying. A job counts as applied when the board says so
+    # *or* the tracking record has an ``applied_at`` — the second case is the
+    # user telling us about an application the board never saw (a portal they
+    # filled in by hand last month).
+    tracked: Dict[int, ApplicationTracking] = {
+        int(row.job_id): row
+        for row in db.query(ApplicationTracking).filter(ApplicationTracking.user_id == user.id).all()
+    }
+    applied = [j for j in jobs
+               if j.status == "applied" or (tracked.get(int(j.id)) and tracked[int(j.id)].applied_at)]
+    interviews = [j for j in applied
+                  if tracked.get(int(j.id)) is not None
+                  and tracked[int(j.id)].state in TRACKING_INTERVIEW_STATES]
+    offers = [j for j in applied
+              if tracked.get(int(j.id)) is not None and tracked[int(j.id)].state == "offer_received"]
+    rejections = [j for j in applied
+                  if tracked.get(int(j.id)) is not None
+                  and tracked[int(j.id)].state == "rejected_by_employer"]
+    # A rate with an empty denominator is ``None``, not ``0.0``: "no applications
+    # yet" and "applications, no interviews" are different facts (contracts/01 §2).
+    interview_rate = round(len(interviews) / len(applied) * 100, 1) if applied else None
+    tracking_coverage = round(len(tracked) / len(applied) * 100, 1) if applied else None
 
-    # Per-role performance
+    # Per-role performance. The family comes from the *shared* normaliser the
+    # tracking report also uses (``app.services.role_family``), so "Backend
+    # Engineer" means the same set of titles on both pages — the inline heuristic
+    # that used to live here was one edit away from disagreeing with itself.
     role_counter: Counter[str] = Counter()
     role_applied: Counter[str] = Counter()
     role_interview: Counter[str] = Counter()
+    interview_ids = {int(job.id) for job in interviews}
+    applied_ids = {int(job.id) for job in applied}
     for job in jobs:
-        # Normalize title to role family
-        title = (job.title or "").lower()
-        if "backend" in title:
-            family = "Backend Engineer"
-        elif "frontend" in title:
-            family = "Frontend Engineer"
-        elif "full" in title and "stack" in title:
-            family = "Full Stack"
-        elif "data" in title:
-            family = "Data Engineer"
-        elif "ml" in title or "machine learning" in title:
-            family = "ML Engineer"
-        elif "devops" in title or "sre" in title:
-            family = "DevOps/SRE"
-        elif "product" in title:
-            family = "Product Manager"
-        else:
-            family = job.title or "Other"
+        family = role_family(job.title)
         role_counter[family] += 1
-        if job.status == "applied":
+        if int(job.id) in applied_ids:
             role_applied[family] += 1
-        if job in interviews:
+        if int(job.id) in interview_ids:
             role_interview[family] += 1
 
-    # Best performing role
+    # Best performing role — only claimed when at least two applications and one
+    # recorded interview back it, because a single lucky reply is not a trend.
     best_role = None
     best_rate: float = 0
     for family in role_counter:
-        rate = role_interview[family] / max(1, role_applied[family]) if role_applied[family] else 0
-        if rate > best_rate and role_applied[family] >= 2:
+        rate = role_interview[family] / role_applied[family] if role_applied[family] else 0
+        if rate > best_rate and role_applied[family] >= 2 and role_interview[family] >= 1:
             best_rate = rate
             best_role = family
 
@@ -135,11 +155,24 @@ def performance_analytics(user: CurrentUser, db: DbSession):
             "applied": len(applied),
             "interviews": len(interviews),
             "interview_rate": interview_rate,
+            "offers": len(offers),
+            "rejections": len(rejections),
             "failed": len(failed),
             "discovered": len(discovered),
             "needs_input": len(needs_input),
             "best_role": best_role,
-            "best_role_rate": round(best_rate * 100, 1) if best_role else 0,
+            "best_role_rate": round(best_rate * 100, 1) if best_role else None,
+            # Provenance of the interview number, so the UI can say what it is
+            # looking at instead of implying the system watched the user's inbox.
+            "interview_data": "application_tracking" if tracked else "none",
+            "tracked_applications": len(tracked),
+            "tracking_coverage": tracking_coverage,
+            "interview_note": (
+                "Interviews are counted from your tracking timeline — nothing is inferred "
+                "from email or from a match score." if tracked else
+                "No application outcomes recorded yet. Add an interview, a rejection or a "
+                "withdrawal on the Tracking page and this becomes a real rate."
+            ),
         },
         "roles": [
             {
@@ -147,7 +180,8 @@ def performance_analytics(user: CurrentUser, db: DbSession):
                 "total": role_counter[role],
                 "applied": role_applied[role],
                 "interviews": role_interview[role],
-                "interview_rate": round(role_interview[role] / max(1, role_applied[role]) * 100, 1) if role_applied[role] else 0,
+                "interview_rate": (round(role_interview[role] / role_applied[role] * 100, 1)
+                                   if role_applied[role] else None),
             }
             # most_common yields (role, count) pairs; the role string is the key.
             for role, _count in role_counter.most_common(10)
@@ -159,6 +193,11 @@ def performance_analytics(user: CurrentUser, db: DbSession):
         "weekly_trend": weekly,
         "ai_usage_daily": dict(ai_daily),
         "is_pro": is_pro,
+        # The grouped conversion read (source / match band / artefact version) is
+        # computed by the tracking layer itself, so the two pages cannot
+        # disagree about what a conversion is.
+        "conversion": tracking_report(db, int(user.id), group_by="source", include_unapplied=True),
+        "disclaimer": REPORT_DISCLAIMER,
     }
 
     if not is_pro:

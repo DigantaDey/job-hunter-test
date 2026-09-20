@@ -31,6 +31,8 @@ from app.models.models import (
     ApplicationPacketEvent,
     ApplicationSession,
     ApplicationSubmission,
+    ApplicationTracking,
+    ApplicationTrackingEvent,
     AuditLog,
     AutomationPolicy,
     AutomationPolicyRevision,
@@ -133,6 +135,11 @@ CHILD_TABLES: dict[str, type] = {
     "automation_policies": AutomationPolicy,
     "automation_policy_revisions": AutomationPolicyRevision,
     "automation_submission_counters": AutomationSubmissionCounter,
+    # Application tracking (v2.2.22, docs/contracts/07 §11): the lifecycle record
+    # and its append-only event timeline. The event rows carry the user's own
+    # words, so an erasure that missed them would leave personal data behind.
+    "application_tracking": ApplicationTracking,
+    "application_tracking_events": ApplicationTrackingEvent,
 }
 
 
@@ -457,12 +464,30 @@ def _seed_every_child_table(db, user: User) -> dict:
         period=datetime.utcnow().strftime("%Y-%m-%d"), record=1, rejected=0,
     ))
     db.commit()
+
+    # Application tracking seed. Written through the service rather than as raw
+    # rows: the sequence counter, the dedupe keys and the ``jobs.status``
+    # projection are the service's invariants, and a hand-built row would seed a
+    # state the product cannot reach (which is exactly what an erasure test must
+    # not do — it has to delete what the app actually writes).
+    from app.services import application_tracking as tracking
+
+    record, _created = tracking.open_tracking(db, user=user, job=job, state="applied",
+                                              origin="system_observed", actor_type="system_worker")
+    tracking.record_interview(db, user=user, record=record,
+                              interview_at=datetime.utcnow() + timedelta(days=3),
+                              format="video", round_name="Hiring manager")
+    tracking.add_note(db, user=user, record=record, note="Prepare the payments case study")
+    tracking.set_follow_up(db, user=user, record=record,
+                           follow_up_at=datetime.utcnow() + timedelta(days=5),
+                           note="Send the thank-you note")
+    db.commit()
     vault = save_vault_entry(db, user.id, domain="jobs.lever.co", username="me@example.com",
                              password="correct-horse-battery", origin="manual")
 
     return {"resume": resume, "derived": derived, "job": job, "profile": profile, "persona": persona,
-            "email": email, "scan": scan, "funding": funding, "vault": vault, "resume_path": resume_path,
-            "rendered_path": rendered_path, "derived_path": derived_path}
+            "email": email, "scan": scan, "funding": funding, "vault": vault, "tracking": record,
+            "resume_path": resume_path, "rendered_path": rendered_path, "derived_path": derived_path}
 
 
 # --------------------------------------------------------------------------- #

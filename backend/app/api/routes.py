@@ -13,6 +13,7 @@ from app.api.deps import search_context  # noqa: F401  (re-exported for callers/
 from app.api.routers import (
     account,
     analytics,
+    application_tracking,
     applications,
     auth,
     automation,
@@ -56,6 +57,7 @@ router.include_router(personas.router)
 router.include_router(automation.router)
 router.include_router(profile_review.router)
 router.include_router(applications.router)
+router.include_router(application_tracking.router)
 router.include_router(packets.router)
 router.include_router(browser_sessions.router)
 

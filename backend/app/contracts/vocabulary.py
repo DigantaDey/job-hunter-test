@@ -33,7 +33,7 @@ from typing import Dict, Tuple
 #: Version of the contract set itself. Surfaced in docs and (proposed) in
 #: ``GET /api/meta`` so a client can detect a server that speaks a newer
 #: vocabulary than it does. Minor = additive, major = a rename/removal.
-CONTRACT_VERSION = "1.3.0"
+CONTRACT_VERSION = "1.4.0"
 
 #: Header a client sends to make a state-changing POST safely retryable.
 #: See ``docs/contracts/01-conventions.md`` §Idempotency.
@@ -402,6 +402,153 @@ APPLICATION_BLOCKED_CODES: Tuple[str, ...] = (
 
 #: ``applications.submission_channel`` — how the application actually went out.
 SUBMISSION_CHANNELS: Tuple[str, ...] = ("automation", "manual_user", "assisted_dry_run")
+
+
+# --------------------------------------------------------------------------- #
+# Application tracking — the lightweight outcome layer (deliverable 6, v1)
+#
+# ``docs/contracts/07-application-state-machine.md`` §11. This is **not** the
+# submission state machine above: it is what happens *after* an application went
+# out — a reply, an interview, a rejection, a withdrawal — recorded so that
+# "how many applications became interviews, from which source, at which match
+# score, with which artefact version?" is a query instead of a guess.
+#
+# Two rules the shipped product broke, and that this vocabulary makes testable:
+#
+# 1. **A status change is an event, never an overwrite.** ``application_tracking``
+#    stores the current state as a *projection*; ``application_tracking_events``
+#    is append-only and is the truth (a correction adds a row, it never edits
+#    one).
+# 2. **An interview is never inferred.** ``TRACKING_TRUSTED_ONLY_STATES`` are
+#    reachable only from a :data:`TRACKING_TRUSTED_ORIGINS` origin — the user
+#    typing "I got an interview", our own submission machinery, or a verified
+#    integration the user connected. A parsed recruiter email may produce a
+#    *provisional suggestion* that somebody replied
+#    (:data:`EMAIL_INFERRED_TRACKING_STATES`) and nothing else.
+# --------------------------------------------------------------------------- #
+#: Board/report grouping for the tracking layer.
+TRACKING_PHASES: Tuple[str, ...] = (
+    "pre_application", "applied", "in_conversation", "interviewing", "closed",
+)
+
+#: ``application_tracking.state`` — one row per ``(user_id, job_id)``.
+APPLICATION_TRACKING_STATES: Tuple[str, ...] = (
+    "not_applied",           # tracked, nothing sent yet
+    "applied",               # the application went out (automation or the user)
+    "recruiter_response",    # a human replied; no interview yet
+    "interview_scheduled",   # an interview is on the calendar
+    "interview_completed",   # the interview happened
+    "offer_received",
+    "rejected_by_employer",
+    "withdrawn",             # the candidate pulled out (incl. declining an offer)
+)
+
+#: State → phase. Complete by construction; ``test_contracts_vocabulary`` fails
+#: if a state is added without a phase.
+TRACKING_STATE_PHASE: Dict[str, str] = {
+    "not_applied": "pre_application",
+    "applied": "applied",
+    "recruiter_response": "in_conversation",
+    "interview_scheduled": "interviewing",
+    "interview_completed": "interviewing",
+    "offer_received": "closed",
+    "rejected_by_employer": "closed",
+    "withdrawn": "closed",
+}
+
+#: No transition out of these. A mistake is fixed with a **correction** event —
+#: which keeps the wrong row and writes a new one — never by "reopening" a
+#: rejection, because the rejection is a fact that happened.
+TRACKING_TERMINAL_STATES: Tuple[str, ...] = ("rejected_by_employer", "withdrawn")
+
+#: A record that reached any of these counts as an interview in the report's
+#: application→interview conversion. ``offer_received`` is included because an
+#: offer implies at least one interview happened, even if the user never logged
+#: the rounds.
+TRACKING_INTERVIEW_STATES: Tuple[str, ...] = (
+    "interview_scheduled", "interview_completed", "offer_received",
+)
+
+#: Projection onto the legacy ``jobs.status`` board column, so the Jobs board,
+#: the dashboard counters and the funnel keep working while the tracking row is
+#: the truth (the same pattern as :data:`JOB_STATUS_PROJECTION`).
+TRACKING_JOB_STATUS_PROJECTION: Dict[str, str] = {
+    "not_applied": "discovered",
+    "applied": "applied",
+    "recruiter_response": "applied",
+    "interview_scheduled": "applied",
+    "interview_completed": "applied",
+    "offer_received": "applied",
+    "rejected_by_employer": "rejected",
+    "withdrawn": "skipped",
+}
+
+#: ``application_tracking_events.origin`` — **who is asserting this happened**.
+#: Rendered next to every timeline row: a system observation and a user's memory
+#: are not the same claim, and the report says which one it is built from.
+TRACKING_ORIGINS: Tuple[str, ...] = (
+    "system_observed",       # our own automation ran it / saw the portal receipt
+    "user_reported",         # the user typed it ("I got an interview")
+    "email_inferred",        # parsed out of an inbound message — provisional
+    "verified_integration",  # a calendar/ATS integration the user connected
+)
+
+#: Origins allowed to move a record into a :data:`TRACKING_TRUSTED_ONLY_STATES`
+#: state. ``email_inferred`` is deliberately absent (see rule 2 above).
+TRACKING_TRUSTED_ORIGINS: Tuple[str, ...] = (
+    "system_observed", "user_reported", "verified_integration",
+)
+
+#: The only state an ``email_inferred`` event may propose — and it is stored
+#: ``is_provisional = true`` until the user confirms or dismisses it.
+EMAIL_INFERRED_TRACKING_STATES: Tuple[str, ...] = ("recruiter_response",)
+
+#: States that require a trusted origin. Reaching one from ``email_inferred`` is
+#: a ``422 origin_not_trusted``, not a silent downgrade.
+TRACKING_TRUSTED_ONLY_STATES: Tuple[str, ...] = (
+    "interview_scheduled", "interview_completed", "offer_received", "rejected_by_employer",
+)
+
+#: ``application_tracking.artifact_kind`` — what was attached to the application.
+#: The snapshot (id + version + sha256) is frozen when tracking opens so a later
+#: regeneration cannot rewrite history.
+TRACKING_ARTIFACT_KINDS: Tuple[str, ...] = ("packet", "resume_document", "resume", "none")
+
+#: ``application_tracking.source`` values that are not a job-board id (the board
+#: keeps the job's own ``source``; these are the ones the user attributes).
+TRACKING_MANUAL_SOURCES: Tuple[str, ...] = (
+    "referral", "company_site", "linkedin", "recruiter_inbound", "job_fair",
+    "newsletter", "other",
+)
+
+#: ``payload.format`` of an ``application.interview_reported`` event.
+INTERVIEW_FORMATS: Tuple[str, ...] = (
+    "phone", "video", "onsite", "take_home", "assessment", "panel", "other",
+)
+
+#: ``payload.channel`` of an ``application.response_received`` event — where the
+#: recruiter's reply arrived. Recorded so "which channel actually answers?" is
+#: answerable; never used to *infer* the reply happened.
+RESPONSE_CHANNELS: Tuple[str, ...] = (
+    "email", "phone", "linkedin", "portal", "sms", "in_person", "other",
+)
+
+#: ``payload.self_assessment`` of an ``application.interview_completed`` event —
+#: the user's own read on how it went. It is feedback about the *process*, not a
+#: prediction, and the report never presents it as one.
+INTERVIEW_SELF_ASSESSMENTS: Tuple[str, ...] = (
+    "went_well", "mixed", "went_poorly", "unknown",
+)
+
+
+def tracking_job_status_for(state: str) -> str:
+    """The legacy board status for a tracking state (``discovered`` if unknown)."""
+    return TRACKING_JOB_STATUS_PROJECTION.get(state, "discovered")
+
+
+def is_terminal_tracking_state(state: str) -> bool:
+    """True when no further transition is allowed out of *state*."""
+    return state in TRACKING_TERMINAL_STATES
 
 
 # --------------------------------------------------------------------------- #
@@ -894,6 +1041,23 @@ EVENT_TYPES: Tuple[str, ...] = (
     "application.cancelled",
     "application.retried",
     "application.dead_lettered",
+    # application tracking — the lightweight outcome layer (contracts/07 §11).
+    # Every one of these is a row in ``application_tracking_events``; the
+    # record's ``state`` is a projection of them, never the other way round.
+    "application.tracking_opened",
+    "application.state_changed",
+    "application.state_corrected",
+    "application.interview_reported",
+    "application.interview_completed",
+    "application.response_received",
+    "application.rejection_received",
+    "application.offer_received",
+    "application.note_added",
+    "application.follow_up_scheduled",
+    "application.follow_up_completed",
+    "application.attribution_updated",
+    "application.snapshot_recorded",
+    "application.suggestion_recorded",
     # browser-assisted sessions (human-in-the-loop)
     "application.session_started",
     "application.session_paused",
@@ -983,6 +1147,10 @@ AUDIT_ACTIONS: Tuple[str, ...] = (
     "job.apply_queued", "job.prepared", "job.submit_approved", "job.apply_failed", "job.apply_retried",
     "application.submitted", "application.submitted_auto", "application.submitted_unverified",
     "application.cancelled", "application.outcome_recorded",
+    # new — application tracking (the outcome layer, contracts/07 §11). A
+    # correction rewrites what the report says happened, so it is audited.
+    "application.tracking_opened", "application.status_updated",
+    "application.interview_recorded", "application.state_corrected",
     "automation.policy_updated", "automation.policy_deleted",
     "automation.auto_submit_enabled", "automation.auto_submit_disabled",
 )
@@ -1015,6 +1183,7 @@ NOTIFICATION_KINDS: Tuple[str, ...] = (
     "resume_ready",
     "application_submitted",
     "application_outcome",
+    "application_follow_up",
     "email_reply",
     "consent_expiring",
     "security",
@@ -1071,6 +1240,11 @@ ERROR_CODES: Tuple[str, ...] = (
     "application_not_found",
     "application_already_submitted",
     "application_not_submittable",
+    "tracking_not_found",
+    "invalid_state_transition",
+    "origin_not_trusted",
+    "correction_reason_required",
+    "duplicate_event",
     "session_expired",
     "action_required",
     "checkpoint_failed",
@@ -1120,6 +1294,19 @@ VOCABULARY: Dict[str, Tuple[str, ...]] = {
     "application_user_action_states": APPLICATION_USER_ACTION_STATES,
     "application_blocked_codes": APPLICATION_BLOCKED_CODES,
     "submission_channels": SUBMISSION_CHANNELS,
+    "application_tracking_states": APPLICATION_TRACKING_STATES,
+    "tracking_phases": TRACKING_PHASES,
+    "tracking_terminal_states": TRACKING_TERMINAL_STATES,
+    "tracking_interview_states": TRACKING_INTERVIEW_STATES,
+    "tracking_origins": TRACKING_ORIGINS,
+    "tracking_trusted_origins": TRACKING_TRUSTED_ORIGINS,
+    "email_inferred_tracking_states": EMAIL_INFERRED_TRACKING_STATES,
+    "tracking_trusted_only_states": TRACKING_TRUSTED_ONLY_STATES,
+    "tracking_artifact_kinds": TRACKING_ARTIFACT_KINDS,
+    "tracking_manual_sources": TRACKING_MANUAL_SOURCES,
+    "interview_formats": INTERVIEW_FORMATS,
+    "response_channels": RESPONSE_CHANNELS,
+    "interview_self_assessments": INTERVIEW_SELF_ASSESSMENTS,
     "application_session_states": APPLICATION_SESSION_STATES,
     "application_session_terminal_states": APPLICATION_SESSION_TERMINAL_STATES,
     "application_session_user_action_states": APPLICATION_SESSION_USER_ACTION_STATES,
@@ -1176,6 +1363,8 @@ MAPPINGS: Dict[str, Dict[str, str]] = {
     "application_state_phase": APPLICATION_STATE_PHASE,
     "job_status_projection": JOB_STATUS_PROJECTION,
     "application_session_phase": APPLICATION_SESSION_PHASE,
+    "tracking_state_phase": TRACKING_STATE_PHASE,
+    "tracking_job_status_projection": TRACKING_JOB_STATUS_PROJECTION,
 }
 
 __all__ = [
@@ -1183,6 +1372,13 @@ __all__ = [
     "ANSWER_REUSE_SCOPES", "APPLICATION_BLOCKED_CODES", "APPLICATION_PHASES",
     "APPLICATION_STATES", "APPLICATION_STATE_PHASE", "APPLICATION_TERMINAL_STATES",
     "APPLICATION_USER_ACTION_STATES", "AUDIT_ACTIONS", "AUTOFILL_VALUE_SOURCES",
+    "APPLICATION_TRACKING_STATES", "TRACKING_PHASES", "TRACKING_STATE_PHASE",
+    "TRACKING_TERMINAL_STATES", "TRACKING_INTERVIEW_STATES",
+    "TRACKING_JOB_STATUS_PROJECTION", "TRACKING_ORIGINS", "TRACKING_TRUSTED_ORIGINS",
+    "EMAIL_INFERRED_TRACKING_STATES", "TRACKING_TRUSTED_ONLY_STATES",
+    "TRACKING_ARTIFACT_KINDS", "TRACKING_MANUAL_SOURCES",
+    "INTERVIEW_FORMATS", "RESPONSE_CHANNELS", "INTERVIEW_SELF_ASSESSMENTS",
+    "tracking_job_status_for", "is_terminal_tracking_state",
     "AUTOMATION_MODES", "AUTOMATION_SCOPES", "AUTOMATION_WORKFLOWS", "CONFIDENCE_BANDS",
     "AUTOMATION_POLICY_REASONS",
     "CONFIDENCE_BAND_THRESHOLDS", "CONTRACT_VERSION", "DISCOVERY_AI_SKIP_REASONS",

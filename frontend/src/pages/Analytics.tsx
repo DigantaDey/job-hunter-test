@@ -1,6 +1,20 @@
 import { useEffect, useState } from 'react'
 import client from '../api/client'
-import { BarChart3, TrendingUp, Target, DollarSign } from 'lucide-react'
+import { BarChart3, TrendingUp, Target, DollarSign, History } from 'lucide-react'
+import { conversionText, groupLabel, rateText, type TrackingTally } from '../lib/tracking'
+
+/**
+ * Interviews on this page are *recorded*, never estimated.
+ *
+ * It used to render "Interviews (est)" over a number the backend invented by
+ * counting applied jobs whose match score was >= 75 — a scorer output dressed as
+ * an outcome, and the interview rate moved when the scorer moved. The tracking
+ * layer (docs/contracts/07 §11) is now the only source: a row exists because the
+ * user pressed "I got an interview", because our own machinery submitted the
+ * application and saw the receipt, or because an integration the user connected
+ * reported it. With no recorded outcomes the number is 0, the rate is `—` when
+ * there is nothing to divide by, and the note says where to fix it.
+ */
 
 export default function Analytics() {
   const [perf, setPerf] = useState<any>(null)
@@ -19,16 +33,40 @@ export default function Analytics() {
     <div className="space-y-6">
       <h1 className="text-xl font-semibold flex items-center gap-2"><BarChart3 className="w-5 h-5"/> Application Intelligence & Performance</h1>
 
-      <div className="grid md:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
         <div className="card p-4"><div className="text-xs text-zinc-500 mono">Total Jobs</div><div className="text-2xl font-bold mono">{perf.summary.total_jobs}</div></div>
         <div className="card p-4"><div className="text-xs text-zinc-500 mono">Applied</div><div className="text-2xl font-bold mono">{perf.summary.applied}</div></div>
-        <div className="card p-4"><div className="text-xs text-zinc-500 mono">Interviews (est)</div><div className="text-2xl font-bold mono">{perf.summary.interviews}</div></div>
-        <div className="card p-4 bg-emerald-50 dark:bg-emerald-950 border-emerald-200 dark:border-emerald-800"><div className="text-xs text-zinc-500 mono">Interview Rate</div><div className="text-2xl font-bold mono text-emerald-700 dark:text-emerald-300">{perf.summary.interview_rate}%</div></div>
+        <div className="card p-4" title={perf.summary.interview_note}>
+          <div className="text-xs text-zinc-500 mono">Interviews recorded</div>
+          <div className="text-2xl font-bold mono" data-testid="interviews">{perf.summary.interviews}</div>
+          <div className="text-[10px] mono text-zinc-400">
+            {perf.summary.interview_data === 'application_tracking' ? 'from your timeline' : 'nothing recorded yet'}
+          </div>
+        </div>
+        <div className="card p-4 bg-emerald-50 dark:bg-emerald-950 border-emerald-200 dark:border-emerald-800"
+             title="Applications that reached an interview, out of applications recorded">
+          <div className="text-xs text-zinc-500 mono">Application → interview</div>
+          <div className="text-2xl font-bold mono text-emerald-700 dark:text-emerald-300" data-testid="interview-rate">
+            {rateText(perf.summary.interview_rate)}
+          </div>
+        </div>
+        <div className="card p-4"><div className="text-xs text-zinc-500 mono">Offers</div><div className="text-2xl font-bold mono">{perf.summary.offers ?? 0}</div></div>
+        <div className="card p-4"><div className="text-xs text-zinc-500 mono">Rejections</div><div className="text-2xl font-bold mono">{perf.summary.rejections ?? 0}</div></div>
+      </div>
+
+      <div className="card p-4 flex flex-wrap items-center gap-3" data-testid="interview-note">
+        <History className="w-4 h-4 text-zinc-400" />
+        <div className="text-xs text-zinc-600 dark:text-zinc-400 flex-1 min-w-[240px]">{perf.summary.interview_note}</div>
+        <a href="/tracking" className="text-xs mono text-blue-600 dark:text-blue-400 underline min-h-[32px] inline-flex items-center">
+          Open the tracking board
+        </a>
       </div>
 
       {perf.summary.best_role && (
         <div className="card p-4 bg-gradient-to-br from-blue-50 to-violet-50 dark:from-blue-950 dark:to-violet-950 border-blue-200 dark:border-blue-800">
-          <div className="text-sm font-medium flex items-center gap-2"><TrendingUp className="w-4 h-4"/> Insight: {perf.summary.best_role} applications perform {perf.summary.best_role_rate>perf.summary.interview_rate ? `${(perf.summary.best_role_rate/perf.summary.interview_rate).toFixed(1)}× better` : 'best'} than other roles</div>
+          {/* The multiplier is only claimed when both rates are real numbers:
+              dividing by a `null` rate would print "Infinity× better". */}
+          <div className="text-sm font-medium flex items-center gap-2"><TrendingUp className="w-4 h-4"/> Insight: {perf.summary.best_role} applications perform {typeof perf.summary.best_role_rate === 'number' && typeof perf.summary.interview_rate === 'number' && perf.summary.interview_rate > 0 && perf.summary.best_role_rate > perf.summary.interview_rate ? `${(perf.summary.best_role_rate/perf.summary.interview_rate).toFixed(1)}× better` : 'best'} than other roles</div>
           <div className="text-xs text-zinc-600 dark:text-zinc-400 mt-1">Strongest matching skill: {perf.skills.strongest?.[0]?.skill || 'N/A'} • Weakest recurring: {perf.skills.weakest?.[0]?.skill || 'N/A'}</div>
         </div>
       )}
@@ -38,9 +76,9 @@ export default function Analytics() {
           <h3 className="font-medium">Per-role performance</h3>
           <div className="mt-3 space-y-2">
             {perf.roles.map((r:any)=>(
-              <div key={r.role} className="flex items-center justify-between p-2 rounded-xl bg-zinc-50 dark:bg-zinc-800">
+              <div key={r.role} data-testid={`role-${r.role.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`} className="flex items-center justify-between p-2 rounded-xl bg-zinc-50 dark:bg-zinc-800">
                 <div><div className="text-sm font-medium">{r.role}</div><div className="text-xs mono text-zinc-500">{r.total} total • {r.applied} applied • {r.interviews} interviews</div></div>
-                <div className="text-sm mono font-bold">{r.interview_rate}%</div>
+                <div className="text-sm mono font-bold" title={r.applied ? 'Interviews recorded for this role family ÷ applications' : 'No applications recorded for this role family'}>{rateText(r.interview_rate)}</div>
               </div>
             ))}
           </div>
@@ -87,7 +125,8 @@ export default function Analytics() {
               <div className="flex justify-between"><span>Total tokens</span><span>{costs.total_tokens}</span></div>
               <div className="flex justify-between"><span>Avg cost / app</span><span>${costs.average_cost_per_application}</span></div>
               <div className="mt-3 space-y-1">
-                {Object.entries(costs.by_workflow).map(([k,v]: any)=>(
+                {/* A partial cost payload must not blank the whole page. */}
+                {Object.entries(costs.by_workflow || {}).map(([k,v]: any)=>(
                   <div key={k} className="flex justify-between p-1.5 rounded bg-zinc-50 dark:bg-zinc-800"><span>{k}</span><span>{v.count} ops • {v.tokens} tokens • ${v.cost_usd}</span></div>
                 ))}
               </div>
@@ -96,11 +135,48 @@ export default function Analytics() {
         </div>
       </div>
 
+      {perf.conversion && (
+        <div className="card p-5">
+          <h3 className="font-medium flex items-center gap-2"><History className="w-4 h-4"/> Application → interview, by source</h3>
+          <div className="text-xs text-zinc-600 dark:text-zinc-400 mt-1" data-testid="conversion-summary">
+            {conversionText(perf.conversion.totals as TrackingTally)}
+          </div>
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full text-xs mono">
+              <thead className="text-zinc-500 text-left">
+                <tr>
+                  <th className="py-1 pr-3 font-medium">Source</th>
+                  <th className="py-1 pr-3 font-medium">Applied</th>
+                  <th className="py-1 pr-3 font-medium">Interviews</th>
+                  <th className="py-1 pr-3 font-medium">Conversion</th>
+                  <th className="py-1 pr-3 font-medium">Recorded by</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(perf.conversion.groups || []).map((g: any) => (
+                  <tr key={g.key} data-testid={`conversion-row-${g.key}`} className="border-t dark:border-zinc-800">
+                    <td className="py-1.5 pr-3">{groupLabel(g.key, 'source')}</td>
+                    <td className="py-1.5 pr-3">{g.applied}</td>
+                    <td className="py-1.5 pr-3">{g.interviews}</td>
+                    <td className="py-1.5 pr-3">{rateText(g.application_to_interview_rate)}</td>
+                    <td className="py-1.5 pr-3 text-zinc-500">
+                      {Object.entries(g.by_origin || {}).map(([origin, count]) => `${origin}: ${count}`).join(' • ') || '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="text-[11px] mono text-zinc-500 mt-2">{perf.disclaimer}</div>
+        </div>
+      )}
+
       {funnel && (
         <div className="card p-5">
           <h3 className="font-medium">Funnel</h3>
           <div className="mt-3 flex gap-2 flex-wrap">
-            {Object.entries(funnel.funnel).map(([stage,count]: any)=>(
+            {/* Same rule as the cost block: a partial payload cannot blank the page. */}
+            {Object.entries(funnel.funnel || {}).map(([stage,count]: any)=>(
               <div key={stage} className="px-3 py-2 rounded-full bg-zinc-100 dark:bg-zinc-800 text-xs mono">{stage}: {count as number}</div>
             ))}
             <div className="px-3 py-2 rounded-full bg-blue-600 text-white text-xs mono">Conversion: {funnel.conversion_rate}%</div>

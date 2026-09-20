@@ -8,6 +8,95 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ### Added
 
+- **Application tracking — the lifecycle and outcome-feedback layer (v1,
+  lightweight, not a CRM).** `jobs.status` is a queue column: it overwrites, it
+  has no actor, and it forced analytics to guess. Two new tables (migration revision
+  `k2l3m4n5o6p7`, after `j1k2l3m4n5o6`; idempotent and portable across
+  PostgreSQL and SQLite) put an honest record next to it —
+  `application_tracking` (one row per `(user_id, job_id)`: current state, phase,
+  first-occurrence timestamps, frozen snapshots, follow-up, attribution) and
+  `application_tracking_events` (append-only, gapless `sequence` per record).
+  Nothing is overwritten in place: the state is a projection of the last event and
+  the timeline is the record of truth. Eight states (`not_applied`, `applied`,
+  `recruiter_response`, `interview_scheduled`, `interview_completed`,
+  `offer_received`, `rejected_by_employer`, `withdrawn`), five phases, four
+  origins and the supporting enumerations live in `app/contracts/vocabulary.py`
+  (v1.4.0) and are mirrored in `frontend/src/lib/contracts.ts` under a parity
+  test. **Status changes:** every write validates the transition table
+  (`409 invalid_state_transition` with the allowed list) and returns
+  `{ok, duplicate, state_changed, event, events, document, state, phase,
+  server_time}`, so the client updates in place; the document also carries a
+  server-owned `actions[]`, which is what the UI renders — a move that is not
+  legal right now is a disabled button with a reason, never a broken one.
+  **"I got an interview"** is one click (`POST …/{id}/interview`: slot, format,
+  round, optional follow-up) writing `application.interview_reported`.
+  **Manual corrections are new events:** `POST …/{id}/correction` appends
+  `application.state_corrected` with `corrected_event_id` and a reason of at
+  least three characters (`422 correction_reason_required`); the original row is
+  never edited or deleted, and a correction cannot reopen a terminal state.
+  **System-observed vs user-reported stays visible:** every event and the state
+  it produced carry `state_origin` (`system_observed`, `user_reported`,
+  `verified_integration`, `email_inferred`), and
+  `TRACKING_TRUSTED_ONLY_STATES` (`interview_scheduled`, `interview_completed`,
+  `offer_received`, `rejected_by_employer`) refuse `email_inferred` with
+  `422 origin_not_trusted`. **No email inference ships in this release** — an
+  interview is counted when somebody recorded one, never because a subject line
+  looked promising; the one thing an inbox heuristic may do is *propose*, via
+  `record_email_suggestion`, which stores a provisional
+  `application.suggestion_recorded` row, leaves the state alone and asks the
+  person to confirm (becoming `user_reported`) or dismiss. **Duplicate events are
+  impossible:** each event has a nullable `dedupe_key` naming the fact
+  (`trk:{id}:{event_type}:{state}:{minute}`) under a unique constraint, writes
+  accept an `idempotency_key` (kept per record, bounded at 64), and the dedupe hit
+  is checked *before* transition validation — so a retry, a double click or a
+  restarted worker gets `200 duplicate: true` with an unchanged timeline, not a
+  `409` and not a second row. **Follow-up notifications:** a follow-up date
+  (`after_application`, `after_interview`, `after_rejection`, `user_defined`) is
+  swept by `notify_due_follow_ups` from the worker's maintenance loop *and* from
+  `GET /api/application-tracking/follow-ups`, producing one
+  `application_follow_up` notification per record per due date
+  (`follow_up_notified_at` is the dedupe marker) that links to
+  `/tracking?tracking_id={id}` and names the last recorded status *with its
+  origin*. **Snapshots** freeze what the decision was made with — match score,
+  band, explanation and `match_id`, plus artifact kind, id, version, label and
+  `sha256` — as plain integers, not foreign keys, so a re-score or a deleted
+  packet cannot break the timeline; a refresh is explicit
+  (`POST …/{id}/snapshot`, no body) and appends `application.snapshot_recorded`
+  with the old and new values. **Reporting** groups application→interview
+  conversion by source, role, match band, score bucket, artifact version,
+  artifact kind, channel and state
+  (`GET /api/application-tracking/report?group_by=…`), with the denominator
+  `applied_at IS NOT NULL`, `null` rates (rendered `—`, never `0%`) on empty
+  groups, a `by_origin` breakdown on every group so self-reported interviews are
+  distinguishable, a `coalesce(applied_at, created_at)` window, and the report's
+  own disclaimer that a match score is an estimated fit and not an interview
+  probability. New service `app/services/application_tracking.py` and router
+  `backend/app/api/routers/application_tracking.py` mounted at
+  `/api/application-tracking` (list, record, per-job lookup with `exists: false`
+  instead of `404`, events, follow-ups, report, `meta` vocabulary, and the
+  writes); `apply_flow` now calls `observe_submission` so a submission the queue
+  landed is `system_observed` without a second writer. The board projection is
+  preserved and tightened: it never downgrades a status the queue owns
+  (`queued`, `preparing`, `needs_input`), and landing on `applied` now carries
+  `applied_at` too, because a board row that says "applied" with no date is
+  invisible to every date filter. Frontend: the `/tracking` page (board with
+  server-supplied column counts, record detail with the full timeline, the
+  follow-up agenda, the conversion report — deep-linkable via
+  `?tab=`/`?tracking_id=`), a tracking panel in the Jobs drawer, and
+  `frontend/src/lib/tracking.ts`, `components/TrackingTimeline.tsx`,
+  `components/TrackingActions.tsx`, `components/TrackingPanel.tsx`. Docs:
+  `docs/APPLICATION_TRACKING.md`, `docs/contracts/07` §11 (state machine,
+  origins, transitions, snapshots, follow-ups, reporting, invariants),
+  `docs/contracts/09` §1, `docs/contracts/12` §2/§3, `docs/contracts/13` §8
+  (wire shapes) and the `docs/contracts/15` ownership registry. Tests: 64 in
+  `backend/tests/test_application_tracking.py` (legal and illegal transitions,
+  corrections, duplicate/replayed events, origin trust, snapshot immutability and
+  refresh, follow-up notification and completion, the projection rules, report
+  grouping and denominators, per-tenant `404`s), both tables added to
+  `test_deletion_integrity.py`, and four frontend spec files
+  (`lib/__tests__/tracking.test.ts`, `components/__tests__/TrackingPanel.test.tsx`,
+  `pages/__tests__/Tracking.test.tsx`, `pages/__tests__/Analytics.test.tsx`) with
+  every tracking call gated by `test_frontend_api_contract.py`.
 - **Browser-assisted application sessions — human-in-the-loop, no solving, no
   interception.** A new `application_sessions` table (migration
   `i9j0k1l2m3n4`, alongside `application_actions` and `application_submissions`)
@@ -109,6 +198,21 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 - Explicit per-request robots enforcement now overrides a disabled global
   default, so supplementary job-page validation cannot silently skip robots.
+- `GET /api/analytics/performance` no longer invents its interview numbers. It
+  used to count "applied **and** `score >= 75`" and the Analytics page labelled
+  the result "(est)" — a fabricated metric that rewarded high-scoring jobs and
+  ignored every real conversation. Interviews, responses, offers and the
+  application→interview rate now come from the tracking timeline and the payload
+  says so (`interview_data: "application_tracking"`), so the estimated label is
+  gone from the UI.
+- The Analytics page no longer crashes on a partial payload: every
+  `Object.entries(serverMap)` over `costs.by_workflow` and `funnel.funnel` reads
+  a default, so an account with no cost or funnel data renders the empty state
+  instead of a blank screen.
+- `frontend/src/pages/Tracking.tsx` writes the URL once per user action. Opening a
+  record from the follow-up agenda used to call `setSearchParams` twice from the
+  same stale params (last write won), so the board never rendered the selected
+  record; `openRecord(id, tab)` now merges both keys into one write.
 
 ## [2.2.21] — 2026-09-18
 

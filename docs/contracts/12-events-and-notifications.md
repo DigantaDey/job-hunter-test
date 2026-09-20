@@ -70,6 +70,7 @@ their payload owners:
 | `discovery.*` | `discovery` handler | [05](05-normalized-job.md) | `run_completed` carries the run report's summary blocks only, not the job rows |
 | `match.*` | scoring | [06](06-match-result.md) | `high_score` is what the notification layer consumes |
 | `application.*` | `application_service` | [09](09-application-events.md) | the richest namespace |
+| `application.*` (tracking) ✓ shipped | `app/services/application_tracking.py` | [07 §11](07-application-state-machine.md) | `tracking_opened`, `state_changed`, `state_corrected`, `interview_reported`, `interview_completed`, `response_received`, `rejection_received`, `offer_received`, `withdrawn`, `note_added`, `follow_up_scheduled`, `follow_up_completed`, `attribution_updated`, `snapshot_recorded`, `suggestion_recorded` |
 | `automation.*` | `auto_scheduler`, policy service | [10](10-automation-policy.md) | `run_skipped` carries the shipped `skipped_*` reason |
 | `job.*` | `job_queue` | [11](11-background-jobs.md) | queue mechanics: `enqueued`, `claimed`, `paused`, `resumed`, `progressed`, `checkpointed`, `completed`, `failed`, `reclaimed`, `dead_lettered`, `cancelled` |
 | `notification.*` | notification service | §3 | `created`, `read`, `dismissed` |
@@ -116,6 +117,7 @@ Indexes: `ix_notifications_user_read (user_id, read, created_at)` ✓,
 | `resume_ready` | `success` | `resume.generated`, `extraction.succeeded` | `/resumes` | — | no |
 | `application_submitted` | `success` | `application.submitted` | `/applications/{id}` | — | no |
 | `application_outcome` | `info` | `application.outcome_recorded` (inferred) | `/applications/{id}` | `new_replies` | no |
+| `application_follow_up` ✓ shipped | `info` | the tracking follow-up sweep ([07 §11.4](07-application-state-machine.md)) | `/tracking?tracking_id={id}` | — | no |
 | `automation_failed` | `error` | `job.dead_lettered`, `job.failed` with the budget gone | `/queues` | `automation_failures` ✓ shipped | no |
 | `quota_exhausted` | `warning` | `automation.quota_exhausted` | `/billing` | — | deduped per period (shipped) |
 | `consent_expiring` | `warning` | `disclosure.version_changed` | `/account?tab=consents` | — | no |
@@ -138,6 +140,14 @@ Rules:
 5. `body` for `high_match` keeps the shipped honesty rule: a run whose surfaced
    rows are not all `score_source = ai` appends "Scored by keyword overlap — open
    a job for the AI verdict."
+6. `application_follow_up` is written once per (record, due date): the sweep
+   stamps `application_tracking.follow_up_notified_at` and treats it as the dedupe
+   marker, so a restart, a second worker or a repeated sweep notifies once. The
+   body names the last *recorded* status together with its origin ("Last recorded
+   status: Interview completed (user reported)"), because a reminder must not
+   imply the product knows something nobody told it. `meta` carries
+   `tracking_id`, `job_id`, `state`, `due_at`, `reason: "follow_up_due"` and
+   `overdue_days`.
 
 ---
 

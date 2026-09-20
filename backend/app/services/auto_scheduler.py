@@ -47,6 +47,7 @@ from app.core.metrics import inc
 from app.db import SessionLocal
 from app.models.models import Job, Notification, PipelineJob, ScheduledRun, SettingsModel, User
 from app.services.ai_client import STATE_ONLINE, ai_availability
+from app.services.application_tracking import notify_due_follow_ups
 from app.services.job_queue import enqueue
 from app.services.user_settings import coerce_bool, get_setting
 
@@ -414,6 +415,13 @@ class AutoScheduler:
         # sweep from writing the subscriptions table on every iteration while
         # still making a long-lived trial expire without an API request.
         self._last_subscription_expiry: Optional[datetime] = None
+        #: Application-tracking follow-up reminders are a promise the *user*
+        #: asked for, not an automation workflow, so this pass is independent of
+        #: ``auto_mode`` (like subscription expiry) and throttled on its own
+        #: clock: a five-minute sweep must not write the notifications table on
+        #: every iteration, and a reminder must not be late by more than the
+        #: throttle either.
+        self._last_follow_up_sweep: Optional[datetime] = None
 
     @property
     def enabled(self) -> bool:
@@ -446,7 +454,7 @@ class AutoScheduler:
     async def sweep(self, *, now: Optional[datetime] = None) -> Dict[str, int]:
         """Sweep every auto-mode user once. Returns per-outcome counters."""
         moment = now or datetime.utcnow()
-        counts = {"users": 0, "enqueued": 0, "skipped": 0, "errors": 0}
+        counts = {"users": 0, "enqueued": 0, "skipped": 0, "errors": 0, "follow_ups": 0}
         db = SessionLocal()
         try:
             # This pass is deliberately independent of ``auto_mode``.  A user
@@ -465,6 +473,26 @@ class AutoScheduler:
                 except Exception as exc:  # pragma: no cover - DB hiccup
                     db.rollback()
                     log.warning("subscription expiry pass failed: %s: %s", type(exc).__name__, exc)
+
+            # Follow-up reminders the user asked for. Deliberately *not* gated on
+            # auto mode or on a plan: somebody who never enables scheduled
+            # workflows still expects "remind me to follow up on Friday" to fire,
+            # and the write is one bounded, deduped pass over due rows.
+            throttle = timedelta(minutes=max(1, int(settings.tracking_follow_up_sweep_minutes)))
+            if self._last_follow_up_sweep is None or moment - self._last_follow_up_sweep >= throttle:
+                try:
+                    swept = notify_due_follow_ups(
+                        db, now=moment, limit=int(settings.tracking_follow_up_sweep_limit)
+                    )
+                    self._last_follow_up_sweep = moment
+                    counts["follow_ups"] = int(swept.get("notified", 0))
+                    if swept.get("notified"):
+                        log.info("follow-up sweep wrote %s reminder(s) of %s due",
+                                 swept.get("notified"), swept.get("due"))
+                except Exception as exc:  # noqa: BLE001 - a reminder must never end the sweep
+                    db.rollback()
+                    inc("jobhunter_auto_sweep_errors_total", stage="follow_ups")
+                    log.warning("follow-up sweep failed: %s: %s", type(exc).__name__, exc)
 
             candidates = users_with_auto_mode(db)
         finally:
@@ -496,7 +524,9 @@ class AutoScheduler:
     async def sweep_user(self, db: Session, user_id: int, now: datetime,
                          counts: Optional[Dict[str, int]] = None) -> Dict[str, int]:
         """One user's pass: fold the history in, then walk their plan's cadence."""
-        tally = counts if counts is not None else {"users": 0, "enqueued": 0, "skipped": 0, "errors": 0}
+        tally = counts if counts is not None else {
+            "users": 0, "enqueued": 0, "skipped": 0, "errors": 0, "follow_ups": 0,
+        }
         user = db.query(User).filter(User.id == user_id).first()
         if user is None or not user.is_active:
             return tally  # deleted or deactivated account: nothing to schedule, nothing to report

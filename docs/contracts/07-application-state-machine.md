@@ -377,3 +377,181 @@ Transition rules that matter:
 7. `application_sessions.user_id` scopes every read and write: another tenant's
    session is `404`, never a merge, and the on-disk profile reference is resolved
    under the artifact root (a value that tries to escape it is refused).
+
+## 11. The application tracking state machine (v2.2.22)
+
+`jobs.status` is a queue column: it says what the *product* is doing about a job
+right now. It cannot say what happened to the application. Tracking is a separate,
+lightweight lifecycle layer — two tables, one vocabulary, no CRM:
+
+| Table | Cardinality | Holds |
+|---|---|---|
+| `application_tracking` | one row per `(user_id, job_id)` | the current state, its phase, the first-occurrence timestamps, and the snapshots frozen when the record opened |
+| `application_tracking_events` | append-only | every fact that ever happened: state changes, notes, follow-ups, corrections, snapshot refreshes |
+
+Nothing is overwritten in place. The current state is a *projection* of the last
+event; the timeline is the record of truth.
+
+```
+not_applied ──applied──▶ applied ──┬──▶ recruiter_response ─┐
+     │                             │                        │
+     └──────────────┐              └──▶ interview_scheduled ┤
+                    │                        ▲   │  (self-loop = reschedule)
+                    │                        │   ▼
+                    │               interview_completed ───┤
+                    │                        ▲   │  (self-loop = another round)
+                    │                        └───┘         ▼
+                    │                                offer_received
+                    ▼                                      │
+                withdrawn ◀────────────────────────────────┘
+                    ▲
+     rejected_by_employer   (terminal)
+```
+
+| State | Phase | `jobs.status` projection | Meaning | Terminal |
+|---|---|---|---|---|
+| `not_applied` | pre_application | `discovered` | a record exists before anything went out (a suggestion, a note) | |
+| `applied` | applied | `applied` | the application is out — by the queue or by the person | |
+| `recruiter_response` | in_conversation | `applied` | the employer answered; no interview yet | |
+| `interview_scheduled` | interviewing | `applied` | a slot exists (a reschedule is a new event, not an edit) | |
+| `interview_completed` | interviewing | `applied` | the interview happened; the self-assessment is the person's, not the product's | |
+| `offer_received` | closed | `applied` | an offer is on the table | |
+| `rejected_by_employer` | closed | `rejected` | the employer said no | yes |
+| `withdrawn` | closed | `skipped` | the person stopped | yes |
+
+### 11.1 Origin — who is claiming this
+
+Every event, and the state it produced, carries an `state_origin`. The column is
+the honesty mechanism: a fact the product saw is not the same fact as one the
+person typed, and a guess read out of an inbox is neither.
+
+| Origin | Means | May reach |
+|---|---|---|
+| `system_observed` | the queue ran and saw it (a submission landed, a board status moved) | any state except the four trusted-only ones |
+| `user_reported` | the person said so, in the product | any state |
+| `verified_integration` | a separate, working integration — a calendar connection, a portal API | any state |
+| `email_inferred` | a heuristic read of an inbox | `recruiter_response` **only** |
+
+`TRACKING_TRUSTED_ONLY_STATES` = `interview_scheduled`, `interview_completed`,
+`offer_received`, `rejected_by_employer`. Reaching one of them with
+`email_inferred` origin is refused with `422 origin_not_trusted`. **There is no
+email-parsing path in this release** — the value exists so the refusal is
+enforced by the vocabulary rather than by the absence of a caller, and so a future
+integration has a truthful origin to write with instead of borrowing
+`system_observed`. An interview is counted when somebody recorded one, never when
+a subject line looked promising.
+
+What an inbox heuristic *may* do is propose. `record_email_suggestion` stores an
+`application.suggestion_recorded` event with `is_provisional = true`, keeps the
+record's state where it was, and surfaces a confirm/dismiss pair in the UI
+(`actions[]` keys `confirm_suggestion` / `dismiss_suggestion`). Confirming runs
+the normal transition with `user_reported` origin — the fact becomes true because
+a person said so, and the provisional evidence stays in the timeline as the
+reason they were asked.
+
+### 11.2 Transition rules that matter
+
+1. The table above is the only source of legal moves
+   (`TRACKING_TRANSITIONS`). Anything else is `409 invalid_state_transition`
+   with the allowed list in the body — the UI renders the answer from the same
+   list, so a button that cannot work is disabled rather than broken.
+2. Self-loops are legal for `recruiter_response`, `interview_scheduled` and
+   `interview_completed`: a second recruiter email, a reschedule and another
+   interview round are all new facts, and each one appends.
+3. `offer_received → withdrawn` is the only move out of an offer. Accepting an
+   offer is out of scope for v1 (there is nothing to track after it), and
+   declining is the person withdrawing.
+4. Terminal states accept **no** transition — not even back to `applied`. Getting
+   one wrong is a *correction*, which is rule 5.
+5. A correction writes a new `application.state_corrected` event with
+   `is_correction = true`, `corrected_event_id` pointing at the event being
+   amended, and a reason of at least three characters (`422
+   correction_reason_required`). The old event is never deleted or edited: the
+   timeline shows what was believed and when it changed. A correction cannot
+   reopen a terminal state — it records the truth about what already happened.
+6. Replays are idempotent by fact, not by request. Each event carries a nullable
+   `dedupe_key` naming the fact (`trk:{id}:{event_type}:{state}:{minute}`), and
+   every write accepts an `idempotency_key` (kept per record, bounded at 64). A
+   duplicate returns `200` with `duplicate: true` and an unchanged timeline —
+   never `409`, and never a second row.
+7. The dedupe hit is checked **before** transition validation, and the
+   origin-trust check **before** it too. A retry of a terminal state therefore
+   answers "already recorded", not "illegal move".
+8. The projection into `jobs.status` never downgrades a status the queue owns
+   (`queued`, `preparing`, `needs_input`): a tracker moving back to `not_applied`
+   must not erase an automation mid-run. When the projection lands on `applied`
+   it also carries `applied_at` if the job row has none — a board row that says
+   "applied" with no date is invisible to every date filter.
+9. Timestamps are first-occurrence columns: `applied_at`,
+   `first_response_at`, `interview_scheduled_at`, `interview_completed_at`,
+   `outcome_at` are written once and never rewritten by a later transition, so
+   "days from applied to first interview" stays a real measurement even after a
+   correction. `interview_at` is the exception — it is the *next* slot, so a
+   reschedule moves it.
+10. `application_tracking.user_id` scopes every read and write. Another tenant's
+    record is `404`, never a merge. Both tables are in the deletion-integrity
+    child list, so erasing an account erases its history too.
+
+### 11.3 Snapshots — what the decision was made with
+
+A record freezes what was true when it opened: `match_id`, `match_score`,
+`match_band`, `match_explanation`, `artifact_kind`, `artifact_id`,
+`artifact_version`, `artifact_label`. Both ids are plain integers, **not**
+foreign keys: a match result or a packet can be deleted or re-scored later
+without breaking the timeline, and the snapshot keeps answering "which version of
+my resume got this interview?".
+
+A snapshot can be refreshed explicitly (`POST …/{id}/snapshot`, no body), which
+appends an `application.snapshot_recorded` event carrying the old and new
+values. It is never refreshed implicitly — silently moving a score under a
+historical record would make the report unanswerable.
+
+### 11.4 Follow-ups and notifications
+
+A follow-up is a date the person owes themselves: `follow_up_at`, an optional
+note, and `follow_up_reason` (`after_application`, `after_interview`,
+`after_rejection`, `user_defined`). The scheduler sweep turns due, un-notified
+follow-ups into notifications of kind `application_follow_up` (see
+`docs/contracts/12` §7), one per record per due date, and stamps `notified_at`.
+Reading `GET /api/application-tracking/follow-ups` runs the same sweep, so the
+agenda is never stale by more than the request that opened it. Marking a
+follow-up done writes `follow_up_completed_at` and appends an event.
+
+### 11.5 Reporting
+
+`GET /api/application-tracking/report?group_by=…` groups by `source`, `role`,
+`match_band`, `score_bucket`, `artifact_version`, `artifact_kind`, `channel` and
+`state`. Rules:
+
+- The denominator is `applied_at IS NOT NULL` — a record that never went out is
+  not a failed application.
+- `interviews` counts records that reached `interview_scheduled`,
+  `interview_completed` or `offer_received`. `conversion_rate` is
+  interviews ÷ applied, and is `null` (rendered `—`, never `0%`) when the group
+  is empty.
+- Every group carries `by_origin` — `{system_observed: n, user_reported: n,
+  verified_integration: n}` — so a source that only ever produces
+  user-reported interviews is visible as such.
+- The window is `coalesce(applied_at, created_at)` between `from`/`to`, so a
+  record opened today about an application sent last month still lands in the
+  month it was sent.
+- `GET /api/analytics/performance` reads the same timeline. The interview count
+  there used to be a guess (`applied AND score >= 75`); it now reports
+  `interview_data: "application_tracking"` and the frontend dropped the
+  "(estimated)" label, because the number is recorded rather than modelled.
+
+The report ships its own disclaimer: a match score is an estimated fit, not an
+interview probability, and nothing in these numbers was inferred from email.
+
+### 11.6 Invariants (tests)
+
+`backend/tests/test_application_tracking.py` covers: every legal transition;
+every illegal one (`409` + allowed list); corrections (event appended, reason
+required, terminal states never reopened); duplicate events (idempotent replay,
+`dedupe_key`, `idempotency_key`); origin trust (`email_inferred` refused for the
+four states, allowed for `recruiter_response`); system-observed vs user-reported
+bookkeeping; snapshot immutability and explicit refresh; follow-up creation,
+sweep notification and completion; the projection rules including the
+queue-owned-status guard; report grouping across all eight dimensions with
+correct denominators and `null` rates; per-tenant isolation; and deletion
+integrity for both tables.

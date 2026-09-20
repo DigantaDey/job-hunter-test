@@ -87,6 +87,7 @@ column/endpoint exists today and the contract only *pins* it.
 | Match result | `match_results` | `GET /api/jobs/{id}/matches` | Proposed (`score_*` columns shipped on `jobs`) |
 | Application | `applications`, `application_field_answers`, `application_attempts` | `POST /api/jobs/{id}/apply` (shipped) | Proposed |
 | Application events | `job_events` (shipped), `application_events` | `GET /api/jobs/{id}/events` (shipped) | Proposed |
+| Application tracking | `application_tracking`, `application_tracking_events` | `GET/POST /api/application-tracking*` | **Shipped** ([07 §11](07-application-state-machine.md), [13 §8](13-api-response-shapes.md), [docs/APPLICATION_TRACKING.md](../APPLICATION_TRACKING.md)) |
 | Automation policy | `settings` rows (shipped), `automation_policies` | `GET/PUT /api/settings` (shipped) | Proposed |
 | Background jobs | `pipeline_jobs` (shipped) + `checkpoint`, `progress`, `idempotency_key` | `GET /api/queues/ai` (shipped) | Partially shipped |
 | Events/notifications | `notifications` (shipped), `domain_events` | `GET /api/notifications` (shipped) | Partially shipped |

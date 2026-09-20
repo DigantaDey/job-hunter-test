@@ -629,3 +629,183 @@ the `application_input` subset of this read.
 7. **Write endpoints return the document they changed**, plus the events they
    emitted, so the client can update without a re-read — and a re-read must
    produce the same document (read-after-write consistency within a tenant).
+
+---
+
+## 8. Application tracking *(shipped, v2.2.22)*
+
+State machine, origins and rules: [07 §11](07-application-state-machine.md).
+Every endpoint is under `/api/application-tracking` and scoped to the caller;
+another tenant's record is `404`.
+
+### `GET /api/application-tracking/{tracking_id}?timeline_limit=50`
+
+The document. Self-contained by rule 1 of §7: labels, transitions and actions
+arrive with it, so the page renders and acts without a second call.
+
+```jsonc
+{
+  "tracking_id": 1, "job_id": 1,
+  "job": { "id": 1, "title": "Senior Backend Engineer", "company": "FinCo",
+           "url": "https://jobs.lever.co/finco/1", "status": "applied", "source": "lever" },
+  "state": "interview_completed", "state_label": "Interview completed",
+  "phase": "interviewing",      "phase_label": "Interviewing",
+  "job_status": "applied",                    // the board projection, 07 §11
+  "state_origin": "user_reported",            // who claims the current state
+  "is_provisional": false, "provisional_evidence": null,
+  "attribution": { "source": "lever", "channel": "manual_user", "role_family": "Backend Engineer" },
+  "snapshots": {
+    "match":    { "score": 88.0, "band": "strong", "score_source": "ai",
+                  "scorer_version": null, "match_id": null },
+    "artifact": { "kind": "none", "id": null, "version": null, "label": null, "sha256": null }
+  },
+  "timestamps": { "applied_at": "…", "first_response_at": null, "interview_scheduled_at": "…",
+                  "interview_at": "…", "interview_completed_at": "…", "outcome_at": "…",
+                  "created_at": "…", "updated_at": "…" },
+  "durations_days": { "applied_to_first_response": null, "applied_to_interview": 0,
+                      "applied_to_outcome": 0 },
+  "follow_up": { "due_at": "…", "note": "Send the thank-you note", "notified_at": "…",
+                 "completed_at": null, "overdue": true, "pending": true },
+  "counts": { "events": 4, "corrections": 1, "last_sequence": 4 },
+  "note": "They offered",
+  "transitions": { "allowed": ["interview_scheduled", "…"], "allowed_labels": ["Interview scheduled", "…"],
+                   "terminal": false },
+  "timeline": [ /* oldest first — see below */ ],
+  "actions": [
+    { "key": "interview", "label": "I got an interview", "method": "POST",
+      "route": "/api/application-tracking/1/interview",
+      "primary": true, "disabled": false, "disabled_reason": null }
+  ],
+  "server_time": "2026-09-19T23:10:03Z",
+  "exists": true
+}
+```
+
+One timeline row:
+
+```jsonc
+{
+  "id": 2, "event_id": "2b7a6737-…", "sequence": 2,
+  "event_type": "application.interview_reported",
+  "state_from": "applied", "state_from_label": "Applied",
+  "state_to": "interview_scheduled", "state_to_label": "Interview scheduled",
+  "phase": "interviewing",
+  "origin": "user_reported",            // the honesty column
+  "actor_type": "user", "actor_label": "smoke@example.com", "trigger": "user",
+  "severity": "success",
+  "message": "Interview scheduled on 2026-09-23 23:05 UTC (video) Hiring manager",
+  "note": "",
+  "payload": { "interview_at": "…", "format": "video", "round": "Hiring manager",
+               "follow_up_at": "…", "note_present": false },
+  "evidence": [ { "kind": "user_statement", "locator": "user", "captured_at": "…" } ],
+  "is_correction": false, "correction_of_event_id": null, "correction_reason": "",
+  "is_provisional": false,
+  "follow_up_at": "…", "occurred_at": "…", "recorded_at": "…", "late_reported": false
+}
+```
+
+`actions[]` is **server-owned**: the client renders the buttons it is given, in
+order, and honours `disabled`/`disabled_reason`. Keys: `interview`,
+`interview_completed`, `response`, `offer`, `rejected`, `withdraw`, `note`,
+`follow_up`, `correct`, `attribution`, `follow_up_done`,
+`confirm_suggestion`/`dismiss_suggestion` (provisional records only),
+`open_job`, plus `applied` on a `not_applied` record. A key that is not legal
+right now is either absent or `disabled: true` with a reason — the client never
+derives legality from the state string.
+
+### `GET /api/application-tracking?state=&source=&q=&page=1&page_size=50&sort=updated`
+
+```jsonc
+{ "items": [ /* documents, timeline trimmed */ ], "page": 1, "page_size": 50,
+  "total": 2, "has_more": false,
+  "counts": { "not_applied": 0, "applied": 1, "recruiter_response": 0,
+              "interview_scheduled": 0, "interview_completed": 1,
+              "offer_received": 0, "rejected_by_employer": 0, "withdrawn": 0 },
+  "states": ["not_applied", "…"], "state_labels": { "applied": "Applied", "…": "…" },
+  "server_time": "…" }
+```
+
+`counts` is the whole board, not the page — the column headers stay true while
+the list is filtered.
+
+### `GET /api/application-tracking/job/{job_id}`
+
+Same document shape with `exists: false`, `state: "not_applied"` and an empty
+timeline when the job is untracked, so the job drawer can render "Track this
+application" without a second branch or a `404` handler.
+
+### The writes
+
+`POST /api/application-tracking` (open, requires `job_id`),
+`…/{id}/status`, `…/{id}/interview`, `…/{id}/interview-complete`,
+`…/{id}/response`, `…/{id}/rejection`, `…/{id}/offer`, `…/{id}/withdraw`,
+`…/{id}/note`, `…/{id}/follow-up`, `…/{id}/follow-up/complete`,
+`…/{id}/correction`, `…/{id}/attribution`, `…/{id}/snapshot` (no body),
+`…/{id}/suggestion/confirm`, `…/{id}/suggestion/dismiss`.
+`GET …/{id}/events?after_sequence=0&limit=100` pages the timeline on its own.
+
+All of them return rule 7's shape — the document they changed plus what they
+emitted — so the client updates in place:
+
+```jsonc
+{ "ok": true,
+  "duplicate": false,        // true ⇒ a replay: nothing was written
+  "state_changed": true,
+  "event": { /* the timeline row above */ },
+  "events": [ /* every row this call appended, in sequence order */ ],
+  "document": { /* the full document */ },
+  "state": "interview_scheduled", "phase": "interviewing",
+  "server_time": "…" }
+```
+
+Errors carry the code in `detail.code` and the reason in `detail.message`:
+`409 invalid_state_transition` (with `detail.allowed`), `422 origin_not_trusted`,
+`422 correction_reason_required`, `422 validation_error` (unknown enum value,
+with `detail.allowed`), `404 not_found`. A replay is **not** an error.
+
+### `GET /api/application-tracking/report?group_by=source&from=&to=&origin=&state=`
+
+```jsonc
+{ "group_by": "source",
+  "window": { "since": null, "until": null },
+  "filters": { "origin": null, "state": null, "include_unapplied": false },
+  "totals": { "tracked": 2, "applied": 2, "responses": 0, "interviews": 1,
+              "offers": 0, "rejections": 0, "withdrawn": 0, "provisional": 0,
+              "corrections": 1,
+              "application_to_interview_rate": 50.0,
+              "applied_to_response_rate": 0.0,
+              "interview_to_offer_rate": 0.0,
+              "avg_match_score": 70.0, "avg_days_to_interview": 0.0,
+              "by_origin": { "user_reported": 1, "system_observed": 1 } },
+  "groups": [ { "key": "lever", "label": "lever", "records": 1, /* the same
+                 measures per group */ "by_origin": { "user_reported": 1 } } ],
+  "disclaimer": "Counts come from the tracking timeline: an interview is only ever
+                 counted when you recorded one (or a verified integration did).
+                 Nothing here is inferred from email, and a match score is an
+                 estimated fit, not an interview probability.",
+  "server_time": "…" }
+```
+
+Rates are `null` when the denominator is `0` (`interview_to_offer_rate` with no
+interviews, `avg_days_to_interview` with none reached) — §7 rule 2: `null` means
+"did not happen", and the client renders `—`, never `0%`. An unknown `group_by`
+is `422 validation_error` with the allowed keys, not an empty list.
+
+### `GET /api/application-tracking/follow-ups?days=14`
+
+```jsonc
+{ "items": [ /* documents with a pending or recently completed follow-up */ ],
+  "sweep": { "due": 1, "notified": 1, "skipped": 0 },   // this read ran the sweep
+  "notification_kind": "application_follow_up",
+  "server_time": "…" }
+```
+
+### `GET /api/application-tracking/meta`
+
+The vocabulary, for a client that wants to render forms from the server instead
+of shipping a copy: `states`, `state_labels`, `phases`, `origins`, `transitions`,
+`terminal_states`, `interview_states`, `manual_sources`, `channels`,
+`interview_formats`, `self_assessments`, `response_channels`,
+`report_group_keys`, `counts`, `disclaimer`. The SPA mirrors the same values in
+`frontend/src/lib/contracts.ts`, and a parity test fails the build if the two
+lists drift.
