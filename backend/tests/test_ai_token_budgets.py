@@ -74,8 +74,13 @@ def test_token_limit_rejects_out_of_range(client, auth):
         assert rejected.status_code == 400, f"{key}={bad!r}: {rejected.text}"
 
 
-def test_paid_tier_can_edit_token_limits(client, auth, db):
-    """A non-owner on a paid plan edits the limits through the same API."""
+def test_token_budgets_are_owner_level_even_on_paid_tiers(client, auth, db):
+    """Token budgets moved to the owner surface (v2.3 role separation).
+
+    A member used to be able to edit their own budgets on a paid plan; the
+    product now treats budgets as owner-level infrastructure: even a paying
+    member is refused server-side, while the owner keeps full control.
+    """
     from datetime import datetime, timezone
 
     from app.models.models import Subscription, User
@@ -91,33 +96,38 @@ def test_paid_tier_can_edit_token_limits(client, auth, db):
                         current_period_start=datetime.now(timezone.utc)))
     db.commit()
 
+    refused = client.put("/api/settings", json={"ai": {"max_input_tokens": 8000,
+                                                       "max_output_tokens": 2000}},
+                         headers=member_auth)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["code"] == "owner_required"
+
+    # The owner edits the same budgets through the same API.
     saved = client.put("/api/settings", json={"ai": {"max_input_tokens": 8000,
                                                      "max_output_tokens": 2000}},
-                       headers=member_auth)
+                       headers=auth)
     assert saved.status_code == 200, saved.text
-    ai = client.get("/api/settings", headers=member_auth).json()["ai"]
+    ai = client.get("/api/settings", headers=auth).json()["ai"]
     assert ai["max_input_tokens"] == 8000
     assert ai["max_output_tokens"] == 2000
     assert ai["token_limits_editable"] is True
 
 
-def test_free_tier_cannot_edit_token_limits(client, auth, db, member_auth):
-    """Free tier: the token limits are locked — the server rejects the PUT,
-    not just the UI hiding the fields. Everything else stays writable."""
+def test_free_tier_member_cannot_edit_ai_settings(client, auth, db, member_auth):
+    """Members (free tier included) never write the ai category — the server
+    rejects the PUT with owner_required, not just the UI hiding the fields."""
     rejected = client.put("/api/settings", json={"ai": {"max_output_tokens": 4000}},
                           headers=member_auth)
     assert rejected.status_code == 403, rejected.text
-    body = rejected.json()["detail"]
-    assert body.get("code") == "upgrade_required", body
-    assert "max_output_tokens" in body.get("fields", []), body
+    assert rejected.json()["detail"]["code"] == "owner_required"
 
-    # And the readable view says the same thing the server would do.
-    ai = client.get("/api/settings", headers=member_auth).json()["ai"]
-    assert ai["token_limits_editable"] is False
+    # Non-token AI settings are owner-level too now.
+    timeout = client.put("/api/settings", json={"ai": {"timeout": 60}}, headers=member_auth)
+    assert timeout.status_code == 403, timeout.text
 
-    # Non-token AI settings remain writable for everyone.
-    ok = client.put("/api/settings", json={"ai": {"timeout": 60}}, headers=member_auth)
-    assert ok.status_code == 200, ok.text
+    # The owner keeps full control of the same field through the same API.
+    saved = client.put("/api/settings", json={"ai": {"max_output_tokens": 4000}}, headers=auth)
+    assert saved.status_code == 200, saved.text
 
 
 # --------------------------------------------------------------------------- #
@@ -412,11 +422,13 @@ def test_plan_ceiling_is_the_tier_boundary(client, auth, db, member_auth):
     assert pro_plus["max_output_tokens"] == 0, pro_plus
     assert pro_plus["plan_max_output_tokens"] == 0
 
-    # A Pro+ user who *chooses* a ceiling still gets it (unlimited is a default,
-    # not an override of an explicit choice).
-    _set_tokens(client, member_auth, max_output_tokens=4000)
-    assert resolve_config_for_user(db, int(member.id))["max_output_tokens"] == 4000
-    _set_tokens(client, member_auth, max_output_tokens=0)
+    # (v2.3) Per-user budget *choices* are owner-level now: the owner's chosen
+    # ceiling is the platform default members inherit, and a member cannot set
+    # their own — the PUT is refused before the tier gate even runs.
+    refused = client.put("/api/settings", json={"ai": {"max_output_tokens": 4000}},
+                         headers=member_auth)
+    assert refused.status_code == 403, refused.text
+    assert resolve_config_for_user(db, int(member.id))["max_output_tokens"] == 0
     assert resolve_config_for_user(db, int(member.id))["max_output_tokens"] == 0
 
 
@@ -528,7 +540,10 @@ def test_pro_plus_long_jd_gets_the_ai_verdict(client, auth, db, provider_owner):
     # only the 4th (1200 → 4800 → 19200 → 76800) can answer. Every one of those
     # steps past 16000 was impossible under the old clamp — the escalation
     # stopped there and the call died `truncated_response`.
-    _set_tokens(client, member_auth, max_input_tokens=0, max_output_tokens=0, max_retries=4)
+    # (v2.3) Retry budgets are owner-level: the owner raises the platform
+    # default and the Pro+ member inherits it; their own budgets come from the
+    # plan (unlimited), not from a member-editable field.
+    _set_tokens(client, auth, max_retries=4)
     conftest.ScriptedAIHandler.behavior["override"] = [_thinking_only() for _ in range(3)]
 
     response = client.get(f"/api/jobs/{job_id}/intelligence", headers=member_auth)

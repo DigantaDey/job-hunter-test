@@ -448,7 +448,7 @@ export default function Funding() {
             {lastReport?.ai?.fix ? <><br /><strong>Fix:</strong> {lastReport.ai.fix}</> : null}
             {companies.length ? <><br />The companies below are from the last successful scan; nothing was deleted.</> : null}
           </div>
-          <Link to="/settings#ai" className="mt-2 inline-block px-3 py-1.5 rounded-full bg-red-600 text-white text-xs mono">Open Settings → AI API</Link>
+          <Link to="/admin" className="mt-2 inline-block px-3 py-1.5 rounded-full bg-red-600 text-white text-xs mono">Open admin console → AI providers</Link>
         </div>
       )}
       {!outage && scanStatus === 'ok' && providerErrors.length > 0 && (
@@ -512,7 +512,7 @@ export default function Funding() {
             </button>
           )}
           {scanStatus !== 'ok' && scanStatus !== 'scan_failed' && (
-            <Link to="/settings#ai" className="mt-3 inline-flex px-4 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm items-center gap-2">Fix AI settings</Link>
+            <Link to="/admin" className="mt-3 inline-flex px-4 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm items-center gap-2">Open the admin console</Link>
           )}
         </div>
       ) : (

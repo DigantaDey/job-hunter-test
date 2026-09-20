@@ -15,9 +15,9 @@
  * switching the account to unlimited by accident.
  */
 import { describe, expect, it } from 'vitest'
-import { budgetValue } from '../Settings'
+import { budgetValue } from '../../lib/aiConfig'
 
-describe('Settings: token-budget form round-trip', () => {
+describe('AI config: token-budget form round-trip', () => {
   it('keeps 0 as 0 — unlimited is a value, not an empty field', () => {
     // The reported regression, in both directions.
     expect(budgetValue(0, 16000)).toBe(0)        // read back from GET /api/settings

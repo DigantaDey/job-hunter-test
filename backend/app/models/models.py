@@ -597,6 +597,27 @@ class SettingsModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
 
 
+class GlobalSetting(Base):
+    """
+    One platform-wide, owner-controlled setting (currently: feature flags).
+
+    Unlike :class:`SettingsModel` — which is always tenant-scoped — these rows
+    have no user: they are the workspace-level switches the owner console edits
+    (``/admin``) and every user's request path consults. ``updated_by`` records
+    the last owner who changed the row, so the audit trail can answer "who
+    turned this off" without guessing.
+    """
+
+    __tablename__ = "global_settings"
+    __table_args__ = (UniqueConstraint("key", name="uq_global_settings_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(80), nullable=False)
+    value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    updated_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
 class ErrorLog(Base):
     __tablename__ = "error_logs"
 

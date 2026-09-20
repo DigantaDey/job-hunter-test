@@ -247,7 +247,16 @@ def funnel_analytics(user: CurrentUser, db: DbSession):
 
 @router.get("/costs")
 def cost_analytics(user: CurrentUser, db: DbSession):
-    """Cost breakdown for transparency."""
+    """Cost & token accounting — owner-level "usage and cost", not a user metric.
+
+    Ordinary accounts get 403 ``owner_required``: the product measures a job
+    seeker's success in applications and interviews, never in tokens, so this
+    read is reserved for the workspace owner's admin console.
+    """
+    if (user.role or "").lower() != "owner":
+        from app.core.auth import require_owner
+
+        require_owner(user)
     ledger = db.query(AICreditLedger).filter(AICreditLedger.user_id == user.id).all()
     total_cost = sum(r.estimated_cost_usd for r in ledger)
     total_tokens = sum(r.total_tokens for r in ledger)

@@ -168,8 +168,10 @@ are available in Chrome and Apple Passwords CSV formats.
 | Vault | `GET/POST/DELETE /api/vault`, `GET /api/vault/{id}/reveal`, `GET /api/vault/export/{chrome,apple}` (+ signed `{chrome,apple}/url` for browser downloads) |
 | Email | `POST /api/emails/generate`, `GET /api/emails`, `POST /api/emails/{id}/{approve,send,check}`, `GET /api/emails/{id}/events`, `GET/POST/DELETE /api/emails/suppressions` |
 | Funding | `GET /api/funding/{companies,providers,context}`, `POST /api/funding/refresh`, `POST /api/funding/{name}/process` |
-| Settings | `GET/PUT /api/settings`, `GET /api/settings/{ai/status,runtime}`, `GET/POST/DELETE /api/ai/config` |
-| Ops | `GET /api/health`, `/api/health/live`, `/api/health/ready`, `/api/metrics`, `/api/meta`, `/api/logs`, `/api/dashboard/summary`, `GET/POST /api/ops/queue/*` |
+| Me (user surface) | `GET /api/me/dashboard` — the tenant-scoped aggregate the home page renders (profile completeness, discovery status, top matches with reasons, review/attention queues, applications in progress, interview activity, weekly outcome report, follow-up reminders) — and `GET /api/me/assistant`, the sanitized assistant-availability signal (no provider URL, key, model or usage on it) |
+| Settings | `GET/PUT /api/settings` (the `ai` category is owner-only: members get `{"configured": bool}` and cannot write it), `GET /api/settings/ai/status` *(owner)*, `GET /api/settings/runtime` *(owner)*, `GET/POST/DELETE /api/ai/config` *(owner)* |
+| Admin (owner only) | `GET /api/admin/overview` (sources, queues, usage & cost, failure rates, automation health), `GET /api/admin/audit`, `GET/PUT /api/admin/flags`, `GET /api/admin/users`, `PUT /api/admin/users/{id}/{plan,role}` — every route 403s non-owners with `owner_required` |
+| Ops | `GET /api/health`, `/api/health/live`, `/api/health/ready`, `/api/metrics`, `/api/meta`, `/api/logs`, `/api/dashboard/summary`, `GET /api/ops/status` *(owner)*, `GET/POST /api/ops/queue/*` *(owner)* |
 | Tracking | `GET /api/track/open/{token}.png`, `GET/POST /api/track/unsubscribe/{token}`, `POST /api/track/events` |
 
 Interactive docs: `/api/docs`. Machine-readable spec: `/api/openapi.json`.

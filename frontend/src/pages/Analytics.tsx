@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import client from '../api/client'
 import { BarChart3, TrendingUp, Target, DollarSign, History } from 'lucide-react'
 import { conversionText, groupLabel, rateText, type TrackingTally } from '../lib/tracking'
+import { useAuth } from '../context/AuthContext'
+import { isOwner } from '../lib/role'
 
 /**
  * Interviews on this page are *recorded*, never estimated.
@@ -14,9 +16,15 @@ import { conversionText, groupLabel, rateText, type TrackingTally } from '../lib
  * application and saw the receipt, or because an integration the user connected
  * reported it. With no recorded outcomes the number is 0, the rate is `—` when
  * there is nothing to divide by, and the note says where to fix it.
+ *
+ * The cost breakdown is owner-level (v2.3): `GET /api/analytics/costs` 403s a
+ * member, so the page only fetches — and renders — it for the workspace owner.
+ * A member's success metrics here are applications and interviews.
  */
 
 export default function Analytics() {
+  const { user } = useAuth()
+  const owner = isOwner(user)
   const [perf, setPerf] = useState<any>(null)
   const [funnel, setFunnel] = useState<any>(null)
   const [costs, setCosts] = useState<any>(null)
@@ -24,7 +32,10 @@ export default function Analytics() {
   useEffect(()=>{
     client.get('/api/analytics/performance').then(r=>setPerf(r.data)).catch(()=>{})
     client.get('/api/analytics/funnel').then(r=>setFunnel(r.data)).catch(()=>{})
-    client.get('/api/analytics/costs').then(r=>setCosts(r.data)).catch(()=>{})
+    if (isOwner(user)) {
+      client.get('/api/analytics/costs').then(r=>setCosts(r.data)).catch(()=>{})
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   },[])
 
   if(!perf) return <div className="p-8 mono text-sm">Loading analytics…</div>
@@ -117,7 +128,8 @@ export default function Analytics() {
           </div>
         </div>
 
-        <div className="card p-5">
+        {owner && (
+        <div className="card p-5" data-testid="cost-breakdown">
           <h3 className="font-medium flex items-center gap-2"><DollarSign className="w-4 h-4"/> Cost breakdown</h3>
           {costs ? (
             <div className="mt-3 text-xs mono space-y-2">
@@ -133,6 +145,7 @@ export default function Analytics() {
             </div>
           ) : <div className="text-xs mono text-zinc-500">No cost data.</div>}
         </div>
+        )}
       </div>
 
       {perf.conversion && (

@@ -419,6 +419,14 @@ def delete_workflow_override(db: Session, user_id: int, workflow: str) -> None:
     ).delete(synchronize_session=False)
 
 
+def _first_set(*values):
+    """First argument that is not None — an explicit 0/False still counts."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
     """
     Resolve per-user AI config from DB (owner fallback as global default).
@@ -445,6 +453,7 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
 
     # If current user doesn't have api_key, try owner fallback
     owner_provider = None
+    owner_rpm = owner_retries = owner_timeout = None
     if not api_key:
         try:
             owner = db.query(User).filter(User.role == "owner").order_by(User.id.asc()).first()
@@ -463,6 +472,12 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
                     max_output_tokens = get_setting(db, int(owner.id), "ai", "max_output_tokens", None)
                 if not provider and owner_provider:
                     provider = _normalize_provider(owner_provider)
+                # (v2.3 role separation) The operational knobs — retries,
+                # timeout, rate — are owner-console settings now, so a member
+                # riding the owner's key rides the owner's knobs too.
+                owner_rpm = get_setting(db, int(owner.id), "ai", "rpm", None)
+                owner_retries = get_setting(db, int(owner.id), "ai", "max_retries", None)
+                owner_timeout = get_setting(db, int(owner.id), "ai", "timeout", None)
         except Exception:
             pass
 
@@ -486,9 +501,9 @@ def get_user_ai_config(db: Session, user_id: int) -> Dict[str, Any]:
         "api_key_set": bool(api_key),
         "key_source": key_source,
         "api_key_error": api_key_error,
-        "rpm": get_setting(db, user_id, "ai", "rpm", settings.ai_rpm),
-        "max_retries": get_setting(db, user_id, "ai", "max_retries", settings.ai_max_retries),
-        "timeout": get_setting(db, user_id, "ai", "timeout", settings.ai_timeout),
+        "rpm": _first_set(get_setting(db, user_id, "ai", "rpm", None), owner_rpm, settings.ai_rpm),
+        "max_retries": _first_set(get_setting(db, user_id, "ai", "max_retries", None), owner_retries, settings.ai_max_retries),
+        "timeout": _first_set(get_setting(db, user_id, "ai", "timeout", None), owner_timeout, settings.ai_timeout),
         # ``0`` = unlimited, so these must be first-value-set, never
         # ``value or default`` — that silently turned an explicit "unlimited"
         # back into the env ceiling.

@@ -688,8 +688,14 @@ def discovery_sources_config(db: Session, user_id: int) -> Dict[str, Any]:
     board_tokens = get_setting(db, user_id, "scraping", "board_tokens", []) or []
     if isinstance(board_tokens, str):
         board_tokens = [t.strip() for t in board_tokens.split(",") if t.strip()]
+    from app.services.flags import is_enabled
+
     return {
         "sources": [s for s in sources if s in source_registry.ADAPTERS],
         "board_tokens": board_tokens,
-        "live_enabled": bool(get_setting(db, user_id, "scraping", "live_enabled", settings.live_scraping_enabled)),
+        # Live fetching needs BOTH the user's own source setting and the
+        # workspace-wide flag from the owner console — either off stops it.
+        "live_enabled": bool(
+            get_setting(db, user_id, "scraping", "live_enabled", settings.live_scraping_enabled)
+        ) and is_enabled(db, "discovery.live_sources"),
     }
