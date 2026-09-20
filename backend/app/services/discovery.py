@@ -27,6 +27,7 @@ empty. Reporting only — no fetching, scoring or quota behaviour changes.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -43,6 +44,7 @@ from app.services.company_normalize import normalize_company_name
 from app.services.demo_pool import demo_jobs
 from app.services.events import record_job_event
 from app.services.form_detector import detect_form_structure
+from app.services.reliability import count, duration
 from app.services.scoring import preliminary_score, score_job
 from app.services.user_settings import get_setting
 
@@ -265,7 +267,33 @@ async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[
         candidate["score_detail"] = result.get("detail") or {}
 
 
-async def discover_for_user(
+async def discover_for_user(db: Session, user: User, **kwargs: Any) -> Dict[str, Any]:
+    """
+    One discovery run, with the operational metrics around it.
+
+    Thin on purpose: the run body is :func:`_run_discovery` and this wrapper
+    only classifies its outcome. The duration histogram is recorded on the
+    exception path too, so a run that died halfway is in the latency series
+    instead of vanishing from it.
+
+    ``result`` is derived from the report the run already produces, not from a
+    guess: ``ok`` added jobs, ``empty`` added none, ``partial`` added some but
+    recorded insert or source errors. ``failed`` means the run raised.
+    """
+    started = time.perf_counter()
+    outcome = "failed"
+    try:
+        report = await _run_discovery(db, user, **kwargs)
+        inserted = int(report.get("inserted") or 0)
+        degraded = bool(report.get("insert_errors")) or bool(
+            (report.get("sources") or {}).get("errors"))
+        outcome = "ok" if inserted and not degraded else ("partial" if inserted else "empty")
+        return report
+    finally:
+        duration("jobhunter_discovery_run_seconds", time.perf_counter() - started, result=outcome)
+
+
+async def _run_discovery(
     db: Session,
     user: User,
     *,
@@ -391,9 +419,13 @@ async def discover_for_user(
         posting["dedupe_key"] = key
         posting.setdefault("canonical_id", key)
         if key in seen:
+            count("jobhunter_discovery_jobs_found_total",
+                  source=posting.get("source", "other"), disposition="duplicate")
             continue
         content_hash = str(posting.get("content_hash") or "")
         if content_hash and content_hash in seen_hash:
+            count("jobhunter_discovery_jobs_found_total",
+                  source=posting.get("source", "other"), disposition="duplicate")
             continue
         seen.add(key)
         if content_hash:
@@ -473,6 +505,10 @@ async def discover_for_user(
             if job is None:
                 continue
             _merge_existing_job(job, candidate, merged_now)
+            # A re-seen posting refreshes the existing row: counted as an
+            # update, never as a new job, so "jobs found" cannot be inflated by
+            # a board that re-lists the same role every run.
+            count("jobhunter_discovery_jobs_found_total", source=job.source, disposition="updated")
         try:
             db.commit()
         except Exception as exc:  # noqa: BLE001
@@ -575,6 +611,7 @@ async def discover_for_user(
             })
             continue
         created.append(job)
+        count("jobhunter_discovery_jobs_found_total", source=job.source, disposition="new")
 
     # Increment usage by actual inserted count (more accurate than trigger-time 1)
     try:

@@ -14,6 +14,13 @@ a value containing a newline could otherwise append records nobody wrote. The
 context filter scrubs those values on the way onto the record
 (:func:`sanitize_log_value`) and the text formatter scrubs everything it
 interpolates, so neither format can be used to forge a line.
+
+The same two formatters are also the *redaction* boundary: every rendered
+message and every ``extra=`` field passes through :mod:`app.core.redaction`, so
+a secret or a piece of personal data that reaches a log call is masked on its
+way out regardless of which of the two formats the deployment emits. Masking at
+the formatter (rather than at each call site) is what makes it enforceable —
+there are hundreds of log calls and one pair of formatters.
 """
 from __future__ import annotations
 
@@ -24,6 +31,8 @@ import sys
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, Literal, Optional
+
+from app.core.redaction import redact_fields, redact_text
 
 request_id_var: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 #: The authenticated user's primary key. Always an ``int``: the annotation, the
@@ -142,19 +151,29 @@ class JsonFormatter(logging.Formatter):
             "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(timespec="milliseconds"),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            # Redacted *after* ``%``-interpolation, so a secret or an email
+            # address that arrived as a log argument is masked exactly like one
+            # baked into the format string.
+            "message": redact_text(record.getMessage()),
             "service": getattr(record, "service", "api"),
             "environment": getattr(record, "environment", "development"),
         }
-        for key, value in record.__dict__.items():
-            if key not in _RESERVED and key not in payload and not key.startswith("_"):
-                try:
-                    json.dumps(value)
-                    payload[key] = value
-                except (TypeError, ValueError):
-                    payload[key] = repr(value)
+        # ``extra=`` fields (audit detail, provider reports, queue payloads) go
+        # through the same boundary, including sensitive *key names*: a nested
+        # ``{"password": ...}`` is masked whether or not its value looks like a
+        # secret.
+        fields = redact_fields({
+            key: value for key, value in record.__dict__.items()
+            if key not in _RESERVED and key not in payload and not key.startswith("_")
+        })
+        for key, value in fields.items():
+            try:
+                json.dumps(value)
+                payload[key] = value
+            except (TypeError, ValueError):
+                payload[key] = redact_text(repr(value))
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            payload["exception"] = redact_text(self.formatException(record.exc_info))
         return json.dumps(payload, default=str)
 
 
@@ -170,6 +189,10 @@ class TextFormatter(logging.Formatter):
     therefore passed through :func:`sanitize_log_value`, and the traceback block
     is indented so that even a newline smuggled inside an exception message
     cannot start a line at column 0, where a real record begins.
+
+    The message and the traceback are also *redacted*
+    (:mod:`app.core.redaction`) before they are scrubbed, so a secret or a
+    piece of personal data interpolated into a message never reaches stdout.
     """
 
     def format(self, record: logging.LogRecord) -> str:
@@ -177,7 +200,7 @@ class TextFormatter(logging.Formatter):
             f"{self.formatTime(record, '%Y-%m-%dT%H:%M:%S')} "
             f"{sanitize_log_value(record.levelname):<7} "
             f"{sanitize_log_value(record.name):<28} "
-            f"{sanitize_log_value(record.getMessage())}"
+            f"{sanitize_log_value(redact_text(record.getMessage()))}"
         )
         rid = getattr(record, "request_id", None)
         if rid:
@@ -186,8 +209,8 @@ class TextFormatter(logging.Formatter):
         if uid is not None:
             base = f"{base} [user_id={sanitize_log_value(uid)}]"
         if record.exc_info:
-            indented = "\n".join(f"    {line}" for line in
-                                 self.formatException(record.exc_info).splitlines())
+            exception = redact_text(self.formatException(record.exc_info))
+            indented = "\n".join(f"    {line}" for line in exception.splitlines())
             base = f"{base}\n{indented}"
         return base
 

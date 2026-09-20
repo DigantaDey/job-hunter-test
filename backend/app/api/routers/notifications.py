@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import CurrentUser, DbSession
 from app.core.entitlements import enforce
 from app.models.models import Job, Notification
+from app.services.reliability import count
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -87,7 +88,14 @@ def update_preferences(payload: dict, user: CurrentUser, db: DbSession):
 
 
 def create_notification(db: Session, user_id: int, kind: str, title: str, body: str = "", link: str = "", meta: Optional[Dict[str, Any]] = None):
-    """Helper to create notification from anywhere."""
+    """Helper to create notification from anywhere.
+
+    Every in-app notification is written through here, so this is where the
+    delivery metric lives: a notification that silently fails to persist is the
+    difference between "we told the user their run expired" and a user who
+    thinks the product stopped working. ``kind`` is bounded by
+    ``NOTIFICATION_KINDS`` — an unmapped kind is counted as ``other``.
+    """
     try:
         n = Notification(
             user_id=user_id,
@@ -101,9 +109,11 @@ def create_notification(db: Session, user_id: int, kind: str, title: str, body: 
         )
         db.add(n)
         db.commit()
+        count("jobhunter_notifications_total", kind=kind, outcome="created")
         return n
     except Exception:
         # Best effort
+        count("jobhunter_notifications_total", kind=kind, outcome="failed")
         try:
             db.rollback()
         except Exception:

@@ -51,6 +51,7 @@ from app.core.config import ai_token_budget, settings
 from app.core.logging import get_logger, user_id_var
 from app.core.metrics import inc, observe, set_gauge
 from app.core.rate_limiter import rate_limiter
+from app.core.redaction import SECRET_PATTERNS
 from app.services.http import get_client as get_http_client
 
 log = get_logger("app.ai")
@@ -2056,12 +2057,10 @@ def _key_preview(key: str) -> str:
 # --------------------------------------------------------------------------- #
 # Prompt secret scrubbing — defence in depth at the AI boundary
 # --------------------------------------------------------------------------- #
-_PROMPT_SECRET_PATTERNS = (
-    re.compile(r"sk-[A-Za-z0-9_\-]{6,}"),
-    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+"),
-    re.compile(r"(?i)\b(api[_\-]?key|apikey|token|secret|password|authorization)\b\s*[:=]\s*\S+"),
-    re.compile(r"(?i)\b(eyJ[A-Za-z0-9_\-]{20,})"),  # JWT-shaped
-)
+#: The canonical shapes live in :mod:`app.core.redaction`, shared with the audit
+#: boundary and the log formatters: a new secret shape is then masked on every
+#: outbound channel at once rather than on two of the three.
+_PROMPT_SECRET_PATTERNS = tuple(pattern for pattern, _ in SECRET_PATTERNS)
 
 
 def _scrub_prompt_secrets(text: Optional[str]) -> str:

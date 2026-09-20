@@ -323,6 +323,21 @@ class Settings(BaseSettings):
     auto_scheduler_interval_seconds: float = 300.0
 
     # ------------------------------------------------------------------ #
+    # User-action-required states (contracts/11 §2, docs/OBSERVABILITY.md)
+    # ------------------------------------------------------------------ #
+    #: How long a run may sit waiting on the user before it is closed out
+    #: (minutes). Covers ``pipeline_jobs.status='needs_input'`` and the
+    #: ``user_input_requests`` row it points at. Expiry is *not* a retry: the
+    #: row is finished with a reason the user can see, and the next run starts
+    #: fresh. Browser actions keep their own (shorter) TTL from the automation
+    #: policy — see ``application_actions.expires_at``.
+    user_action_ttl_minutes: int = Field(default=10080, ge=5, le=525600)
+    #: How often the worker runs the user-action expiry sweep (seconds).
+    user_action_sweep_interval_seconds: float = Field(default=900.0, ge=30.0, le=86400.0)
+    #: Rows considered per sweep, per scope (bounded, oldest first).
+    user_action_sweep_limit: int = Field(default=200, ge=1, le=2000)
+
+    # ------------------------------------------------------------------ #
     # Application tracking — follow-up reminders
     # ------------------------------------------------------------------ #
     #: How far ahead a promised follow-up counts as "due" (hours). A reminder

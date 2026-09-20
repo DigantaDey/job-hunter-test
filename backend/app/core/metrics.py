@@ -80,12 +80,39 @@ _HELP: Dict[str, str] = {
     "jobhunter_applications_total": "Application pipeline outcomes.",
     "jobhunter_vault_credentials": "Credentials held in the encrypted vault.",
     "jobhunter_db_up": "1 when the database answers a health query.",
+    "jobhunter_registry_series": "Live series per metric name in the in-process registry.",
+    "jobhunter_registry_evicted_series": "Series dropped because a metric reached its cap.",
+}
+
+#: Names that are gauges but do not end in one of the suffixes the exposition
+#: infers a type from. Without this the registry's own self-metrics would be
+#: declared ``counter`` while being set, not incremented.
+_GAUGE_NAMES = {
+    "jobhunter_registry_series",
+    "jobhunter_registry_evicted_series",
 }
 
 
 # --------------------------------------------------------------------------- #
 # Core API
 # --------------------------------------------------------------------------- #
+def register_catalog(catalog: Dict[str, Dict[str, Any]]) -> None:
+    """
+    Take metric metadata from a domain module's own catalog.
+
+    ``services/reliability.py`` declares every metric it writes — name, type,
+    help text and the *only* label values it may carry. Registering that table
+    here keeps the exposition's ``# HELP``/``# TYPE`` lines and the cardinality
+    contract in one place, so a new metric cannot be emitted as an untyped
+    series and cannot be declared without its allowed labels.
+    """
+    for name, spec in (catalog or {}).items():
+        if spec.get("help"):
+            _HELP.setdefault(name, str(spec["help"]))
+        if spec.get("type") == "histogram":
+            _HISTOGRAM_NAMES.add(name)
+
+
 def _key(name: str, labels: Optional[Dict[str, str]]) -> Tuple[str, SeriesKey]:
     return name, tuple(sorted((str(k), str(v)) for k, v in (labels or {}).items()))
 
@@ -212,6 +239,7 @@ def metrics_text(*, version: str = "", environment: str = "") -> str:
     Shared by the public route and the internal metrics listener so both emit
     byte-identical output.
     """
+    _publish_registry_stats()
     payload = render_prometheus()
     labels = f'version="{escape_label_value(version)}",environment="{escape_label_value(environment)}"'
     payload += "# HELP jobhunter_info Build and environment information.\n"
@@ -220,15 +248,42 @@ def metrics_text(*, version: str = "", environment: str = "") -> str:
     return payload
 
 
+def _publish_registry_stats() -> None:
+    """
+    Write the registry's own shape as series, so the cardinality backstop is
+    alertable instead of being something you only notice in
+    ``GET /api/ops/status``.
+
+    Called before rendering (never while the lock is held — :func:`gauge` takes
+    it). The ``metric`` label is bounded by the metric names in the source, not
+    by request data: this is the one place a label per metric name is correct,
+    because the whole point is to see *which* metric is growing.
+    """
+    try:
+        for name, entry in stats()["by_metric"].items():
+            gauge("jobhunter_registry_series", float(entry["series"]), {"metric": name})
+            gauge("jobhunter_registry_evicted_series", float(entry["evicted"]), {"metric": name})
+    except Exception:  # pragma: no cover - self-metrics must never break a scrape
+        pass
+
+
 def render_prometheus() -> str:
     lines: List[str] = []
+    #: Metric name -> the store its samples came from. The exposition needs a
+    #: ``# TYPE`` for every family it emits, and deriving it from the store
+    #: means a metric that was never described in a catalog is still typed
+    #: correctly instead of going out untyped.
+    kinds: Dict[str, set] = defaultdict(set)
     with _LOCK:
         emitted: Dict[str, List[str]] = defaultdict(list)
         for (name, labels), value in sorted(_COUNTERS.items()):
+            kinds[name].add("counter")
             emitted[name].append(f"{name}{_render_labels(dict(labels))} {_format(value)}")
         for (name, labels), value in sorted(_GAUGES.items()):
+            kinds[name].add("gauge")
             emitted[name].append(f"{name}{_render_labels(dict(labels))} {_format(value)}")
         for (name, labels), entry in sorted(_HISTOGRAMS.items()):
+            kinds[name].add("histogram")
             base = dict(labels)
             cumulative = 0.0
             for bound in entry["bounds"]:
@@ -242,8 +297,21 @@ def render_prometheus() -> str:
     for name in sorted(emitted):
         if name in _HELP:
             lines.append(f"# HELP {name} {_HELP[name]}")
-            metric_type = "histogram" if name in _HISTOGRAM_NAMES else ("gauge" if name.endswith(("_in_progress", "_up", "_info")) else "counter")
-            lines.append(f"# TYPE {name} {metric_type}")
+        # An explicit declaration wins over both the store and the suffix: a
+        # gauge set from a cumulative number, or a histogram registered by a
+        # domain catalog, must not be second-guessed. When a name has samples
+        # in more than one store, the most specific type wins — histogram over
+        # gauge over counter — so the answer never depends on iteration order.
+        seen = kinds.get(name) or set()
+        if name in _HISTOGRAM_NAMES or "histogram" in seen:
+            metric_type = "histogram"
+        elif name in _GAUGE_NAMES or "gauge" in seen:
+            metric_type = "gauge"
+        elif "counter" in seen:
+            metric_type = "counter"
+        else:
+            metric_type = "gauge" if name.endswith(("_in_progress", "_up", "_info")) else "counter"
+        lines.append(f"# TYPE {name} {metric_type}")
         lines.extend(emitted[name])
     lines.append("")
     return "\n".join(lines)

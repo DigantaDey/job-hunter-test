@@ -1,0 +1,189 @@
+# JobHunter AI — alert rules for the background workflows.
+#
+# Not wired into docker-compose by default: point a Prometheus instance at this
+# file (`rule_files:`) if you run one. Every rule has a runbook entry in
+# docs/OBSERVABILITY.md §7 — an alert without a runbook is noise, so a new rule
+# here needs a section there.
+#
+# Thresholds are tuned to catch a workflow that has *stopped*, not to page on a
+# bad hour. Loosen them for a small deployment before you trust them.
+groups:
+  - name: jobhunter-worker
+    interval: 30s
+    rules:
+      - alert: JobHunterWorkerDown
+        expr: absent(jobhunter_worker_running == 1) or sum(jobhunter_worker_running) < 1
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "No JobHunter worker is running"
+          description: >-
+            Nothing is claiming pipeline jobs. Queue rows are not lost — they
+            are re-queued at the next worker boot — but nothing is progressing.
+          runbook: "docs/OBSERVABILITY.md#jobhunterworkerdown--no-worker-is-running"
+
+      - alert: JobHunterWorkerSlotCrashing
+        expr: sum(rate(jobhunter_worker_task_crashes_total[10m])) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "A worker slot keeps crashing and being respawned"
+          description: >-
+            The supervisor is respawning a dead child task. Capacity is reduced
+            while it backs off; the traceback is in the worker log.
+          runbook: "docs/OBSERVABILITY.md#5-worker-restart-safety"
+
+      - alert: JobHunterQueueBacklog
+        expr: sum(jobhunter_queue_depth{status="queued"}) > 100
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Pipeline queue is not draining"
+          description: "More than 100 items have been waiting for 15 minutes."
+          runbook: "docs/OBSERVABILITY.md#jobhunterqueuebacklog--work-is-not-draining"
+
+      - alert: JobHunterDeadLetterGrowing
+        expr: sum(rate(jobhunter_queue_dead_total[15m])) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Permanent failures are dead-lettering work"
+          description: >-
+            Jobs are reaching the dead-letter state. These are visible to users;
+            check the `code` label on jobhunter_job_failures_total for the cause.
+          runbook: "docs/OBSERVABILITY.md#jobhunterdeadlettergrowing--permanent-failures-are-accumulating"
+
+      - alert: JobHunterTransientFailuresHigh
+        expr: sum(rate(jobhunter_job_failures_total{kind="transient"}[10m])) > 0.5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "A dependency is degrading the pipelines"
+          description: >-
+            Transient failures are high. These self-heal (pause + watchdog, or
+            backoff); act only if this persists.
+          runbook: "docs/OBSERVABILITY.md#jobhuntertransientfailureshigh--a-dependency-is-degraded"
+
+  - name: jobhunter-workflows
+    interval: 30s
+    rules:
+      - alert: JobHunterSourceFailing
+        expr: |
+          (
+            sum by (source) (rate(jobhunter_source_fetch_outcomes_total{outcome="error"}[15m]))
+              /
+            sum by (source) (rate(jobhunter_source_fetch_outcomes_total[15m]))
+          ) > 0.5
+        for: 20m
+        labels: { severity: warning }
+        annotations:
+          summary: "A job board is failing most of its fetches"
+          description: >-
+            One source's error rate is above 50%. `outcome="empty"` is not a
+            failure — this is real errors only.
+          runbook: "docs/OBSERVABILITY.md#jobhuntersourcefailing--one-job-board-is-broken"
+
+      - alert: JobHunterSearchProviderDown
+        expr: |
+          (
+            sum by (provider) (rate(jobhunter_search_provider_requests_total{outcome="error"}[15m]))
+              /
+            sum by (provider) (rate(jobhunter_search_provider_requests_total{outcome!~"cached|coalesced|skipped"}[15m]))
+          ) > 0.5
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "A paid search provider is failing"
+          description: >-
+            Discovery still works through the direct adapters; search discovery
+            contributes nothing while this is red.
+          runbook: "docs/OBSERVABILITY.md#search-provider-usage"
+
+      - alert: JobHunterSearchSpendHigh
+        expr: sum(increase(jobhunter_search_provider_cost_microusd_total[1d])) / 1e6 > 20
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Search spend is above the daily expectation"
+          description: "Micro-USD counter converted to USD, summed over 24h."
+          runbook: "docs/OBSERVABILITY.md#search-provider-usage"
+
+      - alert: JobHunterArtifactFailures
+        expr: sum by (artifact) (rate(jobhunter_artifact_generation_total{outcome="failed"}[15m])) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Artifact generation is failing"
+          description: >-
+            Resumes, packets, cover letters or reports are not being produced.
+            A guardrail rejection is `outcome="rejected"`, not this alert.
+          runbook: "docs/OBSERVABILITY.md#jobhunterartifactfailures--generation-is-broken"
+
+  - name: jobhunter-user-actions
+    interval: 30s
+    rules:
+      - alert: JobHunterUserActionsExpiring
+        expr: sum(rate(jobhunter_user_action_expiry_total[1h])) > 1
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "User-action-required work is timing out unanswered"
+          description: >-
+            Compare the p90 of jobhunter_user_action_wait_seconds
+            {outcome="completed"} with USER_ACTION_TTL_MINUTES: if they are
+            close, the TTL is too short rather than the users being absent.
+          runbook: "docs/OBSERVABILITY.md#jobhunteruseractionsexpiring--asks-are-timing-out-unanswered"
+
+      - alert: JobHunterUserActionsNotDelivered
+        expr: sum(rate(jobhunter_notifications_total{outcome="failed"}[30m])) > 0
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "Notifications are failing to persist"
+          description: >-
+            A user who is never told their run needs them will believe the
+            product stopped working. This is the delivery funnel for every
+            in-app notification.
+          runbook: "docs/OBSERVABILITY.md#reports-and-notifications"
+
+      - alert: JobHunterAutoSubmitRefused
+        expr: |
+          sum(rate(jobhunter_auto_submit_total{outcome="refused"}[30m])) > 0
+            and sum(rate(jobhunter_auto_submit_total{outcome="success"}[30m])) == 0
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "Auto-submit is enabled but nothing is going out"
+          description: >-
+            Usually correct behaviour: a withdrawn consent, a daily cap or a
+            confidence gate. Do not widen the policy — tell the user what is
+            blocking them.
+          runbook: "docs/OBSERVABILITY.md#jobhunterautosubmitrefused--consent-or-quota-is-blocking-submissions"
+
+  - name: jobhunter-integrity
+    interval: 30s
+    rules:
+      - alert: JobHunterDedupeStopped
+        expr: |
+          sum(rate(jobhunter_dedupe_hits_total[1h])) == 0
+            and sum(rate(jobhunter_queue_enqueued_total[1h])) > 10
+        for: 30m
+        labels: { severity: critical }
+        annotations:
+          summary: "No duplicate work is being prevented while work is flowing"
+          description: >-
+            These counters are the evidence that a double application, a double
+            email or a double charge is still being refused. Zero hits under
+            load means a dedupe key stopped matching.
+          runbook: "docs/OBSERVABILITY.md#jobhunterdedupestopped--a-duplicate-boundary-went-quiet"
+
+      - alert: JobHunterMetricsCardinality
+        expr: sum by (metric) (jobhunter_registry_evicted_series) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "A metric hit its series cap and evicted series"
+          description: >-
+            Something is labelling on unbounded data. GET /api/ops/status →
+            edge.registry.by_metric names the metric.
+          runbook: "docs/OBSERVABILITY.md#jobhuntermetricscardinality--someone-labelled-on-unbounded-data"

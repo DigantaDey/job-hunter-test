@@ -15,13 +15,13 @@ passes credentials, but a future one cannot silently leak them either.
 """
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, Optional
 
 from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger, request_id_var
 from app.core.middleware import resolve_client_ip
+from app.core.redaction import SECRET_PATTERNS, SENSITIVE_KEYS
 from app.models.models import AuditLog
 
 logger = get_logger("audit")
@@ -29,18 +29,16 @@ logger = get_logger("audit")
 # --------------------------------------------------------------------------- #
 # Secret masking for audit detail — defence in depth
 # --------------------------------------------------------------------------- #
-_AUDIT_SECRET_VALUE_PATTERNS: tuple = (
-    re.compile(r"sk-[A-Za-z0-9_\-]{6,}"),
-    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+"),
-    re.compile(r"(?i)\b(api[_\-]?key|apikey|token|secret|password|authorization)\b\s*[:=]\s*\S+"),
-    re.compile(r"(?i)\b(eyJ[A-Za-z0-9_\-]{20,})"),  # JWT-shaped
-)
+#: The canonical shapes live in :mod:`app.core.redaction` and are shared with
+#: the logging formatters and the stored-error path, so a new secret shape is
+#: masked on every channel at once instead of on two of the three. The audit
+#: policy is the strictest of the three: a value that matches *any* shape is
+#: masked in full, because an audit row is append-only and nobody gets a second
+#: look at it.
+_AUDIT_SECRET_VALUE_PATTERNS: tuple = tuple(pattern for pattern, _ in SECRET_PATTERNS)
 
 #: Key names whose values are always masked, regardless of content.
-_SENSITIVE_KEY_NAMES = frozenset({
-    "password", "secret", "api_key", "apikey", "token", "mfa_code", "otp",
-    "authorization", "credential", "ssn", "credit_card",
-})
+_SENSITIVE_KEY_NAMES = SENSITIVE_KEYS
 
 _MASK = "***"
 

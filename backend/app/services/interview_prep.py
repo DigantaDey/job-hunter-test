@@ -11,10 +11,12 @@ asked for" this product must not produce.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from app.core.logging import get_logger
 from app.services.ai_client import fit_prompt_part, input_budget_chars
+from app.services.reliability import count, duration
 
 log = get_logger("app.interview")
 
@@ -34,6 +36,34 @@ INTERVIEW_CATEGORIES = [
 
 
 async def generate_interview_questions(
+    profile: Dict[str, Any],
+    job_title: str,
+    company: str,
+    job_description: str,
+    count: int = 10,
+    db=None,
+    user_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Interview questions, counted as a generated artifact and an interview event.
+
+    Thin wrapper over :func:`_generate_interview_questions`.
+    """
+    started = time.perf_counter()
+    try:
+        questions = await _generate_interview_questions(
+            profile, job_title, company, job_description, count, db=db, user_id=user_id)
+    except Exception:
+        count("jobhunter_artifact_generation_total", artifact="interview_prep", outcome="failed")
+        count("jobhunter_interview_events_total", event="prep_generated", outcome="failed")
+        raise
+    duration("jobhunter_artifact_generation_seconds", time.perf_counter() - started,
+             artifact="interview_prep")
+    count("jobhunter_artifact_generation_total", artifact="interview_prep", outcome="ok")
+    count("jobhunter_interview_events_total", event="prep_generated", outcome="ok")
+    return questions
+
+
+async def _generate_interview_questions(
     profile: Dict[str, Any],
     job_title: str,
     company: str,
@@ -108,6 +138,25 @@ JD:
 
 
 async def generate_feedback(
+    question: str,
+    user_answer: str,
+    profile: Dict[str, Any],
+    job_description: str = "",
+    db=None,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Answer feedback — the practice half of the interview events metric."""
+    try:
+        feedback = await _generate_feedback(question, user_answer, profile, job_description,
+                                            db=db, user_id=user_id)
+    except Exception:
+        count("jobhunter_interview_events_total", event="feedback_generated", outcome="failed")
+        raise
+    count("jobhunter_interview_events_total", event="feedback_generated", outcome="ok")
+    return feedback
+
+
+async def _generate_feedback(
     question: str,
     user_answer: str,
     profile: Dict[str, Any],

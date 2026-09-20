@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.logging import get_logger
 from app.core.metrics import inc
+from app.services.reliability import count
 from app.services.sources import health as source_health
 from app.services.sources.adapters import ADAPTERS, SOURCE_META, SourceError
 from app.services.sources.base import (  # noqa: F401  (re-export)
@@ -119,15 +120,21 @@ async def fetch_from_source(
     except SourceError as exc:
         latency = (time.perf_counter() - started) * 1000.0
         source_health.record_failure(source_id, exc, latency_ms=round(latency, 1))
+        count("jobhunter_source_fetch_outcomes_total", source=source_id, outcome="error")
         raise
     except Exception as exc:  # pragma: no cover - defensive
         classified = classify_error(exc)
         latency = (time.perf_counter() - started) * 1000.0
         source_health.record_failure(source_id, classified, latency_ms=round(latency, 1))
+        count("jobhunter_source_fetch_outcomes_total", source=source_id, outcome="error")
         raise classified from exc
     latency = (time.perf_counter() - started) * 1000.0
     source_health.record_success(source_id, results=len(postings), latency_ms=round(latency, 1))
     inc("jobhunter_source_results_total", source=source_id, value=len(postings))
+    # An empty board is not an error, but it is not a result either: the third
+    # outcome is what separates "the source is down" from "nothing is hiring".
+    count("jobhunter_source_fetch_outcomes_total", source=source_id,
+          outcome="ok" if postings else "empty")
     return postings
 
 

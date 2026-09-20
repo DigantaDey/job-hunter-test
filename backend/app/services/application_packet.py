@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,6 +33,7 @@ from app.models.models import (
 from app.services.ai_guardrails import (
     FactLedger,
     FieldSpec,
+    GuardrailError,
     SchemaSpec,
     build_fact_ledger,
     run_guarded_task,
@@ -41,6 +43,7 @@ from app.services.candidate_profile import (
     FIELD_DEFINITIONS,
     REQUIRED_APPLICATION_FIELDS,
 )
+from app.services.reliability import count, duration
 
 log = get_logger("app.application_packet")
 
@@ -768,6 +771,38 @@ def _latest_token_usage(db: Session, user_id: int, workflow: str = "packet_gen")
 
 
 async def generate_packet(
+    db: Session,
+    *,
+    user: User,
+    job: Job,
+    persona_id: Optional[int] = None,
+    strict_skeleton: bool = False,
+) -> ApplicationPacket:
+    """
+    Generate the packet, counting the artifact and its outcome.
+
+    Thin wrapper over :func:`_generate_packet`. A guardrail rejection is
+    ``rejected``, not ``failed``: the packet engine did its job and the answer
+    is "these facts are not in your profile", which the user has to see. Only an
+    exception is a failure.
+    """
+    started = time.perf_counter()
+    try:
+        packet = await _generate_packet(db, user=user, job=job, persona_id=persona_id,
+                                        strict_skeleton=strict_skeleton)
+    except GuardrailError:
+        count("jobhunter_artifact_generation_total", artifact="packet", outcome="rejected")
+        raise
+    except Exception:
+        count("jobhunter_artifact_generation_total", artifact="packet", outcome="failed")
+        raise
+    duration("jobhunter_artifact_generation_seconds", time.perf_counter() - started,
+             artifact="packet")
+    count("jobhunter_artifact_generation_total", artifact="packet", outcome="ok")
+    return packet
+
+
+async def _generate_packet(
     db: Session,
     *,
     user: User,
