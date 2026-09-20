@@ -95,8 +95,7 @@ Pre-existing metrics these sit next to (unchanged names, documented in
 paused / resumed / dead / recovered / reclaimed / needs_input / depth),
 `jobhunter_applications_total`, `jobhunter_autofill_runs_total`,
 `jobhunter_application_session_pauses_total`, `jobhunter_source_fetch_total`,
-`jobhunter_jobs_discovered_total`, `jobhunter_ai_requests_total`,
-`jobhunter_worker_*`.
+`jobhunter_ai_requests_total`, `jobhunter_worker_*`.
 
 Self-metrics about the registry itself, both gauges published on every scrape
 and both labelled only with `metric`:
