@@ -39,7 +39,7 @@ def my_assistant(
     key material, model id, rate-limit counters or token usage that
     ``GET /api/settings/ai/status`` (owner-only) reports.
     """
-    from app.services.ai_client import ai_availability, is_configured
+    from app.services.ai_client import is_configured
     from app.services.job_queue import paused_count
 
     configured = is_configured(db=db, user_id=int(user.id))

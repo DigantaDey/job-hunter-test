@@ -455,7 +455,7 @@ def interview_activity(db: Session, user_id: int, limit: int = 3) -> Dict[str, A
             }
             for tracking, job in completed
         ],
-        "practice_sessions": preps and [
+        "practice_sessions": [
             {
                 "id": prep.id,
                 "title": prep.job_title or "Practice session",
@@ -465,7 +465,7 @@ def interview_activity(db: Session, user_id: int, limit: int = 3) -> Dict[str, A
                 "route": f"/interview?session={prep.id}",
             }
             for prep in preps
-        ] or [],
+        ],
         "practice_completed": prep_completed,
         "upcoming_count": len(upcoming),
     }

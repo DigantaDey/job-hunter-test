@@ -20,7 +20,7 @@ What lives here (and deliberately nowhere on the user surface):
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import case, func
@@ -85,9 +85,9 @@ def overview(user: CurrentUser, db: DbSession) -> Dict[str, Any]:
 
     # --- Queue health ------------------------------------------------------- #
     depths = queue_stats(db, user_id=None)
-    totals: Dict[str, int] = {
-        key: 0 for key in ("queued", "processing", "paused", "done", "failed", "dead", "needs_input")
-    }
+    totals: Dict[str, int] = dict.fromkeys(
+        ("queued", "processing", "paused", "done", "failed", "dead", "needs_input"), 0
+    )
     for buckets in depths.values():
         for key in totals:
             totals[key] += int(buckets.get(key, 0))

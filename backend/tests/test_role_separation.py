@@ -84,9 +84,8 @@ def test_member_cannot_write_per_workflow_ai_config(client, member_auth):
     response = client.post("/api/ai/config", json={"scoring": {"api_key": "sk-member-key"}}, headers=member_auth)
     assert response.status_code == 403
     # and nothing was stored
-    from app.services.user_settings import read_workflow_override
-
     from app.models.models import User
+    from app.services.user_settings import read_workflow_override
 
     # read via the API instead: the member's own key set is untouched (none)
     assert client.get("/api/ai/config", headers=member_auth).status_code == 403
