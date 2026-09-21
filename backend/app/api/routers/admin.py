@@ -38,7 +38,7 @@ from app.models.models import (
 )
 from app.services import flags as feature_flags
 from app.services import http as http_client
-from app.services import net_guard
+from app.services import net_guard, robots
 from app.services.ai_client import breaker_snapshot
 from app.services.billing import create_or_update_subscription_manual
 from app.services.funding_sources import provider_status
@@ -126,6 +126,7 @@ def overview(user: CurrentUser, db: DbSession) -> Dict[str, Any]:
             "outbound": {
                 "http_cache": http_client.cache_stats(),
                 "dns_cache": net_guard.dns_cache_stats(),
+                "robots_cache": robots.cache_stats(),
             },
         },
         "queues": {

@@ -648,3 +648,47 @@ def test_api_key_listing_reports_revocation(client, auth):
     row = client.get("/api/auth/api-keys", headers=auth).json()[0]
     assert row["revoked"] is True
     assert row["revoked_at"], "revoked_at must be exposed for the UI"
+
+
+# --------------------------------------------------------------------------- #
+# The /me/assistant probe bridge must work from a running event loop, not
+# just from a threadpool thread.
+# --------------------------------------------------------------------------- #
+def test_ai_probe_bridge_from_a_threadpool_thread(monkeypatch):
+    """FastAPI runs the sync handler in a threadpool: no running loop, so
+    asyncio.run is the whole job. This path must keep returning the payload."""
+    from app.api.routers.me import await_aware_availability
+
+    async def fake_probe(db=None, user_id=None):
+        return {"state": "online", "online": True, "reason": None, "hint": None,
+                "retry_after_hint": None}
+
+    monkeypatch.setattr("app.services.ai_client.ai_availability", fake_probe)
+    payload = await_aware_availability(db=None, user_id=1)
+    assert payload["state"] == "online"
+
+
+def test_ai_probe_bridge_from_inside_a_running_loop(monkeypatch):
+    """The regression: called from inside a running loop, the old code ran
+    ``loop.run_until_complete()`` on the already-running loop and raised
+    ``RuntimeError: This event loop is already running`` — every time, since
+    that branch was only reachable from a running loop."""
+    import asyncio
+
+    from app.api.routers.me import await_aware_availability
+
+    consumed = {"n": 0}
+
+    async def fake_probe(db=None, user_id=None):
+        consumed["n"] += 1
+        return {"state": "online", "online": True, "reason": None, "hint": None,
+                "retry_after_hint": None}
+
+    monkeypatch.setattr("app.services.ai_client.ai_availability", fake_probe)
+
+    async def main():
+        return await_aware_availability(db=None, user_id=1)
+
+    payload = asyncio.run(main())
+    assert payload["state"] == "online"
+    assert consumed["n"] == 1, "the probe coroutine must be consumed exactly once"

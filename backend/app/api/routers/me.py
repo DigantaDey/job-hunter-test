@@ -9,6 +9,8 @@ endpoints; this router never forwards them.
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 from typing import Any, Dict
 
 from fastapi import APIRouter, Query
@@ -72,14 +74,19 @@ def my_assistant(
 
 def await_aware_availability(db: Any, user_id: int) -> Dict[str, Any]:
     """Bridge: FastAPI runs this sync handler in a threadpool, so block on the probe."""
-    import asyncio
-
     from app.services.ai_client import ai_availability
 
+    # Create the coroutine once and consume it on exactly one path — a
+    # consumed-or-abandoned coroutine must never be run twice.
+    coro = ai_availability(db=db, user_id=user_id)
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
-        loop = None
-    if loop is not None:
-        return loop.run_until_complete(ai_availability(db=db, user_id=user_id))
-    return asyncio.run(ai_availability(db=db, user_id=user_id))
+        # No running loop (the threadpool case): asyncio.run is the whole
+        # job.
+        return asyncio.run(coro)
+    # A running loop cannot be blocked on from inside itself — run_until_complete()
+    # on it raises "This event loop is already running". Hand the probe to a
+    # short-lived thread with its own loop instead.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()

@@ -6,6 +6,153 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security — the browser policy now checks DNS before it trusts the allow-list
+
+Nothing a user could see — this was a hole in the outbound URL policy that the
+autofill headless Chromium runs as a pre-flight before every navigation, and a
+posting URL that passed the check could have pointed the browser at the cloud
+metadata service.
+
+`net_guard`'s module docstring promised that for browser navigation, loopback,
+link-local (``169.254.0.0/16`` = the cloud metadata range) and metadata
+hostnames are refused **even when the host is on the operator allow-list**. The
+code only enforced that for *literal IPs* and for the small set of well-known
+metadata hostnames. An allow-listed *hostname* short-circuited at
+`allow("allowlisted", …)` before DNS was ever consulted — reproduced before the
+fix: `portal.example.com` on the allow-list, its answer `169.254.169.254`, and
+the verdict came back `allowed: True | code: allowlisted | dns_checked: False`.
+That is the confused-deputy case the docstring declared impossible: a browser
+that will later be fed vault credentials, pointed at the metadata service by a
+host the operator trusted (stale internal DNS, a resolver takeover, a broad
+allow-list entry).
+
+The allow-list no longer skips the address check for a browser when the host is
+not a literal IP: the name is resolved through the existing `_resolve`, and the
+hard-block subset — loopback, link-local/metadata, the same ranges
+`_browser_hard_block` refuses absolutely — is applied to the answers, classified
+through `_unsafe_ip_reason` so the NAT64 (``64:ff9b::/96``) and IPv4-mapped
+(``::ffff:0:0/96``) envelopes are unwrapped exactly once, as before. A host
+whose answer lands in that subset is refused with code `metadata_host` and a
+reason naming the offending address, with `addresses=` and `dns_checked=True`
+populated so the verdict stays diagnosable. The allow-list's normal effect on
+genuinely private ranges is unchanged (an allow-listed host answering
+`10.10.0.5` still reaches that service), a DNS *failure* is still not a policy
+violation (the module-wide rule that keeps offline deployments working — the
+allow-list verdict stands), and the HTTP path (`browser=False`) is untouched:
+`OUTBOUND_ALLOWED_HOSTS` combined with `OUTBOUND_ALLOW_PRIVATE` behaves exactly
+as documented there. `tests/test_net_guard.py` asserts each of these: the
+metadata, loopback and NAT64-wrapped-metadata refusals (with the address named
+and the verdict *not* marked allowlisted), the private-range allowance that
+must not regress, the unchanged HTTP path, and the DNS-failure fallback.
+
+### Fixed — the remaining loop-bound singletons are loop-aware
+
+A process-global asyncio object that is reused from a second event loop raises
+`RuntimeError: … is bound to a different event loop`. The pooled HTTP client and
+the AI semaphore got the loop-aware fix earlier; three more objects were missed,
+and the failure is intermittent *by construction*: `asyncio.Lock.acquire()`
+binds the lock to the running loop only on its **contended** path — an
+uncontended acquire never touches the loop — so a probe that does not force two
+coroutines onto the same lock passes, and the real failure depends on when the
+contention lands.
+
+* **The source throttle** (`services/sources/throttle.py`) — used by every
+  source fetch, and its `acquire` awaits `asyncio.sleep` *while holding* the
+  lock, so contention is normal whenever two tasks hit the same source with a
+  `min_interval_seconds > 0`.
+* **The AI rate limiter** (`core/rate_limiter.py`) — on every AI request. Its
+  `acquire` never awaits while holding the lock, so a single loop can never
+  reach the contended path; it is only reproducible by holding the lock from
+  outside. Reachability is lower than the throttle's — this closes the
+  invariant, not a demonstrated outage.
+* **The AI-probe bridge** (`api/routers/me.py`) — its in-loop branch ran
+  `loop.run_until_complete(...)` on an already-running loop: a branch that can
+  *only* crash (`RuntimeError: This event loop is already running`). Harmless
+  today only because FastAPI runs the sync handler in a threadpool; the moment
+  the route becomes `async def`, or anything calls the helper from a loop, it
+  is a 500.
+
+Each object now records the loop it was created for and is rebuilt for the
+running loop — the same pattern `services/http.py` uses for the client and the
+semaphore. The throttle drops the whole lock map *and* the `_last` / `_window`
+state (meaningless across loops) on a loop change, and its `reset()` — which
+cleared the counters but left the loop-bound locks behind, so "reset" did not
+reset — now clears those too. The bridge runs the probe on `asyncio.run` when
+there is no running loop, and hands it to a short-lived thread with its own
+loop when called from inside one; the coroutine is created once and consumed on
+exactly one path. `tests/test_async_singleton_loop_safety.py` asserts the
+throttle survives a second event loop **and still actually waits** (a fix that
+silently disables throttling cannot pass), that `reset()` drops the stale
+locks, that the same lock is reused within one loop (the fix is not "always
+rebuild"), and that the rate limiter survives a second loop under deliberately
+forced contention (the test name says why it looks artificial).
+`tests/test_regressions.py` pins both bridge paths, the in-loop one being the
+regression.
+
+### Changed — the robots.txt cache is bounded like the DNS verdict cache
+
+The middleware docstring states the invariant "nothing keyed on request data
+may be unbounded", and the SSRF guard's DNS verdict cache was made a bounded
+LRU for exactly that reason. The robots.txt cache in `services/robots.py` was
+keyed on the *same kind of data* — `urlparse(url).netloc`, consulted on every
+polite outbound fetch, including posting URLs that arrive from third-party
+feeds — but was a plain dict with a TTL and no cap: a host never revisited
+stayed, with its parsed `RobotFileParser`, for the whole process lifetime.
+
+The cache is now a `BoundedTTLMap` (cap `ROBOTS_CACHE_MAX_ENTRIES`, default
+256, TTL unchanged at one hour). One subtlety the naive swap gets wrong: this
+cache deliberately stores `None` to mean "robots.txt unreachable, so allow
+everything", and `BoundedTTLMap.get()` returns its default for an *absent* key
+— so a stored `None` would be indistinguishable from a miss, and every
+unreachable host would be re-fetched on every request within the TTL, turning
+a memory fix into request amplification. Unreachable is stored under a
+module-level sentinel and translated back at the read sites; `crawl_delay`
+stays a read-only path (no network call) and `clear_cache` is unchanged. The
+counters ride the existing `/api/ops/status` shape under
+`outbound.robots_cache` (and the admin mirror), so a cache sitting at its cap
+with `evictions` climbing is the healthy shape, like the DNS cache's. The new
+`tests/test_robots_cache_bounds.py` asserts the cache stays bounded past the
+cap and counts evictions, that an unreachable robots.txt is cached — not
+re-fetched — within the TTL (the sentinel regression), that an expired entry is
+re-fetched (clock driven through the map), and that `crawl_delay` reads the
+cache without fetching.
+
+### Added — the operator settings .env.example left out
+
+`.env.example` is the documented operator surface, but thirty of the 193
+`Settings` fields had no entry in it (derived by diffing the annotated fields
+in `config.py` against the file's `KEY=` lines, not from a stale list). The
+operationally significant ones are now documented in the file's existing
+section style, showing the current default and what breaks when they are wrong:
+AI concurrency and circuit-breaker tuning
+(`AI_MAX_CONCURRENCY`, `AI_BACKOFF_BASE`, `AI_BREAKER_FAILURES`,
+`AI_BREAKER_COOLDOWN_SECONDS`), the auth rate limit and login lockout
+(`AUTH_RATE_LIMIT_PER_MINUTE`, `LOGIN_LOCKOUT_SECONDS`), the HTTP client group
+(`HTTP_TIMEOUT`, `HTTP_MAX_RETRIES`, `LIVE_SCRAPE_TIMEOUT`, `HTTP_USER_AGENT`),
+the worker reaper / max-runtime group (`WORKER_MAX_RUNTIME_SECONDS`,
+`WORKER_REAPER_INTERVAL_SECONDS`, `WORKER_REAPER_SAFETY_SECONDS`,
+`WORKER_MAX_RECLAIMS`), and the new `ROBOTS_CACHE_MAX_ENTRIES`.
+`docs/DEPLOYMENT.md` §6 carries one line on the reaper tuning.
+
+**Audit findings, reported rather than silently fixed:** deriving the list
+meant checking each candidate against its read sites, and three of the missing
+settings turned out to be dead — defined in `config.py`, read by nothing
+(grep over `backend/app` and `backend/tests` matches only the definition each
+time). `LOGIN_LOCKOUT_SECONDS`: the login gate that actually exists is the
+`MAX_LOGIN_ATTEMPTS` / `LOGIN_THROTTLE_WINDOW_SECONDS` window, and a tripped
+address is refused only until the window's remainder elapses (the 429's
+`Retry-After` says how long); wiring a separate lockout duration in would
+change login behaviour pinned by
+`test_login_threshold_and_window_come_from_settings` — which asserts the
+throttle forgets an address once the window has elapsed — so the entry is
+documented with the gap called out rather than pretending the value does what
+its name says (a hard lockout vs the sliding window is a product decision that
+belongs in its own change). `HTTP_MAX_RETRIES`: the outbound client's default
+retry budget comes from `AI_MAX_RETRIES`; per-source adapters may pass their
+own. `LIVE_SCRAPE_TIMEOUT`: there is no per-board wall-clock budget
+implemented. All three are documented in `.env.example` with the gap called
+out, not with invented prose claiming behaviour the code does not have.
+
 ### Added — reliability, operational visibility and recovery for the background workflows (v2.4.0)
 
 The background half of the product — onboarding workers, resume extraction,

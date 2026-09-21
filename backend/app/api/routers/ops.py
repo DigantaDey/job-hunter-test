@@ -32,7 +32,7 @@ from app.models.models import (
 )
 from app.schemas.schemas import ErrorLogOut
 from app.services import http as http_client
-from app.services import net_guard
+from app.services import net_guard, robots
 from app.services.ai_client import breaker_snapshot, is_configured, ping
 from app.services.auto_scheduler import brief as auto_scheduler_brief
 from app.services.job_queue import queue_stats, recover_stalled
@@ -321,6 +321,10 @@ async def ops_status(request: Request, user: CurrentUser, db: DbSession):
         "outbound": {
             "http_cache": http_client.cache_stats(),
             "dns_cache": net_guard.dns_cache_stats(),
+            # robots.txt parsers — keyed on feed-derived netlocs, so bounded
+            # like the rest; a stored "unreachable" is a sentinel, never a
+            # miss (see app/services/robots.py).
+            "robots_cache": robots.cache_stats(),
         },
         # Bounded *edge* state (v2.2.12): the rate limiter's key log, the body
         # cap and the metrics registry itself. All three are keyed on data a

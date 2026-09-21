@@ -286,6 +286,12 @@ product, because the app's budgets live in process memory:
 The app logs a warning naming these at startup when `WEB_CONCURRENCY > 1`
 (`Settings.scaling_warnings()`), and `GET /api/ops/status` reports `edge.workers`.
 
+Stalled-job recovery is tuned in-process the same way: the stall reaper
+(`WORKER_REAPER_INTERVAL_SECONDS`) re-queues jobs whose lease expired more than
+`WORKER_REAPER_SAFETY_SECONDS` ago — keep that margin at or above `AI_TIMEOUT`
+or the reaper will clone a job that is merely inside a long AI call under a
+live worker.
+
 Scale horizontally instead — it is the topology this product is built for:
 
 ```bash
