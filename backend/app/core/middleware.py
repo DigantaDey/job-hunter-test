@@ -34,6 +34,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import math
 import re
 import time
@@ -365,7 +366,12 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             user_id = getattr(request.state, "user_id", None)
             if user_id is not None:
                 extra["user_id"] = user_id
-            logger.log(30 if status_code < 400 else 40, "request", extra=extra)
+            # Successes are routine — logging every 2xx/3xx at WARNING made the
+            # access log drown real warnings (a WARNING flood looks like an
+            # incident). 4xx is a client mistake worth noticing; 5xx is ours.
+            logger.log(logging.INFO if status_code < 400
+                       else logging.WARNING if status_code < 500
+                       else logging.ERROR, "request", extra=extra)
             request_id_var.reset(token)
 
     @staticmethod

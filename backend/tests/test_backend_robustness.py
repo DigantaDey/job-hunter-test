@@ -454,7 +454,9 @@ def test_request_id_header_is_sanitized_at_the_edge(client, caplog):
     assert sanitize_request_id(FORGED).count("\n") == 0
     assert sanitize_request_id("\n\r") == ""
 
-    with caplog.at_level(logging.WARNING):
+    # Successes are logged at INFO now; only 4xx/5xx are warning-grade. The
+    # test's subject is id sanitization, so it reads the access log at INFO.
+    with caplog.at_level(logging.INFO):
         response = client.get("/api/health", headers={"X-Request-ID": FORGED})
     assert response.status_code == 200
 
