@@ -413,6 +413,7 @@ def _translate_from_google_stream_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]
 
 _workflow_overrides: Dict[Tuple[int, str], Dict[str, str]] = {}
 _semaphore: Optional[asyncio.Semaphore] = None
+_semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 @dataclass
@@ -484,9 +485,11 @@ def _breaker(workflow: str) -> Breaker:
 
 
 def _sem() -> asyncio.Semaphore:
-    global _semaphore
-    if _semaphore is None:
+    global _semaphore, _semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _semaphore is None or _semaphore_loop is not loop or _semaphore_loop.is_closed():
         _semaphore = asyncio.Semaphore(max(1, settings.ai_max_concurrency))
+        _semaphore_loop = loop
     return _semaphore
 
 

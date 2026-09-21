@@ -163,6 +163,7 @@ async def test_http_layer_enforces_the_policy(monkeypatch):
         except Exception:
             pass
         http._client = None
+        http._client_loop = None
 
     with pytest.raises(OutboundURLBlocked):
         await http.request("GET", "http://127.0.0.1:9/internal")

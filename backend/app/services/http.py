@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, Optional, Tuple, Union
@@ -51,8 +52,28 @@ from app.services.net_guard import (
 log = get_logger("app.http")
 
 _client: Optional[httpx.AsyncClient] = None
-_client_lock = asyncio.Lock()
+_client_loop: Optional[asyncio.AbstractEventLoop] = None
+_client_lock = threading.Lock()
 _semaphore: Optional[asyncio.Semaphore] = None
+_semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _client_is_stale(loop: asyncio.AbstractEventLoop) -> bool:
+    return (
+        _client is None
+        or _client_loop is None
+        or _client_loop is not loop
+        or _client_loop.is_closed()
+    )
+
+
+def _sem_is_stale(loop: asyncio.AbstractEventLoop) -> bool:
+    return (
+        _semaphore is None
+        or _semaphore_loop is None
+        or _semaphore_loop is not loop
+        or _semaphore_loop.is_closed()
+    )
 
 
 @dataclass(frozen=True)
@@ -195,10 +216,11 @@ def _host_label(host: str) -> str:
 
 
 async def get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        async with _client_lock:
-            if _client is None:
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client_is_stale(loop):
+        with _client_lock:
+            if _client_is_stale(loop):
                 # The SSRF guard lives on the transport so that *every* hop —
                 # including redirects httpx resolves internally — is checked.
                 transport = install_transport_guard(
@@ -218,20 +240,26 @@ async def get_client() -> httpx.AsyncClient:
                     follow_redirects=True,
                     max_redirects=5,
                 )
+                _client_loop = loop
+    assert _client is not None
     return _client
 
 
 async def close_client() -> None:
-    global _client
+    global _client, _client_loop
     if _client is not None:
         await _client.aclose()
         _client = None
+        _client_loop = None
 
 
 def _sem() -> asyncio.Semaphore:
-    global _semaphore
-    if _semaphore is None:
+    global _semaphore, _semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _sem_is_stale(loop):
         _semaphore = asyncio.Semaphore(max(1, settings.max_concurrent_fetches))
+        _semaphore_loop = loop
+    assert _semaphore is not None
     return _semaphore
 
 
