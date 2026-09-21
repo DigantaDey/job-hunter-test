@@ -491,6 +491,12 @@ class Settings(BaseSettings):
     http_host_state_max_entries: int = 512
     #: DNS verdicts in the SSRF guard.
     dns_cache_max_entries: int = 512
+    #: robots.txt parsers in the politeness cache (``app/services/robots.py``).
+    #: The key is a netloc that arrives from third-party job feeds — the same
+    #: request-shaped data the middleware invariant bounds — so a host never
+    #: revisited used to stay in the old plain dict (and its parsed parser) for
+    #: the whole process lifetime.
+    robots_cache_max_entries: int = 256
     #: Derived per-scope Fernet keys (``app.core.security._key_cache``). One
     #: entry per user vault scope, so this is bounded like the rest — and it
     #: carries a TTL so that rotating ``VAULT_KEY`` on a running process stops
