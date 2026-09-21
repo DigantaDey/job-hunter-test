@@ -114,6 +114,45 @@ within a loop. `tests/test_async_singleton_loop_safety.py` asserts singletons ar
 rebuilt per event loop, that a closed-loop client is never handed out, and that
 pooling within one loop is preserved.
 
+### Changed — the per-request access log matches its level to the outcome
+
+The edge middleware logged *every* completed request at `WARNING` — healthy
+`2xx` and `3xx` responses included — so a deployment doing nothing but serving
+the healthchecks and polling the queue filled the console with
+`WARNING http request [request_id=…]` every few seconds. An access log that is
+always shouting trains the operator to stop reading it, and a real warning then
+drowns in the flood. The level now follows the outcome: `INFO` below 400,
+`WARNING` for a client mistake, `ERROR` for ours. The structured fields
+(`method`, `path`, `status`, `duration_ms`, `request_id`, `user_id`) are
+unchanged, so nothing downstream of the formatter moves.
+
+### Fixed — every IPv4-only job board "resolves to a reserved address" on DNS64/NAT64 networks
+
+On an IPv6-only host, the DNS64 resolver answers every IPv4-only hostname with a
+synthesised AAAA record: the RFC 6052 well-known NAT64 prefix `64:ff9b::`
+followed by the four bytes of the public IPv4 address. Which is to say, every
+job board that has no IPv6 — `boards-api.greenhouse.io`, `api.lever.co`, and
+most of the big ATS APIs — came back as `64:ff9b::…`, and the SSRF guard's
+`is_reserved` check classified the prefix and refused it:
+
+```
+outbound request blocked: boards-api.greenhouse.io resolves to 64:ff9b::d23:141e (reserved address)
+```
+
+One warning per retry, the entire IPv4 internet declined, and a discovery run
+that reported success with zero sources from every adapter. `net_guard._unsafe_ip_reason`
+now unwraps both translation envelopes before the flag checks — NAT64
+`64:ff9b::/96` and IPv4-mapped `::ffff:0:0/96`, the latter also misreported as
+reserved by Python 3.11's `ipaddress` — and classifies the *embedded* address
+instead of the one that carries it. A public destination dials normally, and a
+NAT64-wrapped loopback or private address is still refused with the underlying
+reason named alongside it (`loopback address embedded in translated address
+64:ff9b::7f00:1`), so unwrapping opens no hole in the guard. Network-specific
+NAT64 prefixes (RFC 6052 §3.3) remain undetectable by design: they are
+indistinguishable from ordinary global addresses, which is documented in the
+module rather than quietly assumed away. Asserted by the NAT64 regression tests
+in `tests/test_net_guard.py`.
+
 ### Fixed — the exposition typed only the metrics it could describe (v2.4.0)
 
 `render_prometheus()` wrote a `# TYPE` line only for names present in the

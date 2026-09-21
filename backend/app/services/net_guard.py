@@ -91,6 +91,15 @@ METADATA_HOSTNAMES = frozenset({"metadata", "metadata.google.internal", "instanc
 #: single most valuable target on a cloud host.
 LINK_LOCAL_V4 = ipaddress.ip_network("169.254.0.0/16")
 
+#: RFC 6052 well-known NAT64 prefix. An IPv6-only deployment's DNS64 resolver
+#: answers every IPv4-only hostname with an AAAA of exactly this shape — the
+#: synthesised record is ``64:ff9b::`` followed by the four bytes of the public
+#: IPv4 address. The prefix is IANA-reserved, but refusing it refuses the whole
+#: IPv4 internet (which is every job board), so we classify the *embedded*
+#: address instead. Network-specific NAT64 prefixes (RFC 6052 §3.3) are
+#: indistinguishable from ordinary global addresses and cannot be detected here.
+NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
 _DNS_TTL = 60.0
 
 #: Cached DNS verdicts: host -> (allowed, detail, addresses). Bounded LRU + TTL,
@@ -162,6 +171,23 @@ def _unsafe_ip_reason(address: str) -> Optional[str]:
         ip = ipaddress.ip_address(address)
     except ValueError:
         return f"unparsable address {address}"
+    if isinstance(ip, ipaddress.IPv6Address):
+        # Translation envelopes (::ffff:0:0/96 IPv4-mapped, 64:ff9b::/96
+        # NAT64/DNS64) are IANA-reserved prefixes that merely *carry* an IPv4
+        # destination. Classify the destination, not the envelope: on an
+        # IPv6-only deployment the DNS64 resolver answers every IPv4-only
+        # job-board host with a 64:ff9b::… AAAA record, and refusing the
+        # prefix refuses the entire IPv4 internet. A wrapped loopback/private
+        # address is still refused, because the embedded IPv4 is what gets
+        # classified.
+        embedded: Optional[ipaddress.IPv4Address] = ip.ipv4_mapped
+        if embedded is None and ip in NAT64_WELL_KNOWN_PREFIX:
+            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if embedded is not None:
+            reason = _unsafe_ip_reason(str(embedded))
+            if reason is None:
+                return None
+            return f"{reason} embedded in translated address {ip}"
     if ip.is_loopback:
         return "loopback address"
     if ip.is_link_local:

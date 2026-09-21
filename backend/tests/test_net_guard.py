@@ -89,6 +89,60 @@ async def test_metadata_ip_in_dns_answer_is_refused(monkeypatch):
         await check_url("https://sneaky.example.com/")
 
 
+async def _nat64_resolver(*_args, **_kwargs):
+    return ["64:ff9b::20b9:908a", "64:ff9b::d23:141e"]
+
+
+@pytest.mark.asyncio
+async def test_dns64_answers_for_public_hosts_are_allowed(monkeypatch):
+    monkeypatch.setattr(net_guard, "_resolve", _nat64_resolver)
+    verdict = await net_guard.preflight("https://api.lever.co/api/postings")
+    assert verdict.allowed, verdict.reason
+    assert verdict.code == "dns_public"
+
+
+@pytest.mark.asyncio
+async def test_dns64_wrapped_loopback_is_still_refused(monkeypatch):
+    async def _resolver(*_args, **_kwargs):
+        return ["64:ff9b::7f00:1"]  # 127.0.0.1 behind the NAT64 prefix
+    monkeypatch.setattr(net_guard, "_resolve", _resolver)
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
+    with pytest.raises(OutboundURLBlocked) as excinfo:
+        await check_url("https://sneaky.example.com/")
+    assert "loopback" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_dns64_wrapped_private_address_is_still_refused(monkeypatch):
+    async def _resolver(*_args, **_kwargs):
+        return ["64:ff9b::a00:1"]  # 10.0.0.1 behind the NAT64 prefix
+    monkeypatch.setattr(net_guard, "_resolve", _resolver)
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
+    with pytest.raises(OutboundURLBlocked) as excinfo:
+        await check_url("https://sneaky.example.com/")
+    assert "private address" in str(excinfo.value)
+
+
+def test_translated_public_addresses_classify_the_embedded_ipv4():
+    assert net_guard._unsafe_ip_reason("64:ff9b::20b9:908a") is None
+    assert net_guard._unsafe_ip_reason("::ffff:8.8.8.8") is None
+    assert "loopback" in net_guard._unsafe_ip_reason("::ffff:127.0.0.1")
+    assert "loopback" in net_guard._unsafe_ip_reason("64:ff9b::7f00:1")
+    reason = net_guard._unsafe_ip_reason("64:ff9b::a00:1")
+    assert reason is not None and "private address" in reason and "translated" in reason
+
+
+@pytest.mark.asyncio
+async def test_translated_literal_urls_are_judged_by_the_embedded_ipv4(monkeypatch):
+    monkeypatch.setattr(settings, "outbound_allow_private", False, raising=False)
+    verdict = await net_guard.preflight("http://[64:ff9b::d23:141e]/jobs")
+    assert verdict.allowed and verdict.code == "literal_ip"
+    mapped = await net_guard.preflight("http://[::ffff:8.8.8.8]/")
+    assert mapped.allowed and mapped.code == "literal_ip"
+    with pytest.raises(OutboundURLBlocked):
+        await check_url("http://[64:ff9b::7f00:1]/")
+
+
 @pytest.mark.asyncio
 async def test_dns_failure_defers_to_the_http_client(monkeypatch):
     async def _boom(*_args, **_kwargs):
