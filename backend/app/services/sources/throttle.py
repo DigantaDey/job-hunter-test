@@ -6,6 +6,16 @@ budget, and a noisy source cannot starve the rest of a discovery fan-out.
 
 The map is keyed by source id (a closed set of adapters) so it cannot grow
 with the hosts a feed mentions.
+
+Loop safety: an ``asyncio.Lock`` binds to an event loop on its *contended*
+acquire path and refuses to run from any other loop. This throttle holds its
+lock across an ``asyncio.sleep``, so contention is normal — a process that
+runs a second loop (pytest-asyncio's per-test loops, a script doing repeated
+``asyncio.run``) used to get ``RuntimeError: … is bound to a different event
+loop`` on the first contended acquire there. The lock map, together with the
+``_last``/``_window`` state (which is meaningless across loops), is rebuilt
+for the running loop — the same pattern the HTTP client and the AI semaphore
+use in ``app/services/http.py`` and ``app/services/ai_client.py``.
 """
 from __future__ import annotations
 
@@ -22,12 +32,30 @@ class SourceThrottle:
 
     def __init__(self) -> None:
         self._locks: Dict[str, asyncio.Lock] = {}
+        #: The loop the locks in ``_locks`` were created for; None = none yet.
+        self._locks_loop: Optional[asyncio.AbstractEventLoop] = None
         self._last: Dict[str, float] = {}
         self._window: Dict[str, deque] = {}
         self.waits = 0
         self.acquires = 0
 
     def _lock(self, source_id: str) -> asyncio.Lock:
+        # Only ever called from coroutines on the running loop, and there is
+        # no await between the check and the rebuild, so a plain guard is
+        # defensible — no threading.Lock (there is no second thread to race
+        # against, and the map is touched from exactly one loop at a time).
+        loop = asyncio.get_running_loop()
+        if (self._locks_loop is None
+                or self._locks_loop is not loop
+                or self._locks_loop.is_closed()):
+            # No recorded loop, or a different/closed one: the existing locks
+            # may be bound to the old loop. Drop the whole map — and the
+            # last-call stamps / rolling windows, which are meaningless across
+            # loops — and rebuild for this one.
+            self._locks = {}
+            self._last.clear()
+            self._window.clear()
+            self._locks_loop = loop
         lock = self._locks.get(source_id)
         if lock is None:
             lock = self._locks[source_id] = asyncio.Lock()
@@ -72,8 +100,12 @@ class SourceThrottle:
         return {"acquires": self.acquires, "waits": self.waits, "sources": len(self._locks)}
 
     def reset(self) -> None:
+        # A "reset" that leaves the loop-bound locks behind does not reset:
+        # the next acquire on a fresh loop would still hit the stale binding.
         self._last.clear()
         self._window.clear()
+        self._locks.clear()
+        self._locks_loop = None
         self.waits = 0
         self.acquires = 0
 

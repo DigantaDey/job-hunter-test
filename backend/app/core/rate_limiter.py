@@ -1,6 +1,7 @@
 import asyncio
 import time
 from collections import deque
+from typing import Optional
 
 
 class TokenBucketRateLimiter:
@@ -14,6 +15,8 @@ class TokenBucketRateLimiter:
         self.tokens = rpm
         self.last_refill = time.monotonic()
         self.lock = asyncio.Lock()
+        #: The loop ``self.lock`` is current for; None = not yet bound to any.
+        self._lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self.request_timestamps: deque = deque()
         self.total_requests = 0
         self.throttled_count = 0
@@ -22,11 +25,30 @@ class TokenBucketRateLimiter:
         self.rpm = rpm
         # refill tokens lazily on next acquire
 
+    def _ensure_loop(self) -> None:
+        """
+        Rebuild the lock when the running loop is not the one it was created
+        for, the same loop-safety fix the HTTP client, the AI semaphore and
+        the source throttle got. An asyncio.Lock binds to a loop on its
+        contended acquire path and then refuses any other loop. In this
+        class acquire() never awaits while holding the lock, so a single
+        loop never reaches that path — the rebuild only fires when the
+        process runs a *second* loop (tests, scripts doing repeated
+        asyncio.run), which is what this removes.
+        """
+        loop = asyncio.get_running_loop()
+        if self._lock_loop is None:
+            self._lock_loop = loop
+        elif self._lock_loop is not loop or self._lock_loop.is_closed():
+            self.lock = asyncio.Lock()
+            self._lock_loop = loop
+
     async def acquire(self, tokens: int = 1) -> float:
         """
         Acquires tokens, returns wait_time if throttled else 0.
         Sleeps if necessary to respect rate limit.
         """
+        self._ensure_loop()
         async with self.lock:
             now = time.monotonic()
             # Clean timestamps older than 60s
