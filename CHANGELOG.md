@@ -114,6 +114,45 @@ within a loop. `tests/test_async_singleton_loop_safety.py` asserts singletons ar
 rebuilt per event loop, that a closed-loop client is never handed out, and that
 pooling within one loop is preserved.
 
+### Added — Assisted Apply's browser ships with the deployment
+
+Assisted Apply was dead in every containerised deployment: the page carried the
+banner *"playwright is not installed (pip install playwright && playwright install
+chromium)"* and pressing **Run a pass** answered `503 autofill_unavailable`. The
+cause was simply that neither image ever installed the optional extra —
+`requirements-autofill.txt` was in the repository and in no build, so the feature
+was unreachable the moment you deployed with Docker instead of running the backend
+from a checkout.
+
+Both Dockerfiles now take a `WITH_AUTOFILL` build argument. When it is `1` the
+image installs `requirements-autofill.txt` and then runs `playwright install
+--with-deps chromium`, which pulls a Chromium build *and* the shared libraries it
+needs onto `debian:slim` — roughly 400 MB more, cached at
+`PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright` so it survives into the final layer.
+Both compose files pass `WITH_AUTOFILL=1` (the production stack on all four
+services that share the image, the dev stack on the backend), so a compose
+deployment gets a working Assisted Apply out of the box. The default stays `0`: a
+plain `docker build` remains minimal, and CI's docker job never downloads a
+browser. The dev compose also sets `AUTOFILL_ENABLED=true` — the stack ships the
+browser, automation is on, and submissions stay dry-run unless the operator says
+otherwise, because pressing submit on somebody's behalf is not a decision an
+image should make. Documented in `docs/DEPLOYMENT.md` §2 and `.env.example`.
+
+Shipping the software is still only half the switch, and the feature stays off
+until `AUTOFILL_ENABLED=true`; installing a package never turns it on by itself.
+`autofill_available()` now says which half is missing, because it used to answer
+only one of three questions. It checked `import playwright` and nothing else, so
+the state right after a bare `pip install playwright` — package present, browser
+never downloaded — was reported as **available**, and the first real pass died on
+a Playwright `DriverError("Executable doesn't exist…")` instead of telling anyone
+what to run. There are now three ordered failure modes, each naming its own fix:
+the pip package, the Chromium download, and the flag. The browser is found by
+inspecting the browser cache (`chromium*` build directories and the per-platform
+executable layout, cross-checked against Playwright 1.44's registry) rather than
+by spawning the driver, so an availability check costs one directory listing.
+`tests/test_autofill_availability.py` asserts all three messages plus a
+`headless_shell`-only install, hermetically.
+
 ### Changed — the per-request access log matches its level to the outcome
 
 The edge middleware logged *every* completed request at `WARNING` — healthy

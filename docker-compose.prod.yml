@@ -29,6 +29,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Assisted Apply's browser ships with the deployment by default.
+        WITH_AUTOFILL: "${WITH_AUTOFILL:-1}"
     restart: unless-stopped
     depends_on:
       db:
@@ -79,6 +82,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Assisted Apply's browser ships with the deployment by default.
+        WITH_AUTOFILL: "${WITH_AUTOFILL:-1}"
     restart: unless-stopped
     depends_on:
       api:
@@ -114,6 +120,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Assisted Apply's browser ships with the deployment by default.
+        WITH_AUTOFILL: "${WITH_AUTOFILL:-1}"
     profiles: ["ops"]
     depends_on:
       db:
@@ -140,6 +149,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Assisted Apply's browser ships with the deployment by default.
+        WITH_AUTOFILL: "${WITH_AUTOFILL:-1}"
     restart: unless-stopped
     depends_on:
       db:

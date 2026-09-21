@@ -43,7 +43,9 @@ run says which field matched which selector instead of just "0 fields filled".
 """
 from __future__ import annotations
 
+import glob
 import os
+import sys
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urlsplit
@@ -167,12 +169,66 @@ def build_autofill_plan(
     }
 
 
+#: The executables Playwright places inside a downloaded browser build, one
+#: entry per platform layout it can produce. Cross-checked against playwright
+#: 1.44's registry — ``playwright install --dry-run chromium`` prints the same
+#: destination offline, so this list can be verified without the browser CDN.
+_BROWSER_EXECUTABLES = (
+    "chrome-linux/chrome",
+    "chrome-linux64/chrome",
+    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+    "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
+    "chrome-win/chrome.exe",
+    "chrome-win64/chrome.exe",
+    "chrome-linux/headless_shell",
+)
+
+
+def _browsers_root() -> str:
+    """The directory Playwright downloads browser builds into."""
+    override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if override:
+        return os.path.expanduser(override)
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "Caches", "ms-playwright")
+    if sys.platform == "win32":
+        return os.path.join(home, "AppData", "Local", "ms-playwright")
+    return os.path.join(home, ".cache", "ms-playwright")
+
+
+def _chromium_browser_path() -> Optional[str]:
+    """
+    The Chromium executable Playwright would launch, or None when no browser
+    build is downloaded.
+
+    Answered from the filesystem alone: asking the driver spawns a Node process
+    per call, and this runs on the hot path of an availability check. Build
+    directories are versioned (``chromium-1117``,
+    ``chromium_headless_shell-1150``), so the newest is preferred.
+    """
+    root = _browsers_root()
+    if not os.path.isdir(root):
+        return None
+    for build in sorted(glob.glob(os.path.join(root, "chromium*-[0-9]*")), reverse=True):
+        for relative in _BROWSER_EXECUTABLES:
+            candidate = os.path.join(build, *relative.split("/"))
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
 def autofill_available() -> Dict[str, Any]:
     """Report whether real browser automation can run in this deployment."""
     try:
         import playwright  # noqa: F401
     except Exception:
         return {"available": False, "reason": "playwright is not installed (pip install playwright && playwright install chromium)"}
+    # A bare `pip install playwright` gets this far, and then the first pass
+    # dies on DriverError("Executable doesn't exist…"). Name the download
+    # instead of claiming the feature works.
+    if _chromium_browser_path() is None:
+        return {"available": False, "reason": "the Chromium browser is not downloaded (playwright install chromium)"}
     if not settings.autofill_enabled:
         return {"available": False, "reason": "AUTOFILL_ENABLED is false"}
     return {"available": True, "dry_run": settings.autofill_dry_run}

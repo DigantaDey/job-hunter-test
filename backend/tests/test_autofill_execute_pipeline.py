@@ -135,6 +135,13 @@ def fake_playwright(monkeypatch):
     pw.async_api = async_api
     monkeypatch.setitem(sys.modules, "playwright", pw)
     monkeypatch.setitem(sys.modules, "playwright.async_api", async_api)
+
+    # The availability check looks for a real Chromium build on disk; this fake
+    # browser never downloads one, so answer the lookup directly.
+    from app.services import autofill as autofill_service
+
+    monkeypatch.setattr(autofill_service, "_chromium_browser_path", lambda: "/fake/chromium/chrome")
+
     monkeypatch.setattr(settings, "autofill_enabled", True)
     monkeypatch.setattr(settings, "autofill_dry_run", False)
     monkeypatch.setattr(settings, "autofill_allow_submit", True)

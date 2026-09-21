@@ -33,8 +33,18 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY backend/requirements.txt /app/backend/requirements.txt
+COPY backend/requirements.txt backend/requirements-autofill.txt /app/backend/
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+
+# Assisted Apply's browser: WITH_AUTOFILL=1 bakes Playwright plus a Chromium
+# build (and its OS libraries) into the image — roughly 400 MB more. The compose
+# files pass 1; a plain `docker build` stays minimal.
+ARG WITH_AUTOFILL=0
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN if [ "$WITH_AUTOFILL" = "1" ]; then \
+        pip install --no-cache-dir -r /app/backend/requirements-autofill.txt \
+        && playwright install --with-deps chromium; \
+    fi
 
 COPY backend/ /app/backend/
 COPY --from=web /web/dist /app/frontend/dist

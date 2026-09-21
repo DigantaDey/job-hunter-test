@@ -7,7 +7,12 @@
 
 services:
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        # Assisted Apply needs Playwright + Chromium inside the image; set to
+        # "0" for the minimal dev image.
+        WITH_AUTOFILL: "1"
     ports:
       - "8000:8000"
     env_file:
@@ -17,6 +22,9 @@ services:
       UPLOAD_DIR: /app/data/uploads
       GENERATED_DIR: /app/data/generated
       SCREENSHOT_DIR: /app/data/screenshots
+      # The dev stack ships the browser, automation on but still dry-run —
+      # submissions stay a conscious operator decision.
+      AUTOFILL_ENABLED: "true"
     volumes:
       - ./backend:/app
       - backend-data:/app/data

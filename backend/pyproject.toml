@@ -26,3 +26,11 @@ known-first-party = ["app"]
 python_version = "3.11"
 ignore_missing_imports = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# Playwright is an optional extra (requirements-autofill.txt). Machines that
+# have it installed expose its bundled type stubs, machines without it do not;
+# skipping its imports keeps `mypy app` deterministic across both.
+module = "playwright.*"
+follow_imports = "skip"
+ignore_missing_imports = true

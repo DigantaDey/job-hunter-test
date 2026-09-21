@@ -62,6 +62,28 @@ docker compose -f docker-compose.prod.yml run --rm api python -m alembic upgrade
 # then set AUTO_MIGRATE=false for the API/worker services
 ```
 
+### Browser automation (Assisted Apply)
+
+Both compose files build their image with `WITH_AUTOFILL=1`, which installs the optional
+Playwright extra and downloads a Chromium build plus its OS libraries
+(`playwright install --with-deps chromium`, cached at `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`)
+— roughly 400 MB more image. Set `WITH_AUTOFILL=0` in `.env` (or
+`docker compose build --build-arg WITH_AUTOFILL=0 …`) for the minimal image; a plain
+`docker build` defaults to `0` as well, so CI never downloads a browser.
+
+Shipping the browser is only half of the switch. The feature stays off until you also set
+`AUTOFILL_ENABLED=true` in `.env` — installing software never turns it on by itself. The
+Assisted Apply page reports exactly which half is missing: the pip package
+(`pip install playwright`), the browser download (`playwright install chromium`) or the flag.
+Bare-metal installs need both steps by hand:
+
+```bash
+pip install -r backend/requirements-autofill.txt && playwright install chromium
+```
+
+`AUTOFILL_DRY_RUN=true` (default) still means a pass fills the form but never presses submit,
+and `AUTOFILL_ALLOW_SUBMIT=false` (default) keeps submission a separate opt-in.
+
 ---
 
 ## 3. Reverse proxy (nginx)

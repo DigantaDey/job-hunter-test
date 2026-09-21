@@ -300,12 +300,18 @@ def test_autofill_plan_uses_user_answers_over_profile():
     assert values["notice"] == "30 days"
 
 
-def test_autofill_availability_is_honest():
+def test_autofill_availability_is_honest(monkeypatch):
+    import sys
+
     from app.services.autofill import autofill_available
+
+    # Hermetic: the optional extra may or may not be installed in this
+    # environment, so make `import playwright` fail and assert on that branch.
+    monkeypatch.setitem(sys.modules, "playwright", None)
 
     status = autofill_available()
     assert status["available"] is False
-    assert "playwright" in status["reason"]
+    assert "playwright is not installed" in status["reason"]
 
 
 def test_adapters_registry_contains_all_expected_ids():

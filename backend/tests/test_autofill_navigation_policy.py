@@ -142,6 +142,12 @@ def _install_fake_playwright(monkeypatch, page: FakePage) -> None:
     monkeypatch.setitem(sys.modules, "playwright", pw)
     monkeypatch.setitem(sys.modules, "playwright.async_api", async_api)
 
+    # The availability check looks for a real Chromium build on disk; this fake
+    # browser never downloads one, so answer the lookup directly.
+    from app.services import autofill as autofill_service
+
+    monkeypatch.setattr(autofill_service, "_chromium_browser_path", lambda: "/fake/chromium/chrome")
+
 
 @pytest.fixture()
 def make_browser(monkeypatch):
