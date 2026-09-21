@@ -92,6 +92,28 @@ and wired into the module that owns the work, user-action expiry (stored
 deadline, no retry, notification, idempotent sweep), restart recovery, duplicate
 refusals, registry self-metrics, and log redaction across both formats.
 
+### Fixed — "Event loop is closed" AI failures from loop-bound singletons
+
+AI requests (and any outbound HTTP through the shared client) could fail mid-request
+with `RuntimeError: Event loop is closed`, which the AI layer classified as an
+unknown/unclassified provider error. The cause was not the provider: it was
+process-global asyncio singletons — the pooled `httpx.AsyncClient`, its
+`asyncio.Lock` and the concurrency `asyncio.Semaphore`s in `services/http.py` and
+`services/ai_client.py` — being reused across event loops. A FastAPI process runs
+several loops (the long-lived uvicorn loop, plus the throwaway loops that the
+`asyncio.run(...)` sync bridges in `api/routers/me.py` and
+`services/assisted_fill.py` create and close), and asyncio objects only work on
+the loop that first awaited them. Whichever loop touched a singleton first owned
+it; the next call from a different loop reused an object whose loop was closed.
+
+The singletons are now loop-aware: each records the loop that created it and is
+rebuilt for a new (or closed-loop-free) event loop, with double-checked locking
+moved from an `asyncio.Lock` to a `threading.Lock` so the check never awaits on a
+foreign loop. Connection pooling and semaphore concurrency limits are unchanged
+within a loop. `tests/test_async_singleton_loop_safety.py` asserts singletons are
+rebuilt per event loop, that a closed-loop client is never handed out, and that
+pooling within one loop is preserved.
+
 ### Fixed — the exposition typed only the metrics it could describe (v2.4.0)
 
 `render_prometheus()` wrote a `# TYPE` line only for names present in the

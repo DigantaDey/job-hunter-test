@@ -81,10 +81,12 @@ def _clean(monkeypatch):
     http.clear_cache()
     http._host_state.clear()
     http._semaphore = None
+    http._semaphore_loop = None
     yield
     http.clear_cache()
     http._host_state.clear()
     http._semaphore = None
+    http._semaphore_loop = None
     net_guard.clear_dns_cache()
 
 
