@@ -309,6 +309,95 @@ async def test_navigation_hard_blocks_survive_the_allow_list(monkeypatch):
     assert verdict.allowlisted is True
 
 
+# --------------------------------------------------------------------------- #
+# Browser policy: an allow-listed *hostname* is checked against its answers
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_allowlisted_host_resolving_to_metadata_is_refused_for_a_browser(monkeypatch):
+    """The confused-deputy case: an allow-listed name that answers with the metadata range."""
+    monkeypatch.setattr(net_guard, "_resolve", _metadata_resolver)
+    verdict = await net_guard.preflight_navigation(
+        "http://portal.example.com/apply", allowlist=["portal.example.com"])
+    assert verdict.allowed is False
+    assert verdict.code == "metadata_host"
+    assert verdict.allowlisted is False
+    assert verdict.dns_checked is True
+    assert verdict.addresses == ("169.254.169.254",)
+    assert "169.254.169.254" in verdict.reason
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_host_resolving_to_loopback_is_refused_for_a_browser(monkeypatch):
+    async def _loopback(*_args, **_kwargs):
+        return ["127.0.0.1"]
+
+    monkeypatch.setattr(net_guard, "_resolve", _loopback)
+    verdict = await net_guard.preflight_navigation(
+        "http://portal.example.com/apply", allowlist=["portal.example.com"])
+    assert verdict.allowed is False
+    assert verdict.code == "metadata_host"
+    assert verdict.allowlisted is False
+    assert "127.0.0.1" in verdict.reason
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_host_resolving_to_nat64_metadata_is_refused_for_a_browser(monkeypatch):
+    """64:ff9b::a9fe:a9fe is 169.254.169.254 behind the NAT64 prefix — the classification
+    must come from the existing envelope unwrapping, not a second copy of it."""
+    async def _resolver(*_args, **_kwargs):
+        return ["64:ff9b::a9fe:a9fe"]
+
+    monkeypatch.setattr(net_guard, "_resolve", _resolver)
+    verdict = await net_guard.preflight_navigation(
+        "http://portal.example.com/apply", allowlist=["portal.example.com"])
+    assert verdict.allowed is False
+    assert verdict.code == "metadata_host"
+    assert "64:ff9b::a9fe:a9fe" in verdict.reason
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_host_resolving_to_private_still_reaches_a_browser(monkeypatch):
+    """Existing documented behaviour: the allow-list keeps its normal effect on genuinely
+    private ranges — only the hard-block subset became absolute for a browser."""
+    async def _resolver(*_args, **_kwargs):
+        return ["10.10.0.5"]
+
+    monkeypatch.setattr(net_guard, "_resolve", _resolver)
+    verdict = await net_guard.preflight_navigation(
+        "http://internal.example.com/apply", allowlist=["internal.example.com"])
+    assert verdict.allowed is True
+    assert verdict.allowlisted is True
+    assert verdict.dns_checked is True
+    assert verdict.addresses == ("10.10.0.5",)
+
+
+@pytest.mark.asyncio
+async def test_non_browser_allowlist_still_bypasses_the_private_check(monkeypatch):
+    """The HTTP path is byte-for-byte unchanged: an allow-listed host never reaches DNS."""
+    monkeypatch.setattr(net_guard, "_resolve", _metadata_resolver)
+    verdict = await net_guard.preflight(
+        "http://portal.example.com/apply", allowlist=["portal.example.com"])
+    assert verdict.allowed is True
+    assert verdict.code == "allowlisted"
+    assert verdict.dns_checked is False
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_host_whose_dns_fails_stays_allowed_for_a_browser(monkeypatch):
+    """A DNS failure is not a policy violation — offline deployments and the offline test
+    suite keep working, for a browser too."""
+    async def _boom(*_args, **_kwargs):
+        raise socket.gaierror("name resolution unavailable")
+
+    monkeypatch.setattr(net_guard, "_resolve", _boom)
+    verdict = await net_guard.preflight_navigation(
+        "http://portal.example.com/apply", allowlist=["portal.example.com"])
+    assert verdict.allowed is True
+    assert verdict.code == "allowlisted"
+    assert verdict.allowlisted is True
+    assert verdict.dns_checked is False
+
+
 def test_host_matching_is_subdomain_aware():
     assert net_guard.host_matches("jobs.lever.co", "jobs.lever.co")
     assert net_guard.host_matches("sub.jobs.lever.co", "jobs.lever.co")

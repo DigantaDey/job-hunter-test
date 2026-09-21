@@ -29,9 +29,17 @@ Two shapes of the same policy:
   not have: the browser will render, follow redirects and *type vault
   credentials* into whatever answers. For navigation, loopback, link-local
   (``169.254.0.0/16`` = the cloud metadata range) and metadata hostnames are
-  refused **even when the host is on the operator allow-list**, and
-  ``OUTBOUND_ALLOW_PRIVATE`` is ignored entirely — a private range is reachable
-  by a browser only when that exact host is allow-listed.
+  refused **even when the host is on the operator allow-list** — and for an
+  allow-listed *hostname* that is checked against its resolved answers: an
+  allow-list entry that later resolves to a hard-blocked address (stale DNS,
+  resolver takeover, a broad entry) is still refused, while an allow-listed
+  host answering with a merely private range keeps the allow-list's normal
+  effect. A DNS *failure* is not a policy violation (the module-wide rule that
+  keeps offline deployments working), so an allow-listed host whose name does
+  not resolve keeps the allow-list verdict, and the refusal names the address
+  that triggered it. ``OUTBOUND_ALLOW_PRIVATE`` is ignored entirely — a
+  private range is reachable by a browser only when that exact host is
+  allow-listed.
 
 Reusable pre-flight: :func:`preflight` answers with a :class:`URLVerdict`
 instead of raising, so a caller can decline *before* doing expensive work
@@ -224,6 +232,30 @@ def _browser_hard_block(host: str, literal: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+#: Reason prefixes from :func:`_unsafe_ip_reason` that belong to the browser
+#: hard-block subset — loopback and link-local (the cloud metadata range
+#: included). The rest of its classes (private, multicast, carrier-grade NAT,
+#: unique-local) stay subject to the allow-list's normal effect: an
+#: allow-listed host that answers with one of them still reaches the service.
+_BROWSER_HARD_BLOCK_PREFIXES = ("loopback address", "link-local address")
+
+
+def _browser_hard_block_answer(address: str) -> Optional[str]:
+    """
+    The hard-block subset applied to a *resolved* DNS answer.
+
+    Reuses :func:`_unsafe_ip_reason` for the classification, which unwraps the
+    NAT64 (``64:ff9b::/96``) and IPv4-mapped (``::ffff:0:0/96``) translation
+    envelopes — an ``64:ff9b::a9fe:a9fe`` answer is the metadata IP carried in
+    an envelope, not an ordinary IPv6 address. Returns a reason naming the
+    answer, or None when it is outside the hard-block subset.
+    """
+    reason = _unsafe_ip_reason(address)
+    if reason is None or not reason.startswith(_BROWSER_HARD_BLOCK_PREFIXES):
+        return None
+    return f"resolves to {address} ({reason})"
+
+
 #: Second-level parts of the common multi-part public suffixes. Used only by
 #: :func:`registrable_domain` — we ship no public-suffix list and do not want
 #: the dependency for a "did this redirect stay inside one organisation?" check.
@@ -334,6 +366,33 @@ async def preflight(
         skip_private = settings.outbound_allow_private if allow_private is None else allow_private
 
     if trusted:
+        if browser and resolve and not ipaddress_ok(literal):
+            # The allow-list short-circuits *before* DNS — but an allow-list
+            # entry promises the hostname, not whatever address DNS answers
+            # for it later (stale internal DNS, resolver takeover, a broad
+            # entry). Apply the hard-block subset — the same ranges
+            # _browser_hard_block refuses absolutely — to the answers; the
+            # allow-list keeps its normal effect on everything else.
+            try:
+                answers = tuple(await _resolve(host, effective_port))
+            except (socket.gaierror, UnicodeError, OSError, asyncio.TimeoutError) as exc:
+                # A DNS failure is not a policy violation — the module-wide
+                # rule that keeps offline deployments (and the offline test
+                # suite) working. Keep the allow-list verdict.
+                log.debug("allow-listed %s did not resolve (%s) — keeping the allow-list verdict",
+                          host, exc)
+                return allow("allowlisted", "host is on OUTBOUND_ALLOWED_HOSTS", allowlisted=True)
+            for address in answers:
+                hard_reason = _browser_hard_block_answer(address)
+                if hard_reason is not None:
+                    return deny(
+                        "metadata_host",
+                        f"allow-listed host '{host}' {hard_reason} — browser navigation "
+                        f"is refused even for allow-listed hosts",
+                        addresses=answers, dns_checked=True,
+                    )
+            return allow("allowlisted", "host is on OUTBOUND_ALLOWED_HOSTS", allowlisted=True,
+                         dns_checked=True, addresses=answers)
         return allow("allowlisted", "host is on OUTBOUND_ALLOWED_HOSTS", allowlisted=True)
 
     if host in BLOCKED_HOSTNAMES or host.endswith(".local") or host.endswith(".internal"):
