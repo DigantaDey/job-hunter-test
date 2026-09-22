@@ -160,7 +160,7 @@ export default function Jobs(){
     try{
       const {data}=await client.post('/api/application-sessions', {job_id: selected.id})
       setApplyMsg(data.created ? 'Assisted session started — continuing to Assisted Apply…' : 'You already have a live session for this job.')
-      navigate('/assist')
+      navigate(`/assist?job=${selected.id}`)
     }catch(e:any){ setApplyMsg(apiError(e, 'Could not start an assisted session')) }
     finally{ setBusy(false) }
   }
@@ -348,7 +348,7 @@ export default function Jobs(){
                   <label className={`text-xs p-2 min-h-[44px] flex items-center justify-center rounded-xl border cursor-pointer text-center focus-within:ring-2 focus-within:ring-blue-500 ${resumeChoice==='generated'?'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900':'bg-white dark:bg-zinc-900 dark:border-zinc-700'}`}><input type="radio" name="resumeChoice" value="generated" checked={resumeChoice==='generated'} onChange={()=>setResumeChoice('generated')} className="sr-only"/>Generated</label>
                 </div>
                 <button onClick={apply} disabled={busy || applyLive} className="w-full min-h-[44px] py-2.5 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1">
-                  {busy || applyLive ? <Loader2 className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} {applyLive ? 'Application in progress…' : selected.status==='needs_input' ? 'Re-queue application' : 'Auto-apply (vault + autofill)'}
+                  {busy || applyLive ? <Loader2 className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} {applyLive ? 'Application in progress…' : selected.status==='needs_input' ? 'Re-queue application' : 'Prepare application'}
                 </button>
                 <button onClick={assist} disabled={busy} className="w-full min-h-[44px] py-2 rounded-full border border-blue-300 dark:border-blue-800 text-blue-700 dark:text-blue-300 text-sm font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1">
                   {busy ? <Loader2 className="w-4 h-4 animate-spin"/> : <Eye className="w-4 h-4"/>} Assisted session (you stay in the loop)
@@ -357,7 +357,7 @@ export default function Jobs(){
                 <WorkStatusLine row={applyRow} prefix="Auto-apply" testId="apply-status" onDismiss={()=>work.untrack(`apply:${selected.id}`)} />
                 {applyMsg && <div className="text-xs mono p-2 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200 flex gap-2"><AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5"/>{applyMsg}</div>}
                 <div className="text-[11px] mono text-zinc-500 leading-relaxed">
-                  Prepare → Review → Confirm → Execute. For Workday/Lever: auto-creates vault credential. Unknown fields → User Input Needed queue. Never silently fails.
+                  Prepares your resume and form plan first. Continue in Assisted Apply for a human-in-the-loop browser pass; automatic browser submission is separately opt-in. Unknown fields go to User Input Needed.
                 </div>
               </div>
 

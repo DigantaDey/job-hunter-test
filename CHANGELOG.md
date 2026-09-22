@@ -6,6 +6,13 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed — Auto-apply now completes honestly, and Assisted Apply no longer inherits its off switch
+
+A prepare-only **Auto-apply** run could finish successfully in the worker while its job and queue outcome still said `preparing`. The Jobs page consequently showed an apparently permanent “preparing” state with no next step, even though it had selected a resume, detected the form and built the field plan. Completed prepare-only work now records `ready_to_apply`; the durable queue UI calls this **Preparation complete**, states that no browser submission ran, and links directly to **Assisted Apply** with the job preselected. The Jobs action is labelled **Prepare application** to make that safe fallback explicit. Existing execute, user-input, submission and queue-retry behavior is unchanged.
+
+Assisted Apply also incorrectly reused `AUTOFILL_ENABLED`, the deliberate safety switch for unattended Auto-apply. A completed profile could therefore not launch an interactive, human-in-the-loop pass and received `AUTOFILL_ENABLED is false`. Browser-runtime detection is now factored from that autonomous feature gate: `AUTOFILL_ENABLED` still controls unattended Auto-apply, while `ASSISTED_APPLY_ENABLED` (default `true`) controls Assisted Apply separately. The assisted route, resumed queue path and browser driver all use the same availability decision; the existing consent, destination validation, CAPTCHA/MFA/credential handoffs, dry-run behavior and submission policy remain in force. `/api/account/runtime` reports the assisted runtime separately and the Assisted Apply page displays its real runtime failure instead of the unrelated Auto-apply flag. Deployment guidance and `.env.example` document the split. Regression coverage verifies Auto-apply-off / Assisted-Apply-on operation, the direct and queued assisted paths, and the preparation-complete handoff.
+
+
 ### Fixed — Profile completeness never shows 110% and the dashboard agrees with profile review
 
 The dashboard's **Profile completeness** chip and the profile review header disagreed — the dashboard could render `110%` while **Complete your profile** (`GET /api/profile/completeness`) reported `63%` on the same account, and the bar overflowed its track. The profile review's completeness endpoint was also stale after confirm/reject/defer because those actions never recalculated the stored `CandidateProfile.completeness`.

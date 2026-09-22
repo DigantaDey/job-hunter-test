@@ -258,9 +258,9 @@ def test_execute_intent_without_consent_stays_dry_run(client, full_consent, db, 
     assert receipt["mode"] == "prepare"
     _run(receipt["pipeline_job_id"])
     row = _row(client, full_consent, receipt["pipeline_job_id"])
-    assert row["result"]["status"] == "preparing"
+    assert row["result"]["status"] == "ready_to_apply"
     db.expire_all()
-    assert db.query(Job).filter(Job.id == _job_no_consent.id).one().status == "preparing"
+    assert db.query(Job).filter(Job.id == _job_no_consent.id).one().status == "ready_to_apply"
     assert "button[type=submit]" not in fake_playwright.clicks
 
     # Now the user consents and clicks (mode=execute), then revokes the

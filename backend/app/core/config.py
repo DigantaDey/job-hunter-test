@@ -585,10 +585,20 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Browser automation
     # ------------------------------------------------------------------ #
+    #: Enables the unattended Auto-apply browser path. This remains separate
+    #: from the interactive Assisted Apply runtime: an operator can keep
+    #: fire-and-forget autofill off while still allowing a user-controlled,
+    #: human-in-the-loop browser pass (``assisted_apply_enabled`` below).
     autofill_enabled: bool = False
     autofill_dry_run: bool = True
     autofill_allow_submit: bool = False
     autofill_headless: bool = True
+    #: Enables browser-assisted field filling. Unlike ``autofill_enabled`` it
+    #: never permits unattended submission; the session policy and submission
+    #: ledger remain the only route to that. Defaults on so the shipped
+    #: Playwright image can provide Assisted Apply even when Auto-apply is
+    #: deliberately disabled.
+    assisted_apply_enabled: bool = True
     autofill_timeout_ms: int = 45000
     screenshot_dir: str = "./artifacts/screenshots"
 
@@ -1133,6 +1143,7 @@ class Settings(BaseSettings):
             "email_configured": self.smtp_configured,
             "email_compliance_ready": self.compliance_ready_for_sending,
             "autofill_enabled": self.autofill_enabled,
+            "assisted_apply_enabled": self.assisted_apply_enabled,
             "autofill_dry_run": self.autofill_dry_run,
             "autofill_allow_submit": self.autofill_allow_submit,
             "registration_open": self.allow_registration,

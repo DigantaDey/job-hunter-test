@@ -662,13 +662,17 @@ def _remove_files(paths: List[str]) -> int:
 @router.get("/runtime")
 def runtime_settings(user: CurrentUser, db: DbSession):
     """Effective (non-secret) platform configuration for the UI's status panel."""
-    from app.services.autofill import autofill_available
+    from app.services.autofill import assisted_apply_available, autofill_available
     from app.services.funding_sources import provider_status
     from app.services.sources import list_sources
 
     return {
         **settings.public_settings(),
         "autofill_runtime": autofill_available(),
+        # Interactive Assistance is intentionally reported separately: the
+        # unattended Auto-apply switch may be off while a user-controlled
+        # browser session is available.
+        "assisted_apply_runtime": assisted_apply_available(),
         "funding_providers": provider_status(),
         "sources": list_sources(),
         "consents": {key: bool((user.consents or {}).get(f"{key}_accepted_at")) for key in DISCLOSURES},

@@ -131,6 +131,7 @@ def test_account_runtime_includes_sources(client, auth):
     ids = {row["id"] for row in body["sources"]}
     assert {"greenhouse", "lever", "linkedin"} <= ids
     assert body["autofill_runtime"]["available"] is False
+    assert "assisted_apply_runtime" in body
 
 
 def test_audit_trail_is_available(client, auth):

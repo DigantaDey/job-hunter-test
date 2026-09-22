@@ -397,6 +397,7 @@ APPLICATION_BLOCKED_CODES: Tuple[str, ...] = (
     "policy_daily_limit",
     "quota_exhausted",
     "autofill_unavailable",
+    "assisted_apply_unavailable",
     "portal_unreachable",
 )
 

@@ -73,12 +73,14 @@ Playwright extra and downloads a Chromium build plus its OS libraries
 CI builds both variants and launches Chromium in the default image as its
 unprivileged runtime user.
 
-Shipping the browser is only half of the switch. The feature stays off until you also set
-`AUTOFILL_ENABLED=true` in `.env` — installing software never turns it on by itself. The
-Assisted Apply page reports exactly which half is missing: the pip package
-(`pip install playwright`), the browser download (`playwright install chromium`) or the flag.
-`./run.sh` installs both by default (opt out with `WITH_AUTOFILL=0`). For manual
-bare-metal installs, use the same Python environment as the backend:
+Shipping the browser enables the **human-in-the-loop Assisted Apply** runtime (unless you
+set `ASSISTED_APPLY_ENABLED=false`). `AUTOFILL_ENABLED=true` is a separate, deliberate opt-in
+for unattended Auto-apply; turning it off does not block an assisted browser session and never
+permits a submission. The Assisted Apply page reports an actionable runtime failure — the pip
+package (`pip install playwright`), the browser download (`playwright install chromium`) or its
+own explicit feature flag — instead of incorrectly naming `AUTOFILL_ENABLED`.
+`./run.sh` installs both by default (opt out with `WITH_AUTOFILL=0`). For manual bare-metal
+installs, use the same Python environment as the backend:
 
 ```bash
 python -m pip install -r backend/requirements-autofill.txt

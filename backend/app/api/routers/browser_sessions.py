@@ -145,9 +145,9 @@ def _queue_continuing_pass(db, user, session: ApplicationSession, *, trigger: st
     hiccup, must not fail the request that finished the human's step — the
     session state is already committed, and the pass can be queued again by hand.
     """
-    from app.services.autofill import autofill_available
+    from app.services.autofill import assisted_apply_available
 
-    if not autofill_available()["available"]:
+    if not assisted_apply_available()["available"]:
         return None
     try:
         return assisted_fill.enqueue_pass(db, user=user, session=session, trigger=trigger)
@@ -432,19 +432,21 @@ async def run_pass(session_id: int, body: PassRequest, request: Request, user: C
     """
     Run one assisted pass in a real browser.
 
-    Refused with ``autofill_unavailable`` when Playwright is not installed —
-    never simulated. The pass stops at the first human-required step and the
-    queue item says which one.
+    Refused with ``assisted_apply_unavailable`` when the interactive browser
+    runtime is not installed or has been disabled — never simulated. This is
+    intentionally independent from the unattended Auto-apply feature flag.
+    The pass stops at the first human-required step and the queue item says
+    which one.
     """
     session = _session_or_404(db, user, session_id)
     enforce(db, user.id, "can_use_autofill")
     # A pass fills fields; it never submits unless the policy chain allows it —
     # ``run_pass`` only reaches the submit control through a reservation.
-    from app.services.autofill import autofill_available
+    from app.services.autofill import assisted_apply_available
 
-    availability = autofill_available()
+    availability = assisted_apply_available()
     if not availability["available"]:
-        raise HTTPException(503, {"code": "autofill_unavailable", "message": availability["reason"]})
+        raise HTTPException(503, {"code": "assisted_apply_unavailable", "message": availability["reason"]})
 
     job = db.query(Job).filter(Job.id == session.job_id).first()
     if job is None:

@@ -765,6 +765,25 @@ class TestDuplicateSubmissions:
 # The pass loop (recording driver)
 # --------------------------------------------------------------------------- #
 class TestAssistedPass:
+    def test_direct_pass_uses_assisted_runtime_when_auto_apply_is_disabled(self, client, db, owner, auth, profile, monkeypatch):
+        """The direct HTTP route must share the queue's independent gate."""
+        from app.services import autofill
+
+        user = db.query(User).order_by(User.id).first()
+        job = _make_job(db, user_id=user.id)
+        session, _ = sessions.start_session(db, user=user, job=job)
+        monkeypatch.setattr(settings, "autofill_enabled", False)
+        monkeypatch.setattr(autofill, "assisted_apply_available", lambda: {"available": True, "dry_run": True})
+
+        async def fake_run_pass(*_args, **_kwargs):
+            return {"status": "filled", "filled": ["first_name"], "submitted": False}
+
+        monkeypatch.setattr(assisted_fill, "run_pass", fake_run_pass)
+        response = client.post(f"/api/application-sessions/{session.id}/pass", json={}, headers=auth)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["pass"]["status"] == "filled"
+
     def test_pass_fills_safe_fields_and_stops_at_the_captcha(self, db, owner, auth, profile):
         user = db.query(User).order_by(User.id).first()
         job = _make_job(db, user_id=user.id)
@@ -914,15 +933,16 @@ class TestQueuePipeline:
             db, user_id=user.id, pipeline="browser_session", job_id=job.id,
             payload={"session_id": session.id}, dedupe_key=f"browser-session:{session.id}",
         )
-        # ``test_ops_health_and_privacy``-style deployments keep automation off.
-        monkeypatch_off = settings.autofill_enabled
-        settings.autofill_enabled = False
+        # The interactive runtime has its own explicit operator switch; this
+        # test must not treat AUTOFILL_ENABLED as that switch.
+        original = settings.assisted_apply_enabled
+        settings.assisted_apply_enabled = False
         try:
             result = asyncio.run(assisted_fill.run_queued_pass(db, item))
         finally:
-            settings.autofill_enabled = monkeypatch_off
+            settings.assisted_apply_enabled = original
         assert result["status"] == "unavailable"
-        assert result["noop"] == "autofill_unavailable"
+        assert result["noop"] == "assisted_apply_unavailable"
 
     def test_worker_handler_runs_a_pass_and_keeps_the_pause(self, db, owner, auth, profile):
         from app.services.handlers import HANDLERS
@@ -935,13 +955,13 @@ class TestQueuePipeline:
             db, user_id=user.id, pipeline="browser_session", job_id=job.id,
             payload={"session_id": session.id}, dedupe_key=f"browser-session:{session.id}",
         )
-        monkeypatch_off = settings.autofill_enabled
-        settings.autofill_enabled = False
+        original = settings.assisted_apply_enabled
+        settings.assisted_apply_enabled = False
         try:
             result = asyncio.run(HANDLERS["browser_session"](db, item))
         finally:
-            settings.autofill_enabled = monkeypatch_off
-        assert result["noop"] == "autofill_unavailable" and result["session_id"] == session.id
+            settings.assisted_apply_enabled = original
+        assert result["noop"] == "assisted_apply_unavailable" and result["session_id"] == session.id
         # The step vocabulary is the contract the UI's stepper renders.
         assert item.payload["progress"]["step"] == "done"
 
@@ -981,7 +1001,7 @@ class TestResumeQueuesTheNextPass:
 
         from app.services import autofill
 
-        monkeypatch.setattr(autofill, "autofill_available",
+        monkeypatch.setattr(autofill, "assisted_apply_available",
                             lambda: {"available": True, "reason": ""})
         completed = client.post(
             f"/api/application-sessions/{session.id}/actions/{action.id}/complete",
@@ -994,7 +1014,8 @@ class TestResumeQueuesTheNextPass:
         assert row.pipeline == "browser_session"
         assert row.payload["session_id"] == session.id
 
-    def test_resume_queues_nothing_when_automation_is_off(self, client, db, owner, auth, profile):
+    def test_resume_queues_nothing_when_assisted_apply_is_disabled(self, client, db, owner, auth, profile, monkeypatch):
+        monkeypatch.setattr(settings, "assisted_apply_enabled", False)
         user = db.query(User).order_by(User.id).first()
         job = _make_job(db, user_id=user.id)
         session, _ = sessions.start_session(db, user=user, job=job)

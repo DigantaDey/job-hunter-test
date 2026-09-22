@@ -43,7 +43,7 @@ from app.core.metrics import inc
 from app.models.models import ApplicationSession, Job, User
 from app.services import browser_session as sessions
 from app.services import net_guard
-from app.services.autofill import autofill_available
+from app.services.autofill import assisted_apply_available
 from app.services.field_classifier import classify_form
 from app.services.form_detector import VAULT_DOMAINS
 from app.services.reliability import duration
@@ -195,9 +195,9 @@ class PlaywrightDriver:
         self._page: Any = None
 
     async def open(self, session: ApplicationSession) -> None:
-        availability = autofill_available()
+        availability = assisted_apply_available()
         if not availability["available"]:
-            raise DriverError(f"browser automation unavailable: {availability['reason']}")
+            raise DriverError(f"assisted browser unavailable: {availability['reason']}")
         target = self.target_url or str((session.last_observation or {}).get("url") or "")
         verdict = await net_guard.preflight_navigation(target)
         if not verdict.allowed:
@@ -324,7 +324,7 @@ def build_driver(
     Constructed here — never by a request handler — so the destination, the
     stored state and the submit flag all come from the session's own binding.
     """
-    availability = autofill_available()
+    availability = assisted_apply_available()
     if not availability["available"]:
         return None
     policy = policy or sessions.effective_policy(db, user.id)
@@ -464,10 +464,10 @@ async def _run_queued_pass(
     policy = sessions.effective_policy(db, user.id)
     active_driver = driver or build_driver(db, session, job, user=user, policy=policy)
     if active_driver is None:
-        report_queue_progress(db, item, "done", detail="autofill_unavailable")
+        report_queue_progress(db, item, "done", detail="assisted_apply_unavailable")
         return {"status": "unavailable", "session_id": session.id,
-                "noop": "autofill_unavailable",
-                "reason": autofill_available().get("reason") or "autofill_disabled"}
+                "noop": "assisted_apply_unavailable",
+                "reason": assisted_apply_available().get("reason") or "assisted_apply_disabled"}
     report_queue_progress(db, item, "opening", session_state=session.state)
     try:
         result = await run_pass(db, user=user, session=session, driver=active_driver, policy=policy)

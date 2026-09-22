@@ -252,20 +252,57 @@ def _chromium_browser_path() -> Optional[str]:
     return None
 
 
-def autofill_available() -> Dict[str, Any]:
-    """Report whether real browser automation can run in this deployment."""
+def browser_runtime_available() -> Dict[str, Any]:
+    """Report whether the Playwright + Chromium runtime is installed.
+
+    This answers an operational question only. Product workflows layer their
+    own policy gates over it: unattended Auto-apply uses
+    :func:`autofill_available`, whereas human-in-the-loop Assisted Apply uses
+    :func:`assisted_apply_available`.
+    """
     try:
         import playwright  # noqa: F401
     except Exception:
-        return {"available": False, "reason": "playwright is not installed (pip install playwright && playwright install chromium)"}
+        return {
+            "available": False,
+            "reason": "playwright is not installed (pip install playwright && playwright install chromium)",
+        }
     # A bare `pip install playwright` gets this far, and then the first pass
     # dies on DriverError("Executable doesn't exist…"). Name the download
     # instead of claiming the feature works.
     if _chromium_browser_path() is None:
-        return {"available": False, "reason": "the Chromium browser is not downloaded (playwright install chromium)"}
+        return {
+            "available": False,
+            "reason": "the Chromium browser is not downloaded (playwright install chromium)",
+        }
+    return {"available": True}
+
+
+def autofill_available() -> Dict[str, Any]:
+    """Report whether unattended Auto-apply browser automation can run."""
+    runtime = browser_runtime_available()
+    if not runtime["available"]:
+        return runtime
     if not settings.autofill_enabled:
         return {"available": False, "reason": "AUTOFILL_ENABLED is false"}
     return {"available": True, "dry_run": settings.autofill_dry_run}
+
+
+def assisted_apply_available() -> Dict[str, Any]:
+    """Report whether interactive, human-in-the-loop browser filling can run.
+
+    ``AUTOFILL_ENABLED`` deliberately does *not* gate this workflow. It is the
+    switch for unattended Auto-apply; an assisted session pauses for the user
+    at sign-in, CAPTCHA, MFA, unknown, and submission checkpoints, and its
+    submit policy is still enforced by ``browser_session.effective_policy``.
+    Operators can disable Assisted Apply independently when needed.
+    """
+    runtime = browser_runtime_available()
+    if not runtime["available"]:
+        return runtime
+    if not settings.assisted_apply_enabled:
+        return {"available": False, "reason": "ASSISTED_APPLY_ENABLED is false"}
+    return {"available": True}
 
 
 # --------------------------------------------------------------------------- #
