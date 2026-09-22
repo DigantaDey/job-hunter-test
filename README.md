@@ -57,13 +57,20 @@ The v1.2 build was a working single-user prototype. v2.0 closes the gaps that bl
 ```bash
 # backend
 python -m venv .venv && source .venv/bin/activate
-pip install -r backend/requirements-dev.txt
+pip install -r backend/requirements-dev.txt -r backend/requirements-autofill.txt
+python -m playwright install --with-deps chromium
 cp .env.example .env                     # fill SECRET_KEY + ENCRYPTION_KEY (see below)
 cd backend && PYTHONPATH=. uvicorn app.main:app --reload --port 8000
 
 # frontend (second terminal)
 cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /api to :8000
 ```
+
+`./run.sh` also installs Python Playwright and Chromium by default. Use
+`WITH_AUTOFILL=0 ./run.sh` for a browser-free install, or `AUTO_INSTALL=0 ./run.sh`
+to skip all installation. The frontend npm package is not a substitute for the
+backend Python package. Installing the browser does not enable automatic submission;
+see the Assisted Apply settings below.
 
 Generate the two secrets once:
 

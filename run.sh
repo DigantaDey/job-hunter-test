@@ -2,7 +2,8 @@
 # One-command development launcher: installs deps, builds the SPA, starts the API.
 #
 #   ./run.sh              # http://localhost:8000 (SPA + API, hot reload)
-#   AUTO_INSTALL=0 ./run.sh
+#   AUTO_INSTALL=0 ./run.sh     # skip all dependency installation
+#   WITH_AUTOFILL=0 ./run.sh    # omit the optional browser stack
 #
 # For production use docker-compose.prod.yml (see docs/DEPLOYMENT.md).
 set -euo pipefail
@@ -10,6 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 AUTO_INSTALL="${AUTO_INSTALL:-1}"
+WITH_AUTOFILL="${WITH_AUTOFILL:-1}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "→ Creating virtualenv…"
@@ -20,6 +22,11 @@ fi
 if [ "$AUTO_INSTALL" = "1" ]; then
   echo "→ Installing backend dependencies…"
   "$PYTHON_BIN" -m pip install -q -r backend/requirements-dev.txt
+  if [ "$WITH_AUTOFILL" = "1" ]; then
+    echo "→ Installing backend Playwright and Chromium (may request sudo for OS libraries)…"
+    "$PYTHON_BIN" -m pip install -q -r backend/requirements-autofill.txt
+    "$PYTHON_BIN" -m playwright install --with-deps chromium
+  fi
   if [ ! -d frontend/node_modules ]; then
     echo "→ Installing frontend dependencies…"
     (cd frontend && npm install --silent)
