@@ -7,4 +7,4 @@
 # autofill.available=false and applications are prepared (fields mapped, form
 # snapshots stored) but never submitted. Standard Docker images and run.sh
 # install this extra; WITH_AUTOFILL=0 opts into a smaller browser-free install.
-playwright==1.62.0
+playwright==1.63.0
