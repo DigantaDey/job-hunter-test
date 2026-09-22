@@ -64,22 +64,30 @@ docker compose -f docker-compose.prod.yml run --rm api python -m alembic upgrade
 
 ### Browser automation (Assisted Apply)
 
-Both compose files build their image with `WITH_AUTOFILL=1`, which installs the optional
+Both Dockerfiles and compose files default to `WITH_AUTOFILL=1`, which installs the optional
 Playwright extra and downloads a Chromium build plus its OS libraries
 (`playwright install --with-deps chromium`, cached at `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`)
 — roughly 400 MB more image. Set `WITH_AUTOFILL=0` in `.env` (or
 `docker compose build --build-arg WITH_AUTOFILL=0 …`) for the minimal image; a plain
-`docker build` defaults to `0` as well, so CI never downloads a browser.
+`docker build --build-arg WITH_AUTOFILL=0 .` also builds the minimal image.
+CI builds both variants and launches Chromium in the default image as its
+unprivileged runtime user.
 
 Shipping the browser is only half of the switch. The feature stays off until you also set
 `AUTOFILL_ENABLED=true` in `.env` — installing software never turns it on by itself. The
 Assisted Apply page reports exactly which half is missing: the pip package
 (`pip install playwright`), the browser download (`playwright install chromium`) or the flag.
-Bare-metal installs need both steps by hand:
+`./run.sh` installs both by default (opt out with `WITH_AUTOFILL=0`). For manual
+bare-metal installs, use the same Python environment as the backend:
 
 ```bash
-pip install -r backend/requirements-autofill.txt && playwright install chromium
+python -m pip install -r backend/requirements-autofill.txt
+python -m playwright install --with-deps chromium
 ```
+
+Rebuild and recreate existing API **and worker** containers after upgrading;
+changing source files alone cannot install dependencies in a running container.
+For production: `docker compose -f docker-compose.prod.yml up -d --build api worker`.
 
 `AUTOFILL_DRY_RUN=true` (default) still means a pass fills the form but never presses submit,
 and `AUTOFILL_ALLOW_SUBMIT=false` (default) keeps submission a separate opt-in.
