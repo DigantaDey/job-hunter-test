@@ -23,8 +23,7 @@ FROM python:3.11-slim AS api
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app/backend \
-    WORKDIR=/app/backend
+    PYTHONPATH=/app/backend
 
 # libpq5: the psycopg2 runtime. postgresql-client: pg_dump, used by the
 # backup service in docker-compose.prod.yml (it exits non-zero without it).
@@ -43,16 +42,20 @@ ARG WITH_AUTOFILL=0
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN if [ "$WITH_AUTOFILL" = "1" ]; then \
         pip install --no-cache-dir -r /app/backend/requirements-autofill.txt \
-        && playwright install --with-deps chromium; \
+        && playwright install --with-deps chromium \
+        && chmod -R 755 /opt/ms-playwright; \
     fi
 
 COPY backend/ /app/backend/
 COPY --from=web /web/dist /app/frontend/dist
 
 # Run as an unprivileged user; the writable data directories are chowned to it.
+# Also ensure the playwright browser cache is readable by the unprivileged user
+# when WITH_AUTOFILL=1 baked the browser in as root.
 RUN useradd --create-home --uid 10001 jobhunter \
-    && mkdir -p /app/backend/uploads /app/backend/generated /app/backend/artifacts/screenshots \
-    && chown -R jobhunter:jobhunter /app
+    && mkdir -p /app/backend/uploads /app/backend/generated /app/backend/artifacts/screenshots /opt/ms-playwright \
+    && chown -R jobhunter:jobhunter /app /opt/ms-playwright \
+    && chmod -R 755 /opt/ms-playwright
 USER jobhunter
 
 EXPOSE 8000

@@ -10,8 +10,10 @@ ARG WITH_AUTOFILL=0
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN if [ "$WITH_AUTOFILL" = "1" ]; then \
         pip install --no-cache-dir -r requirements-autofill.txt \
-        && playwright install --with-deps chromium; \
+        && playwright install --with-deps chromium \
+        && chmod -R 755 /opt/ms-playwright; \
     fi
 COPY . .
+RUN mkdir -p /opt/ms-playwright && chmod -R 755 /opt/ms-playwright
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
