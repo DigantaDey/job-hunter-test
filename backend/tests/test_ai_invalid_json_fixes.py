@@ -335,6 +335,32 @@ def test_fenced_json_with_prose_is_parsed_leniently(direct_ai):
 # 4. Provider parameter fix-ups (400s that name the offending parameter)
 # --------------------------------------------------------------------------- #
 @pytest.mark.real_ai
+def test_huggingface_structured_outputs_rejection_retries_without_response_format(direct_ai):
+    """Hugging Face router 400s json_object as unsupported structured-outputs.
+
+    The error body does not mention ``response_format``, so the generic
+    OpenAI/Google field-name matchers would miss it.
+    """
+    import asyncio
+
+    hf_body = (
+        '{"code":400, "reason":"INVALID_REQUEST_BODY", '
+        '"message":"model: inclusionai/ling-3.0-flash-fin does not support '
+        'feature: structured-outputs", "metadata":{}}'
+    )
+    ScriptedAIHandler.behavior["script"] = [
+        {"status": 400, "body": json.loads(hf_body)},
+        ok(json.dumps(GOOD_PROFILE)),
+    ]
+    result = asyncio.run(direct_ai.chat_completion("parse", "extract the resume"))
+
+    assert result["name"] == "Test Candidate"
+    requests = _wire_requests(direct_ai)
+    assert "response_format" in requests[0]
+    assert "response_format" not in requests[1]
+
+
+@pytest.mark.real_ai
 def test_provider_requiring_max_completion_tokens_is_renamed(direct_ai):
     import asyncio
 

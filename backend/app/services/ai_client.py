@@ -1135,6 +1135,26 @@ def _read_usage(data: Dict[str, Any], prompt: str, content: str) -> Tuple[int, i
     return prompt_tokens, completion_tokens, total_tokens
 
 
+def _json_mode_rejected(body_lowered: str) -> bool:
+    """True when a 400 names json/structured-output mode as unsupported.
+
+    OpenAI-style errors mention ``response_format``; Google mentions
+    ``responseMimeType``. Hugging Face's OpenAI-compatible router reports
+    ``does not support feature: structured-outputs`` without naming the
+    request field, so that phrase must also drop json mode.
+    """
+    return any(token in (body_lowered or "") for token in (
+        "response_format",
+        "responsemimetype",
+        "response_mime_type",
+        "structured-outputs",
+        "structured_outputs",
+        "structured outputs",
+        "json_object",
+        "json_schema",
+    ))
+
+
 def _json_retry_action(content: str, finish_reason: Optional[str], *, json_mode_active: bool,
                        plain_retries: int) -> Optional[str]:
     """Decide how to recover from an empty/invalid JSON answer.
@@ -1429,7 +1449,7 @@ async def chat_completion(
                                     lowered = body.lower()
                                     if response.status_code == 400 and fixups < 3:
                                         fixup_applied = False
-                                        if json_mode_active and ("response_format" in lowered or "responsemimetype" in lowered or "response_mime_type" in lowered):
+                                        if json_mode_active and _json_mode_rejected(lowered):
                                             log.warning("AI %s: provider rejected json mode, retrying without it", workflow)
                                             json_mode_active = False
                                             if is_google and "generationConfig" in payload:
@@ -1819,7 +1839,7 @@ async def chat_completion(
                 lowered = body.lower()
                 if response.status_code == 400 and fixups < 3:
                     fixup_applied = False
-                    if json_mode_active and ("response_format" in lowered or "responsemimetype" in lowered):
+                    if json_mode_active and _json_mode_rejected(lowered):
                         log.warning("AI %s: provider rejected json_object response_format, retrying without it", workflow)
                         if is_google and "generationConfig" in payload:
                             payload["generationConfig"].pop("responseMimeType", None)
