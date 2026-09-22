@@ -107,14 +107,48 @@ def resolve_field(request: Request, user: CurrentUser, db: DbSession, body: Reso
         elif body.action == "reject":
             cp_service.reject_field(db, user.id, body.profile_id, body.path, actor_id=user.id, reason=body.reason)
         elif body.action == "defer":
-            # Mark as deferred
+            # Deferred keeps the value but removes it from the required queue;
+            # still needs to recalc completeness so the percent does not stay stale.
+            import uuid
+            from datetime import datetime
+
+            from app.services.candidate_profile import ProfileFieldHistory
+            # Append history for audit (defer is a review decision)
+            deferred_hist = ProfileFieldHistory(
+                user_id=user.id,
+                provenance_id=provenance.id,
+                path=provenance.path,
+                previous_value_hash=provenance.value_hash,
+                previous_value_preview=provenance.value_preview,
+                new_value_hash=provenance.value_hash,
+                new_value_preview=provenance.value_preview,
+                origin_before=provenance.origin,
+                origin_after=provenance.origin,
+                review_status_before=provenance.review_status,
+                review_status_after="deferred",
+                actor_type="user",
+                actor_id=user.id,
+                reason=body.reason or "user deferred",
+                event_id=str(uuid.uuid4()),
+                occurred_at=datetime.utcnow(),
+            )
+            db.add(deferred_hist)
             provenance.review_status = "deferred"
             provenance.review_required = False
             provenance.reviewed_by = user.id
-            from datetime import datetime
             provenance.reviewed_at = datetime.utcnow()
+            provenance.needs_answer_for = []
             db.add(provenance)
             db.flush()
+            # Recalculate completeness/state — defer counts separately
+            try:
+                from app.services.candidate_profile import _recalculate_profile_state
+                prof = db.query(CandidateProfile).filter(CandidateProfile.id == body.profile_id, CandidateProfile.user_id == user.id).first()
+                if prof:
+                    _recalculate_profile_state(db, prof)
+                    db.flush()
+            except Exception:
+                pass
     except ValueError as exc:
         raise HTTPException(404, {"code": "field_needs_review", "message": str(exc)}) from exc
 
@@ -167,18 +201,49 @@ def get_completeness(user: CurrentUser, db: DbSession, profile_id: Optional[int]
             raise HTTPException(404, {"code": "profile_missing", "message": "No current profile"})
 
     completeness = profile.completeness or {}
-    # Also compute completion requirements from provenance
+    # Compute completion requirements from provenance + canonical document
+    # (document is source of truth for sensitive masked previews — using preview
+    # alone marked every sensitive field as missing, causing the stale 63% etc.)
     provenance = cp_service.list_provenance_for_review(db, user.id, profile.id)
-    # Rebuild fields dict for requirements
+    # Use the stored completeness' missing/uncertain only as stored value is already
+    # authoritative. For requirements we need field-level value existence —
+    # rebuild from document + provenance via the same helpers the service uses.
     fields = {}
+    doc = profile.document or {}
     for prov in provenance:
         fk = prov.path.lstrip("/").split("/")[0]
-        # Use preview as value approximation for requirement building
+        # Resolve actual value from document (masked previews are None for sensitive)
+        try:
+            from app.services.candidate_profile import _get_doc_value, _hash_value
+            val = _get_doc_value(doc, fk)
+            if val in (None, "", [], {}):
+                if prov.sensitivity not in ("sensitive", "restricted") and prov.value_preview not in (None, "", [], {}):
+                    val = prov.value_preview
+                elif prov.value_hash != _hash_value(None) and prov.review_status not in ("rejected", "missing"):
+                    val = "__sensitive_filled__"
+                else:
+                    val = None
+        except Exception:
+            val = prov.value_preview if prov.value_preview is not None else None
+        # Derive status consistently with _recalculate_profile_state
+        if prov.review_status in ("confirmed", "corrected", "auto_accepted"):
+            status = "confirmed"
+        elif prov.review_status == "rejected":
+            status = "missing"
+            val = None
+        elif getattr(prov, "ambiguity", "none") == "conflicting_sources":
+            status = "conflicting"
+        elif val in (None, "", [], {}):
+            status = "missing"
+        elif prov.review_status in ("needs_review", "deferred") or prov.confidence_band in ("low", "none"):
+            status = "uncertain"
+        else:
+            status = prov.review_status or "uncertain"
         fields[fk] = {
-            "value": prov.value_preview if prov.value_preview is not None else None,
+            "value": val,
             "confidence": prov.confidence or 0.0,
             "confidence_band": prov.confidence_band,
-            "status": "confirmed" if prov.review_status in ("confirmed", "corrected", "auto_accepted") else ("missing" if prov.confidence_band == "none" else "uncertain"),
+            "status": status,
             "review_required": prov.review_required,
             "evidence": prov.evidence,
             "evidence_quotes": [ev.get("quote") for ev in (prov.evidence or []) if isinstance(ev, dict)],

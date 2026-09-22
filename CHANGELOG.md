@@ -6,6 +6,30 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed — Profile completeness never shows 110% and the dashboard agrees with profile review
+
+The dashboard's **Profile completeness** chip and the profile review header disagreed — the dashboard could render `110%` while **Complete your profile** (`GET /api/profile/completeness`) reported `63%` on the same account, and the bar overflowed its track. The profile review's completeness endpoint was also stale after confirm/reject/defer because those actions never recalculated the stored `CandidateProfile.completeness`.
+
+**Root cause:** two independent percentage sources. `GET /api/me/dashboard` derived `profile.percent` from a hand-rolled `earned/110*100` over `PreflightResult` weights (legacy `Profile` path) while `GET /api/profile/completeness` rebuilt its percent from the candidate document. Confirming or rejecting a field left the candidate's `completeness` row untouched — so the dashboard kept serving the old row and the review page rebuilt the percent from live field states but off document-derived values. A narrow model could therefore return `earned=110` → `100%*1.10=110%` on the dashboard while the review page's rebuilt view was `63%`. Frontend then rendered both verbatim — `style.width: "110%"` spilling out, and `110%` text.
+
+**Fix:** `user_dashboard.profile_completeness()` now prefers the authoritative `candidate_profiles.completeness.percent` (the same table the review API maintains), deriving a human `missing` list from its `missing`+`uncertain` keys via `FIELD_DEFINITIONS`, and **clamps** to `0…100` with integer rounding. The legacy `earned/110*100` path is kept as a fallback but normalized and clamped identically. `candidate_profile._recalculate_profile_state()` is the single writer of `CandidateProfile.completeness` / `state` / `review`; `correct_field`, `confirm_field`, `reject_field` now update `document` via `_set_doc_value` and immediately call it, and the review router's `defer` path and `get_completeness` now do the same (the latter rebuilds fields from `document`+`provenance` handling `sensitive` masked previews via hash comparison). No percentage the product emits can exceed `100`. Frontend is defensive too — `ProfileReview.tsx` and `Dashboard.tsx` both `Math.min(100, Math.max(0, …))` before printing or sizing the bar, with `overflow-hidden` on the track, so a future backend regression cannot paint `110%` again. Verified that `earned=110` now reports `100%`.
+
+### Fixed — every field on profile review is editable at any time
+
+The **Profile review** page only offered *Correct* for fields flagged `needs_review` and *Confirm/Reject* for uncertain ones, leaving confirmed, auto-accepted and missing fields without an edit affordance. A field that was wrong but not flagged required navigating away to fix.
+
+**Root cause:** the `All fields` section rendered by status — only `review_required` cards got an inline editor, the rest were read-only summaries with no action.
+
+**Fix:** `ProfileReview.tsx` now renders an **Edit** (confirmed/auto-accepted/missing) / **Correct** (needs-review) button on **every** card, plus `Confirm`/`Reject` self-service where the affordance is legitimate, an `Edit`→inline `Save`/`Cancel` for arbitrary corrections, and `History` on all cards. There is no gate on field status — the section header reads *"…editable at any time — use Edit/Correct or Confirm/Reject on any card."*
+
+### Fixed — Fields needing review was unreadable in dark mode
+
+The cards in **Fields needing review** rendered `bg-white text-white` over the page's `bg-zinc-800/50`, so confidence, origin and evidence were invisible.
+
+**Root cause:** Tailwind classes that forced a white card without also setting a dark-mode text/background — `bg-white` on a card inside a dark track with `text-white`.
+
+**Fix:** `ProfileReview.tsx` replaces every offending `bg-white`/`text-zinc-…` with explicit `bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700`, amber cards to `bg-amber-50 dark:bg-amber-950/30 text-zinc-900 dark:text-amber-100`, evidence quotes to `bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-700 text-zinc-800 dark:text-zinc-200`, inputs to `border-zinc-200 dark:border-zinc-700 text-zinc-900 dark:text-zinc-100`, and buttons to proper `hover:bg-zinc-50 dark:hover:bg-zinc-700` variants, so contrast passes in both light and dark.
+
 ### Fixed — per-workflow AI overrides had no inputs
 
 The admin console's **Per-workflow overrides** section only rendered fields for workflows that already had a saved override. A workspace with none — the normal case — showed "No overrides set" and no base URL, model, provider or API key control, so an owner could not create one. The form now always lists every workflow (from `GET /api/ai/config`, falling back to the known workflow set) with labeled inputs, a provider select, Save and Clear. Save posts `POST /api/ai/config`; Clear calls `DELETE /api/ai/config/{workflow}`. A blank key still means "keep the stored key". A provider on its own is rejected in the form, because the API treats that as "delete this override". `GET /api/ai/config` no longer invents `provider: openai_compatible` for a model-only override — the form round-trips that field, and the invented value would have pinned a Gemini default to OpenAI on the next save. Unusable base URLs and one-character models are rejected with `invalid_ai_config` instead of being stored.
