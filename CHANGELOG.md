@@ -6,6 +6,10 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed — per-workflow AI overrides had no inputs
+
+The admin console's **Per-workflow overrides** section only rendered fields for workflows that already had a saved override. A workspace with none — the normal case — showed "No overrides set" and no base URL, model, provider or API key control, so an owner could not create one. The form now always lists every workflow (from `GET /api/ai/config`, falling back to the known workflow set) with labeled inputs, a provider select, Save and Clear. Save posts `POST /api/ai/config`; Clear calls `DELETE /api/ai/config/{workflow}`. A blank key still means "keep the stored key". A provider on its own is rejected in the form, because the API treats that as "delete this override". `GET /api/ai/config` no longer invents `provider: openai_compatible` for a model-only override — the form round-trips that field, and the invented value would have pinned a Gemini default to OpenAI on the next save. Unusable base URLs and one-character models are rejected with `invalid_ai_config` instead of being stored.
+
 ### Security — the browser policy now checks DNS before it trusts the allow-list
 
 Nothing a user could see — this was a hole in the outbound URL policy that the

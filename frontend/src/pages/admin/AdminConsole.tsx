@@ -5,7 +5,15 @@ import {
   Layers, RefreshCw, Save, ShieldCheck, ToggleRight, TrendingUp, Zap,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
-import { budgetValue, AI_WORKFLOWS } from '../../lib/aiConfig'
+import {
+  budgetValue,
+  overrideSaveError,
+  overrideSavePayload,
+  workflowCatalog,
+  type WorkflowOption,
+  type WorkflowOverrideDraft,
+} from '../../lib/aiConfig'
+import { WorkflowOverrides } from '../../components/WorkflowOverrides'
 import { EmptyState, ErrorState, LoadingBlock, SectionCard, SectionSkeleton } from '../../components/states'
 
 /**
@@ -74,14 +82,17 @@ export default function AdminConsole() {
   const [ops, setOps] = useState<any>(null)
   const [aiStatus, setAiStatus] = useState<any>(null)
   const [settings, setSettings] = useState<any>(null)
-  const [wfConfig, setWfConfig] = useState<any>({})
+  const [wfConfig, setWfConfig] = useState<Record<string, WorkflowOverrideDraft>>({})
+  const [workflows, setWorkflows] = useState<WorkflowOption[]>(() => workflowCatalog({}))
+  const [savedOverrideIds, setSavedOverrideIds] = useState<string[]>([])
   const [flags, setFlags] = useState<any[]>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const [msg, setMsg] = useState('')
+  const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [showKey, setShowKey] = useState(false)
   const [aiSaving, setAiSaving] = useState(false)
   const [busyOp, setBusyOp] = useState<string | null>(null)
+  const [wfBusy, setWfBusy] = useState<string | null>(null)
   const [aiForm, setAiForm] = useState({ base_url: '', model: '', api_key: '', rpm: 60, timeout: 300, max_input_tokens: 0, max_output_tokens: 0, provider: 'openai_compatible' })
   const mounted = useRef(true)
 
@@ -98,7 +109,15 @@ export default function AdminConsole() {
       if (ov.status === 'fulfilled') setOverview(ov.value.data)
       if (op.status === 'fulfilled') setOps(op.value.data)
       if (st.status === 'fulfilled') setAiStatus(st.value.data)
-      if (cf.status === 'fulfilled') setWfConfig(cf.value.data.overrides || {})
+      if (cf.status === 'fulfilled') {
+        const data = cf.value.data || {}
+        const overrides = data.overrides && typeof data.overrides === 'object' && !Array.isArray(data.overrides)
+          ? data.overrides as Record<string, WorkflowOverrideDraft>
+          : {}
+        setWorkflows(workflowCatalog(data))
+        setWfConfig(overrides)
+        setSavedOverrideIds(Object.keys(overrides))
+      }
       if (fl.status === 'fulfilled') setFlags(fl.value.data.flags || [])
       const settingsResponse = await client.get('/api/settings')
       if (!mounted.current) return
@@ -130,18 +149,27 @@ export default function AdminConsole() {
     return () => { mounted.current = false }
   }, [])
 
+  const flash = (kind: 'ok' | 'err', text: string, clearMs = 0) => {
+    setNotice({ kind, text })
+    if (clearMs > 0) {
+      window.setTimeout(() => {
+        setNotice(current => current?.text === text ? null : current)
+      }, clearMs)
+    }
+  }
+
   const saveAiDefault = async () => {
-    setAiSaving(true); setMsg('')
+    setAiSaving(true); setNotice(null)
     try {
       if (!aiForm.base_url || !aiForm.base_url.startsWith('http')) {
-        setMsg('base_url must be a valid URL like https://api.openai.com/v1'); return
+        flash('err', 'base_url must be a valid URL like https://api.openai.com/v1'); return
       }
       if (!aiForm.model || aiForm.model.length < 2) {
-        setMsg('model must be at least 2 chars like gpt-4o-mini'); return
+        flash('err', 'model must be at least 2 chars like gpt-4o-mini'); return
       }
       const timeoutSecs = Number(aiForm.timeout) || 300
       if (timeoutSecs < 5 || timeoutSecs > 1800) {
-        setMsg('timeout must be between 5 and 1800 seconds'); return
+        flash('err', 'timeout must be between 5 and 1800 seconds'); return
       }
       const payload: any = {
         ai: {
@@ -157,31 +185,50 @@ export default function AdminConsole() {
       }
       if (aiForm.api_key && aiForm.api_key.trim()) payload.ai.api_key = aiForm.api_key.trim()
       await client.put('/api/settings', payload)
-      setMsg('AI provider saved ✓')
+      flash('ok', 'AI provider saved', 4000)
       setAiForm({ ...aiForm, api_key: '' })
-      setTimeout(() => setMsg(''), 4000)
       void load()
-    } catch (e) { setMsg(apiError(e)) } finally { setAiSaving(false) }
+    } catch (e) { flash('err', apiError(e)) } finally { setAiSaving(false) }
+  }
+
+  const patchWf = (wf: string, patch: Partial<WorkflowOverrideDraft>) => {
+    setWfConfig(prev => ({ ...prev, [wf]: { ...(prev[wf] || {}), ...patch } }))
   }
 
   const saveWf = async (wf: string) => {
-    setMsg('')
+    const draft = wfConfig[wf] || {}
+    const problem = overrideSaveError(draft)
+    if (problem) {
+      flash('err', problem)
+      return
+    }
+    setWfBusy(wf)
+    setNotice(null)
     try {
-      await client.post('/api/ai/config', { [wf]: wfConfig[wf] || {} })
-      setMsg(`Saved override for "${wf}" ✓`)
-      setTimeout(() => setMsg(''), 3000)
-      void load()
-    } catch (e) { setMsg(apiError(e)) }
+      // Blank api_key means "keep the stored key" — the API never returns the full key.
+      await client.post('/api/ai/config', { [wf]: overrideSavePayload(draft) })
+      flash('ok', `Saved override for "${wf}"`, 4000)
+      await load()
+    } catch (e) { flash('err', apiError(e)) } finally { setWfBusy(null) }
+  }
+
+  const clearWf = async (wf: string) => {
+    setWfBusy(wf)
+    setNotice(null)
+    try {
+      await client.delete(`/api/ai/config/${encodeURIComponent(wf)}`)
+      flash('ok', `Cleared override for "${wf}"`, 4000)
+      await load()
+    } catch (e) { flash('err', apiError(e)) } finally { setWfBusy(null) }
   }
 
   const queueOp = async (path: string, key: string) => {
     setBusyOp(key)
     try {
       await client.post(path)
-      setMsg(key === 'recover' ? 'Stalled queue items recovered ✓' : 'Dead items re-queued ✓')
-      setTimeout(() => setMsg(''), 3000)
+      flash('ok', key === 'recover' ? 'Stalled queue items recovered' : 'Dead items re-queued', 3000)
       void load()
-    } catch (e) { setMsg(apiError(e)) } finally { setBusyOp(null) }
+    } catch (e) { flash('err', apiError(e)) } finally { setBusyOp(null) }
   }
 
   if (loading) {
@@ -225,7 +272,14 @@ export default function AdminConsole() {
           <Link to="/admin/plans" className="text-xs px-3 py-2 rounded-full border dark:border-zinc-700">Plans & users</Link>
         </div>
       </div>
-      {msg && <div className="text-sm mono p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300">{msg}</div>}
+      {notice && (
+        <div role={notice.kind === 'err' ? 'alert' : 'status'} data-testid="admin-notice"
+             className={`text-sm mono p-3 rounded-xl border ${notice.kind === 'err'
+               ? 'bg-red-50 dark:bg-red-950 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+               : 'bg-emerald-50 dark:bg-emerald-950 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'}`}>
+          {notice.text}
+        </div>
+      )}
 
       {/* ── AI provider configuration ─────────────────────────────────────── */}
       <SectionCard title="AI provider configuration" icon={Bot}
@@ -310,32 +364,24 @@ export default function AdminConsole() {
           Members inherit this default (key, model, budgets) unless they never see it — their requests simply use it. Per-workflow overrides below win over the default.
         </div>
 
-        <div className="mt-4">
+        <div className="mt-4" data-testid="workflow-overrides">
           <div className="text-xs mono font-medium flex items-center gap-1"><Zap className="w-3.5 h-3.5" /> Per-workflow overrides <span className="text-zinc-400">(optional)</span></div>
-          {Object.keys(wfConfig).length === 0 ? (
-            <div className="mt-2 text-[11px] mono text-zinc-500">No overrides set — every workflow uses the default above.</div>
-          ) : (
-            <div className="mt-2 grid md:grid-cols-2 gap-2 max-h-64 overflow-auto">
-              {Object.keys(wfConfig).map(wf => {
-                const cfg = wfConfig[wf] || {}
-                return (
-                  <div key={wf} className="border dark:border-zinc-700 rounded-lg p-2 bg-white dark:bg-zinc-900">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px] mono font-medium">{wf}</span>
-                      <button onClick={() => void saveWf(wf)} className="text-[11px] px-2 py-1 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900">Save</button>
-                    </div>
-                    <div className="mt-1.5 grid grid-cols-4 gap-1.5">
-                      <input value={cfg.base_url || ''} onChange={e => setWfConfig({ ...wfConfig, [wf]: { ...cfg, base_url: e.target.value } })} placeholder="Base URL" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700" />
-                      <input value={cfg.model || ''} onChange={e => setWfConfig({ ...wfConfig, [wf]: { ...cfg, model: e.target.value } })} placeholder="Model" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700" />
-                      <input value={cfg.provider || ''} onChange={e => setWfConfig({ ...wfConfig, [wf]: { ...cfg, provider: e.target.value } })} placeholder="Provider" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700" />
-                      <input value={cfg.api_key || ''} onChange={e => setWfConfig({ ...wfConfig, [wf]: { ...cfg, api_key: e.target.value } })} type="password" placeholder="API key" className="border rounded-lg px-2 py-1 text-[11px] mono bg-white dark:bg-zinc-800 dark:border-zinc-700" />
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          )}
+          <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+            {savedOverrideIds.length === 0
+              ? 'No overrides saved yet. Fill in any workflow below — blank fields inherit the default above.'
+              : `${savedOverrideIds.length} override${savedOverrideIds.length === 1 ? '' : 's'} saved. Blank fields inherit the default above; leave a key blank to keep the saved one.`}
+          </p>
+          <WorkflowOverrides
+            workflows={workflows}
+            drafts={wfConfig}
+            savedIds={savedOverrideIds}
+            busyId={wfBusy}
+            onChange={patchWf}
+            onSave={wf => void saveWf(wf)}
+            onClear={wf => void clearWf(wf)}
+          />
         </div>
+
       </SectionCard>
 
       {/* ── Health at a glance ────────────────────────────────────────────── */}
