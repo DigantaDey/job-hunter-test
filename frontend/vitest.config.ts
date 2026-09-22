@@ -16,5 +16,13 @@ export default defineConfig({
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
     restoreMocks: true,
     clearMocks: true,
+    // Explicitly disable browser mode for the default `npm test` run.
+    // Browser tests (via @vitest/browser-playwright) are opt-in and require
+    // `playwright` to be installed (`npx playwright install chromium`).
+    // Without this, a stray `browser.enabled: true` or a future vitest default
+    // could surface as "playwright not installed" in CI.
+    browser: {
+      enabled: false,
+    },
   }
 })

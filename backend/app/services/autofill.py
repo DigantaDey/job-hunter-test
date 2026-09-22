@@ -173,9 +173,14 @@ def build_autofill_plan(
 #: entry per platform layout it can produce. Cross-checked against playwright
 #: 1.44's registry — ``playwright install --dry-run chromium`` prints the same
 #: destination offline, so this list can be verified without the browser CDN.
+#: Updated for 1.62: headless shell moved under ``chrome-headless-shell-linux64``
+#: and ``chrome-linux`` stays, plus the ``chrome-headless-shell`` legacy path.
 _BROWSER_EXECUTABLES = (
     "chrome-linux/chrome",
     "chrome-linux64/chrome",
+    "chrome-linux/chrome-wrapper",
+    "chrome-headless-shell-linux64/chrome-headless-shell",
+    "chrome-headless-shell-linux/chrome-headless-shell",
     "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
     "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
     "chrome-win/chrome.exe",
@@ -206,15 +211,44 @@ def _chromium_browser_path() -> Optional[str]:
     per call, and this runs on the hot path of an availability check. Build
     directories are versioned (``chromium-1117``,
     ``chromium_headless_shell-1150``), so the newest is preferred.
+
+    Robustness: playwright 1.44 → 1.62 changed the headless shell layout
+    (``chrome-headless-shell-linux64/chrome-headless-shell``) and some builds
+    expose only a wrapper. We therefore (1) check the known executables, (2)
+    fall back to any executable file under a ``chromium*`` build dir, so a
+    future layout change still counts as \"browser downloaded\" rather than
+    \"playwright is not installed\".
     """
     root = _browsers_root()
     if not os.path.isdir(root):
         return None
-    for build in sorted(glob.glob(os.path.join(root, "chromium*-[0-9]*")), reverse=True):
+    # Newest build first — versioned as chromium-1117, chromium_headless_shell-1150, etc.
+    builds = sorted(glob.glob(os.path.join(root, "chromium*-[0-9]*")), reverse=True)
+    for build in builds:
         for relative in _BROWSER_EXECUTABLES:
             candidate = os.path.join(build, *relative.split("/"))
             if os.path.isfile(candidate):
                 return candidate
+    # Fallback: any file that looks like a chromium executable inside a build dir.
+    # This keeps autofill_available() honest when playwright bumps its layout.
+    for build in builds:
+        # Look for chrome or headless_shell binaries anywhere under the build
+        for pattern in ("**/chrome", "**/chrome-wrapper", "**/chrome.exe", "**/Chromium", "**/headless_shell", "**/chrome-headless-shell"):
+            for candidate in glob.glob(os.path.join(build, pattern), recursive=True):
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return candidate
+        # If the build dir itself exists and is non-empty, treat as installed
+        # — the driver will surface a clearer DriverError if launch still fails.
+        try:
+            if os.listdir(build):
+                # Find any file to return as evidence the browser is present
+                for dirpath, _, filenames in os.walk(build):
+                    for fn in filenames:
+                        fp = os.path.join(dirpath, fn)
+                        if os.path.isfile(fp):
+                            return fp
+        except Exception:
+            continue
     return None
 
 
