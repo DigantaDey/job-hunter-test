@@ -1060,6 +1060,200 @@ def persist_candidate_profile(
 # --------------------------------------------------------------------------- #
 # Corrections — user overrides without deleting original evidence
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Document helpers — canonical document ↔ field_key mapping (root cause fix)
+# --------------------------------------------------------------------------- #
+def _get_doc_value(doc: Dict[str, Any], field_key: str) -> Any:
+    """Extract a field's actual value from the canonical document.
+
+    The document nests some fields (identity, contact, eligibility, etc.)
+    while completeness works on flat field_keys. This is the single mapping
+    used for every recalculation so dashboard and review cannot diverge.
+    """
+    if not isinstance(doc, dict):
+        return None
+    # Direct top-level (skills, tools, industries, achievements, education, certs, etc.)
+    if field_key in doc and field_key not in ("identity", "contact", "eligibility", "preferences", "compensation", "availability"):
+        return doc.get(field_key)
+    # Nested structures
+    if field_key == "full_name":
+        return (doc.get("identity") or {}).get("full_name")
+    if field_key in ("email", "phone", "location"):
+        return (doc.get("contact") or {}).get(field_key)
+    if field_key in ("work_authorization", "sponsorship_required"):
+        return (doc.get("eligibility") or {}).get(field_key)
+    if field_key == "remote_preference":
+        return (doc.get("preferences") or {}).get("remote")
+    if field_key == "target_roles":
+        return (doc.get("preferences") or {}).get("target_roles")
+    if field_key == "salary_expectations":
+        comp = doc.get("compensation") or {}
+        # stored as {minimum,target,currency} or raw string
+        if isinstance(comp, dict) and (comp.get("minimum") or comp.get("target") or comp.get("currency")):
+            return comp
+        # fallback: if compensation holds a single value, return it
+        if isinstance(comp, dict) and not comp:
+            return None
+        return comp if comp else None
+    if field_key == "notice_period":
+        return (doc.get("availability") or {}).get("notice_period")
+    # Roles / employers / dates are materialised from experience + current_title
+    if field_key == "roles":
+        exp = doc.get("experience") or []
+        if isinstance(exp, list) and exp:
+            titles = [e.get("title") for e in exp if isinstance(e, dict) and e.get("title")]
+            if titles:
+                return titles
+        ct = doc.get("current_title")
+        if ct:
+            return [ct] if isinstance(ct, str) else ct
+        return doc.get("roles")
+    if field_key == "employers":
+        exp = doc.get("experience") or []
+        if isinstance(exp, list) and exp:
+            comps = [e.get("company") for e in exp if isinstance(e, dict) and e.get("company")]
+            if comps:
+                return comps
+        return doc.get("employers")
+    if field_key == "dates":
+        exp = doc.get("experience") or []
+        if isinstance(exp, list) and exp:
+            dates = [e.get("duration") for e in exp if isinstance(e, dict) and e.get("duration")]
+            if dates:
+                return dates
+        return doc.get("dates")
+    return doc.get(field_key)
+
+
+def _set_doc_value(doc: Dict[str, Any], field_key: str, normalized: Any) -> Dict[str, Any]:
+    """Write a normalised field value into the canonical document in place."""
+    if field_key == "full_name":
+        doc.setdefault("identity", {})["full_name"] = normalized
+    elif field_key in ("email", "phone", "location"):
+        doc.setdefault("contact", {})[field_key] = normalized
+    elif field_key in ("work_authorization", "sponsorship_required"):
+        doc.setdefault("eligibility", {})[field_key] = normalized
+    elif field_key == "remote_preference":
+        doc.setdefault("preferences", {})["remote"] = normalized
+    elif field_key == "target_roles":
+        doc.setdefault("preferences", {})["target_roles"] = normalized
+    elif field_key == "salary_expectations":
+        # Store as compensation object
+        if isinstance(normalized, dict):
+            doc["compensation"] = normalized
+        elif normalized is None:
+            doc["compensation"] = {}
+        else:
+            doc["compensation"] = {"minimum": normalized}
+    elif field_key == "notice_period":
+        doc.setdefault("availability", {})["notice_period"] = normalized
+    elif field_key in ("roles", "employers", "dates"):
+        # Keep both the denormalised list and the structured experience in sync
+        # Simple: store top-level and keep current_title / experience consistent
+        doc[field_key] = normalized
+        if field_key == "roles" and isinstance(normalized, list) and normalized:
+            doc["current_title"] = normalized[0]
+        # Rebuild experience titles/companies if we have all three
+        # (best-effort, does not drop other experience fields)
+        roles = doc.get("roles") or _get_doc_value(doc, "roles") or []
+        employers = doc.get("employers") or _get_doc_value(doc, "employers") or []
+        dates = doc.get("dates") or _get_doc_value(doc, "dates") or []
+        if roles or employers or dates:
+            exp = []
+            max_len = max(len(roles) if isinstance(roles, list) else 0,
+                          len(employers) if isinstance(employers, list) else 0,
+                          len(dates) if isinstance(dates, list) else 0)
+            for i in range(max_len):
+                r = roles[i] if isinstance(roles, list) and i < len(roles) else None
+                e = employers[i] if isinstance(employers, list) and i < len(employers) else None
+                d = dates[i] if isinstance(dates, list) and i < len(dates) else None
+                if r or e or d:
+                    exp.append({"title": r, "company": e, "duration": d})
+            doc["experience"] = exp
+    else:
+        # Generic top-level (skills, tools, industries, achievements, education, certifications)
+        doc[field_key] = normalized
+    return doc
+
+
+def _recalculate_profile_state(db: Session, profile: CandidateProfile) -> None:
+    """Recompute completeness, review counts and state from the current provenance.
+
+    Centralises the logic that was previously only in ``correct_field`` and was
+    missing (stale completeness) after ``confirm``/``reject``/``defer``. The
+    document is the source of truth for *whether* a field has a value
+    (sensitive previews are masked), provenance for *how* trustworthy it is.
+    """
+    all_provenance = db.query(ProfileFieldProvenance).filter(ProfileFieldProvenance.profile_id == profile.id).all()
+    doc = profile.document or {}
+    fields_for_comp: Dict[str, Any] = {}
+    for prov in all_provenance:
+        fk = prov.path.lstrip("/").split("/")[0]
+        val = _get_doc_value(doc, fk)
+        # Fallback for non-nested fields where _get_doc_value returned None but preview exists (non-sensitive)
+        if val in (None, "", [], {}):
+            # For sensitive fields preview is None intentionally — do not fallback
+            if prov.sensitivity not in ("sensitive", "restricted") and prov.value_preview not in (None, "", [], {}):
+                # Preview is JSON serialised for lists/objects; try to decode but for completeness existence check, any non-empty suffices
+                val = prov.value_preview
+                # If preview looks like JSON list, keep truthy string as filled
+                # completeness only checks emptiness, so string is enough
+            elif prov.value_hash != _hash_value(None) and prov.review_status not in ("rejected", "missing"):
+                # Sensitive field with non-empty hash — document should have value, but if lookup missed, treat as filled via hash
+                # Keep val as truthy placeholder
+                val = "__sensitive_filled__"
+
+        # Confidence: user truth is high, else stored
+        conf = prov.confidence if prov.confidence is not None else (1.0 if prov.review_status in ("corrected", "confirmed", "auto_accepted") else 0.0)
+        band = prov.confidence_band or "none"
+        # Status derived from provenance, not just value
+        if prov.review_status in ("confirmed", "corrected", "auto_accepted"):
+            status = "confirmed"
+        elif prov.review_status == "rejected":
+            status = "missing"
+            val = None
+        elif prov.ambiguity == "conflicting_sources":
+            status = "conflicting"
+        elif prov.review_status in ("needs_review", "deferred") or band in ("low", "none") or val in (None, "", [], {}):
+            # Missing takes precedence when val empty even if band is high but review_required
+            if val in (None, "", [], {}):
+                status = "missing"
+            else:
+                status = "uncertain"
+        else:
+            status = prov.review_status or "uncertain"
+
+        fields_for_comp[fk] = {
+            "value": val,
+            "confidence": conf,
+            "confidence_band": band,
+            "status": status,
+            "review_required": bool(prov.review_required),
+        }
+
+    for k in FIELD_DEFINITIONS:
+        if k not in fields_for_comp:
+            fields_for_comp[k] = {"value": None, "confidence": 0.0, "confidence_band": "none", "status": "missing", "review_required": True}
+
+    profile.completeness = calculate_completeness(fields_for_comp)
+    remaining = sum(1 for p in all_provenance if bool(p.review_required))
+    deferred = sum(1 for p in all_provenance if p.review_status == "deferred")
+    profile.review = {
+        "required": remaining,
+        "resolved": len(all_provenance) - remaining,
+        "deferred": deferred,
+        "completed_at": datetime.utcnow().isoformat() if remaining == 0 else None,
+    }
+    if remaining == 0:
+        profile.state = "active"
+        profile.activated_at = datetime.utcnow()
+    else:
+        if profile.state in ("draft", "active"):
+            profile.state = "review_required"
+    db.add(profile)
+    db.flush()
+
+
 def correct_field(
     db: Session,
     user_id: int,
@@ -1076,6 +1270,7 @@ def correct_field(
     - New value gets origin user_corrected, confidence None (user is truth)
     - Old evidence stays in history
     - Records who changed and when
+    - Recalculates completeness and review state (root-cause fix for stale 110%/63% divergence after edits)
     """
     provenance = (
         db.query(ProfileFieldProvenance)
@@ -1152,64 +1347,13 @@ def correct_field(
     db.add(provenance)
     db.flush()
 
-    # Update candidate profile document
+    # Update candidate profile document (canonical) and recalc completeness
     profile = db.query(CandidateProfile).filter(CandidateProfile.id == profile_id, CandidateProfile.user_id == user_id).first()
     if profile:
         doc = dict(profile.document or {})
-        # Simple top-level update; for nested paths we'd need JSON pointer logic
-        # For now, handle top-level keys and known nested structures
-        if field_key in doc:
-            doc[field_key] = normalized
-        elif "contact" in doc and field_key in ("email", "phone", "location"):
-            doc["contact"][field_key] = normalized
-        elif "eligibility" in doc and field_key in ("work_authorization", "sponsorship_required"):
-            doc["eligibility"][field_key] = normalized
-        elif "preferences" in doc and field_key == "remote_preference":
-            doc["preferences"]["remote"] = normalized
-        elif "preferences" in doc and field_key == "target_roles":
-            doc["preferences"]["target_roles"] = normalized
-        elif field_key == "full_name" and "identity" in doc:
-            doc["identity"]["full_name"] = normalized
-        # Recalculate completeness
-        # Rebuild fields dict from provenance for completeness calc would be ideal,
-        # but for now patch the document and recalc from current provenance
-        all_provenance = db.query(ProfileFieldProvenance).filter(ProfileFieldProvenance.profile_id == profile_id).all()
-        # Reconstruct fields for completeness
-        fields_for_comp = {}
-        for prov in all_provenance:
-            fk = prov.path.lstrip("/").split("/")[0]
-            # Decode value from preview if not sensitive, else use hash placeholder
-            # For completeness we need actual value — we have it in doc or we can use preview
-            # Simplify: use doc value
-            val = doc.get(fk)
-            if fk in ("email", "phone", "location") and "contact" in doc:
-                val = doc["contact"].get(fk, val)
-            fields_for_comp[fk] = {
-                "value": val,
-                "confidence": prov.confidence if prov.confidence is not None else 1.0,
-                "confidence_band": prov.confidence_band,
-                "status": "confirmed" if prov.review_status in ("confirmed", "corrected", "auto_accepted") else ("missing" if val in (None, "", [], {}) else "uncertain"),
-                "review_required": prov.review_required,
-            }
-        # Ensure all defined fields present
-        for k, _d in FIELD_DEFINITIONS.items():
-            if k not in fields_for_comp:
-                fields_for_comp[k] = {"value": None, "confidence": 0.0, "confidence_band": "none", "status": "missing", "review_required": True}
-
+        _set_doc_value(doc, field_key, normalized)
         profile.document = doc
-        profile.completeness = calculate_completeness(fields_for_comp)
-        # Update review counts
-        remaining = sum(1 for p in all_provenance if p.review_required)
-        profile.review = {
-            "required": remaining,
-            "resolved": len(all_provenance) - remaining,
-            "deferred": 0,
-            "completed_at": datetime.utcnow().isoformat() if remaining == 0 else None,
-        }
-        if remaining == 0:
-            profile.state = "active"
-            profile.activated_at = datetime.utcnow()
-        db.add(profile)
+        _recalculate_profile_state(db, profile)
 
     db.flush()
     return provenance
@@ -1222,7 +1366,11 @@ def confirm_field(
     field_path: str,
     actor_id: Optional[int] = None,
 ) -> ProfileFieldProvenance:
-    """Confirm an extracted field without changing value."""
+    """Confirm an extracted field without changing value.
+
+    Root-cause fix: confirms now recalculate completeness/review state so the
+    profile percent updates immediately (previously stale until next correction).
+    """
     provenance = (
         db.query(ProfileFieldProvenance)
         .filter(
@@ -1263,8 +1411,18 @@ def confirm_field(
     provenance.reviewed_by = actor_id or user_id
     provenance.reviewed_at = datetime.utcnow()
     provenance.needs_answer_for = []
+    # Ensuring band reflects user truth: confirmed fields are high
+    if provenance.confidence_band == "none" or provenance.confidence_band == "low":
+        provenance.confidence = provenance.confidence if provenance.confidence is not None else 1.0
+        provenance.confidence_band = "high"
     db.add(provenance)
     db.flush()
+
+    # Recalculate profile completeness / state so dashboard and review stay in sync
+    profile = db.query(CandidateProfile).filter(CandidateProfile.id == profile_id, CandidateProfile.user_id == user_id).first()
+    if profile:
+        _recalculate_profile_state(db, profile)
+        db.flush()
     return provenance
 
 
@@ -1276,7 +1434,11 @@ def reject_field(
     actor_id: Optional[int] = None,
     reason: Optional[str] = None,
 ) -> ProfileFieldProvenance:
-    """Reject an extracted field — value cleared, original evidence kept in history."""
+    """Reject an extracted field — value cleared, original evidence kept in history.
+
+    Root-cause fix: reject now clears the canonical document and recalculates
+    completeness so the percent reflects the removal.
+    """
     provenance = (
         db.query(ProfileFieldProvenance)
         .filter(
@@ -1330,6 +1492,16 @@ def reject_field(
 
     db.add(provenance)
     db.flush()
+
+    # Clear value from canonical document and recalc
+    profile = db.query(CandidateProfile).filter(CandidateProfile.id == profile_id, CandidateProfile.user_id == user_id).first()
+    if profile:
+        doc = dict(profile.document or {})
+        field_key = field_path.lstrip("/").split("/")[0]
+        _set_doc_value(doc, field_key, None)
+        profile.document = doc
+        _recalculate_profile_state(db, profile)
+        db.flush()
     return provenance
 
 

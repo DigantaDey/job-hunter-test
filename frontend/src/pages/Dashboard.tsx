@@ -350,9 +350,9 @@ export default function Dashboard() {
             <div className="flex items-center gap-3">
               <div className="flex-1 h-2 rounded-full bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
                 <div className="h-full bg-gradient-to-r from-blue-600 to-violet-600 rounded-full transition-all"
-                     style={{ width: `${Math.min(100, profile.percent ?? 0)}%` }} data-testid="profile-completeness-bar" />
+                     style={{ width: `${Math.min(100, Math.max(0, Number(profile.percent ?? 0)))}%` }} data-testid="profile-completeness-bar" />
               </div>
-              <span className="text-sm mono font-semibold" data-testid="profile-completeness">{profile.percent ?? 0}%</span>
+              <span className="text-sm mono font-semibold" data-testid="profile-completeness">{Math.min(100, Math.max(0, Number(profile.percent ?? 0)))}%</span>
             </div>
             <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">{profile.next_step}</p>
             {profile.missing?.length > 0 && (

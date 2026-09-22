@@ -67,7 +67,88 @@ def _iso(value: Optional[datetime]) -> Optional[str]:
 
 
 def profile_completeness(db: Session, user_id: int) -> Dict[str, Any]:
-    """Percent complete + what is missing, in the user's own words."""
+    """Percent complete + what is missing, in the user's own words.
+
+    Prefers the versioned *CandidateProfile* (the v2 extraction pipeline with
+    field-level provenance and a weighted 0–100 completeness) when one exists —
+    so ``/api/me/dashboard`` and ``/api/profile/review`` cannot disagree about
+    "how complete" the profile is. Falls back to the legacy ``Profile`` model
+    with a correctly normalised percent (the previous code returned the raw
+    0–110 earned total as a percent, hence the 110% bug).
+    """
+    # --- Prefer CandidateProfile (v2) when available — single source of truth ---
+    try:
+        from app.models.models import CandidateProfile  # local to avoid circular import
+
+        cand = (
+            db.query(CandidateProfile)
+            .filter(CandidateProfile.user_id == user_id, CandidateProfile.is_current.is_(True))
+            .order_by(CandidateProfile.version.desc())
+            .first()
+        )
+        if cand is not None and isinstance(cand.completeness, dict) and "percent" in cand.completeness:
+            cand_comp: Dict[str, Any] = cand.completeness
+            raw_percent = cand_comp.get("percent", 0)
+            try:
+                pct_f = float(raw_percent)
+            except Exception:
+                pct_f = 0.0
+            percent = int(round(max(0.0, min(100.0, pct_f))))
+            # Build actionable missing list from candidate's own completeness
+            # (missing + uncertain) so the dashboard chip line matches the
+            # review page's breakdown. Labels come from FIELD_DEFINITIONS.
+            try:
+                from app.services.candidate_profile import FIELD_DEFINITIONS as _CP_FIELDS
+
+                missing_fields: List[Dict[str, Any]] = []
+                breakdown = cand_comp.get("breakdown", {}) if isinstance(cand_comp.get("breakdown"), dict) else {}
+                for key in list(cand_comp.get("missing", []) or []) + list(cand_comp.get("uncertain", []) or []):
+                    if not isinstance(key, str):
+                        continue
+                    defn = _CP_FIELDS.get(key, {})
+                    label = str(defn.get("label", key.replace("_", " ").title()))
+                    weight = 5
+                    try:
+                        if isinstance(breakdown, dict) and key in breakdown and isinstance(breakdown[key], dict):
+                            weight = int(breakdown[key].get("weight", weight))
+                    except Exception:
+                        pass
+                    missing_fields.append({"field": key, "label": label, "weight": weight})
+                    if len(missing_fields) >= 6:
+                        break
+            except Exception:
+                missing_fields = []
+
+            has_master_resume = (
+                db.query(Resume).filter(Resume.user_id == user_id, Resume.type == "master").count() > 0
+            )
+            # Master resume is still part of the onboarding gate; surface it
+            # when absent even though candidate completeness does not weight it.
+            if not has_master_resume:
+                if not any(m["field"] == "master_resume" for m in missing_fields):
+                    missing_fields.append({"field": "master_resume", "label": "Master resume upload", "weight": 10})
+                # If the candidate is otherwise complete, percent should not be 100 when resume is missing
+                if percent == 100:
+                    percent = 95
+
+            if not missing_fields:
+                next_step = "Your profile is complete — discovery and matching have everything they need."
+            else:
+                next_step = f"Add your {missing_fields[0]['label'].lower()} to improve your matches."
+
+            return {
+                "percent": percent,
+                "missing": missing_fields,
+                "has_master_resume": has_master_resume,
+                "next_step": next_step,
+                "profile_id": cand.id,
+                "source": "candidate_profile",
+            }
+    except Exception:
+        # CandidateProfile path is best-effort; legacy path is the fallback
+        pass
+
+    # --- Legacy Profile fallback (correctly normalised) ---
     profile = (
         db.query(Profile).filter(Profile.user_id == user_id)
         .order_by(Profile.created_at.desc()).first()
@@ -90,13 +171,20 @@ def profile_completeness(db: Session, user_id: int) -> Dict[str, Any]:
     else:
         missing.append({"field": "master_resume", "label": "Master resume upload", "weight": 10})
 
+    total_possible = sum(w for _, _, w in _PROFILE_WEIGHTS) + 10
+    if total_possible:
+        percent_float = earned / total_possible * 100.0
+    else:
+        percent_float = 0.0
+    percent = int(round(max(0.0, min(100.0, percent_float))))
+
     if not missing:
         next_step = "Your profile is complete — discovery and matching have everything they need."
     else:
         next_step = f"Add your {missing[0]['label'].lower()} to improve your matches."
 
     return {
-        "percent": int(round(earned)),
+        "percent": percent,
         "missing": missing,
         "has_master_resume": has_master_resume,
         "next_step": next_step,
