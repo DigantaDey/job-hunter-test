@@ -125,13 +125,13 @@ def test_application_preparation_creates_vault_credential(client, auth, db, uplo
     row = _apply(client, auth, job.id, {"resume_choice": "master"})
     assert row["status"] == "done", row
     body = row["result"]
-    assert body["status"] == "preparing"
+    assert body["status"] == "ready_to_apply"
     assert body["resume_decision"] == "master"
     assert body["credential_created"] is True
     assert body["portal_type"] == "lever"
     assert body["fields_mapped"] == 3
     db.refresh(job)
-    assert job.status == "preparing"
+    assert job.status == "ready_to_apply"
 
     # The finished row stays in the live feed's ``recent`` list so a page
     # refreshed after the run still sees the outcome.
@@ -363,7 +363,7 @@ def test_application_consent_gate_is_recorded(client, full_consent, db, uploaded
     """With consent + automation disabled we prepare, never silently submit."""
     job = _job(db)
     row = _apply(client, full_consent, job.id)
-    assert row["result"]["status"] in ("preparing", "needs_input")
+    assert row["result"]["status"] in ("ready_to_apply", "needs_input")
     db.refresh(job)
     assert job.status != "applied"
 

@@ -97,3 +97,28 @@ def test_installed_but_disabled_names_the_flag(monkeypatch, tmp_path):
 
     assert status["available"] is False
     assert status["reason"] == "AUTOFILL_ENABLED is false"
+
+
+def test_assisted_apply_uses_the_browser_runtime_not_the_auto_apply_flag(monkeypatch, tmp_path):
+    """A human-controlled session remains usable when unattended runs are off."""
+    _install_fake_playwright(monkeypatch)
+    _make_browser_build(tmp_path, "chromium-1148", "chrome-linux/chrome")
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "autofill_enabled", False)
+    monkeypatch.setattr(settings, "assisted_apply_enabled", True)
+
+    assert autofill.autofill_available()["available"] is False
+    status = autofill.assisted_apply_available()
+
+    assert status == {"available": True}
+
+
+def test_assisted_apply_can_be_explicitly_disabled(monkeypatch, tmp_path):
+    _install_fake_playwright(monkeypatch)
+    _make_browser_build(tmp_path, "chromium-1148", "chrome-linux/chrome")
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "assisted_apply_enabled", False)
+
+    status = autofill.assisted_apply_available()
+
+    assert status == {"available": False, "reason": "ASSISTED_APPLY_ENABLED is false"}

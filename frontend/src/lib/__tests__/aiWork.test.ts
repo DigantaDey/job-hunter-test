@@ -55,12 +55,15 @@ describe('finding rows', () => {
 })
 
 describe('apply derivation', () => {
-  it('walks Queued → Preparing → Prepared with the resume decision', () => {
+  it('walks Queued → Preparing → preparation complete with an Assisted Apply next step', () => {
     expect(deriveApplyState(row({ status: 'queued' }))?.label).toBe('Queued')
     const prep = deriveApplyState(row({ status: 'processing' }))!
     expect(prep.phase).toBe('preparing'); expect(prep.live).toBe(true)
-    const done = deriveApplyState(row({ status: 'done', result: { status: 'preparing', resume_decision: 'master' } }))!
-    expect(done.detail).toContain('Status: preparing • resume: master')
+    const done = deriveApplyState(row({ status: 'done', job_id: 42, result: { status: 'ready_to_apply', resume_decision: 'master' } }))!
+    expect(done.label).toBe('Preparation complete')
+    expect(done.detail).toContain('No browser submission was run')
+    expect(done.link).toBe('/assist?job=42')
+    expect(done.linkLabel).toBe('Continue in Assisted Apply')
     expect(deriveApplyState(row({ status: 'processing', payload: { mode: 'execute' } }))?.phase).toBe('applying')
     expect(deriveApplyState(row({ status: 'done', result: { status: 'applied' } }))?.phase).toBe('applied')
   })

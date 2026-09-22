@@ -193,7 +193,7 @@ def test_apply_prepare_mode_never_marks_the_job_failed_without_a_browser(client,
     run_queue_item(receipt["pipeline_job_id"], "application")
     db.expire_all()
     fresh = db.query(Job).filter(Job.id == job.id).one()
-    assert fresh.status == "preparing", fresh.status
+    assert fresh.status == "ready_to_apply", fresh.status
     assert not fresh.error
 
 

@@ -20,6 +20,7 @@
  * Emails): one visibility-aware interval, no reads in a hidden tab.
  */
 import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import client, { apiError } from '../api/client'
 import {
   AlertTriangle, CheckCircle, Clock, ExternalLink, Hand, Loader2,
@@ -43,6 +44,8 @@ type Action = {
   occurrences: number
   created_at: string
 }
+type BrowserRuntime = { available: boolean; reason?: string }
+
 type Session = {
   id: number
   job_id: number
@@ -90,10 +93,12 @@ const STATE_TONE: Record<string, string> = {
 const isLive = (s: Session) => !['completed', 'expired', 'failed', 'cancelled'].includes(s.state)
 
 export default function Assist() {
+  const [searchParams] = useSearchParams()
   const [sessions, setSessions] = useState<Session[]>([])
   const [actions, setActions] = useState<Action[]>([])
   const [jobs, setJobs] = useState<any[]>([])
-  const [jobId, setJobId] = useState('')
+  const [jobId, setJobId] = useState(() => searchParams.get('job') || '')
+  const [browserRuntime, setBrowserRuntime] = useState<BrowserRuntime | null>(null)
   const [answers, setAnswers] = useState<Record<number, string>>({})
   const [descriptors, setDescriptors] = useState<Record<number, any>>({})
   const [busy, setBusy] = useState<number | 'start' | null>(null)
@@ -124,8 +129,18 @@ export default function Assist() {
     client.get('/api/jobs', { params: { limit: 50 } })
       .then(r => setJobs(r.data.jobs || r.data || []))
       .catch(() => setJobs([]))
+    // This operational read is separate from Auto-apply: Assisted Apply can
+    // remain available while unattended autofill is purposefully disabled.
+    client.get('/api/account/runtime')
+      .then(r => setBrowserRuntime(r.data?.assisted_apply_runtime || null))
+      .catch(() => setBrowserRuntime(null))
     return () => { stop(); document.removeEventListener('visibilitychange', onVis) }
   }, [])
+
+  useEffect(() => {
+    const requested = searchParams.get('job')
+    if (requested) setJobId(requested)
+  }, [searchParams])
 
   const startSession = async () => {
     if (!jobId) return
@@ -215,6 +230,13 @@ export default function Assist() {
         it types anything, and fields that are already done are never filled twice.
       </p>
 
+      {browserRuntime && !browserRuntime.available && (
+        <div className="card p-3 text-xs mono text-amber-700 dark:text-amber-300 flex items-center gap-2" role="alert">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          <span><b>Assisted browser unavailable.</b> {browserRuntime.reason || 'The browser runtime is not ready.'} You can still review the prepared application, but a browser pass cannot start until this is resolved.</span>
+        </div>
+      )}
+
       {msg && <div className="card p-3 text-xs mono text-emerald-700 dark:text-emerald-300">{msg}</div>}
       {err && <div className="card p-3 text-xs mono text-red-700 dark:text-red-300 flex items-center gap-2">
         <AlertTriangle className="w-4 h-4" /> {err}
@@ -226,6 +248,7 @@ export default function Assist() {
         <div className="flex flex-wrap items-center gap-2">
           <select className="input" value={jobId} onChange={e => setJobId(e.target.value)} aria-label="Job">
             <option value="">Choose a job…</option>
+            {jobId && !jobs.some(j => String(j.id) === jobId) && <option value={jobId}>#{jobId} prepared application</option>}
             {jobs.map(j => <option key={j.id} value={j.id}>#{j.id} {j.title} — {j.company}</option>)}
           </select>
           <button className="btn" onClick={startSession} disabled={!jobId || busy === 'start'}>
@@ -354,7 +377,7 @@ export default function Assist() {
             )}
             <div className="flex flex-wrap gap-2">
               {isLive(s) && s.state !== 'awaiting_user' && (
-                <button className="btn" onClick={() => act(s, 'pass')} disabled={busy === s.id}>
+                <button className="btn" onClick={() => act(s, 'pass')} disabled={busy === s.id || browserRuntime?.available === false}>
                   <Play className="w-4 h-4" /> Run a pass
                 </button>
               )}

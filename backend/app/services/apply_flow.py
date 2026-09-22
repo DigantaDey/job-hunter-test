@@ -235,7 +235,12 @@ async def _prepare_application(
     extra["resume_decision"] = decision
     job.extra = extra
     job.applied_with_resume_id = chosen_id
-    job.status = "preparing" if not plan["missing_required"] else "needs_input"
+    # This function has finished preparation synchronously from the worker's
+    # perspective. ``preparing`` is reserved for an in-flight queue item;
+    # leaving a completed prepare-only run there made it look stuck forever.
+    # ``ready_to_apply`` truthfully says a plan exists but no browser submission
+    # has happened yet.
+    job.status = "ready_to_apply" if not plan["missing_required"] else "needs_input"
     db.commit()
 
     record_job_event(

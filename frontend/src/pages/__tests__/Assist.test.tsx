@@ -81,6 +81,14 @@ describe('Assisted Apply page', () => {
     expect(screen.getByText(/I finished this step in the browser/)).toBeTruthy()
   })
 
+  it('preselects the prepared job from the Assisted Apply next-action link', async () => {
+    const queryWrapper = ({ children }: { children: React.ReactNode }) => (
+      <MemoryRouter initialEntries={['/assist?job=3']}>{children}</MemoryRouter>
+    )
+    render(<Assist />, { wrapper: queryWrapper })
+    await waitFor(() => expect((screen.getByLabelText('Job') as HTMLSelectElement).value).toBe('3'))
+  })
+
   it('closes a handoff item with a note — never with a value', async () => {
     render(<Assist />, { wrapper })
     await waitFor(() => expect(screen.getByTestId('action-captcha')).toBeTruthy())

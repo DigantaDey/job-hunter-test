@@ -250,12 +250,14 @@ async def handle_application(db: Session, item: PipelineJob) -> Dict[str, Any]:
 
     # ``mode`` (v2.2.8): the interactive Auto-apply button queues the whole
     # flow now — it used to prepare synchronously and only queue when a real
-    # submission was allowed. A deployment without browser automation
-    # (AUTOFILL_ENABLED=false, the default) must therefore be able to queue a
-    # *prepare-only* run: running ``execute_application`` there would record
-    # "autofill unavailable" and flip the job to ``failed`` for a step nobody
-    # asked for. Absent/``execute`` keeps the historical behaviour (the auto
-    # scheduler and the input re-queue depend on it).
+    # submission was allowed. A deployment without unattended Auto-apply
+    # (AUTOFILL_ENABLED=false, the default) deliberately finishes a
+    # *prepare-only* run at ``ready_to_apply``. It must not call
+    # ``execute_application`` merely to record "autofill unavailable" and turn
+    # the job into ``failed``. The UI directs this completed outcome to Assisted
+    # Apply, whose browser runtime has an independent availability gate.
+    # Absent/``execute`` keeps the historical behaviour (the auto scheduler and
+    # the input re-queue depend on it).
     mode = str(payload.get("mode") or "execute")
     if mode == "prepare":
         return {**prepared, "status": prepared.get("status") or job.status, "mode": "prepare"}

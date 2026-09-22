@@ -344,6 +344,7 @@ export const APPLICATION_BLOCKED_CODES = [
   'policy_daily_limit',
   'quota_exhausted',
   'autofill_unavailable',
+  'assisted_apply_unavailable',
   'portal_unreachable',
 ] as const
 export type ApplicationBlockedCode = (typeof APPLICATION_BLOCKED_CODES)[number]

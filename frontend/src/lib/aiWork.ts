@@ -194,11 +194,21 @@ export function deriveApplyState(row: QueueItem | null): DerivedState | null {
     return { phase: 'applied', label: 'Applied', detail: `Application submitted${decision}${vault}.`, tone: 'ok', live: false, needsInput: false }
   }
   if (status === 'ready_to_apply') {
-    return { phase: 'ready_to_apply', label: 'Ready to apply', detail: `Prefilled in dry-run — review and submit, or enable automation${decision}.`, tone: 'ok', live: false, needsInput: false }
+    const prepareOnly = (row.payload?.mode || 'prepare') === 'prepare'
+    if (prepareOnly) {
+      return {
+        phase: 'ready_to_apply', label: 'Preparation complete',
+        detail: `Your resume and form plan are ready${decision}${vault}. No browser submission was run — continue in Assisted Apply.`,
+        tone: 'ok', live: false, needsInput: false,
+        link: `/assist?job=${row.job_id}`, linkLabel: 'Continue in Assisted Apply',
+      }
+    }
+    return { phase: 'ready_to_apply', label: 'Ready to apply', detail: `Prefilled in dry-run — review and submit${decision}.`, tone: 'ok', live: false, needsInput: false }
   }
   if (status === 'preparing' || status === 'prepared') {
     const mapped = result.fields_total != null ? ` • ${result.fields_mapped ?? 0}/${result.fields_total} fields mapped` : ''
-    return { phase: 'prepared', label: 'Prepared', detail: `Status: preparing${decision}${vault}${mapped}. Review the plan, then submit or mark as applied.`, tone: 'ok', live: false, needsInput: false }
+    return { phase: 'prepared', label: 'Prepared', detail: `Preparation completed${decision}${vault}${mapped}. Continue in Assisted Apply to fill and review the application.`, tone: 'ok', live: false, needsInput: false,
+      link: `/assist?job=${row.job_id}`, linkLabel: 'Continue in Assisted Apply' }
   }
   if (status === 'failed') {
     return { phase: 'failed', label: 'Failed', detail: result.message || row.error || 'Autofill could not run.', tone: 'bad', live: false, needsInput: false, link: '/queues', linkLabel: 'Queues' }
