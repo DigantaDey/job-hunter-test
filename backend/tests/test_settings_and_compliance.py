@@ -89,6 +89,45 @@ def test_ai_workflow_config_validation_and_masking(client, auth, db, owner):
     assert resolve_config_for_user(db, owner_user.id, "resume_gen")["api_key"] == ""
 
 
+def test_ai_config_lists_workflows_when_nothing_is_overridden(client, auth):
+    """The admin form renders an input per workflow from this list, even with no overrides."""
+    listing = client.get("/api/ai/config", headers=auth).json()
+    assert listing["overrides"] == {}
+    assert isinstance(listing["workflows"], dict)
+    assert "scoring" in listing["workflows"]
+    assert "persona" in listing["workflows"]
+    assert listing["workflows"]["scoring"]
+
+
+def test_ai_workflow_override_rejects_unusable_url_and_does_not_pin_provider(client, auth, db, owner):
+    bad = client.post(
+        "/api/ai/config",
+        json={"scoring": {"base_url": "not a url", "model": "gpt-4o"}},
+        headers=auth,
+    )
+    assert bad.status_code == 400
+    assert bad.json()["detail"]["code"] == "invalid_ai_config"
+    assert "scoring" not in client.get("/api/ai/config", headers=auth).json()["overrides"]
+
+    # A model-only override must not come back as provider=openai_compatible.
+    # The form round-trips that field; inventing a provider would pin Gemini
+    # workspaces to OpenAI the next time the owner hit Save.
+    ok = client.post("/api/ai/config", json={"scoring": {"model": "gpt-4o"}}, headers=auth)
+    assert ok.status_code == 200, ok.text
+    override = client.get("/api/ai/config", headers=auth).json()["overrides"]["scoring"]
+    assert override["model"] == "gpt-4o"
+    assert override["provider"] == ""
+    assert override["base_url"] == ""
+
+    from app.models.models import User
+    from app.services.ai_client import resolve_config_for_user
+
+    db.expire_all()
+    owner_user = db.query(User).filter(User.email == owner["email"]).first()
+    cfg = resolve_config_for_user(db, owner_user.id, "scoring")
+    assert cfg["model"] == "gpt-4o"
+
+
 def test_ai_status_reports_offline_without_key(client, auth):
     status = client.get("/api/settings/ai/status", headers=auth).json()
     assert status["online"] is False

@@ -213,7 +213,11 @@ def get_ai_config(user: CurrentUser, db: DbSession, _owner: None = Depends(requi
         result[workflow] = {
             "base_url": cfg.get("base_url", ""),
             "model": cfg.get("model", ""),
-            "provider": cfg.get("provider", "") or "openai_compatible",
+            # Empty provider means "inherit the default". Do not invent
+            # openai_compatible here — the form round-trips this value, and a
+            # synthesized provider would pin every model-only override to OpenAI
+            # even when the workspace default is Gemini.
+            "provider": cfg.get("provider") or "",
             "api_key": "",
             "api_key_set": bool(cfg.get("api_key")),
         }
@@ -230,6 +234,7 @@ def update_ai_config(payload: Dict[str, Any], request: Request, user: CurrentUse
         _normalize_provider,
         delete_workflow_override,
         read_workflow_override,
+        validate_openai_compatible,
         write_workflow_override,
     )
 
@@ -247,6 +252,15 @@ def update_ai_config(payload: Dict[str, Any], request: Request, user: CurrentUse
                 raise HTTPException(400, {"code": "invalid_provider", "message": f"provider must be one of {sorted(AI_PROVIDERS)}"})
         elif cleaned.get("base_url"):
             cleaned["provider"] = _detect_provider_from_base_url(cleaned["base_url"])
+        # Same URL/model rules as the default provider form, so a workflow override
+        # cannot be saved in a shape the gateway will reject on the next call.
+        err = validate_openai_compatible(cleaned.get("base_url") or "", cleaned.get("model") or "", "")
+        if err:
+            raise HTTPException(
+                400,
+                {"code": "invalid_ai_config", "message": err,
+                 "hint": "OpenAI compatible format: base_url like https://api.openai.com/v1, model like gpt-4o-mini"},
+            )
         existing = read_workflow_override(db, user.id, workflow)
         # A blank api_key means "keep the stored one" (the UI never receives it).
         if not cleaned["api_key"] and existing.get("api_key"):
