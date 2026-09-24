@@ -491,6 +491,11 @@ async def run_forever(pipelines: Sequence[str] = PIPELINES, concurrency: Optiona
         await task
     except asyncio.CancelledError:
         pass
+    # Assisted Apply keeps headed windows open across pauses; this process
+    # owns them, so it closes them on the way out.
+    from app.services import live_browser
+
+    await live_browser.close_all()
     if metrics_listener is not None:
         metrics_listener.stop()
 

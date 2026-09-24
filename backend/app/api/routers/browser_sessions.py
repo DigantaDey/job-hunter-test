@@ -14,7 +14,11 @@ The surface is deliberately small and honest about who does what:
 * ``GET  /application-sessions/actions`` is the actionable queue: CAPTCHA and
   MFA items are first-class rows there, each with its handoff descriptor.
 * ``POST …/actions/{id}/handoff`` mints a one-time, short-lived window for the
-  user to complete a login/MFA/CAPTCHA step **in the browser themselves**.
+  user to complete a login/MFA/CAPTCHA step **in the browser themselves** — and,
+  when this host can show one, opens the session's own Playwright window on
+  that step's URL (``window_opened`` in the descriptor says which happened), so
+  the login's cookies belong to the automation's context and the continuing
+  pass resumes signed in.
 * ``POST …/actions/{id}/complete`` closes the item. It accepts no secret: a
   payload carrying a password/code field is refused with ``restricted_field``.
 
@@ -35,7 +39,7 @@ from app.core import audit
 from app.core.entitlements import enforce
 from app.core.logging import get_logger
 from app.models.models import ApplicationSession, Job
-from app.services import assisted_fill
+from app.services import assisted_fill, live_browser
 from app.services import browser_session as sessions
 from app.services.apply_flow import prepare_form_plan
 
@@ -228,7 +232,7 @@ def session_detail(session_id: int, user: CurrentUser, db: DbSession):
     db.refresh(session)
     detail = sessions.session_detail(db, session=session)
     job = db.query(Job).filter(Job.id == session.job_id).first()
-    detail["plan"] = (assisted_fill.plan_for_session(job, session) if job else None)
+    detail["plan"] = (assisted_fill.plan_for_session(job, session, db=db) if job else None)
     return detail
 
 
@@ -329,26 +333,42 @@ def resume(session_id: int, body: ResumeRequest, request: Request, user: Current
 
 
 @router.post("/{session_id}/reauthenticate")
-def reauthenticate(session_id: int, request: Request, user: CurrentUser, db: DbSession):
+async def reauthenticate(session_id: int, request: Request, user: CurrentUser, db: DbSession):
     """
     Restart an expired session the safe way: drop persisted state, new TTL, and a
     login handoff so the user re-proves who they are in the browser.
+
+    Any window left from the old session closes first — its cookie jar is the
+    one we just purged — and a fresh one opens on the posting for the new
+    sign-in, when this host can show a window at all.
     """
     session = _session_or_404(db, user, session_id)
     try:
         outcome = sessions.reauthenticate(db, user=user, session=session)
     except sessions.SessionError as exc:
         raise _session_error(exc) from exc
+    # The old window's cookie jar is the one we just purged: close it, then
+    # open a fresh one on the posting for the new sign-in.
+    await live_browser.close(session.id)
+    job = db.query(Job).filter(Job.id == session.job_id).first()
+    if job is not None:
+        window = await assisted_fill.open_handoff_window(
+            db, user=user, session=session,
+            url=job.url or str((session.last_observation or {}).get("url") or ""))
+        outcome["window"] = window
     audit.audit(db, "application.session_expired", user=user, target=f"job:{session.job_id}",
                 detail={"session_id": session.id, "action": "reauthenticate"}, request=request)
     return outcome
 
 
 @router.post("/{session_id}/cancel")
-def cancel(session_id: int, request: Request, user: CurrentUser, db: DbSession,
-           reason: str = Query("user_cancelled")):
+async def cancel(session_id: int, request: Request, user: CurrentUser, db: DbSession,
+                 reason: str = Query("user_cancelled")):
     session = _session_or_404(db, user, session_id)
     sessions.cancel_session(db, user=user, session=session, reason=reason)
+    # A cancelled session has no window: close it before the response says
+    # "cancelled", not whenever the idle sweep gets around to it.
+    await live_browser.close(session.id)
     audit.audit(db, "application.session_cancelled", user=user, target=f"job:{session.job_id}",
                 detail={"session_id": session.id, "reason": reason}, request=request)
     return sessions.session_detail(db, session=session)
@@ -373,13 +393,18 @@ def _action_or_404(db, user, session: ApplicationSession, action_id: int):
 
 
 @router.post("/{session_id}/actions/{action_id}/handoff")
-def issue_handoff(session_id: int, action_id: int, request: Request, user: CurrentUser, db: DbSession):
+async def issue_handoff(session_id: int, action_id: int, request: Request, user: CurrentUser, db: DbSession):
     """
-    Mint a one-time handoff window for a human-only browser step.
+    Mint a one-time handoff window for a human-only browser step — and, when
+    this host can show one, actually **open the session's browser window** on
+    the step's URL so the human works in the very context the next pass
+    continues in.
 
     The response carries the token exactly once (only its hash is stored) and
     states, in the payload the UI renders, that the user — not the automation —
-    performs the step.
+    performs the step. ``window_opened`` is the honest answer to "did a window
+    appear?"; when it is false the descriptor's link into the user's own
+    browser remains, with the reason why no window could be shown.
     """
     session = _session_or_404(db, user, session_id)
     action = _action_or_404(db, user, session, action_id)
@@ -389,17 +414,26 @@ def issue_handoff(session_id: int, action_id: int, request: Request, user: Curre
         raise _session_error(exc) from exc
     except sessions.SessionError as exc:
         raise _session_error(exc) from exc
+    window = await assisted_fill.open_handoff_window(
+        db, user=user, session=session, url=str(descriptor.get("url") or ""))
+    descriptor.update(window)
     audit.audit(db, "application.handoff_issued", user=user, target=f"job:{session.job_id}",
-                detail={"session_id": session.id, "action_id": action.id, "kind": action.kind},
+                detail={"session_id": session.id, "action_id": action.id, "kind": action.kind,
+                        "window_opened": bool(window.get("window_opened"))},
                 request=request)
     return descriptor
 
 
 @router.post("/{session_id}/actions/{action_id}/complete")
-def complete_action(session_id: int, action_id: int, body: CompleteActionRequest, request: Request,
-                    user: CurrentUser, db: DbSession):
+async def complete_action(session_id: int, action_id: int, body: CompleteActionRequest, request: Request,
+                          user: CurrentUser, db: DbSession):
     """
     Close an action. Secrets are refused here, by name — see ``restricted_field``.
+
+    Before the continuing pass is queued, the live window's cookie jar is
+    exported (when persistence is enabled): that is how a sign-in the human
+    just performed in the window reaches the automation, so the next pass
+    resumes logged in instead of meeting the login wall again.
     """
     session = _session_or_404(db, user, session_id)
     action = _action_or_404(db, user, session, action_id)
@@ -408,10 +442,21 @@ def complete_action(session_id: int, action_id: int, body: CompleteActionRequest
         sessions.record_user_answers(db, session, body.answers)
     sessions.complete_action(db, user=user, action=action, note=body.note)
     # Any values the user typed in the browser stay in the browser: only the
-    # fact that the step is done is recorded.
+    # fact that the step is done is recorded — except the cookie jar, which
+    # the next pass legitimately needs to still be signed in.
     if session.state == "awaiting_user":
         sessions.transition(session, "paused", actor="user", reason="action_completed")
         db.commit()
+    driver = live_browser.adopt(session.id)
+    if driver is not None and hasattr(driver, "export_storage_state"):
+        policy = sessions.effective_policy(db, user.id)
+        if policy.persist_state:
+            try:
+                state = await driver.export_storage_state()
+                if state:
+                    sessions.persist_storage_state(db, session, state, policy=policy)
+            except Exception as exc:  # pragma: no cover - best effort by design
+                log.warning("could not persist the window's state (%s)", type(exc).__name__)
     audit.audit(db, "application.action_completed", user=user, target=f"job:{session.job_id}",
                 detail={"session_id": session.id, "action_id": action.id, "kind": action.kind},
                 request=request)
@@ -453,9 +498,13 @@ async def run_pass(session_id: int, body: PassRequest, request: Request, user: C
         raise HTTPException(404, {"code": "job_not_found", "message": "Job not found"})
 
     policy = sessions.effective_policy(db, user.id)
-    storage_state = sessions.load_storage_state(db, session, user=user, policy=policy)
-    driver = assisted_fill.PlaywrightDriver(session, target_url=job.url, storage_state=storage_state,
-                                            allow_submit=policy.allow_submit)
+    # A window the session left open for the human is the driver to use: it is
+    # the context they may have just signed in to. Otherwise a fresh one.
+    driver = live_browser.adopt(session.id)
+    if driver is None:
+        storage_state = sessions.load_storage_state(db, session, user=user, policy=policy)
+        driver = assisted_fill.PlaywrightDriver(session, target_url=job.url, storage_state=storage_state,
+                                                allow_submit=policy.allow_submit)
     try:
         result = await assisted_fill.run_pass(db, user=user, session=session, driver=driver,
                                               policy=policy, open_driver=body.open_browser,

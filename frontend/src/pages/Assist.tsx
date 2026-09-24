@@ -81,6 +81,8 @@ type Session = {
   checkpoint: { fields: Record<string, any>; completed_fields: string[]; answer_fields: string[] }
   /** What the run actually did, in order — the recording behind "future reference". */
   flow?: { journal: FlowStep[]; progress: Record<string, any> }
+  /** The session's visible browser window, if one is still open for you to work in. */
+  window?: { open?: boolean; idle_seconds?: number; age_seconds?: number }
   plan?: {
     must_pause: boolean
     autofillable: string[]
@@ -276,7 +278,11 @@ export default function Assist() {
         setMsg('A fresh sign-in window was issued. Nothing from the old session is reused.')
       } else {
         const r = await client.post(`/api/application-sessions/${session.id}/pass`, {})
-        setMsg(passSummary(r.data?.pass))
+        let summary = passSummary(r.data?.pass)
+        if (r.data?.window?.open) {
+          summary += ' The browser window is still open — take over in it when it hands you a step.'
+        }
+        setMsg(summary)
       }
       await load()
     } catch (e: any) {
@@ -292,7 +298,14 @@ export default function Assist() {
     try {
       const r = await client.post(
         `/api/application-sessions/${action.session_id}/actions/${action.id}/handoff`, {})
+      const opened = Boolean(r.data?.window_opened)
       setDescriptors(prev => ({ ...prev, [action.id]: r.data }))
+      setMsg(opened
+        ? 'A visible browser window just opened on the machine running the app — do this step there, '
+          + 'then come back and click “I finished this step in the browser”. What you type there '
+          + '(except passwords and codes) is saved for this and future sessions.'
+        : `No window could be opened here (${r.data?.reason || r.data?.window_reason || 'headless host'}). `
+          + 'Use the “open the posting” link below to continue in your own browser tab.')
     } catch (e: any) {
       setErr(apiError(e, 'Could not open a handoff window'))
     } finally {
@@ -311,6 +324,7 @@ export default function Assist() {
         text ? { answers: { [action.fields[0]?.name || 'answer']: text } } : { note: 'done in the browser' },
       )
       setAnswers(prev => ({ ...prev, [action.id]: '' }))
+      setMsg('Step recorded — the run continues from the checkpoint, never from the top.')
       await load()
     } catch (e: any) {
       setErr(apiError(e, 'Could not close that item'))
@@ -418,18 +432,26 @@ export default function Assist() {
                   {descriptor && (
                     <div className="text-[11px] mono text-zinc-500 space-y-1">
                       <div className="flex items-center gap-1"><Clock className="w-3 h-3" /> one-time window, expires {descriptor.expires_at || '—'}</div>
-                      <div>
-                        the browser window is yours for this step — a password, a code or a bot check is typed
-                        there, never here.
-                        {descriptor.url && (
-                          <>
-                            {' '}
-                            <a className="underline" href={descriptor.url} target="_blank" rel="noreferrer">
-                              open the posting
-                            </a>
-                          </>
-                        )}
-                      </div>
+                      {descriptor.window_opened ? (
+                        <div className="text-emerald-700 dark:text-emerald-300" data-testid="handoff-window-open">
+                          ✓ a visible browser window is open on this machine — the step is yours to do
+                          there; this page never sees the password, the code or the check.
+                        </div>
+                      ) : (
+                        <div>
+                          no browser window could be shown here{descriptor.reason ? ` (${descriptor.reason})` : ''} —
+                          the browser window is yours for this step — a password, a code or a bot check is typed
+                          there, never here.
+                        </div>
+                      )}
+                      {descriptor.url && (
+                        <>
+                          {' '}
+                          <a className="underline" href={descriptor.url} target="_blank" rel="noreferrer">
+                            open the posting
+                          </a>
+                        </>
+                      )}
                       {(descriptor.never || []).slice(0, 4).map((line: string, i: number) => (
                         <div key={i} className="flex items-center gap-1"><XCircle className="w-3 h-3" /> {line}</div>
                       ))}
@@ -489,6 +511,12 @@ export default function Assist() {
               {s.expires_at ? ` • expires ${new Date(s.expires_at).toLocaleTimeString()}` : ''}
             </div>
             {s.state_reason && <div className="text-[11px] mono text-zinc-500">why: {s.state_reason}</div>}
+            {s.window?.open && (
+              <div className="text-[11px] mono text-emerald-700 dark:text-emerald-300" data-testid={`window-${s.id}`}>
+                ● the browser window for this session is open — do sign-in, bot-check or final-submit
+                steps in it; what you type there (never a password or code) is recorded for replay
+              </div>
+            )}
             {s.plan && (
               <div className="text-[11px] mono text-zinc-500">
                 plan: {s.plan.autofillable.length} fillable
