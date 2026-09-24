@@ -55,6 +55,27 @@ const session = {
   plan: null, expires_at: '2099-01-01T00:00:00',
 }
 
+const activeSession = { ...session, state: 'active', phase: 'running', pause: { kind: '', reason: '' } }
+
+/** The page's three reads, with whatever a test needs to differ. */
+function mockGet(overrides: { sessions?: any[]; actions?: any[]; jobs?: any[] } = {}) {
+  get.mockImplementation((url: string) => {
+    if (url === '/api/application-sessions') {
+      return Promise.resolve({ data: { sessions: overrides.sessions ?? [session] } })
+    }
+    if (url === '/api/application-sessions/actions') {
+      return Promise.resolve({ data: { actions: overrides.actions ?? [captchaAction, unknownAction] } })
+    }
+    if (url === '/api/jobs') {
+      return Promise.resolve({ data: { jobs: overrides.jobs ?? [{ id: 3, title: 'Backend Engineer', company: 'Acme' }] } })
+    }
+    if (url === '/api/account/runtime') {
+      return Promise.resolve({ data: { assisted_apply_runtime: { available: true, mode: 'headed' } } })
+    }
+    return Promise.resolve({ data: {} })
+  })
+}
+
 const wrapper = ({ children }: { children: React.ReactNode }) => <MemoryRouter>{children}</MemoryRouter>
 
 describe('Assisted Apply page', () => {
@@ -65,6 +86,9 @@ describe('Assisted Apply page', () => {
       if (url === '/api/application-sessions') return Promise.resolve({ data: { sessions: [session] } })
       if (url === '/api/application-sessions/actions') return Promise.resolve({ data: { actions: [captchaAction, unknownAction] } })
       if (url === '/api/jobs') return Promise.resolve({ data: { jobs: [{ id: 3, title: 'Backend Engineer', company: 'Acme' }] } })
+      if (url === '/api/account/runtime') {
+        return Promise.resolve({ data: { assisted_apply_runtime: { available: true, mode: 'headed' } } })
+      }
       return Promise.resolve({ data: {} })
     })
     post.mockImplementation(() => Promise.resolve({ data: {} }))
@@ -132,6 +156,87 @@ describe('Assisted Apply page', () => {
     ).toBe(true))
     const call = post.mock.calls.find((c: any[]) => String(c[0]).endsWith('/actions/12/complete'))!
     expect(call[1]).toEqual({ answers: { q_17: 'Blue' } })
+  })
+
+  it('reports what a pass actually did, straight from the run', async () => {
+    mockGet({ sessions: [activeSession] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByText(/Run a pass/)).toBeTruthy())
+    post.mockImplementation((url: string) => {
+      if (url.endsWith('/pass')) {
+        return Promise.resolve({
+          data: {
+            pass: {
+              pages: 3, filled: ['full_name', 'email'], advanced: ['Apply for this job'],
+              confirmed: '', next_step: { reason: 'waiting_for_you_to_submit' },
+            },
+          },
+        })
+      }
+      return Promise.resolve({ data: {} })
+    })
+
+    fireEvent.click(screen.getByText(/Run a pass/))
+    await waitFor(() => expect(screen.getByText(/Looked at 3 page\(s\)/)).toBeTruthy())
+    // The old message ("Pass finished") was true of nothing the user cared
+    // about; the summary names the fields, the movement and the reason to stop.
+    expect(screen.getByText(/typed 2 field\(s\)/)).toBeTruthy()
+    expect(screen.getByText(/moved on with “Apply for this job”/)).toBeTruthy()
+    expect(screen.getByText(/submitting is yours to do/)).toBeTruthy()
+  })
+
+  it('says the portal confirmed the application only when it did', async () => {
+    mockGet({ sessions: [activeSession] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByText(/Run a pass/)).toBeTruthy())
+    post.mockImplementation((url: string) => {
+      if (url.endsWith('/pass')) {
+        return Promise.resolve({ data: { pass: { pages: 4, filled: ['email'], confirmed: 'submitted',
+                                                 advanced: [] } } })
+      }
+      return Promise.resolve({ data: {} })
+    })
+    fireEvent.click(screen.getByText(/Run a pass/))
+    await waitFor(() => expect(screen.getByText(/the portal confirmed the application/)).toBeTruthy())
+  })
+
+  it('hands a review_required item to the browser instead of asking for a value', async () => {
+    const reviewAction = {
+      ...captchaAction, id: 13, kind: 'review_required',
+      title: 'Review the prepared application', fields: [],
+      instructions: 'The page is filled — the final Submit is yours to press.',
+      reason: 'waiting_for_you_to_submit',
+    }
+    mockGet({ actions: [reviewAction] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByTestId('action-review_required')).toBeTruthy())
+    expect(screen.getByText(/I finished the application in the browser/)).toBeTruthy()
+    expect(screen.queryByLabelText('Answer for action 13')).toBeNull()
+  })
+
+  it('shows the recorded flow so the run can be reviewed afterwards', async () => {
+    const recorded = {
+      ...session,
+      state: 'active',
+      flow: {
+        journal: [
+          { event: 'page', host: 'jobs.lever.co', title: 'Backend Engineer', fields_total: 0 },
+          { event: 'advance', control: 'Apply for this job', kind: 'start_application', reason: 'moved' },
+          { event: 'fill', fields: ['full_name', 'email'] },
+          { event: 'pause', kind: 'captcha', reason: 'captcha_detected' },
+        ],
+        progress: { pages: 2, browser_mode: 'headless' },
+      },
+    }
+    mockGet({ sessions: [recorded], actions: [] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByTestId('flow-5')).toBeTruthy())
+    fireEvent.click(screen.getByText(/What this session did/))
+    await waitFor(() => expect(screen.getByText(/full_name, email/)).toBeTruthy())
+    expect(screen.getByText(/Apply for this job/)).toBeTruthy()
+    expect(screen.getByText(/a bot check needs a human/)).toBeTruthy()
+    // …and an invisible run says so, rather than pretending the user watched it.
+    expect(screen.getByText(/headless/)).toBeTruthy()
   })
 
   it('resumes through the checkpoint-validating route', async () => {

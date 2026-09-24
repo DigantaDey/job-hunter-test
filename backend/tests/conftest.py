@@ -54,6 +54,11 @@ os.environ.update(
         # allowed in the test environment — the guard still applies to real
         # provider URLs in production (public by default).
         "OUTBOUND_ALLOW_PRIVATE": "true",
+        # Browser-runtime tests must answer the same way on a laptop with Chrome
+        # installed and on a bare CI runner. System-browser discovery is a real
+        # feature (and its own tests turn it back on), but the default answer in
+        # the suite is "Playwright's own build, or nothing".
+        "AUTOFILL_BROWSER_AUTODETECT": "false",
     }
 )
 

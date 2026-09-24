@@ -47,7 +47,7 @@ import glob
 import os
 import sys
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from app.core.config import settings
@@ -252,13 +252,218 @@ def _chromium_browser_path() -> Optional[str]:
     return None
 
 
+#: Chrome/Chromium/Edge install locations, newest-preferred order, per platform.
+#: A machine that already runs the user's own browser should not also need a
+#: second copy downloaded by Playwright — and for Assisted Apply the *point* is
+#: that the user can watch (and act in) the window.
+_SYSTEM_BROWSERS: Dict[str, Tuple[Tuple[str, Tuple[str, ...]], ...]] = {
+    "linux": (
+        ("chrome", ("/usr/bin/google-chrome-stable", "/usr/bin/google-chrome",
+                    "/opt/google/chrome/chrome", "/usr/bin/google-chrome-beta")),
+        ("chromium", ("/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium",
+                      "/usr/lib/chromium/chromium")),
+        ("msedge", ("/usr/bin/microsoft-edge-stable", "/usr/bin/microsoft-edge",
+                    "/opt/microsoft/msedge/msedge")),
+    ),
+    "darwin": (
+        ("chrome", ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")),
+        ("chromium", ("/Applications/Chromium.app/Contents/MacOS/Chromium",)),
+        ("msedge", ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",)),
+    ),
+    "win32": (
+        ("chrome", (r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                    r"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe")),
+        ("msedge", (r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",)),
+        ("chromium", (r"C:\\Program Files\\Chromium\\Application\\chrome.exe",)),
+    ),
+}
+
+#: Bare executable names worth probing on PATH (``shutil.which``).
+_SYSTEM_BROWSER_NAMES: Tuple[str, ...] = (
+    "google-chrome-stable", "google-chrome", "chromium", "chromium-browser",
+    "microsoft-edge-stable", "microsoft-edge", "chrome", "msedge",
+)
+
+
+def _platform_key() -> str:
+    if sys.platform == "darwin":
+        return "darwin"
+    if sys.platform == "win32":
+        return "win32"
+    return "linux"
+
+
+def system_browser() -> Optional[Dict[str, str]]:
+    """
+    The first Chrome/Chromium-family browser already installed on this machine.
+
+    Returns ``{"engine": "chrome", "path": "/usr/bin/google-chrome"}`` or
+    ``None``. Used as the *fallback* engine: Playwright's own build wins when it
+    is present (that is the version the driver is tested against), but a machine
+    with Chrome installed and no download is not "no browser".
+    """
+    import shutil
+
+    for engine, paths in _SYSTEM_BROWSERS.get(_platform_key(), ()):
+        for raw in paths:
+            candidate = os.path.expanduser(raw)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return {"engine": engine, "path": candidate}
+    for name in _SYSTEM_BROWSER_NAMES:
+        found = shutil.which(name)
+        if found:
+            if "edge" in name:
+                engine = "msedge"
+            elif "chromium" in name:
+                engine = "chromium"
+            else:
+                engine = "chrome"
+            return {"engine": engine, "path": found}
+    return None
+
+
+def _display_available() -> bool:
+    """Whether a window could actually be shown on this host."""
+    if _platform_key() in ("darwin", "win32"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _container_chromium_args() -> List[str]:
+    """
+    Flags Chromium needs inside the containers this app ships.
+
+    A root process must pass ``--no-sandbox``; ``/dev/shm`` is 64 MB in Docker
+    unless it was raised, which crashes the renderer on document-heavy ATS
+    pages. Both are added only when they are the honest answer, never silently
+    on a desktop install.
+    """
+    flags: List[str] = []
+    try:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            flags.append("--no-sandbox")
+    except Exception:  # pragma: no cover - platform dependent
+        pass
+    if os.path.exists("/.dockerenv") or os.environ.get("KUBERNETES_SERVICE_HOST"):
+        flags.append("--disable-dev-shm-usage")
+    return flags
+
+
+def browser_launch_plan() -> Dict[str, Any]:
+    """
+    How the next browser should be launched — and, when it cannot be, why.
+
+    Engine resolution, first hit wins:
+
+    1. ``AUTOFILL_BROWSER_EXECUTABLE`` — an operator-named binary.
+    2. ``AUTOFILL_BROWSER_CHANNEL`` — a Playwright channel (``chrome``, ``msedge``…).
+    3. Playwright's own downloaded Chromium.
+    4. a system Chrome/Chromium/Edge (``AUTOFILL_BROWSER_AUTODETECT``, default on).
+
+    The *mode* is what keeps Assisted Apply honest: a run the user is supposed to
+    take part in must be visible. ``auto`` (the default) is headed wherever a
+    display exists and headless on a server, and the previous behaviour is still
+    available verbatim by setting ``AUTOFILL_HEADLESS`` explicitly
+    (``AUTOFILL_BROWSER_MODE`` can also name ``headed``/``headless``).
+    """
+    explicit_env = getattr(settings, "model_fields_set", set()) or set()
+    mode_setting = (getattr(settings, "autofill_browser_mode", "") or "auto").strip().lower()
+    display = _display_available()
+    if "autofill_headless" in explicit_env:
+        # The documented legacy switch is an override, not a default: an
+        # operator who wrote AUTOFILL_HEADLESS=false asked for a window.
+        mode = "headless" if settings.autofill_headless else "headed"
+        mode_reason = "AUTOFILL_HEADLESS explicitly set"
+    elif mode_setting in ("headed", "headless"):
+        mode = mode_setting
+        mode_reason = "AUTOFILL_BROWSER_MODE configured"
+    else:
+        mode = "headed" if display else "headless"
+        mode_reason = ("a display is available, so the browser window is visible"
+                       if display else "no display (DISPLAY/WAYLAND_DISPLAY unset)")
+    if mode == "headed" and not display:
+        # Kept explicit rather than silently downgraded: Playwright will fail to
+        # launch, and the driver turns that into a reported error (plus a
+        # headless retry) instead of an invisible run.
+        mode_reason = f"{mode_reason}; no X/Wayland display found on this host"
+
+    executable = (getattr(settings, "autofill_browser_executable", "") or "").strip() or None
+    if executable:
+        executable = os.path.expanduser(executable)
+        if not (os.path.isfile(executable) and os.access(executable, os.X_OK)):
+            return {"available": False, "mode": mode, "mode_reason": mode_reason,
+                    "headless": mode == "headless",
+                    "reason": (f"AUTOFILL_BROWSER_EXECUTABLE={executable} does not exist or is "
+                               f"not executable")}
+
+    channel = (getattr(settings, "autofill_browser_channel", "") or "").strip()
+    engine, path = "playwright", _chromium_browser_path()
+    if not executable and not channel and path is None \
+            and getattr(settings, "autofill_browser_autodetect", True):
+        found = system_browser()
+        if found:
+            engine, path = found["engine"], found["path"]
+
+    if not executable and not channel and path is None:
+        return {
+            "available": False,
+            "mode": mode,
+            "mode_reason": mode_reason,
+            "headless": mode == "headless",
+            "reason": ("the Chromium browser is not downloaded (playwright install chromium) "
+                       "and no system Chrome/Chromium was found"),
+        }
+
+    configured = [flag for flag in
+                  (getattr(settings, "autofill_browser_args", "") or "").replace(";", ",").split(",")
+                  if flag.strip()]
+    args = [flag.strip() for flag in configured] + _container_chromium_args()
+    return {
+        "available": True,
+        "mode": mode,
+        "mode_reason": mode_reason,
+        "headless": mode == "headless",
+        "display": display,
+        "engine": engine,
+        "channel": channel,
+        "executable_path": executable or (path if not channel else None),
+        "args": list(dict.fromkeys(args)),
+        "reason": "",
+    }
+
+
+def browser_launch_kwargs(plan: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    The ``chromium.launch(...)`` arguments a launch plan describes.
+
+    One place decides how a browser is started, so the unattended path and the
+    assisted path cannot drift apart: the plan already resolved the mode, the
+    engine and the container flags.
+    """
+    kwargs: Dict[str, Any] = {"headless": bool(plan.get("headless", True))}
+    if plan.get("channel"):
+        kwargs["channel"] = str(plan["channel"])
+    elif plan.get("executable_path"):
+        kwargs["executable_path"] = str(plan["executable_path"])
+    if plan.get("args"):
+        kwargs["args"] = list(plan["args"])
+    return kwargs
+
+
 def browser_runtime_available() -> Dict[str, Any]:
-    """Report whether the Playwright + Chromium runtime is installed.
+    """
+    Report whether the Playwright + browser runtime can actually run a pass.
 
     This answers an operational question only. Product workflows layer their
     own policy gates over it: unattended Auto-apply uses
     :func:`autofill_available`, whereas human-in-the-loop Assisted Apply uses
     :func:`assisted_apply_available`.
+
+    The answer carries the *mode* the next launch would use (``headed`` /
+    ``headless``, with the reason) so the UI can tell the user whether they are
+    about to see a window at all — a "Run a pass" that opens an invisible browser
+    the user is expected to sign in to is exactly the failure this exposes.
     """
     try:
         import playwright  # noqa: F401
@@ -270,12 +475,12 @@ def browser_runtime_available() -> Dict[str, Any]:
     # A bare `pip install playwright` gets this far, and then the first pass
     # dies on DriverError("Executable doesn't exist…"). Name the download
     # instead of claiming the feature works.
-    if _chromium_browser_path() is None:
-        return {
-            "available": False,
-            "reason": "the Chromium browser is not downloaded (playwright install chromium)",
-        }
-    return {"available": True}
+    plan = browser_launch_plan()
+    if not plan["available"]:
+        return {"available": False, "reason": plan["reason"], "mode": plan.get("mode", ""),
+                "mode_reason": plan.get("mode_reason", "")}
+    return {"available": True, "mode": plan["mode"], "mode_reason": plan["mode_reason"],
+            "engine": plan["engine"], "headless": plan["headless"], "display": plan["display"]}
 
 
 def autofill_available() -> Dict[str, Any]:
@@ -540,7 +745,8 @@ async def execute_autofill(
 
     try:  # pragma: no cover - requires browsers, exercised in e2e environments
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=settings.autofill_headless)
+            launch_plan = browser_launch_plan()
+            browser = await p.chromium.launch(**browser_launch_kwargs(launch_plan))
             context = await browser.new_context(user_agent=settings.http_user_agent)
             page = await context.new_page()
             page.set_default_timeout(settings.autofill_timeout_ms)

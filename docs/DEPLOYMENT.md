@@ -94,6 +94,38 @@ For production: `docker compose -f docker-compose.prod.yml up -d --build api wor
 `AUTOFILL_DRY_RUN=true` (default) still means a pass fills the form but never presses submit,
 and `AUTOFILL_ALLOW_SUBMIT=false` (default) keeps submission a separate opt-in.
 
+#### Headed or headless
+
+Assisted Apply is human-in-the-loop, so a pass walks the *whole* application flow — landing page,
+account creation, profile, questions, review — by clicking the portal's own "Apply"/"Continue"
+controls, filling each page it reaches, and recording every step. It stops at anything a human
+owns (a sign-in, a code, a bot check, an unmapped question) and it never closes a session as
+`completed` unless the portal itself confirms the application. A session that stops raises a
+`review_required` item that says what remains.
+
+`AUTOFILL_BROWSER_MODE=auto` (the default) resolves to a **headed** browser wherever a display
+exists and to headless on a server, and the mode is reported in `/api/account/runtime` so the UI
+can say whether the user is about to see a window. `AUTOFILL_HEADLESS=true` still works as the
+legacy explicit pin for both paths.
+
+Running the dev stack in Docker on a Linux desktop? Pass the X socket through so the window is
+visible on the host (compose does this already):
+
+```yaml
+    environment:
+      DISPLAY: ${DISPLAY:-}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+```
+
+On macOS/Windows, or on a headless server, leave the mode at `auto`: the run is headless, the
+Assisted Apply page says so, and the steps that need the user are handed over as their own items.
+
+No Playwright browser download? A system Chrome/Chromium/Edge is discovered
+(`AUTOFILL_BROWSER_AUTODETECT`, default on) or can be named directly with
+`AUTOFILL_BROWSER_EXECUTABLE=/path/to/chrome` or a Playwright
+`AUTOFILL_BROWSER_CHANNEL=chrome`.
+
 ---
 
 ## 3. Reverse proxy (nginx)

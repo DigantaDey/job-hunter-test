@@ -25,9 +25,16 @@ services:
       # The dev stack ships the browser, automation on but still dry-run —
       # submissions stay a conscious operator decision.
       AUTOFILL_ENABLED: "true"
+      # Assisted Apply opens a *visible* browser. On a Linux desktop the X
+      # socket below plus this DISPLAY make the window appear on the host; with
+      # neither set the launcher resolves to headless and the UI says so.
+      DISPLAY: ${DISPLAY:-}
     volumes:
       - ./backend:/app
       - backend-data:/app/data
+      # Harmless on macOS/Windows (an empty directory is created, DISPLAY is
+      # unset, so the run is headless there).
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:

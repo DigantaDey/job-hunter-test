@@ -137,6 +137,34 @@ ALLOWED_TRANSITIONS: Dict[str, Tuple[str, ...]] = {
 #: Actions that are always a browser handoff (the user does it themselves).
 HANDOFF_ACTION_KINDS: Tuple[str, ...] = ("login", "mfa", "captcha")
 
+#: Actions whose resolution happens *in the browser window* rather than by typing
+#: an answer into the app. ``review_required`` joins the handoff kinds here: a
+#: pass that ran out of safe steps hands the flow back to the user, who continues
+#: it in the very window the assistant opened.
+BROWSER_STEP_KINDS: Tuple[str, ...] = HANDOFF_ACTION_KINDS + ("review_required",)
+
+#: The flow journal: what actually happened during a pass, in order. This is what
+#: makes a run reviewable afterwards ("it clicked 'Apply for this job', filled 4
+#: fields on step 2, then stopped at a sign-in wall") instead of a black box that
+#: reports a status. Entries carry *structure* — hosts, field names, control
+#: labels, counters — never a value, a code or page text.
+FLOW_STEP_KEYS: Tuple[str, ...] = (
+    "event", "at", "step", "host", "url", "title", "fields", "filled", "control",
+    "reason", "kind", "fields_total", "filled_total", "pages", "mode",
+)
+FLOW_STEP_EVENTS: Tuple[str, ...] = (
+    "page",        # a page was observed (host/title/field counts)
+    "fill",        # fields were typed into the page
+    "advance",     # a navigation control was clicked to move the flow on
+    "pause",       # the run stopped and asked the human for something
+    "blocked",     # the run could not proceed and hands the flow over
+    "submit",      # the portal's own submission receipt
+    "confirmed",   # the portal said the application arrived
+    "resumed",     # the human unblocked the session; the next pass continues
+)
+#: How many journal entries the session payload renders (the row keeps more).
+FLOW_PAYLOAD_LIMIT = 40
+
 #: Screens are never captured while a human is typing a secret into them.
 NEVER_SCREENSHOT_KINDS: Tuple[str, ...] = ("login", "mfa", "captcha")
 
@@ -145,7 +173,15 @@ NEVER_SCREENSHOT_KINDS: Tuple[str, ...] = ("login", "mfa", "captcha")
 #: records *structure*, not page content.
 OBSERVATION_KEYS: Tuple[str, ...] = (
     "url", "host", "title", "employer", "application_identity", "markers",
-    "challenge", "fields", "submit_present", "logged_in",
+    "challenge", "fields", "submit_present", "logged_in", "confirmation",
+    "step_index", "steps_total",
+)
+
+#: Confirmation tokens a page may report (never free text). ``submitted`` and
+#: ``received`` are the portal telling us the application arrived — the only
+#: evidence that lets a pass close a session as *done* rather than *handed over*.
+OBSERVATION_CONFIRMATIONS: Tuple[str, ...] = (
+    "submitted", "received", "thank_you", "under_review",
 )
 OBSERVATION_FIELD_KEYS: Tuple[str, ...] = (
     "name", "id", "label", "type", "required", "options", "value_present",
@@ -442,6 +478,14 @@ def sanitize_observation(observation: Mapping[str, Any]) -> Dict[str, Any]:
     if "url" in clean:
         clean["url"] = canonical_url(str(clean["url"]))
         clean.setdefault("host", host_of(str(clean["url"])))
+    confirmation = str(clean.get("confirmation") or "").strip().lower()
+    clean["confirmation"] = confirmation if confirmation in OBSERVATION_CONFIRMATIONS else ""
+    for key in ("step_index", "steps_total"):
+        if key in clean:
+            try:
+                clean[key] = max(0, min(99, int(clean[key])))
+            except (TypeError, ValueError):
+                clean.pop(key, None)
     return clean
 
 
@@ -843,6 +887,7 @@ def record_fills(
     fills: Sequence[Mapping[str, Any]],
     *,
     commit: bool = True,
+    journal: bool = True,
 ) -> Dict[str, Any]:
     """
     Record what was typed — a fingerprint per field, never a value.
@@ -872,7 +917,11 @@ def record_fills(
         fields[name] = {k: v for k, v in entry.items() if k in FIELD_CHECKPOINT_KEYS}
         recorded.append(name)
     checkpoint["fields"] = fields
-    _append_step(checkpoint, {"step": "fill", "fields": recorded, "at": _iso(_now())})
+    if journal:
+        # The pass loop journals its own (richer) fill entry — host, step, page —
+        # so a caller that is mid-flow passes ``journal=False`` and the journal
+        # keeps one entry per action instead of two.
+        _append_step(checkpoint, {"event": "fill", "fields": recorded, "at": _iso(_now())})
     session.checkpoint = checkpoint
     progress = dict(session.progress or {})
     progress["filled"] = sum(1 for f in fields.values() if f.get("status") == "filled")
@@ -956,6 +1005,82 @@ def _append_step(checkpoint: Dict[str, Any], step: Mapping[str, Any]) -> None:
     steps = list(checkpoint.get("steps") or [])
     steps.append(step)
     checkpoint["steps"] = steps[-MAX_SESSION_EVENTS:]
+
+
+def record_flow_step(
+    db: Session,
+    session: ApplicationSession,
+    event: str,
+    *,
+    commit: bool = True,
+    **entry: Any,
+) -> Dict[str, Any]:
+    """
+    Append one entry to the session's flow journal (``checkpoint["steps"]``).
+
+    The journal is the answer to "what did the run actually do?" — it is what the
+    user reads after a pass, and what makes a resume/replay auditable. Everything
+    passed in is filtered through :data:`FLOW_STEP_KEYS`, so a caller cannot
+    smuggle page text or a value into it, and the entry always carries ``event``
+    and ``at``.
+    """
+    checkpoint = dict(session.checkpoint or {})
+    steps = list(checkpoint.get("steps") or [])
+    row: Dict[str, Any] = {"event": str(event)[:40], "at": _iso(_now())}
+    for key in FLOW_STEP_KEYS:
+        if key in ("event", "at") or key not in entry:
+            continue
+        value = entry[key]
+        if isinstance(value, str):
+            value = value[:200]
+        elif isinstance(value, (list, tuple)):
+            value = [str(item)[:80] for item in list(value)[:24]]
+        elif isinstance(value, dict):
+            value = {str(k)[:40]: (str(v)[:120] if isinstance(v, (str, int, float, bool)) else None)
+                     for k, v in list(value.items())[:12]}
+        row[key] = value
+    steps.append(row)
+    checkpoint["steps"] = steps[-MAX_SESSION_EVENTS:]
+    session.checkpoint = checkpoint
+    session.last_activity_at = _now()
+    if commit:
+        db.commit()
+    return row
+
+
+def flow_journal(session: ApplicationSession, *,
+                 limit: int = FLOW_PAYLOAD_LIMIT) -> List[Dict[str, Any]]:
+    """
+    The most recent journal entries, newest last, for the session payload.
+
+    A *view*: only keys the journal itself writes are returned, so an older row
+    (or a tampered one) can never widen what the API exposes.
+    """
+    steps = list((session.checkpoint or {}).get("steps") or [])
+    rows: List[Dict[str, Any]] = []
+    for raw in steps[-max(1, limit):]:
+        if not isinstance(raw, Mapping):
+            continue
+        rows.append({key: raw[key] for key in FLOW_STEP_KEYS if key in raw})
+    return rows
+
+
+def flow_progress(session: ApplicationSession) -> Dict[str, Any]:
+    """Counters over the journal for the session card (what has been *done*)."""
+    steps = [s for s in ((session.checkpoint or {}).get("steps") or []) if isinstance(s, Mapping)]
+    pages = [s for s in steps if s.get("event") == "page"]
+    return {
+        "entries": len(steps),
+        "pages": len(pages),
+        "advanced": sum(1 for s in steps if s.get("event") == "advance"),
+        "pauses": sum(1 for s in steps if s.get("event") == "pause"),
+        "filled_fields": len({name for s in steps if s.get("event") == "fill"
+                              for name in (s.get("fields") or [])}),
+        "hosts": list(dict.fromkeys(str(s.get("host")) for s in steps if s.get("host")))[:5],
+        "last_event": str(steps[-1].get("event")) if steps else "",
+        # Whether the last pass opened a window the user could watch (and act in).
+        "browser_mode": next((str(s.get("mode") or "") for s in reversed(steps) if s.get("mode")), ""),
+    }
 
 
 def session_values(session: ApplicationSession,
@@ -1237,6 +1362,8 @@ def _handoff_payload(session: ApplicationSession, kind: str) -> Dict[str, Any]:
             "login": "sign in yourself in the browser window",
             "mfa": "enter the one-time code yourself in the browser window",
             "captcha": "complete the bot check yourself in the browser window",
+            "review_required": ("continue this application yourself in the browser window — "
+                                "the assistant has done everything it is allowed to do"),
         }.get(kind, "answer in the app"),
         "never": [
             "we never ask you for your password",
@@ -1304,7 +1431,7 @@ def action_public(action: ApplicationAction, *, session: Optional[ApplicationSes
                 "url": job.url if job else ""},
         "session_id": action.session_id,
         "session_state": session.state if session else None,
-        "requires_browser_handoff": action.kind in HANDOFF_ACTION_KINDS,
+        "requires_browser_handoff": action.kind in BROWSER_STEP_KINDS,
         "created_at": _iso(action.created_at),
         "expires_at": _iso(action.expires_at),
     }
@@ -2235,6 +2362,13 @@ def session_public(session: ApplicationSession, *, actions: Optional[Sequence[Ap
                 if isinstance(entry, dict) and entry.get("status") == "answered"
             ),
         },
+        # What the run actually did, in order. This is the "record everything for
+        # reference" half of Assisted Apply: hosts, control labels, field names
+        # and counters — never a value, a code or page text.
+        "flow": {
+            "journal": flow_journal(session),
+            "progress": flow_progress(session),
+        },
         "persistence": {
             "enabled": bool(session.user_id and session.storage_state_enc),
             "saved_at": _iso(session.storage_state_saved_at),
@@ -2338,8 +2472,13 @@ def planned_values(job: Job, *, answers: Optional[Mapping[str, Any]] = None) -> 
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
+    "FLOW_PAYLOAD_LIMIT",
+    "OBSERVATION_CONFIRMATIONS",
     "CHECKPOINT_STATUSES",
     "FIELD_CHECKPOINT_KEYS",
+    "BROWSER_STEP_KINDS",
+    "FLOW_STEP_EVENTS",
+    "FLOW_STEP_KEYS",
     "HANDOFF_ACTION_KINDS",
     "LIVE_SESSION_STATES",
     "SessionError",
@@ -2364,6 +2503,8 @@ __all__ = [
     "fill_instructions",
     "finalize_submission",
     "fingerprint_value",
+    "flow_journal",
+    "flow_progress",
     "handoff_token_valid",
     "host_of",
     "is_expired",
@@ -2383,6 +2524,7 @@ __all__ = [
     "purge_storage_state",
     "reauthenticate",
     "record_fills",
+    "record_flow_step",
     "record_observation",
     "record_screenshot",
     "record_user_answers",
