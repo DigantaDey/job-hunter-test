@@ -19,7 +19,11 @@ What a driver may never do, at any layer
 * Type into a field the classifier did not mark ``autofill``. The fill loop
   re-checks every instruction against the classification and refuses the rest.
 * Overwrite a field the page already shows as user-filled.
-* Solve, click, relay or "assist" a CAPTCHA; enter an MFA code; type a password.
+* Solve, click, relay or "assist" a CAPTCHA; enter an MFA code.
+* Type a password — unless the session policy carries the user's explicit
+  ``create_accounts`` opt-in, the instruction's value came from the vault, and
+  the driver's own re-classification (``allow_credentials``) clears it. Every
+  other password instruction, at every layer, is refused as before.
 * Read page text beyond the structural observation (labels/types/options), or
   keep a field value anywhere but in the fill call itself.
 * Submit unless the *session* policy allows it. In this task auto-submit is off
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 import time
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -44,11 +49,12 @@ from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.models.models import ApplicationSession, Job, User
 from app.services import browser_session as sessions
-from app.services import net_guard
+from app.services import live_browser, net_guard
 from app.services.autofill import assisted_apply_available, browser_launch_kwargs, browser_launch_plan
 from app.services.field_classifier import classify_form
 from app.services.form_detector import VAULT_DOMAINS
 from app.services.reliability import duration
+from app.services.user_settings import get_setting
 
 log = get_logger("app.assisted")
 
@@ -179,6 +185,53 @@ CONTROLS_SCRIPT = """
   }
   return out;
 }
+""".strip()
+
+
+#: What the *human* types into the shared handoff window, reported back so the
+#: session can replay it. Installed once per context (survives navigations) and
+#: deliberately conservative:
+#:
+#: * only ``change`` events — a committed value, never a keystroke stream;
+#: * never password/hidden/file fields, never ``one-time-code``/
+#:   ``current-password`` autocomplete — those are refused *in the page* as
+#:   well as by the server, which re-checks every report anyway;
+#: * field identity (name/label/type) plus one bounded value — no page text,
+#:   no cookies, no DOM beyond the edited element.
+RECORD_INPUT_SCRIPT = """
+(() => {
+  if (window.__jobhunterRecorder) return;
+  window.__jobhunterRecorder = true;
+  const BAD_TYPE = /^(password|hidden|file)$/i;
+  const BAD_AC = /(password|one-time-code)/i;
+  const report = (el) => {
+    try {
+      if (!window.__jobhunterInput) return;
+      const name = el.name || el.id || '';
+      if (!name) return;
+      const type = String(el.type || el.tagName.toLowerCase() || '').toLowerCase();
+      if (BAD_TYPE.test(type)) return;
+      const ac = String(el.getAttribute('autocomplete') || '');
+      if (BAD_AC.test(ac)) return;
+      const label = el.labels && el.labels.length ? el.labels[0].innerText
+        : (el.getAttribute('aria-label') || '');
+      window.__jobhunterInput({
+        name: String(name).slice(0, 200),
+        label: String(label || '').trim().slice(0, 200),
+        type: type.slice(0, 40),
+        autocomplete: ac.toLowerCase().slice(0, 60),
+        value: String(el.value == null ? '' : el.value).slice(0, 1000),
+      });
+    } catch (e) { /* recording must never break the page */ }
+  };
+  document.addEventListener('change', (e) => {
+    const el = e.target;
+    if (!el || !el.tagName) return;
+    const tag = el.tagName.toLowerCase();
+    if (tag !== 'input' && tag !== 'select' && tag !== 'textarea') return;
+    report(el);
+  }, true);
+})();
 """.strip()
 
 
@@ -379,6 +432,9 @@ class RecordingDriver:
     async def close(self) -> None:
         self.closed = True
 
+    def healthy(self) -> bool:
+        return self.opened and not self.closed
+
 
 # --------------------------------------------------------------------------- #
 # Playwright driver (real; optional dependency)
@@ -405,22 +461,45 @@ class PlaywrightDriver:
 
     def __init__(self, session: ApplicationSession, *, target_url: str = "",
                  storage_state: Optional[Mapping[str, Any]] = None,
-                 allow_submit: bool = False) -> None:
+                 allow_submit: bool = False, allow_credentials: bool = False) -> None:
         self.session = session
         #: Where to navigate. Comes from the job the session is bound to, so the
         #: session's own binding (not a caller) decides the destination.
         self.target_url = target_url
         self.storage_state = dict(storage_state) if storage_state else None
         self.allow_submit = allow_submit
+        #: Policy-backed: the user opted in to account creation. Only this
+        #: lets ``fill()`` re-classify a password instruction as autofill —
+        #: with it off (the default) passwords are refused here as ever.
+        self.allow_credentials = allow_credentials
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
         self._page: Any = None
+        #: Whether this context already carries the human-input recorder.
+        self._recorder_installed = False
         #: What the launch actually did (mode, engine, why) — surfaced in the
         #: pass result so the UI can say whether the user sees a window.
         self.launch_report: Optional[Dict[str, Any]] = None
 
+    def healthy(self) -> bool:
+        """A window that still exists — the user is allowed to close it."""
+        try:
+            if self._page is None or self._page.is_closed():
+                return False
+            if self._browser is None or not self._browser.is_connected():
+                return False
+            return True
+        except Exception:  # pragma: no cover - defensive
+            return False
+
     async def open(self, session: ApplicationSession) -> None:
+        if self.healthy():
+            # Adopted window: the human may be mid-step in it. Stay exactly
+            # where the page is — reopening or renavigating would throw away
+            # the login they are halfway through.
+            self.session = session
+            return
         availability = assisted_apply_available()
         if not availability["available"]:
             raise DriverError(f"assisted browser unavailable: {availability['reason']}")
@@ -447,9 +526,59 @@ class PlaywrightDriver:
             user_agent=settings.http_user_agent,
             storage_state=self.storage_state or None,
         )
+        await self._install_recorder()
         self._page = await self._context.new_page()
         self._page.set_default_timeout(settings.autofill_timeout_ms)
         await self._page.goto(target, wait_until="domcontentloaded", timeout=settings.autofill_timeout_ms)
+
+    async def _install_recorder(self) -> None:
+        """
+        Bind the human-input recorder to this context.
+
+        ``context``-level bindings and init scripts survive navigations, so a
+        multi-step flow keeps reporting after every ``Continue``. A failure
+        here degrades to *no recording* — never to a broken window.
+        """
+        if self._recorder_installed or self._context is None:
+            return
+        try:
+            await self._context.add_init_script(script=RECORD_INPUT_SCRIPT)
+            await self._context.expose_binding("__jobhunterInput", self._on_recorded_input)
+            self._recorder_installed = True
+        except Exception as exc:  # pragma: no cover - recorder is best effort
+            log.warning("assisted: input recorder not installed (%s)", type(exc).__name__)
+
+    async def _on_recorded_input(self, source: Any, payload: Any) -> None:
+        """A field the human committed in this window — fold it into the session."""
+        try:
+            _record_input_from_browser(int(self.session.id), payload)
+        except Exception as exc:  # pragma: no cover - never surface into the page
+            log.warning("assisted: could not record browser input (%s)", type(exc).__name__)
+
+    async def show(self, url: str) -> bool:
+        """
+        Navigate the live window to a human-step URL (the handoff target).
+
+        The URL faces the same outbound policy as a pass's first navigation:
+        a handoff descriptor can only ever point at the application's own host.
+        Returns ``False`` when the window is gone (the user closed it).
+        """
+        if not self.healthy() or self._page is None:
+            return False
+        target = str(url or "").strip()
+        if not target:
+            return True
+        verdict = await net_guard.preflight_navigation(target)
+        if not verdict.allowed:
+            raise DriverError(f"navigation refused by the outbound policy: {verdict.reason}")
+        session = self.session
+        if session is not None and session.expected_host \
+                and not net_guard.host_matches(verdict.host, session.expected_host) \
+                and not any(net_guard.host_matches(verdict.host, ats) for ats in VAULT_DOMAINS.values()):
+            raise DriverError(f"{verdict.host} is not this application's host ({session.expected_host})")
+        await self._page.goto(target, wait_until="domcontentloaded", timeout=settings.autofill_timeout_ms)
+        await self._settle()
+        return True
 
     async def _launch(self, plan: Mapping[str, Any]) -> Any:
         """
@@ -539,9 +668,12 @@ class PlaywrightDriver:
         refused all of them, filled nothing, and the pass still reported
         success. Two defects, one line apart.
 
-        Still refused here, whatever the plan says: credentials, one-time codes,
-        bot checks, restricted identifiers, and any field the page already holds
-        content in that this session did not put there.
+        Still refused here, whatever the plan says: one-time codes, bot checks,
+        restricted identifiers, and any field the page already holds content in
+        that this session did not put there. A password is refused too — unless
+        the session policy opted in to account creation *and* the instruction
+        carries a vault value, which the ``allow_credentials`` re-classification
+        proves before a character is typed.
         """
         if self._page is None:
             raise DriverError("browser not open")
@@ -549,7 +681,8 @@ class PlaywrightDriver:
         current = await self.observe()
         planned = {str(i.get("name") or ""): i.get("value") for i in instructions}
         checkpoint = dict((self.session.checkpoint or {}).get("fields") or {})
-        form = classify_form(current.get("fields") or [], values=planned, checkpoint=checkpoint)
+        form = classify_form(current.get("fields") or [], values=planned, checkpoint=checkpoint,
+                             allow_credentials=self.allow_credentials)
         allowed = {v.name: v for v in form.autofillable}
         held = {str(f.get("name") or ""): bool(f.get("value_present"))
                 for f in (current.get("fields") or []) if isinstance(f, Mapping)}
@@ -672,9 +805,41 @@ class PlaywrightDriver:
 
 
 def build_instruction_values(job: Job, session: ApplicationSession, *,
-                             answers: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """Values the session may fill: the plan's non-credential values + user answers."""
-    return sessions.planned_values(job, answers=answers or {})
+                             answers: Optional[Mapping[str, Any]] = None,
+                             db: Optional[Session] = None) -> Dict[str, Any]:
+    """
+    Values the session may fill: the plan's non-credential values + user answers.
+
+    With a database handle the user's **learned answers** for this host join
+    underneath the session's own set — answers taught by an earlier browser
+    window or in-app answer, replayed here. Session state always wins over
+    learned state; learned always wins over the static plan.
+    """
+    merged: Dict[str, Any] = {}
+    if db is not None:
+        host = sessions.learning_host(session)
+        merged.update(sessions.learned_values(db, user_id=session.user_id, host=host))
+    merged.update(dict(answers or {}))
+    return sessions.planned_values(job, answers=merged)
+
+
+def _record_input_from_browser(session_id: int, payload: Any) -> Dict[str, Any]:
+    """
+    Persist one field the human committed in the shared browser window.
+
+    Runs on the event loop inside Playwright's binding callback, so it opens
+    its own short-lived database session rather than borrowing the pass's.
+    """
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        session = db.query(ApplicationSession).filter(ApplicationSession.id == int(session_id)).first()
+        if session is None:
+            return {"recorded": [], "restricted": []}
+        return sessions.record_browser_input(db, session, payload)
+    finally:
+        db.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -710,7 +875,80 @@ def build_driver(
         target_url=job.url or "",
         storage_state=storage_state,
         allow_submit=policy.allow_submit,
+        allow_credentials=policy.create_accounts,
     )
+
+
+async def open_handoff_window(
+    db: Session,
+    *,
+    user: User,
+    session: ApplicationSession,
+    url: str = "",
+) -> Dict[str, Any]:
+    """
+    Open (or retarget) the session's **visible** window for a human-only step.
+
+    This is what makes "Start a handoff window" mean what it says: instead of
+    only minting a token and rendering a link into a browser that shares
+    nothing with the automation, the session's own Playwright window — the one
+    whose cookies the next pass will reuse — appears on this machine, parked on
+    the step's URL, and stays open until the human closes the action (or the
+    idle sweep takes it).
+
+    The answer is always honest: ``{"window_opened": True}`` only when a
+    headed window actually exists; otherwise the mode and the reason why not
+    (no display, launch fell back to headless, runtime missing), so the UI can
+    fall back to the plain link without pretending.
+    """
+    availability = assisted_apply_available()
+    if not availability["available"]:
+        return {"window_opened": False, "reason": str(availability.get("reason") or
+                                                      "assisted browser unavailable")[:300]}
+    plan = browser_launch_plan()
+    if not plan.get("available"):
+        return {"window_opened": False, "reason": str(plan.get("reason") or
+                                                      "browser not available")[:300]}
+    if plan.get("headless") or str(plan.get("mode") or "") != "headed":
+        return {"window_opened": False, "mode": "headless",
+                "reason": str(plan.get("mode_reason") or
+                              "this host has no display to show a window on")[:300]}
+
+    driver = live_browser.adopt(session.id)
+    if driver is None:
+        job = db.query(Job).filter(Job.id == session.job_id).first()
+        if job is None:
+            return {"window_opened": False, "reason": "the job for this session no longer exists"}
+        policy = sessions.effective_policy(db, user.id)
+        driver = build_driver(db, session, job, user=user, policy=policy)
+        if driver is None:
+            return {"window_opened": False, "reason": "assisted browser unavailable"}
+        try:
+            await driver.open(session)
+        except DriverError as exc:
+            await driver.close()
+            return {"window_opened": False, "reason": str(exc)[:300]}
+        launch = getattr(driver, "launch_report", None) or {}
+        if str(launch.get("mode") or "") != "headed":
+            # The launch fell back to headless: an invisible window is no
+            # window at all for a human step, so close it and say why.
+            reason = launch.get("fallback_reason") or launch.get("mode_reason") or \
+                "the headed launch failed and fell back to headless"
+            await driver.close()
+            return {"window_opened": False, "mode": "headless", "reason": str(reason)[:300]}
+        live_browser.remember(session.id, driver)
+
+    if url:
+        show = getattr(driver, "show", None)
+        if callable(show):
+            try:
+                await show(url)
+            except DriverError as exc:
+                # The window is open — the user can still navigate it themselves.
+                log.warning("assisted: could not park the handoff window (%s)", str(exc)[:120])
+            except Exception as exc:  # pragma: no cover - portal-side failure
+                log.warning("handoff navigation failed (%s)", type(exc).__name__)
+    return {"window_opened": True, "mode": "headed"}
 
 
 def enqueue_pass(
@@ -838,6 +1076,10 @@ async def _run_queued_pass(
         return {"status": "not_found", "session_id": session.id, "noop": "job_missing"}
 
     policy = sessions.effective_policy(db, user.id)
+    if driver is None:
+        # A window a previous pass (or a handoff) left open for the human is
+        # the best driver there is: it is the context they just signed in to.
+        driver = live_browser.adopt(session.id)
     active_driver = driver or build_driver(db, session, job, user=user, policy=policy)
     if active_driver is None:
         report_queue_progress(db, item, "done", detail="assisted_apply_unavailable")
@@ -855,6 +1097,77 @@ async def _run_queued_pass(
     report_queue_progress(db, item, step, pause=result.get("pause"),
                           filled=len(result.get("filled") or []))
     return result
+
+
+def _password_field_names(observation: Mapping[str, Any]) -> List[str]:
+    """Password controls on this page, in order, names only."""
+    names: List[str] = []
+    for field in observation.get("fields") or []:
+        if not isinstance(field, Mapping):
+            continue
+        if str(field.get("type") or "").lower() != "password":
+            continue
+        name = str(field.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _portal_credential(db: Session, *, session: ApplicationSession, job: Job,
+                       observation: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    The vault credential for the portal this page belongs to.
+
+    Reused when the domain already has one, created when the user's settings
+    allow it (``application.auto_create_credentials``, default on) — either way
+    the entry lands in the user's vault, so the existing Chrome/Apple CSV
+    export already covers it. Returns ``None`` when there is nothing to type
+    with: no readable host, nothing stored and creation refused, or an
+    undecryptable vault (the caller then keeps the login pause — never a
+    partial or empty password). The password travels only in the returned
+    dict, in memory for the single fill that follows; it is never logged.
+    """
+    from app.services.events import record_job_event
+    from app.services.vault import (
+        VaultDecryptionError,
+        credential_for_application,
+        get_vault_entry_for_domain,
+        reveal_password,
+    )
+
+    host = (str(observation.get("host") or "").strip()
+            or sessions.host_of(str(observation.get("url") or ""))
+            or sessions.host_of(job.url or ""))
+    if not host:
+        return None
+    domain = host.lower().rstrip(".")
+    allow_create = bool(get_setting(db, session.user_id, "application", "auto_create_credentials", True))
+    try:
+        if allow_create:
+            credential, created = credential_for_application(
+                db, user_id=session.user_id, domain=domain, company=job.company or "")
+        else:
+            entry = get_vault_entry_for_domain(db, session.user_id, domain)
+            if entry is None:
+                return None
+            credential = {"username": entry.username, "password": reveal_password(entry, db=db),
+                          "domain": domain}
+            created = False
+    except VaultDecryptionError:
+        # The stored password cannot be read — an empty string here would type
+        # garbage into a sign-up. The login pause is the honest outcome.
+        log.warning("vault credential for '%s' unreadable — keeping the login pause", domain)
+        return None
+    if created:
+        # Journal evidence that an account credential was made — domain only,
+        # never the username and certainly never the password.
+        record_job_event(db, user_id=session.user_id, job_id=job.id, stage="credential_created",
+                         status="info",
+                         message=f"Portal credential created in your vault for {domain}",
+                         meta={"domain": domain, "origin": "assisted_session"})
+    if not credential or not str(credential.get("password") or ""):
+        return None
+    return {"password": str(credential["password"]), "created": bool(created), "domain": domain}
 
 
 async def run_pass(
@@ -929,8 +1242,22 @@ async def run_pass(
                                           mode=str(launch.get("mode") or "")[:20])
         for step in range(max_steps):
             observation = await driver.observe()
+            # Account creation (opt-in): when the policy allows it and this
+            # page actually asks for a password, pull the portal's credential
+            # from the vault — creating it on first sight — and hand the
+            # password to this step's classification only. It lives in this
+            # local ``values`` dict for the fill and nowhere else.
+            allow_credentials = False
+            password_names = _password_field_names(observation) if policy.create_accounts else []
+            if password_names:
+                credential = _portal_credential(db, session=session, job=job, observation=observation)
+                if credential:
+                    for field_name in password_names:
+                        values[field_name] = credential["password"]
+                    allow_credentials = True
             outcome = sessions.record_observation(db, session, observation, user=user, values=values,
-                                                  actor="system_worker")
+                                                  actor="system_worker",
+                                                  allow_credentials=allow_credentials)
             progress = outcome.get("progress") or {}
             host = str(observation.get("host") or "") or expect_host
             url_now = str(observation.get("url") or "")
@@ -973,7 +1300,8 @@ async def run_pass(
             # type them would only make the user retype data we already hold.
             # (An *answer* pause — unknown/ambiguous/legal — clears nothing, so
             # nothing is typed on it.)
-            instructions = sessions.fill_instructions(session, observations=[observation], values=values)
+            instructions = sessions.fill_instructions(session, observations=[observation], values=values,
+                                                      allow_credentials=allow_credentials)
             filled_here: List[str] = []
             if instructions:
                 recorded = await driver.fill(instructions)
@@ -996,20 +1324,31 @@ async def run_pass(
                     sessions.record_flow_step(db, session, "fill", step=step, host=host,
                                               fields=[str(row["name"]) for row in filled])
                     values = build_instruction_values(job, session,
-                                                      answers=sessions.session_values(session))
+                                                      answers=sessions.session_values(session), db=db)
                     if policy.persist_state and isinstance(driver, PlaywrightDriver):
                         state = await driver.export_storage_state()
                         if state:
                             sessions.persist_storage_state(db, session, state, policy=policy)
                 if not filled_here:
-                    # The classifier cleared fields and the driver typed none of
-                    # them: that is a broken pass, not a finished one.
-                    result["status"] = session.state
-                    sessions.record_flow_step(db, session, "blocked", reason="no_field_could_be_filled",
-                                              host=host)
-                    result["next_step"] = {"action": "browser",
-                                           "reason": "no_field_could_be_filled"}
-                    break
+                    held = [row for row in recorded
+                            if row.get("status") == "skipped_value_present"]
+                    if len(held) == len(recorded):
+                        # Everything the plan still wanted here is content the
+                        # page already holds — the human typed it (a password
+                        # they entered themselves, data a browser filled).
+                        # Nothing is broken; there is simply nothing left for
+                        # us to type, so the flow may advance below.
+                        result["steps"].append({"step": step, "status": "held",
+                                                "held": [str(row["name"]) for row in held]})
+                    else:
+                        # The classifier cleared fields and the driver typed none of
+                        # them: that is a broken pass, not a finished one.
+                        result["status"] = session.state
+                        sessions.record_flow_step(db, session, "blocked", reason="no_field_could_be_filled",
+                                                  host=host)
+                        result["next_step"] = {"action": "browser",
+                                               "reason": "no_field_could_be_filled"}
+                        break
 
             if outcome.get("pause"):
                 result["pause"] = outcome["pause"]
@@ -1076,7 +1415,20 @@ async def run_pass(
                 break
     finally:
         if open_driver:
-            await driver.close()
+            failed = sys.exc_info()[1] is not None
+            # A pass that died mid-run must not yank away a window the human
+            # may be typing in — only a window *this pass* opened gets closed
+            # on failure. A clean end closes whatever has no human step left.
+            keep = _keep_window_open(session, result, driver) or (
+                failed and live_browser.holds(session.id, driver))
+            if keep:
+                # The human's step starts where this pass ended: the window
+                # stays (headed mode only) so they can sign in, solve the
+                # check or press Submit in the very context we continue in.
+                live_browser.remember(session.id, driver)
+            else:
+                live_browser.forget(session.id)
+                await driver.close()
 
     result["status"] = session.state
     result = await _settle_pass(db, user=user, session=session, result=result, policy=policy)
@@ -1085,6 +1437,33 @@ async def run_pass(
     result["flow"] = sessions.flow_progress(session)
     inc("jobhunter_application_session_passes_total", result=str(result.get("outcome") or result["status"]))
     return result
+
+
+def _keep_window_open(session: ApplicationSession, result: Mapping[str, Any],
+                      driver: BrowserDriver) -> bool:
+    """
+    Whether this pass's window should outlive the pass.
+
+    Three requirements, all of them honest:
+
+    * the window is **headed** — a headless browser has nothing a human can
+      watch or take over, so it keeps the old close-at-once behaviour;
+    * the session still has a human step in front of it — a pause, or a next
+      step that happens in the browser (handoff, review, Submit) — and the
+      portal has not confirmed anything (a confirmed session closes);
+    * the session itself is not terminal.
+    """
+    if session.state in sessions.APPLICATION_SESSION_TERMINAL_STATES:
+        return False
+    if result.get("confirmed"):
+        return False
+    launch = getattr(driver, "launch_report", None) or {}
+    if str(launch.get("mode") or "") != "headed":
+        return False
+    if result.get("pause"):
+        return True
+    next_step = result.get("next_step") or {}
+    return str(next_step.get("action") or "") in ("handoff", "browser", "submit")
 
 
 def _host_in_family(new_host: str, *known: str) -> bool:
@@ -1234,18 +1613,20 @@ def run_pass_sync(db: Session, *, user: User, session: ApplicationSession, drive
 
 
 def plan_for_session(job: Job, session: ApplicationSession, *,
-                     answers: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+                     answers: Optional[Mapping[str, Any]] = None,
+                     db: Optional[Session] = None) -> Dict[str, Any]:
     """
     A reviewable description of what this session would do — no browser needed.
 
     Used by the API's dry-run surface and by tests: it answers "which fields
     would be typed, which pause, and why" without opening anything. Values come
-    from the session's own confirmed working set unless the caller supplies
-    them.
+    from the session's own confirmed working set (plus, with a database handle,
+    the user's learned answers for this host) unless the caller supplies them.
     """
     values = build_instruction_values(
         job, session,
-        answers=sessions.session_values(session) if answers is None else answers)
+        answers=sessions.session_values(session) if answers is None else answers,
+        db=db)
     observation = session.last_observation or {}
     form = classify_form(observation.get("fields") or [], values=values,
                          checkpoint=session.checkpoint or {})
@@ -1270,10 +1651,12 @@ __all__ = [
     "MAX_PASS_STEPS",
     "OBSERVE_SCRIPT",
     "PlaywrightDriver",
+    "RECORD_INPUT_SCRIPT",
     "RecordingDriver",
     "build_driver",
     "build_instruction_values",
     "enqueue_pass",
+    "open_handoff_window",
     "plan_for_session",
     "report_queue_progress",
     "run_queued_pass",

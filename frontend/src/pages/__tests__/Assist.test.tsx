@@ -249,4 +249,85 @@ describe('Assisted Apply page', () => {
     ).toBe(true))
     await waitFor(() => expect(screen.getByText(/continuing from the checkpoint/)).toBeTruthy())
   })
+
+  it('opens a real window for a handoff and says so — never a silent no-op', async () => {
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByTestId('action-captcha')).toBeTruthy())
+    post.mockImplementation((url: string) => {
+      if (url.endsWith('/handoff')) {
+        return Promise.resolve({
+          data: {
+            action_id: 11, session_id: 5, kind: 'captcha', token: 'ho_once',
+            expires_at: '2099-01-01T00:10:00', user_completes_in_browser: true,
+            window_opened: true, mode: 'headed',
+            never: ['We never solve a CAPTCHA'],
+          },
+        })
+      }
+      return Promise.resolve({ data: {} })
+    })
+
+    fireEvent.click(screen.getByText(/Start a handoff window/))
+    await waitFor(() => expect(screen.getByTestId('handoff-window-open')).toBeTruthy())
+    // The message names what happened: a visible window, where the step goes,
+    // and what of the user's input gets kept for replay.
+    await waitFor(() => expect(
+      screen.getByText(/A visible browser window just opened/)).toBeTruthy())
+    expect(screen.getByText(/except passwords and codes/)).toBeTruthy()
+  })
+
+  it('says honestly when no window can be shown, and keeps the link', async () => {
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByTestId('action-captcha')).toBeTruthy())
+    post.mockImplementation((url: string) => {
+      if (url.endsWith('/handoff')) {
+        return Promise.resolve({
+          data: {
+            action_id: 11, session_id: 5, kind: 'captcha', token: 'ho_once',
+            expires_at: '2099-01-01T00:10:00', user_completes_in_browser: true,
+            window_opened: false, mode: 'headless', reason: 'no display (DISPLAY unset)',
+            url: 'https://jobs.lever.co/acme/1',
+            never: ['We never solve a CAPTCHA'],
+          },
+        })
+      }
+      return Promise.resolve({ data: {} })
+    })
+
+    fireEvent.click(screen.getByText(/Start a handoff window/))
+    await waitFor(() => expect(screen.getByText(/No window could be opened here/)).toBeTruthy())
+    // The reason shows up in the banner *and* on the descriptor itself.
+    expect(screen.getAllByText(/DISPLAY unset/).length).toBeGreaterThan(0)
+    const link = screen.getByText('open the posting')
+    expect(link.getAttribute('href')).toBe('https://jobs.lever.co/acme/1')
+    expect(screen.queryByTestId('handoff-window-open')).toBeNull()
+  })
+
+  it('marks the session whose window is still open', async () => {
+    mockGet({ sessions: [{ ...session, window: { open: true, idle_seconds: 3 } }] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByTestId('window-5')).toBeTruthy())
+    expect(screen.getByText(/do sign-in, bot-check or final-submit/)).toBeTruthy()
+    expect(screen.getByText(/recorded for replay/)).toBeTruthy()
+  })
+
+  it('tells the user the window survived the pass', async () => {
+    mockGet({ sessions: [activeSession] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByText(/Run a pass/)).toBeTruthy())
+    post.mockImplementation((url: string) => {
+      if (url.endsWith('/pass')) {
+        return Promise.resolve({
+          data: {
+            pass: { pages: 1, filled: ['email'], advanced: [],
+                    confirmed: '', next_step: { reason: 'waiting_for_you_to_submit' } },
+            window: { open: true },
+          },
+        })
+      }
+      return Promise.resolve({ data: {} })
+    })
+    fireEvent.click(screen.getByText(/Run a pass/))
+    await waitFor(() => expect(screen.getByText(/window is still open/)).toBeTruthy())
+  })
 })

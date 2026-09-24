@@ -149,8 +149,12 @@ async def lifespan(app: FastAPI):
                     await task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+        from app.services import live_browser
         from app.services.http import close_client
 
+        # Windows the assisted flow left open for a human die with the process
+        # anyway; close them explicitly so no Chromium outlives a redeploy.
+        await live_browser.close_all()
         await close_client()
         log.info("shutdown complete")
 

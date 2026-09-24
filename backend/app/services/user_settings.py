@@ -126,6 +126,13 @@ def defaults() -> Dict[str, Dict[str, Any]]:
             "screenshots_enabled": settings.browser_screenshots_enabled,
             "screenshot_retention_days": min(7, settings.browser_screenshot_max_retention_days),
             "pause_on_optional_unknown": True,
+            # Explicit opt-ins, default OFF: a pass may create a portal account
+            # and type a generated vault password (`create_accounts`), and the
+            # AI form mapper may be consulted for unmapped fields (`ai_assist`).
+            # Both are ceilings-capped by `browser_create_accounts_enabled` /
+            # `browser_ai_assist_enabled` in effective_policy / prepare_form_plan.
+            "create_accounts": False,
+            "ai_assist": False,
         },
         "email": {
             "host": settings.email_smtp_host,
@@ -176,7 +183,8 @@ WRITABLE_KEYS: Dict[str, set] = {
     "application": {"auto_create_credentials", "notify_unknown_fields", "autofill_enabled",
                     "autofill_dry_run", "allow_auto_submit", "daily_application_limit"},
     "browser": {"persist_session", "session_ttl_minutes", "max_live_sessions", "handoff_ttl_minutes",
-                 "screenshots_enabled", "screenshot_retention_days", "pause_on_optional_unknown"},
+                 "screenshots_enabled", "screenshot_retention_days", "pause_on_optional_unknown",
+                 "create_accounts", "ai_assist"},
     "email": {"host", "port", "username", "password", "use_tls", "from_name", "postal_address",
               "daily_limit", "dry_run", "tracking_enabled"},
     "funding": {"context_notes", "industries", "freshness_days", "provider", "include_unverified"},
@@ -606,6 +614,13 @@ def grouped(db: Session, user: User, *, reveal_secrets: bool = False) -> Dict[st
     except Exception:
         pass
 
+    # Same one-predicate rule as the token budgets: the UI disables the
+    # assisted-apply opt-ins exactly when the server ceiling would ignore
+    # them, so a stored-but-overridden toggle is never shown as effective.
+    browser = result.setdefault("browser", {})
+    browser["create_accounts_available"] = settings.browser_create_accounts_enabled
+    browser["ai_assist_available"] = settings.browser_ai_assist_enabled
+
     return result
 
 
@@ -696,17 +711,22 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
         for key, value in values.items():
             if key not in allowed:
                 raise HTTPException(400, f"Unknown settings key '{category}.{key}'")
-            if (category, key) == ("automation", "auto_mode"):
+            if (category, key) in {("automation", "auto_mode"),
+                                   ("browser", "create_accounts"),
+                                   ("browser", "ai_assist")}:
                 # Coerce strictly. Storing the *string* "false" would be truthy
                 # to the scheduler, i.e. a user who turned auto mode off would
-                # keep consuming quota on a switch that looks off.
+                # keep consuming quota on a switch that looks off. For the two
+                # assisted-apply opt-ins the same slip would be far worse: a
+                # "false" landing in the row as a non-empty string would read
+                # as *enabled* and gate password typing on.
                 coerced = coerce_bool(value)
                 if coerced is None:
                     raise HTTPException(
                         400,
                         {"code": "invalid_setting_value",
-                         "message": "'automation.auto_mode' must be true or false",
-                         "fields": ["auto_mode"]},
+                         "message": f"'{category}.{key}' must be true or false",
+                         "fields": [key]},
                     )
                 value = coerced
             if key in {"rpm", "port", "freshness_hours", "daily_limit", "max_retries",

@@ -20,12 +20,16 @@ click the button" but:
 
 What this module deliberately cannot do
 ---------------------------------------
-No function here solves a CAPTCHA, intercepts an MFA challenge, types a
-password, or reads page content. ``login``/``mfa``/``captcha`` are *handoffs*:
-the user does the step themselves in the browser, and the process only ever
-learns "it is done" (plus a structured, privacy-minimized observation). Session
-persistence stores the browser's own cookie jar — opt-in, encrypted with the
-per-user key, cleared on expiry/cancel/erasure — and never a credential.
+No function here solves a CAPTCHA, intercepts an MFA challenge, or reads page
+content. ``mfa``/``captcha`` are *handoffs* — the user does the step themselves
+in the browser, and the process only ever learns "it is done" (plus a
+structured, privacy-minimized observation). ``login`` is a handoff too by
+default; it stops being one only when the user's own ``create_accounts``
+opt-in is on *and* the caller holds a vault credential for the page — this
+module then plans the fill, and the driver in :mod:`app.services.assisted_fill`
+types it. Nothing here ever types anything. Session persistence stores the
+browser's own cookie jar — opt-in, encrypted with the per-user key, cleared on
+expiry/cancel/erasure — and never a credential.
 
 Isolation
 ---------
@@ -68,7 +72,7 @@ from app.models.models import (
     Job,
     User,
 )
-from app.services import net_guard
+from app.services import live_browser, net_guard
 from app.services.company_normalize import normalize_company_name
 from app.services.events import record_job_event
 from app.services.field_classifier import (
@@ -83,7 +87,7 @@ from app.services.reliability import (
     note_user_action_outcome,
     note_user_action_pause,
 )
-from app.services.user_settings import get_setting
+from app.services.user_settings import get_setting, set_setting
 
 log = get_logger("app.browser_session")
 
@@ -263,6 +267,10 @@ class SessionPolicy:
     pause_on_optional_unknown: bool = True
     allow_submit: bool = False
     dry_run: bool = True
+    #: The user explicitly opted in to portal account creation: a pass may
+    #: generate/reuse a vault credential and type the password into sign-up
+    #: fields. Default False — a password is typed only when this says so.
+    create_accounts: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -275,6 +283,7 @@ class SessionPolicy:
             "pause_on_optional_unknown": self.pause_on_optional_unknown,
             "allow_submit": self.allow_submit,
             "dry_run": self.dry_run,
+            "create_accounts": self.create_accounts,
         }
 
 
@@ -315,6 +324,15 @@ def effective_policy(db: Session, user_id: int) -> SessionPolicy:
         and settings.autofill_allow_submit
         and get_setting(db, user_id, "application", "allow_auto_submit", False)
     )
+    # Account creation is doubly gated: the per-user opt-in (default OFF) and
+    # the deployment ceiling. Either being off means passwords are refused
+    # exactly as before — the pause, never a silent type. The read is
+    # deliberately ``is True`` (fail-closed): only a literal boolean opt-in
+    # counts, never a stray truthy string.
+    create_accounts = bool(
+        settings.browser_create_accounts_enabled
+        and get_setting(db, user_id, "browser", "create_accounts", False) is True
+    )
     return SessionPolicy(
         ttl_minutes=ttl,
         max_live_sessions=max_live,
@@ -326,6 +344,7 @@ def effective_policy(db: Session, user_id: int) -> SessionPolicy:
         pause_on_optional_unknown=bool(get_setting(db, user_id, "browser", "pause_on_optional_unknown", True)),
         allow_submit=allow_submit,
         dry_run=not allow_submit,
+        create_accounts=create_accounts,
     )
 
 
@@ -500,6 +519,19 @@ _SENSITIVE_ACTION_FIELD_NAMES = frozenset({
     "pin",
 })
 
+#: Field shapes a *browser-window recording* may never keep, even though the
+#: page-level recorder already filtered them: the server is where the rule is
+#: actually enforced, by name, by type and by the classifier's own restricted
+#: verdict. Mirrors the API's ``SECRET_FIELD_PATTERN`` (the router refuses the
+#: same names over HTTP; this refuses them out of the internal binding).
+_RESTRICTED_RECORD_TYPES = frozenset({"password", "hidden", "file"})
+_RESTRICTED_RECORD_PATTERN = re.compile(
+    r"(pass(word|phrase|code)|passwd|\botp\b|one[-_ ]?time|mfa|2fa|totp|"
+    r"verification[-_ ]?code|security[-_ ]?code|captcha|\bpin\b|\bsecret\b|"
+    r"\bssn\b|social[-_ ]?security|credit[-_ ]?card|\bcvv\b|\bcvc\b)",
+    re.IGNORECASE,
+)
+
 
 def sanitize_action_payload(payload: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """Strip credential/PII values from an action payload before persistence.
@@ -557,10 +589,11 @@ def detect_challenges(observation: Mapping[str, Any]) -> List[str]:
     return sorted(dict.fromkeys(found), key=lambda kind: order.get(kind, 9))
 
 
-def _verdict_for_observation_field(field: Mapping[str, Any]) -> FieldVerdict:
+def _verdict_for_observation_field(field: Mapping[str, Any], *, value: Any = None,
+                                   checkpoint_status: str = "") -> FieldVerdict:
     from app.services.field_classifier import classify_field
 
-    return classify_field(field)
+    return classify_field(field, value=value, checkpoint_status=checkpoint_status)
 
 
 # --------------------------------------------------------------------------- #
@@ -718,6 +751,7 @@ def record_observation(
     user: Optional[User] = None,
     values: Optional[Mapping[str, Any]] = None,
     actor: str = "system_api",
+    allow_credentials: bool = False,
 ) -> Dict[str, Any]:
     """
     Fold one sanitized page observation into the session.
@@ -726,6 +760,12 @@ def record_observation(
     then field classification (legal/sensitive/ambiguous/unknown stop the run).
     Nothing is typed here — the caller asks for the fill instructions afterwards
     (:func:`fill_instructions`), which is what makes "safe autofill" reviewable.
+
+    ``allow_credentials`` is passed only by a pass whose policy opted in *and*
+    that holds a vault credential for this page: it lifts the login pause for
+    password fields and lets them classify as autofill. MFA and CAPTCHA pauses
+    are never lifted, and the credential value still never enters the session
+    working set.
     """
     if user is not None:
         _assert_owner(session, user)
@@ -741,16 +781,24 @@ def record_observation(
     checkpoint["fields"] = dict(checkpoint.get("fields") or {})
     merged_values = session_values(session, values)
 
-    form = classify_form(clean.get("fields") or [], values=merged_values, checkpoint=checkpoint)
+    form = classify_form(clean.get("fields") or [], values=merged_values, checkpoint=checkpoint,
+                         allow_credentials=allow_credentials)
     challenges = detect_challenges(clean)
+    if allow_credentials:
+        # The sign-in wall this pass can clear itself: it holds a vault
+        # credential for exactly this page. Anything the human still owns —
+        # a code, a bot check — stays a pause.
+        challenges = [kind for kind in challenges if kind != "login"]
 
     progress = progress_snapshot(form)
     session.progress = progress
     _checkpoint_fields(checkpoint, form)
-    # Keep only what a verdict cleared for autofill; a password, a code, a
-    # CAPTCHA token or a restricted identifier never reaches this set.
+    # Keep only what a verdict cleared for autofill; a code, a CAPTCHA token or
+    # a restricted identifier never reaches this set — and neither does a
+    # credential, even when ``allow_credentials`` cleared it: a password lives
+    # in memory for the one fill and nowhere else.
     cleared = {v.name: merged_values[v.name] for v in form.autofillable
-               if v.name in merged_values}
+               if v.name in merged_values and v.classification != "credential"}
     remember_values(session, cleared)
 
     # An observation only ever moves a session forward through legal edges.
@@ -989,6 +1037,19 @@ def record_user_answers(
     # session (and only this session): it may be typed on the next pass, and it
     # is never asked for twice.
     remember_values(session, {name: answers[name] for name in accepted if name in answers})
+    # ...and, when it is not a credential or a restricted identifier, for
+    # *future* sessions against this host too: an answer the human already
+    # gave once is the definition of something worth replaying.
+    for name in accepted:
+        value = answers.get(name)
+        if value in (None, ""):
+            continue
+        verdict = _verdict_for_observation_field({"name": name, "label": "", "type": "text"},
+                                                 value=value)
+        if str(verdict.sensitivity or "") == "restricted" or verdict.action in ("never", "handoff"):
+            continue
+        learn_answer(db, user_id=session.user_id, host=learning_host(session),
+                     name=name, value=value, commit=False)
     session.last_activity_at = _now()
     if commit:
         db.commit()
@@ -999,6 +1060,119 @@ def fingerprint_value(value: Any) -> str:
     """A short, non-reversible digest used for change detection without a value."""
     text = "" if value is None else str(value)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def record_browser_input(
+    db: Session,
+    session: ApplicationSession,
+    entry: Mapping[str, Any],
+    *,
+    commit: bool = True,
+) -> Dict[str, Any]:
+    """
+    Fold one field the human typed in the **shared browser window** into the
+    session — the "watch me once, reuse later" path.
+
+    The window a pass keeps open is the same Playwright context the automation
+    continues in, so what the user types there can be observed and reused
+    *without* a keystroke logger: the in-page recorder reports a committed
+    field (on ``change``), and this function decides what that report may
+    become.
+
+    Per accepted field, four things are recorded:
+
+    * the portal's own identity for it — name/label/type (structure);
+    * the value, **only** when it is not a credential, code or restricted
+      identifier — filtered in the page, filtered again here by name/type/
+      autocomplete, and finally by the classifier's own restricted verdict;
+    * checkpoint status ``user_completed`` with a fingerprint, so the run
+      never retypes or re-asks for it in this session;
+    * the session working set **and** the user's per-host *learned answers*,
+      so later pages of this flow — and future sessions against the same
+      host — replay it instead of asking again.
+
+    The journal gets one ``fill`` entry carrying the field *name* and
+    ``reason="user_in_browser"`` — never the value. Refused fields are
+    returned in ``restricted`` and are stored nowhere at all.
+    """
+    if not isinstance(entry, Mapping):
+        return {"recorded": [], "restricted": []}
+    name = str(entry.get("name") or "").strip()[:200]
+    raw_value = entry.get("value")
+    value = "" if raw_value is None else str(raw_value)
+    if not name or not value.strip():
+        return {"recorded": [], "restricted": []}
+    field_type = str(entry.get("type") or "").lower()[:40]
+    autocomplete = str(entry.get("autocomplete") or "").lower()[:60]
+    label = str(entry.get("label") or "").strip()[:200]
+
+    restricted = (
+        field_type in _RESTRICTED_RECORD_TYPES
+        or "password" in autocomplete
+        or "one-time-code" in autocomplete
+        or name.lower() in _SENSITIVE_ACTION_FIELD_NAMES
+        or bool(_RESTRICTED_RECORD_PATTERN.search(name))
+        or bool(_RESTRICTED_RECORD_PATTERN.search(label))
+    )
+    classification = "canonical"
+    profile_key = str((dict(session.checkpoint or {}).get("fields") or {})
+                      .get(name, {}).get("profile_key") or "")
+    if not restricted:
+        verdict = _verdict_for_observation_field({
+            "name": name, "label": label, "type": field_type,
+            "autocomplete": autocomplete, "required": False, "options": [],
+        }, value=value)
+        classification = str(verdict.classification or "canonical")
+        profile_key = str(verdict.profile_key or profile_key or "")
+        restricted = (str(verdict.sensitivity or "") == "restricted"
+                      or verdict.action in ("never", "handoff"))
+    if restricted:
+        return {"recorded": [], "restricted": [name]}
+
+    trimmed = value[:1000]
+    checkpoint = dict(session.checkpoint or {})
+    fields = dict(checkpoint.get("fields") or {})
+    row = dict(fields.get(name) or {})
+    row.update({
+        "status": "user_completed",
+        "classification": classification,
+        "profile_key": profile_key,
+        "filled_at": _iso(_now()),
+        "value_fingerprint": fingerprint_value(trimmed),
+        "source": "user_in_browser",
+    })
+    fields[name] = {k: v for k, v in row.items() if k in FIELD_CHECKPOINT_KEYS}
+    checkpoint["fields"] = fields
+    session.checkpoint = checkpoint
+    remember_values(session, {name: trimmed})
+
+    # The open action (if any) that asked for this step gets the value too —
+    # the same precedent as record_user_answers, so the queue can show what
+    # the human actually put in the field.
+    actions = (
+        db.query(ApplicationAction)
+        .filter(ApplicationAction.session_id == session.id,
+                ApplicationAction.status.in_(("pending", "in_progress")))
+        .order_by(ApplicationAction.id.desc())
+        .all()
+    )
+    for action in actions:
+        rows = action.fields or []
+        if any(isinstance(r, Mapping) and str(r.get("name") or "") == name for r in rows):
+            action.fields = [
+                {**dict(r), "value": trimmed}
+                if isinstance(r, Mapping) and str(r.get("name") or "") == name else r
+                for r in rows
+            ]
+
+    learn_answer(db, user_id=session.user_id,
+                 host=learning_host(session), name=name, value=trimmed, label=label)
+    record_flow_step(db, session, "fill", host=host_of(session.last_observation.get("url") or ""),
+                     fields=[name], reason="user_in_browser", commit=False)
+    session.last_activity_at = _now()
+    if commit:
+        db.commit()
+    return {"recorded": [name], "restricted": []}
 
 
 def _append_step(checkpoint: Dict[str, Any], step: Mapping[str, Any]) -> None:
@@ -1090,9 +1264,11 @@ def session_values(session: ApplicationSession,
 
     ``ApplicationSession.fill_values`` holds only values a classifier verdict
     cleared for ``autofill`` (a profile or plan value, or an answer the user gave
-    us in the app for a specific field). Credentials, codes, CAPTCHA tokens,
-    restricted identifiers and unanswered legal/EEO questions have no verdict
-    that reaches it, and the set is purged when the session ends — see
+    us in the app for a specific field). Codes, CAPTCHA tokens, restricted
+    identifiers and unanswered legal/EEO questions have no verdict that reaches
+    it — and neither does a credential: even an opted-in pass that cleared one
+    for typing keeps that value in memory for the single fill (see
+    :func:`record_observation`). The set is purged when the session ends — see
     :func:`purge_session_values`.
     """
     if values is not None:
@@ -1131,11 +1307,93 @@ def purge_session_values(db: Session, session: ApplicationSession, *, reason: st
     return session
 
 
+# ---------------------------------------------------------------------------
+# Learned answers — what the human taught us, replayed in future sessions
+# ---------------------------------------------------------------------------
+#: Where a per-host learned answer lives: a user setting, category ``browser``.
+#: Only non-secret values ever reach this store (``record_browser_input`` and
+#: ``record_user_answers`` both filter first), and it is ordinary user data —
+#: erased with the user's settings like every other per-user row.
+LEARNED_ANSWERS_CATEGORY = "browser"
+LEARNED_ANSWERS_KEY = "learned_answers"
+#: Bounded on purpose: a portal farm that asks a new name for the same answer
+#: must not grow this forever. Oldest entries are pruned first.
+LEARNED_ANSWERS_MAX = 300
+
+
+def learning_host(session: ApplicationSession) -> str:
+    """
+    The host a learned answer is scoped to — the portal this session is bound
+    to, falling back to wherever the browser actually is. Scoping by host is
+    what keeps an answer typed for one employer's portal from being typed into
+    an unrelated one that happens to use the same field name.
+    """
+    host = str(session.expected_host or "").strip().lower()
+    if host:
+        return host
+    return str(host_of((session.last_observation or {}).get("url") or "")).lower()
+
+
+def learn_answer(db: Session, *, user_id: int, host: str, name: str, value: Any,
+                 label: str = "", commit: bool = True) -> bool:
+    """
+    Persist one non-secret answer for **future** sessions against the same
+    host. The value never enters the checkpoint, the journal or any log — it
+    lives only in this per-user setting, keyed by ``(host, field name)``.
+    """
+    if not user_id or not name or value in (None, ""):
+        return False
+    # SessionLocal runs with autoflush=False: without an explicit flush, a
+    # second learn in the same transaction would not see the first one's row
+    # and would try to INSERT it again (UNIQUE user/category/key).
+    db.flush()
+    raw = get_setting(db, user_id, LEARNED_ANSWERS_CATEGORY, LEARNED_ANSWERS_KEY, None)
+    entries = dict(((raw or {}).get("entries") if isinstance(raw, Mapping) else None) or {})
+    entries[f"{host or ''}\x1f{name}"] = {
+        "n": str(name)[:200], "h": str(host or ""), "v": str(value)[:1000],
+        "label": str(label or "")[:200], "at": _iso(_now()),
+    }
+    if len(entries) > LEARNED_ANSWERS_MAX:
+        oldest = sorted(entries, key=lambda k: str((entries[k] or {}).get("at") or ""))
+        for key in oldest[:len(entries) - LEARNED_ANSWERS_MAX]:
+            entries.pop(key, None)
+    set_setting(db, user_id, LEARNED_ANSWERS_CATEGORY, LEARNED_ANSWERS_KEY,
+                {"entries": entries})
+    if commit:
+        db.commit()
+    return True
+
+
+def learned_values(db: Session, *, user_id: int, host: str) -> Dict[str, Any]:
+    """
+    The answers learned for this host: ``{field name: value}``. An empty host
+    matches only entries learned with an empty host — a never-named portal
+    does not get to borrow another portal's answers.
+    """
+    if not user_id:
+        return {}
+    raw = get_setting(db, user_id, LEARNED_ANSWERS_CATEGORY, LEARNED_ANSWERS_KEY, None)
+    entries = ((raw or {}).get("entries") if isinstance(raw, Mapping) else None) or {}
+    out: Dict[str, Any] = {}
+    wanted = host or ""
+    for item in entries.values():
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("h") or "") != wanted:
+            continue
+        name = str(item.get("n") or "")
+        value = item.get("v")
+        if name and value not in (None, ""):
+            out[name] = value
+    return out
+
+
 def fill_instructions(
     session: ApplicationSession,
     *,
     observations: Optional[Sequence[Mapping[str, Any]]] = None,
     values: Optional[Mapping[str, Any]] = None,
+    allow_credentials: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     The fields this session may still type, with their values, for the driver.
@@ -1143,8 +1401,10 @@ def fill_instructions(
     A field whose checkpoint says ``filled``/``user_completed``/``declined`` is
     not returned, which is exactly what makes a resume idempotent; a field the
     page already holds user-typed content in is not returned either. Only
-    ``autofill`` verdicts can appear — a password, code, CAPTCHA, legal or
-    unknown field has no path into this list.
+    ``autofill`` verdicts can appear — a code, CAPTCHA, legal or unknown field
+    has no path into this list, and a password only has one when the caller
+    passes ``allow_credentials`` (opted-in account creation) *with* a
+    vault-sourced value in ``values``.
     """
     checkpoint = dict(session.checkpoint or {})
     fields_checkpoint = dict(checkpoint.get("fields") or {})
@@ -1155,7 +1415,8 @@ def fill_instructions(
     instructions: List[Dict[str, Any]] = []
     for observation in observations or [session.last_observation or {}]:
         clean = sanitize_observation(observation)
-        form = classify_form(clean.get("fields") or [], values=merged_values, checkpoint=checkpoint)
+        form = classify_form(clean.get("fields") or [], values=merged_values, checkpoint=checkpoint,
+                             allow_credentials=allow_credentials)
         for verdict in form.autofillable:
             if verdict.name in known:
                 continue
@@ -2378,6 +2639,10 @@ def session_public(session: ApplicationSession, *, actions: Optional[Sequence[Ap
         "handoff": {"active": bool(session.handoff_token_hash),
                     "expires_at": _iso(session.handoff_expires_at),
                     "action_id": session.handoff_action_id},
+        # The session's *visible* browser window, if one is still open for the
+        # human to work in. Process-local state, reported as a fact — never a
+        # driver, a loop or a URL.
+        "window": live_browser.status(session.id),
         "screenshots": list(session.screenshots or []),
         "resumed_count": session.resumed_count,
         "last_activity_at": _iso(session.last_activity_at),
@@ -2447,9 +2712,12 @@ def planned_values(job: Job, *, answers: Optional[Mapping[str, Any]] = None) -> 
     Values this session may fill, from the job's stored plan plus user answers.
 
     Credential values are dropped on the way out: the plan may carry a decrypted
-    vault password (it is what the legacy autofill used), and this workflow never
-    types a password. Field *values* from a plan are user data, so the caller
-    keeps them in memory only — they are never written to a session row.
+    vault password (it is what the legacy autofill used), and this workflow
+    never types a plan's password — when the user has opted in to account
+    creation, the pass sources a fresh credential from the vault for the page
+    it is on, at typing time, instead of taking one from a possibly stale plan.
+    Field *values* from a plan are user data, so the caller keeps them in
+    memory only — they are never written to a session row.
     """
     values: Dict[str, Any] = {}
     plan = ((job.extra or {}).get("autofill_plan") or {}).get("fields") or []
@@ -2510,6 +2778,9 @@ __all__ = [
     "is_expired",
     "issue_handoff",
     "list_sessions",
+    "learn_answer",
+    "learned_values",
+    "learning_host",
     "live_session_for_job",
     "live_sessions",
     "load_storage_state",
@@ -2523,6 +2794,7 @@ __all__ = [
     "progress_snapshot",
     "purge_storage_state",
     "reauthenticate",
+    "record_browser_input",
     "record_fills",
     "record_flow_step",
     "record_observation",
