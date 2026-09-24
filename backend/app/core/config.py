@@ -592,7 +592,35 @@ class Settings(BaseSettings):
     autofill_enabled: bool = False
     autofill_dry_run: bool = True
     autofill_allow_submit: bool = False
+    #: Legacy switch, kept because it is what existing deployments set. It is an
+    #: *override*, not the default: leave it unset and ``autofill_browser_mode``
+    #: decides (a machine with a display gets a window the user can watch and
+    #: act in). Set it explicitly and it wins — ``AUTOFILL_HEADLESS=true`` forces
+    #: headless, ``false`` forces headed (Playwright then fails to launch without
+    #: a display, which is reported as a launch error, never as a silent no-op).
     autofill_headless: bool = True
+    #: ``auto`` | ``headed`` | ``headless``. Assisted Apply is human-in-the-loop:
+    #: when a display exists the run should be *visible* (the user completes
+    #: sign-in / MFA / CAPTCHA in that very window). Servers without a display
+    #: stay headless — the handoff then opens the posting in the user's own
+    #: browser instead.
+    autofill_browser_mode: str = "auto"
+    #: Playwright channel to launch: ``chrome``, ``chromium``, ``msedge``,
+    #: ``chrome-beta``… Empty means "whatever Playwright ships, else a system
+    #: browser found on PATH". Set this to use the Chrome already installed on
+    #: the machine instead of downloading Playwright's own build.
+    autofill_browser_channel: str = ""
+    #: Explicit path to a Chrome/Chromium binary. Wins over ``channel``.
+    autofill_browser_executable: str = ""
+    #: Use a Chrome/Chromium/Edge already installed on the host when Playwright's
+    #: own download is missing (``/usr/bin/google-chrome``, the macOS app bundle,
+    #: ``C:\Program Files\...``). On by default: "no browser" should mean "no
+    #: browser anywhere", not "Playwright's copy is absent".
+    autofill_browser_autodetect: bool = True
+    #: Extra Chromium flags, comma separated (``--no-sandbox,--disable-dev-shm-usage``).
+    #: The two named above are added automatically when the process looks
+    #: containerised and cannot use them.
+    autofill_browser_args: str = ""
     #: Enables browser-assisted field filling. Unlike ``autofill_enabled`` it
     #: never permits unattended submission; the session policy and submission
     #: ledger remain the only route to that. Defaults on so the shipped

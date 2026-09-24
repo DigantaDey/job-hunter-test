@@ -44,7 +44,30 @@ type Action = {
   occurrences: number
   created_at: string
 }
-type BrowserRuntime = { available: boolean; reason?: string }
+type BrowserRuntime = {
+  available: boolean
+  reason?: string
+  /** The mode the next launch would use — the user is told whether they see a window. */
+  mode?: 'headed' | 'headless' | string
+  mode_reason?: string
+  engine?: string
+}
+
+/** One recorded step of a run: hosts, control labels, field *names* — never a value. */
+type FlowStep = {
+  event?: string
+  step?: number
+  host?: string
+  url?: string
+  title?: string
+  reason?: string
+  kind?: string
+  control?: string
+  fields?: string[]
+  fields_total?: number
+  filled_total?: number
+  mode?: string
+}
 
 type Session = {
   id: number
@@ -56,6 +79,8 @@ type Session = {
   pause: { kind: string; reason: string }
   progress: Record<string, any>
   checkpoint: { fields: Record<string, any>; completed_fields: string[]; answer_fields: string[] }
+  /** What the run actually did, in order — the recording behind "future reference". */
+  flow?: { journal: FlowStep[]; progress: Record<string, any> }
   plan?: {
     must_pause: boolean
     autofillable: string[]
@@ -68,6 +93,86 @@ type Session = {
 
 /** Kinds where the human acts *in the browser* — never by typing a value here. */
 const HANDOFF_KINDS = ['login', 'mfa', 'captcha', 'session_expired']
+
+/** Kinds that hand the *flow itself* over: the assistant stopped on purpose. */
+const TAKEOVER_KINDS = ['review_required']
+
+/** True when the way to answer an item is to act in the browser window. */
+const actsInBrowser = (kind: string) => HANDOFF_KINDS.includes(kind) || TAKEOVER_KINDS.includes(kind)
+
+/** Why a pass stopped, in the user's words. */
+const STOP_LABEL: Record<string, string> = {
+  login: 'the portal wants a sign-in',
+  login_detected: 'the portal wants a sign-in',
+  mfa: 'a verification code is needed',
+  captcha: 'a bot check needs a human',
+  unknown_field: 'a field we do not recognise',
+  ambiguous_field: 'a field with two readings',
+  sensitive_field: 'a question only you can answer',
+  legal_question: 'a legal or eligibility question',
+  session_expired: 'the session expired — sign in again',
+  review_required: 'it needs you to finish the flow',
+  waiting_for_you_to_submit: 'the form is filled; submitting is yours to do',
+  submit_requires_reservation: 'the Submit button is yours to press',
+  flow_cannot_continue_automatically: 'the next step is not one it can take alone',
+  flow_leaves_the_application: 'the flow left the application site',
+  flow_page_budget_reached: 'it reached the page budget for one pass',
+  flow_needs_a_human: 'it needs a human to continue',
+  no_field_could_be_filled: 'nothing on the page could be filled safely',
+  advance_unconfirmed: 'the page did not react to the last click',
+  page_not_readable: 'the page could not be read',
+  no_progress: 'two passes made no progress',
+}
+
+const EVENT_LABEL: Record<string, string> = {
+  page: 'Looked at',
+  fill: 'Typed into',
+  advance: 'Clicked through',
+  pause: 'Stopped for you',
+  blocked: 'Could not continue',
+  confirmed: 'Portal confirmed',
+  resumed: 'Resumed',
+  submit: 'Submission',
+}
+
+/** What a pass actually did — never "done" unless the portal itself said so. */
+function passSummary(result: any): string {
+  if (!result || typeof result !== 'object') return 'Pass finished.'
+  const pages = Number(result.pages || 0)
+  const filled = (result.filled || []).length
+  const parts = [pages ? `Looked at ${pages} page(s)` : 'Looked at the page',
+                 filled ? `typed ${filled} field(s)` : 'typed nothing']
+  if ((result.advanced || []).length) {
+    parts.push(`moved on with ${(result.advanced as string[]).map(a => `“${a}”`).join(', ')}`)
+  }
+  if (result.confirmed) {
+    return `${parts.join(' • ')} • the portal confirmed the application (${result.confirmed}).`
+  }
+  const why = result.next_step?.reason || result.pause_reason || result.pause || ''
+  const stopped = STOP_LABEL[why] || why
+  return `${parts.join(' • ')}${stopped ? ` • stopped because ${stopped}.` : '.'}`
+}
+
+/** One recorded step, as a line a human can read. */
+function flowLine(entry: FlowStep): string {
+  const where = entry.host || entry.url || ''
+  switch (entry.event) {
+    case 'page':
+      return `${entry.title || where}${entry.reason ? ` (step ${entry.reason})` : ''}`
+    case 'fill':
+      return (entry.fields || []).join(', ') || 'fields'
+    case 'advance':
+      return `${entry.control || ''}${entry.kind ? ` — ${entry.kind.replace(/_/g, ' ')}` : ''}`
+    case 'pause':
+      return STOP_LABEL[entry.kind || ''] || entry.kind || entry.reason || ''
+    case 'blocked':
+      return STOP_LABEL[entry.reason || ''] || entry.reason || ''
+    case 'confirmed':
+      return entry.reason || 'submitted'
+    default:
+      return entry.reason || entry.kind || ''
+  }
+}
 
 const KIND_LABEL: Record<string, string> = {
   login: 'Sign in',
@@ -170,8 +275,8 @@ export default function Assist() {
         await client.post(`/api/application-sessions/${session.id}/reauthenticate`)
         setMsg('A fresh sign-in window was issued. Nothing from the old session is reused.')
       } else {
-        await client.post(`/api/application-sessions/${session.id}/pass`, {})
-        setMsg('Pass finished — see the pause below.')
+        const r = await client.post(`/api/application-sessions/${session.id}/pass`, {})
+        setMsg(passSummary(r.data?.pass))
       }
       await load()
     } catch (e: any) {
@@ -230,6 +335,20 @@ export default function Assist() {
         it types anything, and fields that are already done are never filled twice.
       </p>
 
+      {browserRuntime?.available && browserRuntime.mode === 'headless' && (
+        <div className="card p-3 text-xs mono text-zinc-600 dark:text-zinc-400" data-testid="browser-mode">
+          This host has no display, so a pass runs a <b>headless</b> browser you cannot watch
+          {browserRuntime.mode_reason ? ` (${browserRuntime.mode_reason})` : ''}. It still records every step
+          below; steps that need your eyes and hands (a sign-in, a code, a bot check) are handed to you.
+        </div>
+      )}
+      {browserRuntime?.available && browserRuntime.mode === 'headed' && (
+        <div className="card p-3 text-xs mono text-emerald-700 dark:text-emerald-300" data-testid="browser-mode">
+          A pass opens a <b>visible browser window</b> on this machine — watch it work, and take over in that
+          same window when it hands a step to you.
+        </div>
+      )}
+
       {browserRuntime && !browserRuntime.available && (
         <div className="card p-3 text-xs mono text-amber-700 dark:text-amber-300 flex items-center gap-2" role="alert">
           <AlertTriangle className="w-4 h-4 shrink-0" />
@@ -265,7 +384,7 @@ export default function Assist() {
         </div>
         {actions.length === 0 && <div className="text-xs mono text-zinc-500">Nothing needs you right now.</div>}
         {actions.map(a => {
-          const handoff = HANDOFF_KINDS.includes(a.kind)
+          const handoff = actsInBrowser(a.kind)
           const descriptor = descriptors[a.id] || a.handoff
           return (
             <div key={a.id} className="border rounded-xl p-3 space-y-2" data-testid={`action-${a.kind}`}>
@@ -274,7 +393,7 @@ export default function Assist() {
                   {a.kind === 'login' && <LogIn className="w-4 h-4" />}
                   {a.kind === 'mfa' && <ShieldCheck className="w-4 h-4" />}
                   {a.kind === 'captcha' && <Hand className="w-4 h-4" />}
-                  {!HANDOFF_KINDS.includes(a.kind) && <AlertTriangle className="w-4 h-4" />}
+                  {!actsInBrowser(a.kind) && <AlertTriangle className="w-4 h-4" />}
                   {KIND_LABEL[a.kind] || a.title || a.kind}
                   {a.occurrences > 1 && <span className="text-[11px] mono text-zinc-500">seen {a.occurrences}×</span>}
                 </div>
@@ -292,7 +411,9 @@ export default function Assist() {
                 <div className="space-y-2">
                   <button className="btn" onClick={() => openHandoff(a)} disabled={busy === a.id}>
                     {busy === a.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <ExternalLink className="w-4 h-4" />}
-                    {a.kind === 'session_expired' ? 'Issue a fresh sign-in' : 'Start a handoff window'}
+                    {a.kind === 'session_expired' ? 'Issue a fresh sign-in'
+                    : a.kind === 'review_required' ? 'Open a window on the posting'
+                    : 'Start a handoff window'}
                   </button>
                   {descriptor && (
                     <div className="text-[11px] mono text-zinc-500 space-y-1">
@@ -314,14 +435,15 @@ export default function Assist() {
                       ))}
                     </div>
                   )}
-                  {!HANDOFF_KINDS.includes(a.kind) && null}
                   <button className="btn" onClick={() => complete(a)} disabled={busy === a.id}>
-                    <CheckCircle className="w-4 h-4" /> I finished this step in the browser
+                    <CheckCircle className="w-4 h-4" /> {a.kind === 'review_required'
+                      ? 'I finished the application in the browser'
+                      : 'I finished this step in the browser'}
                   </button>
                 </div>
               )}
 
-              {!handoff && (
+              {!handoff && (a.fields?.length ?? 0) > 0 && (
                 <div className="flex flex-wrap items-center gap-2">
                   <input
                     className="input flex-1 min-w-[16rem]"
@@ -374,6 +496,27 @@ export default function Assist() {
                 {s.plan.handoffs.length ? ` • ${s.plan.handoffs.length} handoff` : ''}
                 {s.plan.must_pause ? ' • will pause' : ''}
               </div>
+            )}
+            {/* What the run actually did, in order — the recording the user keeps. */}
+            {(s.flow?.journal?.length ?? 0) > 0 && (
+              <details className="text-[11px] mono text-zinc-600 dark:text-zinc-400" data-testid={`flow-${s.id}`}>
+                <summary className="cursor-pointer">
+                  What this session did — {s.flow!.journal.length} recorded step(s)
+                  {s.flow?.progress?.browser_mode
+                    ? ` • ${s.flow.progress.browser_mode} browser`
+                    : ''}
+                  {s.flow?.progress?.pages ? ` • ${s.flow.progress.pages} page(s)` : ''}
+                </summary>
+                <ol className="mt-1 space-y-0.5 list-decimal pl-5">
+                  {s.flow!.journal.slice(-25).map((entry, i) => (
+                    <li key={i}>
+                      <span className="text-zinc-500">{EVENT_LABEL[entry.event || ''] || entry.event}</span>{' '}
+                      {flowLine(entry)}
+                      {entry.host ? <span className="text-zinc-500"> — {entry.host}</span> : null}
+                    </li>
+                  ))}
+                </ol>
+              </details>
             )}
             <div className="flex flex-wrap gap-2">
               {isLive(s) && s.state !== 'awaiting_user' && (

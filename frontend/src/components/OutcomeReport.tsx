@@ -63,6 +63,16 @@ export default function OutcomeReport({ timezone }: { timezone?: string }) {
 
   const trend = report?.trend
   const trendChip = trendLabel(trend?.direction)
+  // Anything that is not a report renders a notice, never a blank page: the
+  // strip is one card of the Analytics page, and a payload this component
+  // cannot read (an error body, a stale cache, a server that answered with
+  // something else) must not take the rest of the page down with it. The
+  // check is deliberately about the shape this component dereferences, so it
+  // cannot go stale the way a hand-written schema would.
+  const usable = Boolean(
+    report && Array.isArray(report.metrics) && report.signal && report.window
+    && report.timing && report.quality && report.privacy && report.calibration,
+  )
 
   return (
     <section className="space-y-4" data-testid="outcome-report">
@@ -109,7 +119,22 @@ export default function OutcomeReport({ timezone }: { timezone?: string }) {
         </div>
       )}
 
-      {report && (
+      {report && !usable && (
+        <div className="card p-4 text-sm" data-testid="report-unavailable">
+          <div className="flex items-center gap-2">
+            <Info className="w-4 h-4 text-amber-500" />
+            <span>
+              The outcome report came back in a shape this page cannot read — nothing is shown
+              rather than a number that cannot be trusted.
+            </span>
+            <button className="mono text-xs underline" onClick={() => void load(range, timezone)}>
+              Retry
+            </button>
+          </div>
+        </div>
+      )}
+
+      {usable && report && (
         <>
           {/* The week in one sentence, plus whether it beat the last one. */}
           <div className="card p-4 space-y-2" data-testid="report-headline">
