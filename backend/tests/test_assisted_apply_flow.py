@@ -28,7 +28,10 @@ What the loop must do instead:
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
+import sys
+import types
 
 import pytest
 
@@ -449,6 +452,11 @@ class TestBrowserMode:
     def test_availability_reports_the_mode_it_would_use(self, monkeypatch):
         from app.services import autofill
 
+        # The answer must be about *the browser*, not about which pip extras this
+        # environment happens to have installed: on a machine without Playwright,
+        # a browser binary would not be enough, so pretend the package is there.
+        if importlib.util.find_spec("playwright") is None:
+            monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
         monkeypatch.setattr(autofill, "_chromium_browser_path", lambda: "/fake/chrome")
         monkeypatch.setattr(settings, "autofill_browser_executable", "")
         monkeypatch.setattr(settings, "autofill_browser_channel", "")

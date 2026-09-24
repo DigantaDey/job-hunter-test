@@ -237,6 +237,19 @@ describe('OutcomeReport', () => {
       { params: { range: 'last_7_days', timezone: 'Europe/London' } }]))
   })
 
+  it('renders a notice, not a crash, when the payload is not a report', async () => {
+    // The Analytics page renders this strip alongside its own data. A server
+    // that answers with something else (an error body, a stale shape) must not
+    // take the whole page down with a TypeError while the owner is reading it:
+    // the strip says what happened and offers the retry.
+    mockReport({} as never)
+    render(<OutcomeReport />)
+    await waitFor(() => expect(screen.getByTestId('report-unavailable')).toBeTruthy())
+    expect(screen.getByTestId('report-unavailable').textContent)
+      .toMatch(/shape this page cannot read/)
+    expect(screen.queryByTestId('report-metrics')).toBeNull()
+  })
+
   it('says so, and offers a retry, when the read fails', async () => {
     get.mockImplementation(() => Promise.reject(
       { response: { data: { detail: { message: 'The end of the window must be after the start.' } } } }))

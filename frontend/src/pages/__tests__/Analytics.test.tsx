@@ -80,6 +80,12 @@ function mockPerformance(summary: Record<string, unknown>, extra: Record<string,
       return Promise.resolve({ data: { total_cost_usd: 1.2, total_tokens: 1000,
         average_cost_per_application: 0.4, by_workflow: {} } })
     }
+    // The outcome-report strip has its own suite and this page's assertions do
+    // not touch it. It still gets an answer — a shape-less one — because a
+    // double that returns nothing at all for an endpoint the page calls is how
+    // an unrelated test starts failing on a slower machine: the component must
+    // survive a payload it cannot read instead of crashing the whole page.
+    if (url === '/api/analytics/outcomes') return Promise.resolve({ data: {} })
     return Promise.resolve({ data: {} })
   })
 }
