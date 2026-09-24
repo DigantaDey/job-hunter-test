@@ -504,7 +504,8 @@ async def run_pass(session_id: int, body: PassRequest, request: Request, user: C
     if driver is None:
         storage_state = sessions.load_storage_state(db, session, user=user, policy=policy)
         driver = assisted_fill.PlaywrightDriver(session, target_url=job.url, storage_state=storage_state,
-                                                allow_submit=policy.allow_submit)
+                                                allow_submit=policy.allow_submit,
+                                                allow_credentials=policy.create_accounts)
     try:
         result = await assisted_fill.run_pass(db, user=user, session=session, driver=driver,
                                               policy=policy, open_driver=body.open_browser,

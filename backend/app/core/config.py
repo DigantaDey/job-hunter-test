@@ -656,6 +656,15 @@ class Settings(BaseSettings):
     #: Deployments may not retain screenshots longer than this (user requests are
     #: clamped, never trusted).
     browser_screenshot_max_retention_days: int = 30
+    #: Server ceiling for assisted **account creation**: a pass may generate a
+    #: vault credential and type it into a portal sign-up only when this flag
+    #: *and* the user's own ``browser.create_accounts`` opt-in are on. Both
+    #: default so the feature ships available but disabled for every user.
+    browser_create_accounts_enabled: bool = True
+    #: Server ceiling for the AI form-mapping assist (per-user opt-in via
+    #: ``browser.ai_assist``). Off for a user means assisted sessions classify
+    #: fields with the deterministic rules only.
+    browser_ai_assist_enabled: bool = True
 
     # ------------------------------------------------------------------ #
     # Observability

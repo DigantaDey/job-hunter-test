@@ -645,7 +645,8 @@ FIELD_CLASSIFICATIONS: Tuple[str, ...] = (
     "legal",       # attestation / eligibility statement — the user answers
     "unknown",     # nothing we recognise: ask, never guess
     "ambiguous",   # more than one plausible meaning: ask
-    "credential",  # password / passphrase — the user types it, in the browser
+    "credential",  # password/passphrase — by default the user types it in the
+                   # browser; an opted-in session may type a vault credential
     "mfa",         # one-time code — the user types it, in the browser
     "captcha",     # bot check — the user completes it, never solved for them
     "submit",      # a submit control — never clicked unless policy allows

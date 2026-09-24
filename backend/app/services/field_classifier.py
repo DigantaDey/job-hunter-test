@@ -417,6 +417,7 @@ def classify_field(
     *,
     value: Any = None,
     checkpoint_status: str = "",
+    allow_credentials: bool = False,
 ) -> FieldVerdict:
     """
     Classify one detected field.
@@ -427,6 +428,11 @@ def classify_field(
     ``filled``/``user_completed``/``declined`` are skipped (never typed again),
     and ``answered`` (the user gave us the value in the app) is typed but never
     asked again.
+    ``allow_credentials`` is the caller's explicit, policy-backed statement that
+    a vault credential may be typed on this page (the user opted in via
+    ``browser.create_accounts``). It only ever changes a password field's
+    verdict when a value is present — it never unlocks codes, CAPTCHAs or
+    anything else.
     """
     name = str(field.get("name") or field.get("id") or "").strip()
     label = str(field.get("label") or name).strip()
@@ -473,9 +479,23 @@ def classify_field(
                            question="Enter the verification code yourself in the browser",
                            pause_kind="mfa")
 
-    # 3. Credentials: this workflow never types a password, even a stored one.
+    # 3. Credentials. The default is the user typing the password themselves in
+    # the browser — even for a stored one. The exception is a caller that passed
+    # ``allow_credentials`` with a vault-sourced value in hand (opted-in account
+    # creation): then the password is autofilled like any other confirmed value,
+    # and the checkpoint still owns "never typed twice".
     if field_type == "password" or str(field.get("autocomplete") or "") in ("current-password", "new-password") \
             or _has(hay, CREDENTIAL_HINTS):
+        if allow_credentials:
+            if checkpoint_status in ("filled", "user_completed"):
+                return verdict("credential", "skip", blocks=False, pause_kind="login",
+                               reason=f"already_{checkpoint_status}")
+            if checkpoint_status == "declined":
+                return verdict("credential", "never", blocks=False, pause_kind="login",
+                               reason="declined_by_user")
+            if _has_value(value):
+                return verdict("credential", "autofill", blocks=False, pause_kind="login",
+                               reason="vault_credential_allowed")
         return verdict("credential", "handoff", reason="credential_entry_is_user_typed",
                        question="Sign in yourself in the browser",
                        pause_kind="login")
@@ -606,6 +626,7 @@ def classify_form(
     *,
     values: Optional[Mapping[str, Any]] = None,
     checkpoint: Optional[Mapping[str, Any]] = None,
+    allow_credentials: bool = False,
 ) -> FormVerdicts:
     """
     Classify a whole form.
@@ -613,6 +634,8 @@ def classify_form(
     ``values`` maps a field name (or canonical key) to the value we could fill;
     ``checkpoint`` is ``application_sessions.checkpoint["fields"]`` (statuses
     only — the checkpoint never stores a typed value).
+    ``allow_credentials`` — see :func:`classify_field` — lets an opted-in
+    session clear password fields from vault values instead of pausing.
     """
     values = values or {}
     fields_checkpoint: Mapping[str, Any] = (checkpoint or {}).get("fields") or {}
@@ -629,7 +652,8 @@ def classify_form(
             status = str(entry.get("status") or "")
         elif isinstance(entry, str):
             status = entry
-        verdicts.append(classify_field(field, value=value, checkpoint_status=status))
+        verdicts.append(classify_field(field, value=value, checkpoint_status=status,
+                                       allow_credentials=allow_credentials))
     return FormVerdicts(verdicts=verdicts)
 
 

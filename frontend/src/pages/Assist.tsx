@@ -344,9 +344,13 @@ export default function Assist() {
       </h1>
 
       <p className="text-xs mono text-zinc-500">
-        Passwords, verification codes and bot checks are entered by you in the browser — this page never
-        asks for them. Resuming re-checks the job, the posting URL, the employer and the application before
-        it types anything, and fields that are already done are never filled twice.
+        Verification codes and bot checks are entered by you in the browser — this page never
+        asks for them. Passwords too, unless you have turned on “Create portal accounts” in
+        Settings: then the assistant types a generated vault password into the sign-up form in
+        the browser window itself (this page still never sees it, and you can export the login
+        from Vault anytime). Resuming re-checks the job, the posting URL, the employer and the
+        application before it types anything, and fields that are already done are never
+        filled twice.
       </p>
 
       {browserRuntime?.available && browserRuntime.mode === 'headless' && (

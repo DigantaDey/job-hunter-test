@@ -20,12 +20,16 @@ click the button" but:
 
 What this module deliberately cannot do
 ---------------------------------------
-No function here solves a CAPTCHA, intercepts an MFA challenge, types a
-password, or reads page content. ``login``/``mfa``/``captcha`` are *handoffs*:
-the user does the step themselves in the browser, and the process only ever
-learns "it is done" (plus a structured, privacy-minimized observation). Session
-persistence stores the browser's own cookie jar — opt-in, encrypted with the
-per-user key, cleared on expiry/cancel/erasure — and never a credential.
+No function here solves a CAPTCHA, intercepts an MFA challenge, or reads page
+content. ``mfa``/``captcha`` are *handoffs* — the user does the step themselves
+in the browser, and the process only ever learns "it is done" (plus a
+structured, privacy-minimized observation). ``login`` is a handoff too by
+default; it stops being one only when the user's own ``create_accounts``
+opt-in is on *and* the caller holds a vault credential for the page — this
+module then plans the fill, and the driver in :mod:`app.services.assisted_fill`
+types it. Nothing here ever types anything. Session persistence stores the
+browser's own cookie jar — opt-in, encrypted with the per-user key, cleared on
+expiry/cancel/erasure — and never a credential.
 
 Isolation
 ---------
@@ -263,6 +267,10 @@ class SessionPolicy:
     pause_on_optional_unknown: bool = True
     allow_submit: bool = False
     dry_run: bool = True
+    #: The user explicitly opted in to portal account creation: a pass may
+    #: generate/reuse a vault credential and type the password into sign-up
+    #: fields. Default False — a password is typed only when this says so.
+    create_accounts: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -275,6 +283,7 @@ class SessionPolicy:
             "pause_on_optional_unknown": self.pause_on_optional_unknown,
             "allow_submit": self.allow_submit,
             "dry_run": self.dry_run,
+            "create_accounts": self.create_accounts,
         }
 
 
@@ -315,6 +324,15 @@ def effective_policy(db: Session, user_id: int) -> SessionPolicy:
         and settings.autofill_allow_submit
         and get_setting(db, user_id, "application", "allow_auto_submit", False)
     )
+    # Account creation is doubly gated: the per-user opt-in (default OFF) and
+    # the deployment ceiling. Either being off means passwords are refused
+    # exactly as before — the pause, never a silent type. The read is
+    # deliberately ``is True`` (fail-closed): only a literal boolean opt-in
+    # counts, never a stray truthy string.
+    create_accounts = bool(
+        settings.browser_create_accounts_enabled
+        and get_setting(db, user_id, "browser", "create_accounts", False) is True
+    )
     return SessionPolicy(
         ttl_minutes=ttl,
         max_live_sessions=max_live,
@@ -326,6 +344,7 @@ def effective_policy(db: Session, user_id: int) -> SessionPolicy:
         pause_on_optional_unknown=bool(get_setting(db, user_id, "browser", "pause_on_optional_unknown", True)),
         allow_submit=allow_submit,
         dry_run=not allow_submit,
+        create_accounts=create_accounts,
     )
 
 
@@ -732,6 +751,7 @@ def record_observation(
     user: Optional[User] = None,
     values: Optional[Mapping[str, Any]] = None,
     actor: str = "system_api",
+    allow_credentials: bool = False,
 ) -> Dict[str, Any]:
     """
     Fold one sanitized page observation into the session.
@@ -740,6 +760,12 @@ def record_observation(
     then field classification (legal/sensitive/ambiguous/unknown stop the run).
     Nothing is typed here — the caller asks for the fill instructions afterwards
     (:func:`fill_instructions`), which is what makes "safe autofill" reviewable.
+
+    ``allow_credentials`` is passed only by a pass whose policy opted in *and*
+    that holds a vault credential for this page: it lifts the login pause for
+    password fields and lets them classify as autofill. MFA and CAPTCHA pauses
+    are never lifted, and the credential value still never enters the session
+    working set.
     """
     if user is not None:
         _assert_owner(session, user)
@@ -755,16 +781,24 @@ def record_observation(
     checkpoint["fields"] = dict(checkpoint.get("fields") or {})
     merged_values = session_values(session, values)
 
-    form = classify_form(clean.get("fields") or [], values=merged_values, checkpoint=checkpoint)
+    form = classify_form(clean.get("fields") or [], values=merged_values, checkpoint=checkpoint,
+                         allow_credentials=allow_credentials)
     challenges = detect_challenges(clean)
+    if allow_credentials:
+        # The sign-in wall this pass can clear itself: it holds a vault
+        # credential for exactly this page. Anything the human still owns —
+        # a code, a bot check — stays a pause.
+        challenges = [kind for kind in challenges if kind != "login"]
 
     progress = progress_snapshot(form)
     session.progress = progress
     _checkpoint_fields(checkpoint, form)
-    # Keep only what a verdict cleared for autofill; a password, a code, a
-    # CAPTCHA token or a restricted identifier never reaches this set.
+    # Keep only what a verdict cleared for autofill; a code, a CAPTCHA token or
+    # a restricted identifier never reaches this set — and neither does a
+    # credential, even when ``allow_credentials`` cleared it: a password lives
+    # in memory for the one fill and nowhere else.
     cleared = {v.name: merged_values[v.name] for v in form.autofillable
-               if v.name in merged_values}
+               if v.name in merged_values and v.classification != "credential"}
     remember_values(session, cleared)
 
     # An observation only ever moves a session forward through legal edges.
@@ -1230,9 +1264,11 @@ def session_values(session: ApplicationSession,
 
     ``ApplicationSession.fill_values`` holds only values a classifier verdict
     cleared for ``autofill`` (a profile or plan value, or an answer the user gave
-    us in the app for a specific field). Credentials, codes, CAPTCHA tokens,
-    restricted identifiers and unanswered legal/EEO questions have no verdict
-    that reaches it, and the set is purged when the session ends — see
+    us in the app for a specific field). Codes, CAPTCHA tokens, restricted
+    identifiers and unanswered legal/EEO questions have no verdict that reaches
+    it — and neither does a credential: even an opted-in pass that cleared one
+    for typing keeps that value in memory for the single fill (see
+    :func:`record_observation`). The set is purged when the session ends — see
     :func:`purge_session_values`.
     """
     if values is not None:
@@ -1357,6 +1393,7 @@ def fill_instructions(
     *,
     observations: Optional[Sequence[Mapping[str, Any]]] = None,
     values: Optional[Mapping[str, Any]] = None,
+    allow_credentials: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     The fields this session may still type, with their values, for the driver.
@@ -1364,8 +1401,10 @@ def fill_instructions(
     A field whose checkpoint says ``filled``/``user_completed``/``declined`` is
     not returned, which is exactly what makes a resume idempotent; a field the
     page already holds user-typed content in is not returned either. Only
-    ``autofill`` verdicts can appear — a password, code, CAPTCHA, legal or
-    unknown field has no path into this list.
+    ``autofill`` verdicts can appear — a code, CAPTCHA, legal or unknown field
+    has no path into this list, and a password only has one when the caller
+    passes ``allow_credentials`` (opted-in account creation) *with* a
+    vault-sourced value in ``values``.
     """
     checkpoint = dict(session.checkpoint or {})
     fields_checkpoint = dict(checkpoint.get("fields") or {})
@@ -1376,7 +1415,8 @@ def fill_instructions(
     instructions: List[Dict[str, Any]] = []
     for observation in observations or [session.last_observation or {}]:
         clean = sanitize_observation(observation)
-        form = classify_form(clean.get("fields") or [], values=merged_values, checkpoint=checkpoint)
+        form = classify_form(clean.get("fields") or [], values=merged_values, checkpoint=checkpoint,
+                             allow_credentials=allow_credentials)
         for verdict in form.autofillable:
             if verdict.name in known:
                 continue
@@ -2672,9 +2712,12 @@ def planned_values(job: Job, *, answers: Optional[Mapping[str, Any]] = None) -> 
     Values this session may fill, from the job's stored plan plus user answers.
 
     Credential values are dropped on the way out: the plan may carry a decrypted
-    vault password (it is what the legacy autofill used), and this workflow never
-    types a password. Field *values* from a plan are user data, so the caller
-    keeps them in memory only — they are never written to a session row.
+    vault password (it is what the legacy autofill used), and this workflow
+    never types a plan's password — when the user has opted in to account
+    creation, the pass sources a fresh credential from the vault for the page
+    it is on, at typing time, instead of taking one from a possibly stale plan.
+    Field *values* from a plan are user data, so the caller keeps them in
+    memory only — they are never written to a session row.
     """
     values: Dict[str, Any] = {}
     plan = ((job.extra or {}).get("autofill_plan") or {}).get("fields") or []

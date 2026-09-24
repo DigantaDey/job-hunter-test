@@ -19,7 +19,11 @@ What a driver may never do, at any layer
 * Type into a field the classifier did not mark ``autofill``. The fill loop
   re-checks every instruction against the classification and refuses the rest.
 * Overwrite a field the page already shows as user-filled.
-* Solve, click, relay or "assist" a CAPTCHA; enter an MFA code; type a password.
+* Solve, click, relay or "assist" a CAPTCHA; enter an MFA code.
+* Type a password — unless the session policy carries the user's explicit
+  ``create_accounts`` opt-in, the instruction's value came from the vault, and
+  the driver's own re-classification (``allow_credentials``) clears it. Every
+  other password instruction, at every layer, is refused as before.
 * Read page text beyond the structural observation (labels/types/options), or
   keep a field value anywhere but in the fill call itself.
 * Submit unless the *session* policy allows it. In this task auto-submit is off
@@ -50,6 +54,7 @@ from app.services.autofill import assisted_apply_available, browser_launch_kwarg
 from app.services.field_classifier import classify_form
 from app.services.form_detector import VAULT_DOMAINS
 from app.services.reliability import duration
+from app.services.user_settings import get_setting
 
 log = get_logger("app.assisted")
 
@@ -456,13 +461,17 @@ class PlaywrightDriver:
 
     def __init__(self, session: ApplicationSession, *, target_url: str = "",
                  storage_state: Optional[Mapping[str, Any]] = None,
-                 allow_submit: bool = False) -> None:
+                 allow_submit: bool = False, allow_credentials: bool = False) -> None:
         self.session = session
         #: Where to navigate. Comes from the job the session is bound to, so the
         #: session's own binding (not a caller) decides the destination.
         self.target_url = target_url
         self.storage_state = dict(storage_state) if storage_state else None
         self.allow_submit = allow_submit
+        #: Policy-backed: the user opted in to account creation. Only this
+        #: lets ``fill()`` re-classify a password instruction as autofill —
+        #: with it off (the default) passwords are refused here as ever.
+        self.allow_credentials = allow_credentials
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -659,9 +668,12 @@ class PlaywrightDriver:
         refused all of them, filled nothing, and the pass still reported
         success. Two defects, one line apart.
 
-        Still refused here, whatever the plan says: credentials, one-time codes,
-        bot checks, restricted identifiers, and any field the page already holds
-        content in that this session did not put there.
+        Still refused here, whatever the plan says: one-time codes, bot checks,
+        restricted identifiers, and any field the page already holds content in
+        that this session did not put there. A password is refused too — unless
+        the session policy opted in to account creation *and* the instruction
+        carries a vault value, which the ``allow_credentials`` re-classification
+        proves before a character is typed.
         """
         if self._page is None:
             raise DriverError("browser not open")
@@ -669,7 +681,8 @@ class PlaywrightDriver:
         current = await self.observe()
         planned = {str(i.get("name") or ""): i.get("value") for i in instructions}
         checkpoint = dict((self.session.checkpoint or {}).get("fields") or {})
-        form = classify_form(current.get("fields") or [], values=planned, checkpoint=checkpoint)
+        form = classify_form(current.get("fields") or [], values=planned, checkpoint=checkpoint,
+                             allow_credentials=self.allow_credentials)
         allowed = {v.name: v for v in form.autofillable}
         held = {str(f.get("name") or ""): bool(f.get("value_present"))
                 for f in (current.get("fields") or []) if isinstance(f, Mapping)}
@@ -862,6 +875,7 @@ def build_driver(
         target_url=job.url or "",
         storage_state=storage_state,
         allow_submit=policy.allow_submit,
+        allow_credentials=policy.create_accounts,
     )
 
 
@@ -1085,6 +1099,77 @@ async def _run_queued_pass(
     return result
 
 
+def _password_field_names(observation: Mapping[str, Any]) -> List[str]:
+    """Password controls on this page, in order, names only."""
+    names: List[str] = []
+    for field in observation.get("fields") or []:
+        if not isinstance(field, Mapping):
+            continue
+        if str(field.get("type") or "").lower() != "password":
+            continue
+        name = str(field.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _portal_credential(db: Session, *, session: ApplicationSession, job: Job,
+                       observation: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    The vault credential for the portal this page belongs to.
+
+    Reused when the domain already has one, created when the user's settings
+    allow it (``application.auto_create_credentials``, default on) — either way
+    the entry lands in the user's vault, so the existing Chrome/Apple CSV
+    export already covers it. Returns ``None`` when there is nothing to type
+    with: no readable host, nothing stored and creation refused, or an
+    undecryptable vault (the caller then keeps the login pause — never a
+    partial or empty password). The password travels only in the returned
+    dict, in memory for the single fill that follows; it is never logged.
+    """
+    from app.services.events import record_job_event
+    from app.services.vault import (
+        VaultDecryptionError,
+        credential_for_application,
+        get_vault_entry_for_domain,
+        reveal_password,
+    )
+
+    host = (str(observation.get("host") or "").strip()
+            or sessions.host_of(str(observation.get("url") or ""))
+            or sessions.host_of(job.url or ""))
+    if not host:
+        return None
+    domain = host.lower().rstrip(".")
+    allow_create = bool(get_setting(db, session.user_id, "application", "auto_create_credentials", True))
+    try:
+        if allow_create:
+            credential, created = credential_for_application(
+                db, user_id=session.user_id, domain=domain, company=job.company or "")
+        else:
+            entry = get_vault_entry_for_domain(db, session.user_id, domain)
+            if entry is None:
+                return None
+            credential = {"username": entry.username, "password": reveal_password(entry, db=db),
+                          "domain": domain}
+            created = False
+    except VaultDecryptionError:
+        # The stored password cannot be read — an empty string here would type
+        # garbage into a sign-up. The login pause is the honest outcome.
+        log.warning("vault credential for '%s' unreadable — keeping the login pause", domain)
+        return None
+    if created:
+        # Journal evidence that an account credential was made — domain only,
+        # never the username and certainly never the password.
+        record_job_event(db, user_id=session.user_id, job_id=job.id, stage="credential_created",
+                         status="info",
+                         message=f"Portal credential created in your vault for {domain}",
+                         meta={"domain": domain, "origin": "assisted_session"})
+    if not credential or not str(credential.get("password") or ""):
+        return None
+    return {"password": str(credential["password"]), "created": bool(created), "domain": domain}
+
+
 async def run_pass(
     db: Session,
     *,
@@ -1157,8 +1242,22 @@ async def run_pass(
                                           mode=str(launch.get("mode") or "")[:20])
         for step in range(max_steps):
             observation = await driver.observe()
+            # Account creation (opt-in): when the policy allows it and this
+            # page actually asks for a password, pull the portal's credential
+            # from the vault — creating it on first sight — and hand the
+            # password to this step's classification only. It lives in this
+            # local ``values`` dict for the fill and nowhere else.
+            allow_credentials = False
+            password_names = _password_field_names(observation) if policy.create_accounts else []
+            if password_names:
+                credential = _portal_credential(db, session=session, job=job, observation=observation)
+                if credential:
+                    for field_name in password_names:
+                        values[field_name] = credential["password"]
+                    allow_credentials = True
             outcome = sessions.record_observation(db, session, observation, user=user, values=values,
-                                                  actor="system_worker")
+                                                  actor="system_worker",
+                                                  allow_credentials=allow_credentials)
             progress = outcome.get("progress") or {}
             host = str(observation.get("host") or "") or expect_host
             url_now = str(observation.get("url") or "")
@@ -1201,7 +1300,8 @@ async def run_pass(
             # type them would only make the user retype data we already hold.
             # (An *answer* pause — unknown/ambiguous/legal — clears nothing, so
             # nothing is typed on it.)
-            instructions = sessions.fill_instructions(session, observations=[observation], values=values)
+            instructions = sessions.fill_instructions(session, observations=[observation], values=values,
+                                                      allow_credentials=allow_credentials)
             filled_here: List[str] = []
             if instructions:
                 recorded = await driver.fill(instructions)
@@ -1230,14 +1330,25 @@ async def run_pass(
                         if state:
                             sessions.persist_storage_state(db, session, state, policy=policy)
                 if not filled_here:
-                    # The classifier cleared fields and the driver typed none of
-                    # them: that is a broken pass, not a finished one.
-                    result["status"] = session.state
-                    sessions.record_flow_step(db, session, "blocked", reason="no_field_could_be_filled",
-                                              host=host)
-                    result["next_step"] = {"action": "browser",
-                                           "reason": "no_field_could_be_filled"}
-                    break
+                    held = [row for row in recorded
+                            if row.get("status") == "skipped_value_present"]
+                    if len(held) == len(recorded):
+                        # Everything the plan still wanted here is content the
+                        # page already holds — the human typed it (a password
+                        # they entered themselves, data a browser filled).
+                        # Nothing is broken; there is simply nothing left for
+                        # us to type, so the flow may advance below.
+                        result["steps"].append({"step": step, "status": "held",
+                                                "held": [str(row["name"]) for row in held]})
+                    else:
+                        # The classifier cleared fields and the driver typed none of
+                        # them: that is a broken pass, not a finished one.
+                        result["status"] = session.state
+                        sessions.record_flow_step(db, session, "blocked", reason="no_field_could_be_filled",
+                                                  host=host)
+                        result["next_step"] = {"action": "browser",
+                                               "reason": "no_field_could_be_filled"}
+                        break
 
             if outcome.get("pause"):
                 result["pause"] = outcome["pause"]

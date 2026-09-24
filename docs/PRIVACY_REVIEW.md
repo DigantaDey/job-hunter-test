@@ -95,8 +95,11 @@ Start session ──→ ApplicationSession (state machine, per-user, per-job)
 
 **Credential handling:**
 - Vault passwords are decrypted in memory only for autofill typing
-- The browser workflow never types a password (credential fields are skipped in `planned_values`)
-- Login/MFA/CAPTCHA are handoff actions — the user performs them in the browser
+- The plan path (`planned_values`) drops credential entries: a possibly stale plan password is never typed; an opted-in assisted pass instead sources a fresh credential from the vault for the page it is on, at typing time
+- Assisted sessions type a password **only** when the user's `browser.create_accounts` opt-in (default off, capped by `BROWSER_CREATE_ACCOUNTS_ENABLED`) is on and the caller holds a vault credential for that page — the classifier, the fill planner and the driver each re-prove that condition (`allow_credentials`); every other layer refuses as before
+- Even then the password never enters `session.fill_values`, the checkpoint (fingerprint only), the journal (field name only), the input recorder (password fields are hard-excluded) or the logs
+- MFA codes and CAPTCHA are never typed, relayed or silenced by any setting — they always pause
+- Login/MFA/CAPTCHA handoffs remain the default: the user performs them in the browser
 - `test_no_secret_ever_reaches_the_logs` verifies credentials never appear in log output
 
 ### 1.5 Application Submission

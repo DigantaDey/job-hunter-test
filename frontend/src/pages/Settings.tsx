@@ -304,6 +304,44 @@ export default function Settings() {
           <div className="mt-3 text-[11px] mono text-zinc-500">Turn off a step if you would rather always do it yourself.</div>
         </div>
 
+        {/* Assisted apply — two explicit opt-ins (default off, server-capped):
+            account creation with vault passwords, and AI field mapping. */}
+        <div className="card p-5">
+          <h3 className="font-medium flex items-center gap-2"><ShieldCheck className="w-5 h-5" /> Assisted apply</h3>
+          <div className="mt-3 space-y-3">
+            <label className="flex items-start gap-2 text-sm">
+              <input type="checkbox" className="mt-0.5" disabled={data.browser?.create_accounts_available === false}
+                     checked={!!data.browser?.create_accounts}
+                     onChange={e => update('browser', 'create_accounts', e.target.checked)} />
+              <span>
+                Create portal accounts &amp; fill passwords for me
+                <span className="block text-[11px] mono text-zinc-500 mt-1 leading-relaxed">
+                  On a sign-up page the assistant generates a password in your vault, creates the
+                  account and types it in the browser. The login lands in your Vault — export it
+                  anytime (Chrome/Apple CSV) to sign in yourself. Off by default; MFA codes and bot
+                  checks always wait for you.
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-sm">
+              <input type="checkbox" className="mt-0.5" disabled={data.browser?.ai_assist_available === false}
+                     checked={!!data.browser?.ai_assist}
+                     onChange={e => update('browser', 'ai_assist', e.target.checked)} />
+              <span>
+                Let AI map unfamiliar form fields
+                <span className="block text-[11px] mono text-zinc-500 mt-1 leading-relaxed">
+                  Higher accuracy on fields the rules do not recognise. Needs the assistant&apos;s AI
+                  configured — while this is on and AI is unreachable, session start reports the
+                  outage instead of guessing; turn it off to run on heuristics alone.
+                </span>
+              </span>
+            </label>
+            {data.browser?.create_accounts_available === false || data.browser?.ai_assist_available === false ? (
+              <div className="text-[11px] mono text-zinc-500">One or both options are disabled on this deployment.</div>
+            ) : null}
+          </div>
+        </div>
+
         {/* Auto mode — scheduled work (v2.2). Switch, cadence, clocks, last runs. */}
         <div className="card p-5 lg:col-span-2">
           <div className="flex items-start justify-between gap-3">

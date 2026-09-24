@@ -295,7 +295,7 @@ with `expired` / `failed` / `cancelled` terminal.
 
 | Kind | Who acts | Where |
 |---|---|---|
-| `login` | the user | in the browser; a handoff token opens a single-use window |
+| `login` | the user | in the browser; a handoff token opens a single-use window — unless the `create_accounts` opt-in holds a vault credential for the page, in which case there is no login pause at all (MFA/CAPTCHA are unaffected) |
 | `mfa` | the user | in the browser; the code is never relayed |
 | `captcha` | the user | in the browser; never solved, never outsourced |
 | `unknown_field` / `ambiguous_field` | the user | answers in the app, then the pass continues |
@@ -306,14 +306,21 @@ with `expired` / `failed` / `cancelled` terminal.
 **What the assistant may do.** Type into fields whose verdict is `autofill`
 (`FIELD_ACTIONS`) — a confirmed profile/plan value, or an answer the user gave
 for that exact field. Nothing else. Unknown, ambiguous, restricted, legal and
-EEO fields have no path into a fill instruction, and credentials, one-time codes
-and CAPTCHA tokens have no path into the session row either: the checkpoint keeps
-a value *fingerprint*, the working set is purged when the session ends, and the
-API refuses a completion payload carrying a secret-looking field
-(`422 restricted_field`).
+EEO fields have no path into a fill instruction, and one-time codes and CAPTCHA
+tokens have no path into the session row either: the checkpoint keeps a value
+*fingerprint*, the working set is purged when the session ends, and the API
+refuses a completion payload carrying a secret-looking field
+(`422 restricted_field`). One gated exception: when the user's own
+`browser.create_accounts` opt-in (default off, capped by
+`BROWSER_CREATE_ACCOUNTS_ENABLED`) is on, a pass that holds a vault credential
+for the page may clear a password field — the classifier, the fill planner and
+the driver each re-prove that condition (`allow_credentials`), and the password
+behaves like any other typed value: fingerprint in the checkpoint, field name in
+the journal, absent from the working set and from every log.
 
 **What it may never do.** Solve or relay a CAPTCHA; intercept, read or type an
-MFA code; type or store a password; take over a session established elsewhere;
+MFA code; type a password outside the opted-in vault path above, or store one in
+session state; take over a session established elsewhere;
 hide that it is automation (no stealth user-agent spoofing, no proxy rotation, no
 access-control bypass — the shipped outbound policy and host binding still
 apply). A bot check is a full stop, not an obstacle to route around.
