@@ -30,7 +30,9 @@ def profile(db):
                         "email": "ada@example.com", "phone": "+49 30 1234567",
                         "location": "Berlin", "linkedin": "https://linkedin.com/in/ada"},
                   layout={})
-    db.add(row); db.commit(); db.refresh(row)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
     return row
 
 
@@ -45,7 +47,9 @@ def _job(db, user_id: int, *, url: str = "https://jobs.lever.co/acme/1234",
               external_id="req-ai", status="ready_to_apply")
     if plan is not None:
         job.extra = {"autofill_plan": {"fields": plan}}
-    db.add(job); db.commit(); db.refresh(job)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
     return job
 
 

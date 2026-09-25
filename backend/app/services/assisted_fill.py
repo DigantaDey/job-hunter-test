@@ -882,7 +882,7 @@ async def ai_map_unknown_fields(
 
     _SECRET_TYPES = {"password", "hidden", "file"}
     sentinel_by_name: Dict[str, Mapping[str, Any]] = {}
-    unmapped: List[Dict[str, str]] = []
+    unmapped: List[Dict[str, Any]] = []
     for f in observation.get("fields") or []:
         if not isinstance(f, Mapping):
             continue
