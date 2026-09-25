@@ -33,6 +33,7 @@ What a driver may never do, at any layer
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sys
 import time
@@ -52,7 +53,7 @@ from app.services import browser_session as sessions
 from app.services import live_browser, net_guard
 from app.services.autofill import assisted_apply_available, browser_launch_kwargs, browser_launch_plan
 from app.services.field_classifier import classify_form
-from app.services.form_detector import VAULT_DOMAINS
+from app.services.form_detector import VAULT_DOMAINS, hosts_in_same_ats_family
 from app.services.reliability import duration
 from app.services.user_settings import get_setting
 
@@ -127,7 +128,17 @@ OBSERVE_SCRIPT = """
   const markers = [];
   if (document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .g-recaptcha, [data-sitekey]')) markers.push('captcha');
   if (document.querySelector('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]')) markers.push('mfa');
-  for (const el of document.querySelectorAll('input[type=password]')) { markers.push('login'); break; }
+  const pwFields = document.querySelectorAll('input[type=password]');
+  if (pwFields.length >= 2) markers.push('signup');
+  if (pwFields.length >= 1) markers.push('login');
+  // "Sign up" / "Create account" copy in the form area = account creation.
+  const frm = document.querySelector('form') || document.body;
+  if (frm) {
+    const ft = (frm.innerText || '').toLowerCase();
+    if (ft.indexOf('create account') !== -1 || ft.indexOf('sign up') !== -1
+        || ft.indexOf('register') !== -1 || ft.indexOf('confirm password') !== -1
+        || ft.indexOf('new password') !== -1) markers.push('signup');
+  }
   out.markers = markers;
   out.submit_present = !!document.querySelector('button[type=submit], input[type=submit]');
 
@@ -327,12 +338,15 @@ def choose_advance_control(
                          "kind": "submit", "matched": matched, "reason": "submit_control"}
             return {"click": True, **candidate}
         # A link that leaves the application's host is not a step of this flow.
+        # Same-family ATS redirects (Lever → auth.lever.co, Workday → company
+        # subdomain) ARE allowed — they are the application flow.
         if href and not href.startswith(("#", "javascript:", "mailto:")):
             parsed = urlsplit(href)
             if parsed.hostname and parsed.scheme in ("http", "https"):
                 target = parsed.hostname.lower()
                 if expected_host and not net_guard.host_matches(target, expected_host) \
-                        and not net_guard.host_matches(target, current_host):
+                        and not net_guard.host_matches(target, current_host) \
+                        and not _host_in_family(target, expected_host, current_host):
                     superseded = superseded or {"index": int(control.get("index") or 0),
                                                 "label": label[:120], "kind": kind,
                                                 "reason": "off_host_control"}
@@ -508,7 +522,7 @@ class PlaywrightDriver:
         if not verdict.allowed:
             raise DriverError(f"navigation refused by the outbound policy: {verdict.reason}")
         if session.expected_host and not net_guard.host_matches(verdict.host, session.expected_host) \
-                and not any(net_guard.host_matches(verdict.host, ats) for ats in VAULT_DOMAINS.values()):
+                and not _host_in_family(verdict.host, session.expected_host or ""):
             raise DriverError(f"{verdict.host} is not this application's host ({session.expected_host})")
 
         try:
@@ -574,7 +588,7 @@ class PlaywrightDriver:
         session = self.session
         if session is not None and session.expected_host \
                 and not net_guard.host_matches(verdict.host, session.expected_host) \
-                and not any(net_guard.host_matches(verdict.host, ats) for ats in VAULT_DOMAINS.values()):
+                and not _host_in_family(verdict.host, session.expected_host or ""):
             raise DriverError(f"{verdict.host} is not this application's host ({session.expected_host})")
         await self._page.goto(target, wait_until="domcontentloaded", timeout=settings.autofill_timeout_ms)
         await self._settle()
@@ -840,6 +854,150 @@ def _record_input_from_browser(session_id: int, payload: Any) -> Dict[str, Any]:
         return sessions.record_browser_input(db, session, payload)
     finally:
         db.close()
+
+
+# --------------------------------------------------------------------------- #
+# AI-assisted field mapping during a live pass
+# --------------------------------------------------------------------------- #
+async def ai_map_unknown_fields(
+    observation: Mapping[str, Any],
+    *,
+    profile_keys: Sequence[str],
+    profile_sample: Mapping[str, Any],
+) -> Dict[str, str]:
+    """
+    Ask the form_detect AI to map currently-unmapped fields to canonical
+    profile keys *during a live pass*. Returns {field_name: profile_key} for
+    the fields the AI was confident enough about; unknown fields are simply
+    omitted, so the caller falls back to the existing ``unknown_field``
+    pause.
+
+    The AI sees field names, labels, types and select option summaries —
+    never values the user typed, never a password, never the page body. A
+    failure (timeout, AI offline, malformed response) raises so the caller
+    can pause honestly instead of silently guessing.
+    """
+    from app.services.ai_client import chat_completion, fit_prompt_part, input_budget_chars  # noqa: PLC0415
+    from app.services.form_detector import KNOWN_FIELDS as _AI_KNOWN  # noqa: PLC0415
+
+    _SECRET_TYPES = {"password", "hidden", "file"}
+    sentinel_by_name: Dict[str, Mapping[str, Any]] = {}
+    unmapped: List[Dict[str, Any]] = []
+    for f in observation.get("fields") or []:
+        if not isinstance(f, Mapping):
+            continue
+        name = str(f.get("name") or "").strip()
+        ftype = str(f.get("type") or "").lower()
+        if not name or ftype in _SECRET_TYPES:
+            continue
+        # Only fields the classifier would otherwise flag unknown: no
+        # obvious-name mapping already exists. We intentionally do not feed
+        # the AI the obvious ones — that budget is for the hard cases.
+        label = str(f.get("label") or "").strip()[:200]
+        if not label:
+            continue
+        if _looks_obvious(name, label):
+            continue
+        options = [str(o).strip() for o in (f.get("options") or [])[:12] if str(o).strip()]
+        sentinel_by_name[name] = f
+        unmapped.append({"name": name[:120], "label": label, "type": ftype[:30],
+                         "options": options})
+    if not unmapped:
+        return {}
+
+    allowed = sorted(set(_AI_KNOWN) | set(profile_keys or []))
+    fields_json, _ = fit_prompt_part(
+        json.dumps(unmapped[:60]), input_budget_chars(), label="form_detect.live_fields")
+    sample_keys = sorted(str(k) for k in (profile_sample or {}).keys())[:40]
+    prompt = (
+        "You are helping auto-fill a job application form. For each field below, "
+        "pick the single canonical profile key that field is asking for, or null "
+        "if you are not confident. Allowed keys: " + ", ".join(allowed) + ". "
+        "The user's profile has keys: " + ", ".join(sample_keys) + ". "
+        "Return JSON {\"mapping\": {\"<field_name>\": \"<key or null>\"}}.\n"
+        "Fields: " + fields_json
+    )
+    data = await chat_completion("form_detect_live", prompt, temperature=0, stream=False)
+    mapping = (data or {}).get("mapping") if isinstance(data, dict) else {}
+    out: Dict[str, str] = {}
+    if not isinstance(mapping, dict):
+        return out
+    for name, key in mapping.items():
+        skey = str(key or "").strip()
+        sname = str(name or "").strip()
+        if not sname or not skey:
+            continue
+        # Reject hallucinated field names and any mapping whose canonical key
+        # maps back to a credential/secret (the classifier will refuse secret
+        # fills at fill-time too, but we also never let the AI "rename" a
+        # password field into e.g. firstName in the first place).
+        if sname not in sentinel_by_name:
+            continue
+        _sens = _ai_key_sensitivity(skey)
+        if _sens in ("credential", "secret", "mfa", "captcha", "legal"):
+            continue
+        if skey in allowed:
+            out[sname] = skey
+    return out
+
+
+def _looks_obvious(name: str, label: str) -> bool:
+    """Heuristic skip: don't waste AI budget on fields the deterministic map
+    already covers. Mirrors KNOWN_FIELDS loosely but is intentionally broader
+    than the real classifier — it's a budget filter, not a verdict."""
+    from app.services.form_detector import KNOWN_FIELDS as _STATIC_KNOWN
+    hay = f"{label} {name}".lower().replace("_", " ").replace("-", " ")
+    for hints in _STATIC_KNOWN.values():
+        if any(h in hay for h in hints):
+            return True
+    return False
+
+
+def _ai_key_sensitivity(key: str) -> str:
+    """Classify a canonical key for secret-vs-public gating before accepting
+    an AI suggestion. Profile-only keys (custom answer keys, etc.) default to
+    ``internal`` — the real classifier still runs MFA/CAPTCHA/legal detection
+    on the field itself regardless, so this is belt-and-braces."""
+    lowered = key.lower()
+    if any(t in lowered for t in ("password", "passwd", "mfa", "otp", "2fa", "totp",
+                                  "captcha", "ssn", "signature")):
+        return "credential"
+    # EEO/demographic keys are never secret but we keep AI from relabelling a
+    # visible text field into them (would silently fill demographics the user
+    # didn't consent to). The classifier already gates these.
+    if lowered in {"gender", "racere Ethnicity", "veteranstatus",
+                   "disabilitystatus"}:
+        return "legal"
+    return "internal"
+
+
+def apply_ai_hints_to_observation(
+    observation: Mapping[str, Any],
+    hints: Mapping[str, str],
+) -> Dict[str, Any]:
+    """Return a copy of *observation* with an ``ai_mapped_key`` annotation on
+    each field the AI mapped. The classifier in :mod:`field_classifier` picks
+    this up and treats it as a profile-key hint when classifying."""
+    clean = dict(observation)
+    fields: List[Dict[str, Any]] = []
+    for f in clean.get("fields") or []:
+        if isinstance(f, Mapping):
+            row = dict(f)
+            hint = hints.get(str(row.get("name") or ""))
+            if hint:
+                # ``ai_mapped_key`` is the raw AI hint (consumed by
+                # candidate_matches). ``profile_key`` is what classify_form
+                # reads to pull the value out of the profile map — without
+                # this, a field mapped to e.g. firstName would be classified
+                # correctly but never autofilled because the value lookup is
+                # keyed on profile_key. We only stamp it when nothing else
+                # has set profile_key (a declared hint wins over AI).
+                row["ai_mapped_key"] = hint
+                if not row.get("profile_key"):
+                    row["profile_key"] = hint
+            fields.append(row)
+    clean["fields"] = fields
+    return clean
 
 
 # --------------------------------------------------------------------------- #
@@ -1242,6 +1400,37 @@ async def run_pass(
                                           mode=str(launch.get("mode") or "")[:20])
         for step in range(max_steps):
             observation = await driver.observe()
+            host_now = str(observation.get("host") or "") or expect_host
+            # AI-assisted field mapping (opt-in): before classification, ask the
+            # form_detect AI to suggest canonical keys for fields the
+            # deterministic mapper does not recognise. Annotations are applied
+            # to a copy of the observation; classifier treats ``ai_mapped_key``
+            # as a "declared" hint but still runs sensitivity/credential checks
+            # over the result, so AI can never turn a password/MFA/EEO field
+            # into a canonical fill. An AI outage here is a *pause* — never a
+            # silent fallback to guessing, matching the Settings promise.
+            ai_hints: Dict[str, str] = {}
+            if policy.ai_assist:
+                try:
+                    profile_keys_hint = sorted({k for k in values.keys() if k})
+                    ai_hints = await ai_map_unknown_fields(
+                        observation,
+                        profile_keys=profile_keys_hint,
+                        profile_sample=values,
+                    )
+                except Exception as exc:  # pragma: no cover - surfaced as pause
+                    log.warning("assisted: live AI field-mapping failed (%s)", type(exc).__name__)
+                    sessions.record_flow_step(db, session, "blocked",
+                                              reason="ai_mapping_unavailable", host=host_now)
+                    result["next_step"] = {"action": "browser", "reason": "ai_unavailable"}
+                    result["status"] = session.state
+                    break
+                if ai_hints:
+                    observation = apply_ai_hints_to_observation(observation, ai_hints)
+                    sessions.record_flow_step(
+                        db, session, "fill", step=step,
+                        host=host_now,
+                        fields=sorted(ai_hints.keys()), reason="ai_mapped")
             # Account creation (opt-in): when the policy allows it and this
             # page actually asks for a password, pull the portal's credential
             # from the vault — creating it on first sight — and hand the
@@ -1259,7 +1448,7 @@ async def run_pass(
                                                   actor="system_worker",
                                                   allow_credentials=allow_credentials)
             progress = outcome.get("progress") or {}
-            host = str(observation.get("host") or "") or expect_host
+            host = host_now
             url_now = str(observation.get("url") or "")
             result["steps"].append({"step": step, "status": outcome["status"], "host": host,
                                     "progress": progress})
@@ -1467,13 +1656,19 @@ def _keep_window_open(session: ApplicationSession, result: Mapping[str, Any],
 
 
 def _host_in_family(new_host: str, *known: str) -> bool:
-    """Whether a host is the application's own (its portal domain or a sibling)."""
+    """Whether a host is the application's own (its portal domain, the job
+    board, or a sibling host in the same ATS family — Lever/Auth-Lever,
+    Workday/Workday-IDP, etc.)."""
     if not new_host:
         return True
     for candidate in known:
-        if candidate and net_guard.host_matches(new_host, candidate):
+        if candidate and (net_guard.host_matches(new_host, candidate)
+                          or hosts_in_same_ats_family(new_host, candidate)):
             return True
-    return any(net_guard.host_matches(new_host, ats) for ats in VAULT_DOMAINS.values())
+    for ats in VAULT_DOMAINS.values():
+        if net_guard.host_matches(new_host, ats) or hosts_in_same_ats_family(new_host, ats):
+            return True
+    return False
 
 
 async def _driver_controls(driver: BrowserDriver) -> Dict[str, Any]:
@@ -1535,6 +1730,33 @@ async def _settle_pass(
         result["outcome"] = "completed"
         return result
     next_step = result.get("next_step") or {}
+    # AI outage pauses are surfaced as an explicit ai_unavailable pause — they
+    # must not be collapsed into the generic "flow_needs_a_human" review, which
+    # would hide the outage from the user.
+    if next_step.get("reason") == "ai_unavailable":
+        if session.state in ("preparing", "launching", "created"):
+            sessions.transition(session, "active", actor="system_worker",
+                                reason="observation_received")
+        sessions.pause_session(
+            db, session, kind="ai_unavailable", reason="ai_unavailable",
+            instructions="AI-assisted field mapping is unavailable right now — "
+                         "fill the highlighted fields yourself, or re-run the pass later.",
+            actor="system_worker", checkpoint=session.checkpoint)
+        sessions.record_flow_step(db, session, "pause", kind="ai_unavailable",
+                                  reason="ai_unavailable")
+        actions = sessions.pending_actions(db, session.user_id, session_id=session.id)
+        result["status"] = session.state
+        result["outcome"] = "awaiting_user"
+        result["pause"] = "ai_unavailable"
+        result["pause_reason"] = "ai_unavailable"
+        result["next_step"] = {
+            "action": "handoff",
+            "reason": "ai_unavailable",
+            "requires_browser_handoff": True,
+            "action_id": actions[0].id if actions else None,
+            "in_browser": True,
+        }
+        return result
     if next_step.get("action") == "submit" and policy.allow_submit:
         # Nothing left to type and the gates allow submission: the caller (the
         # API's /submit, which owns the ledger) decides whether to use it.

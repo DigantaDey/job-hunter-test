@@ -355,6 +355,9 @@ def candidate_matches(field: Mapping[str, Any]) -> List[Tuple[str, str]]:
     declared = field.get("profile_key")
     if isinstance(declared, str) and declared in KNOWN_FIELDS:
         matches.append((declared, "declared"))
+    ai_hint = field.get("ai_mapped_key")
+    if isinstance(ai_hint, str) and ai_hint in KNOWN_FIELDS and ai_hint != declared:
+        matches.append((ai_hint, "ai_mapped"))
     for canonical, hints in KNOWN_FIELDS.items():
         if any(canonical == existing for existing, _ in matches):
             continue

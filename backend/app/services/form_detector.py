@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -54,7 +54,69 @@ VAULT_DOMAINS = {
     "ashby": "jobs.ashbyhq.com",
     "workable": "apply.workable.com",
     "smartrecruiters": "jobs.smartrecruiters.com",
+    "icims": "icims.com",
+    "successfactors": "successfactors.com",
+    "taleo": "taleo.net",
+    "bamboohr": "bamboohr.com",
+    "jobvite": "jobvite.com",
 }
+
+#:
+#: ATS domain families — every host that is part of the same application
+#: flow for a known ATS. Job boards commonly redirect from the posting host
+#: (``jobs.lever.co``) to a sign-up / sign-in host (``auth.lever.co``,
+#: ``idp.workday.com``) or to the company-branded subdomain of the same ATS
+#: (``acme.wd1.myworkdayjobs.com``). A pass that treats every redirect outside
+#: the *single* ``VAULT_DOMAINS`` entry as "off-host" stops at every login wall
+#: the redirect was built to serve. Family membership is a hard allow-list — a
+#: redirect to something not in this table is still a handoff.
+#:
+#: Values are domain suffixes (checked via :func:`net_guard.host_matches`).
+ATS_FAMILIES: Dict[str, Tuple[str, ...]] = {
+    "lever": ("lever.co",),
+    "greenhouse": ("greenhouse.io", "grnh.se"),
+    "workday": ("myworkdayjobs.com", "workday.com", "wd3.myworkdayjobs.com",
+                "wd5.myworkdayjobs.com", "wd10.myworkdayjobs.com"),
+    "ashby": ("ashbyhq.com", "ashby.app"),
+    "workable": ("workable.com",),
+    "smartrecruiters": ("smartrecruiters.com", "smartrecruiters.app"),
+    "icims": ("icims.com", "iCIMS", "jobs.icims.com"),
+    "successfactors": ("successfactors.com", "sapsf.com", "sapsf-eu.com"),
+    "taleo": ("taleo.net", "tbe.taleo.net"),
+    "bamboohr": ("bamboohr.com", "bamboohr.jobs"),
+    "jobvite": ("jobvite.com", "jobs.jobvite.com"),
+    "linkedin": ("linkedin.com",),
+    "indeed": ("indeed.com",),
+}
+
+
+def ats_family_for_host(host: str) -> Optional[str]:
+    """Return the ATS portal name *host* belongs to, or None."""
+    hay = (host or "").strip().lower().rstrip(".")
+    if not hay:
+        return None
+    # Prefer exact VAULT_DOMAINS mapping first, then family suffixes.
+    for portal, domain in VAULT_DOMAINS.items():
+        if hay == domain or hay.endswith("." + domain):
+            return portal
+    for portal, suffixes in ATS_FAMILIES.items():
+        for suffix in suffixes:
+            if hay == suffix or hay.endswith("." + suffix):
+                return portal
+    return None
+
+
+def hosts_in_same_ats_family(host_a: str, host_b: str) -> bool:
+    """
+    True when two hosts belong to the same known ATS family (or one is
+    unknown). A redirect inside one family — e.g. ``jobs.lever.co`` →
+    ``auth.lever.co`` — is the same application, not a handoff.
+    """
+    fa = ats_family_for_host(host_a)
+    fb = ats_family_for_host(host_b)
+    if fa is None or fb is None:
+        return False
+    return fa == fb
 
 KNOWN_FIELDS: Dict[str, List[str]] = {
     "firstName": ["first name", "firstname", "given name", "first_name", "fname"],
