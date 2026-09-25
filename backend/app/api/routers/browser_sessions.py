@@ -105,6 +105,23 @@ class CompleteActionRequest(BaseModel):
     answers: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ClientObservationRequest(BaseModel):
+    """A structural observation + optional input reports from the user's own
+    browser tab (companion tab / bookmarklet). Mirrors the shape the in-page
+    Playwright recorder produces — names, labels, types, markers only, never a
+    password/code value."""
+
+    token: str = ""
+    url: str = ""
+    host: str = ""
+    title: str = ""
+    markers: List[str] = Field(default_factory=list)
+    submit_present: bool = False
+    logged_in: Optional[bool] = None
+    fields: List[Dict[str, Any]] = Field(default_factory=list)
+    inputs: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class PassRequest(BaseModel):
     """Run one assisted pass with a real browser (requires Playwright)."""
 
@@ -531,6 +548,83 @@ def screenshots(session_id: int, user: CurrentUser, db: DbSession):
         "entries": list(session.screenshots or []),
         "policy": sessions.screenshot_decision(policy, kind="field_fill"),
         "never_captured": list(sessions.NEVER_SCREENSHOT_KINDS),
+    }
+
+
+@router.post("/{session_id}/client-report")
+def client_report(session_id: int, body: ClientObservationRequest, request: Request,
+                  user: CurrentUser, db: DbSession):
+    """
+    Fold a structural observation (and any non-secret committed inputs) from
+    the user's **own** browser tab into the session — the companion-tab path
+    that lets a cloud/headless deployment see the page the user is looking at.
+
+    The token is the single-use ``handoff_token`` issued by ``…/handoff``; once
+    accepted the token is consumed, but the bearer can continue to send
+    ``inputs`` (committed values in non-secret fields) for the session's
+    remaining life — that is how fields the user typed in their own browser
+    (a sign-up form, an unknown field, an EEO answer) become learned answers
+    the assistant may replay later. Secrets (password/code/captcha fields,
+    restricted fields) are refused server-side by the same filters the
+    in-page Playwright recorder applies.
+    """
+    session = _session_or_404(db, user, session_id)
+    token_valid = bool(body.token) and sessions.handoff_token_valid(session, body.token)
+    if not token_valid and not sessions.is_session_recording_open(session):
+        raise HTTPException(401, {"code": "session_expired",
+                                  "message": "This session's handoff token has expired or been used."})
+    if token_valid:
+        sessions.consume_handoff_token(db, session, body.token)
+
+    # Fold the page observation first — this updates session.last_observation
+    # so that redirects from a job board to an ATS (or to company-site ATS)
+    # are reflected in ``expected_host``/``last_observation`` before any input
+    # is classified against them.
+    observation: Dict[str, Any] = {
+        "url": body.url, "host": body.host, "title": body.title,
+        "markers": list(body.markers or []), "submit_present": bool(body.submit_present),
+        "logged_in": body.logged_in,
+        "fields": [dict(f) for f in (body.fields or [])],
+    }
+    observation_clean = sessions.sanitize_observation(observation)
+    if observation_clean.get("url"):
+        session.last_observation = {
+            **(session.last_observation or {}),
+            **{k: v for k, v in observation_clean.items()
+               if k in ("url", "host", "title", "markers", "submit_present", "logged_in", "fields")},
+        }
+        # Dynamically extend the expected host when the user lands on a
+        # different host inside the same ATS family — that is how Lever
+        # redirects from jobs.lever.co to auth.lever.co, Workday to
+        # company.wd*.myworkdayjobs.com, etc., without forcing a handoff.
+        host_now = str(observation_clean.get("host") or "")
+        if host_now and session.expected_host:
+            from app.services.form_detector import hosts_in_same_ats_family
+            if hosts_in_same_ats_family(host_now, session.expected_host):
+                session.expected_host = host_now
+        db.commit()
+
+    recorded: List[str] = []
+    restricted: List[str] = []
+    for entry in body.inputs or []:
+        if not isinstance(entry, dict):
+            continue
+        res = sessions.record_browser_input(db, session, entry, commit=False)
+        recorded.extend(res.get("recorded") or [])
+        restricted.extend(res.get("restricted") or [])
+    db.commit()
+
+    if recorded:
+        audit.audit(db, "application.action_completed", user=user, target=f"job:{session.job_id}",
+                    detail={"session_id": session.id, "source": "client_tab",
+                            "recorded_fields": recorded[:20]},
+                    request=request)
+    return {
+        "ok": True,
+        "session_state": session.state,
+        "recorded": recorded,
+        "restricted": restricted,
+        "expected_host": session.expected_host,
     }
 
 

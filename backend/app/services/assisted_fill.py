@@ -52,7 +52,7 @@ from app.services import browser_session as sessions
 from app.services import live_browser, net_guard
 from app.services.autofill import assisted_apply_available, browser_launch_kwargs, browser_launch_plan
 from app.services.field_classifier import classify_form
-from app.services.form_detector import VAULT_DOMAINS
+from app.services.form_detector import VAULT_DOMAINS, hosts_in_same_ats_family
 from app.services.reliability import duration
 from app.services.user_settings import get_setting
 
@@ -127,7 +127,17 @@ OBSERVE_SCRIPT = """
   const markers = [];
   if (document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .g-recaptcha, [data-sitekey]')) markers.push('captcha');
   if (document.querySelector('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]')) markers.push('mfa');
-  for (const el of document.querySelectorAll('input[type=password]')) { markers.push('login'); break; }
+  const pwFields = document.querySelectorAll('input[type=password]');
+  if (pwFields.length >= 2) markers.push('signup');
+  if (pwFields.length >= 1) markers.push('login');
+  // "Sign up" / "Create account" copy in the form area = account creation.
+  const frm = document.querySelector('form') || document.body;
+  if (frm) {
+    const ft = (frm.innerText || '').toLowerCase();
+    if (ft.indexOf('create account') !== -1 || ft.indexOf('sign up') !== -1
+        || ft.indexOf('register') !== -1 || ft.indexOf('confirm password') !== -1
+        || ft.indexOf('new password') !== -1) markers.push('signup');
+  }
   out.markers = markers;
   out.submit_present = !!document.querySelector('button[type=submit], input[type=submit]');
 
@@ -327,12 +337,15 @@ def choose_advance_control(
                          "kind": "submit", "matched": matched, "reason": "submit_control"}
             return {"click": True, **candidate}
         # A link that leaves the application's host is not a step of this flow.
+        # Same-family ATS redirects (Lever → auth.lever.co, Workday → company
+        # subdomain) ARE allowed — they are the application flow.
         if href and not href.startswith(("#", "javascript:", "mailto:")):
             parsed = urlsplit(href)
             if parsed.hostname and parsed.scheme in ("http", "https"):
                 target = parsed.hostname.lower()
                 if expected_host and not net_guard.host_matches(target, expected_host) \
-                        and not net_guard.host_matches(target, current_host):
+                        and not net_guard.host_matches(target, current_host) \
+                        and not _host_in_family(target, expected_host, current_host):
                     superseded = superseded or {"index": int(control.get("index") or 0),
                                                 "label": label[:120], "kind": kind,
                                                 "reason": "off_host_control"}
@@ -508,7 +521,7 @@ class PlaywrightDriver:
         if not verdict.allowed:
             raise DriverError(f"navigation refused by the outbound policy: {verdict.reason}")
         if session.expected_host and not net_guard.host_matches(verdict.host, session.expected_host) \
-                and not any(net_guard.host_matches(verdict.host, ats) for ats in VAULT_DOMAINS.values()):
+                and not _host_in_family(verdict.host, session.expected_host or ""):
             raise DriverError(f"{verdict.host} is not this application's host ({session.expected_host})")
 
         try:
@@ -574,7 +587,7 @@ class PlaywrightDriver:
         session = self.session
         if session is not None and session.expected_host \
                 and not net_guard.host_matches(verdict.host, session.expected_host) \
-                and not any(net_guard.host_matches(verdict.host, ats) for ats in VAULT_DOMAINS.values()):
+                and not _host_in_family(verdict.host, session.expected_host or ""):
             raise DriverError(f"{verdict.host} is not this application's host ({session.expected_host})")
         await self._page.goto(target, wait_until="domcontentloaded", timeout=settings.autofill_timeout_ms)
         await self._settle()
@@ -1467,13 +1480,19 @@ def _keep_window_open(session: ApplicationSession, result: Mapping[str, Any],
 
 
 def _host_in_family(new_host: str, *known: str) -> bool:
-    """Whether a host is the application's own (its portal domain or a sibling)."""
+    """Whether a host is the application's own (its portal domain, the job
+    board, or a sibling host in the same ATS family — Lever/Auth-Lever,
+    Workday/Workday-IDP, etc.)."""
     if not new_host:
         return True
     for candidate in known:
-        if candidate and net_guard.host_matches(new_host, candidate):
+        if candidate and (net_guard.host_matches(new_host, candidate)
+                          or hosts_in_same_ats_family(new_host, candidate)):
             return True
-    return any(net_guard.host_matches(new_host, ats) for ats in VAULT_DOMAINS.values())
+    for ats in VAULT_DOMAINS.values():
+        if net_guard.host_matches(new_host, ats) or hosts_in_same_ats_family(new_host, ats):
+            return True
+    return False
 
 
 async def _driver_controls(driver: BrowserDriver) -> Dict[str, Any]:

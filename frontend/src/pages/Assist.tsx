@@ -43,6 +43,7 @@ type Action = {
   handoff: any
   occurrences: number
   created_at: string
+  job?: { title: string; company: string; url: string }
 }
 type BrowserRuntime = {
   available: boolean
@@ -249,12 +250,37 @@ export default function Assist() {
     if (requested) setJobId(requested)
   }, [searchParams])
 
+  /** Open a URL in a new tab synchronously so popup blockers don't eat it. */
+  const openClientTab = (url: string, token?: string) => {
+    if (!url || typeof window === 'undefined') return null
+    try {
+      const target = new URL(url, window.location.origin)
+      if (token) target.searchParams.set('jh_handoff', token)
+      return window.open(target.toString(), '_blank', 'noopener,noreferrer')
+    } catch {
+      try { return window.open(String(url), '_blank', 'noopener,noreferrer') } catch { return null }
+    }
+  }
+
   const startSession = async () => {
     if (!jobId) return
+    const job = jobs.find(j => String(j.id) === String(jobId))
+    // Popup blockers only allow window.open() that runs synchronously inside
+    // the click handler — this call is BEFORE the await, so clicking Start
+    // always opens the posting in a new tab, regardless of whether the server
+    // can show a window (headed / headless / cloud). The server-side
+    // Playwright pass (if any) runs in parallel; the user's tab is where
+    // human steps happen.
+    const url = job?.url
+    const clientTab = url ? openClientTab(url) : null
     setBusy('start'); setMsg(''); setErr('')
     try {
       const r = await client.post('/api/application-sessions', { job_id: Number(jobId) })
-      setMsg(r.data.created ? 'Session started — open the browser to begin.' : 'You already have a live session for this job.')
+      setMsg(r.data.created
+        ? `Session started — ${clientTab && !clientTab.closed
+            ? 'a new tab opened on the posting.'
+            : 'open the posting below to continue.'} The server pass runs in parallel; sign in / solve checks in your tab and click Resume when done.`
+        : 'You already have a live session for this job.')
       await load()
     } catch (e: any) {
       setErr(apiError(e, 'Could not start a session'))
@@ -295,17 +321,36 @@ export default function Assist() {
   const openHandoff = async (action: Action) => {
     if (action.session_id === null) return
     setBusy(action.id); setErr('')
+    // Synchronous open before await — always open the tab first so popup
+    // blockers cannot swallow the click. If the server returns a handoff
+    // token we inject it into the URL as a hint (the companion bookmarklet /
+    // future extension can read it and pair to this session).
+    const fallbackUrl = (action.handoff?.url) || action.job?.url || ''
+    const clientTab = fallbackUrl ? openClientTab(fallbackUrl) : null
     try {
       const r = await client.post(
         `/api/application-sessions/${action.session_id}/actions/${action.id}/handoff`, {})
       const opened = Boolean(r.data?.window_opened)
       setDescriptors(prev => ({ ...prev, [action.id]: r.data }))
+      // If the window wasn't opened server-side and our synchronous open
+      // succeeded, the user already has the tab; attach the token by
+      // navigating it (best-effort — blocked by cross-origin/popup-stub).
+      if (!opened && r.data?.token && clientTab && !clientTab.closed && fallbackUrl) {
+        try {
+          const withToken = new URL(fallbackUrl, window.location.origin)
+          withToken.searchParams.set('jh_handoff', r.data.token)
+          if (clientTab.location && typeof clientTab.location.replace === 'function') {
+            clientTab.location.replace(withToken.toString())
+          }
+        } catch { /* cross-origin / jsdom stub — tab is already on the right URL */ }
+      }
       setMsg(opened
-        ? 'A visible browser window just opened on the machine running the app — do this step there, '
-          + 'then come back and click “I finished this step in the browser”. What you type there '
-          + '(except passwords and codes) is saved for this and future sessions.'
-        : `No window could be opened here (${r.data?.reason || r.data?.window_reason || 'headless host'}). `
-          + 'Use the “open the posting” link below to continue in your own browser tab.')
+        ? 'A visible browser window just opened on the machine running the app — do this step there. '
+          + 'A tab also opened in your browser as a fallback. What you type there (except passwords '
+          + 'and codes) is saved for this and future sessions.'
+        : 'A new browser tab opened on the posting — do this step there, then come back and click '
+          + '“I finished this step in the browser”. Passwords, codes and bot checks stay in the tab; '
+          + 'everything else is learned for later sessions.')
     } catch (e: any) {
       setErr(apiError(e, 'Could not open a handoff window'))
     } finally {
@@ -378,6 +423,34 @@ export default function Assist() {
       {err && <div className="card p-3 text-xs mono text-red-700 dark:text-red-300 flex items-center gap-2">
         <AlertTriangle className="w-4 h-4" /> {err}
       </div>}
+
+      <details className="card p-3 text-xs mono text-zinc-600 dark:text-zinc-400">
+        <summary className="cursor-pointer font-medium text-zinc-700 dark:text-zinc-300">
+          How your tab is tracked across redirects (Lever → company ATS, Workday sign-up, etc.)
+        </summary>
+        <div className="mt-2 space-y-2 leading-relaxed">
+          <p>
+            When you click <b>Start</b> or the handoff button below, a new tab opens on the posting
+            in your own browser. Inside that tab, after the handoff step loads, you can activate the
+            companion bridge so fields you type (except passwords, codes and bot checks) are reported
+            back to this session — that is how the assistant learns answers for this portal and how
+            a later pass can resume without asking twice.
+          </p>
+          <p>
+            Passwords are handled two ways: either (a) the server opens its own headed browser window
+            on this machine and types a vault-generated password straight into the sign-up form
+            (when you opted in to “Create portal accounts” in Settings), or (b) you type the password
+            yourself in your own tab — the password never leaves that tab, it is never sent here,
+            and the generated login is already in your Vault (export as Chrome/Apple CSV anytime).
+          </p>
+          <p>
+            Redirects from a job board to the company’s ATS (Lever → auth.lever.co, a posting →
+            company.myworkdayjobs.com, Greenhouse applications, etc.) are followed automatically
+            when the destination belongs to a known ATS family. Unknown cross-site redirects hand
+            control back to you instead of guessing.
+          </p>
+        </div>
+      </details>
 
       {/* Start a session */}
       <div className="card p-4 space-y-2">

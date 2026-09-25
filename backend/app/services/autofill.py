@@ -55,6 +55,7 @@ from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.services import net_guard
 from app.services.form_detector import VAULT_DOMAINS as ATS_VAULT_DOMAINS
+from app.services.form_detector import hosts_in_same_ats_family
 from app.services.reliability import autofill_failure_reason
 
 log = get_logger("app.autofill")
@@ -767,10 +768,14 @@ async def execute_autofill(
                     )
                 if (landing_host != verdict.host
                         and not net_guard.same_registrable_domain(landing_host, verdict.host)
-                        and not _host_allowed(landing_host, policy.application)):
+                        and not _host_allowed(landing_host, policy.application)
+                        and not hosts_in_same_ats_family(landing_host, verdict.host)):
                     # The posting sent the browser to a different organisation:
                     # that page is not the one the user chose to apply on, so
                     # neither the profile data nor a credential goes into it.
+                    # Same-ATS-family redirects (jobs.lever.co → auth.lever.co,
+                    # job board → company Greenhouse/Workday subdomain) are
+                    # allowed — they are the application flow, not a handoff.
                     raise _NavigationRefused(
                         "redirect_offsite",
                         f"the page redirected from {verdict.host} to {landing_host}, which this "

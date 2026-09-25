@@ -81,7 +81,7 @@ from app.services.field_classifier import (
     classify_form,
     is_captcha_marker,
 )
-from app.services.form_detector import VAULT_DOMAINS
+from app.services.form_detector import VAULT_DOMAINS, hosts_in_same_ats_family
 from app.services.reliability import (
     note_dedupe,
     note_user_action_outcome,
@@ -776,6 +776,18 @@ def record_observation(
     clean = sanitize_observation(observation)
     session.last_observation = clean
     session.last_activity_at = _now()
+
+    # When the flow redirects inside the same ATS family (jobs.lever.co →
+    # auth.lever.co, a Workday posting → company subdomain, a job board that
+    # hands off to the company's Greenhouse) extend the expected host rather
+    # than pausing. This is the same-family rule the driver advance uses at
+    # click-time; without it an unbroken sign-up redirect looks like an
+    # off-host navigation.
+    observed_host = str(clean.get("host") or "")
+    if observed_host and session.expected_host \
+            and not net_guard.host_matches(observed_host, session.expected_host) \
+            and hosts_in_same_ats_family(observed_host, session.expected_host):
+        session.expected_host = observed_host
 
     checkpoint = dict(session.checkpoint or {})
     checkpoint["fields"] = dict(checkpoint.get("fields") or {})
@@ -1835,6 +1847,24 @@ def consume_handoff_token(db: Session, session: ApplicationSession, token: str) 
     return True
 
 
+def is_session_recording_open(session: ApplicationSession) -> bool:
+    """Whether an already-paired client tab may keep posting observations.
+
+    After a handoff token has been consumed (the user opened their own
+    browser tab and the companion bridge is recording) the tab is allowed to
+    continue streaming observations and non-secret inputs for the rest of
+    this session's life — until it completes, fails, expires, or is
+    cancelled. A terminal or expired session refuses further reports.
+    """
+    if not session:
+        return False
+    if session.state in APPLICATION_SESSION_TERMINAL_STATES:
+        return False
+    if is_expired(session):
+        return False
+    return session.state in ("active", "awaiting_user", "paused", "resuming", "preparing", "launching")
+
+
 # --------------------------------------------------------------------------- #
 # Expiry
 # --------------------------------------------------------------------------- #
@@ -2776,6 +2806,7 @@ __all__ = [
     "handoff_token_valid",
     "host_of",
     "is_expired",
+    "is_session_recording_open",
     "issue_handoff",
     "list_sessions",
     "learn_answer",

@@ -316,10 +316,15 @@ export default function Settings() {
               <span>
                 Create portal accounts &amp; fill passwords for me
                 <span className="block text-[11px] mono text-zinc-500 mt-1 leading-relaxed">
-                  On a sign-up page the assistant generates a password in your vault, creates the
-                  account and types it in the browser. The login lands in your Vault — export it
-                  anytime (Chrome/Apple CSV) to sign in yourself. Off by default; MFA codes and bot
-                  checks always wait for you.
+                  On a sign-up page (Lever, Greenhouse, Workday, Ashby, Workable, SmartRecruiters,
+                  etc.) the assistant generates a unique password in your vault, creates the
+                  account and types the password straight into both &ldquo;new password&rdquo; and
+                  &ldquo;confirm password&rdquo; fields. On a sign-in page it fills the stored vault
+                  credential. The login lands in your Vault automatically — export any of them as a
+                  Chrome/Apple/1Password CSV to sign in yourself in another browser. Off by default;
+                  MFA codes and bot checks always wait for you. Cross-site redirects (a job board
+                  sending you to the company ATS, or an ATS redirecting to its auth host) are
+                  followed inside known ATS families.
                 </span>
               </span>
             </label>

@@ -18,7 +18,7 @@
  * `/resume` route rather than silently continuing.
  */
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import client from '../../api/client'
 import Assist from '../Assist'
@@ -38,13 +38,15 @@ const captchaAction = {
   id: 11, session_id: 5, job_id: 3, kind: 'captcha', status: 'pending',
   title: 'Complete the bot check', instructions: 'Finish the check in the browser window.',
   reason: 'captcha_detected', fields: [{ name: 'g-recaptcha-response', label: 'Verify you are human' }],
-  handoff: {}, occurrences: 1, created_at: '2026-09-19T10:00:00',
+  handoff: { url: 'https://jobs.lever.co/acme/1' }, occurrences: 1, created_at: '2026-09-19T10:00:00',
+  job: { title: 'Backend Engineer', company: 'Acme', url: 'https://jobs.lever.co/acme/1' },
 }
 const unknownAction = {
   id: 12, session_id: 5, job_id: 3, kind: 'unknown_field', status: 'pending',
   title: 'A field we do not recognise', instructions: 'Tell us what to put here.',
   reason: 'unclassified_field', fields: [{ name: 'q_17', label: 'Favourite colour?' }],
   handoff: {}, occurrences: 2, created_at: '2026-09-19T10:00:00',
+  job: { title: 'Backend Engineer', company: 'Acme', url: 'https://jobs.lever.co/acme/1' },
 }
 const session = {
   id: 5, job_id: 3, job: { title: 'Backend Engineer', company: 'Acme', url: 'https://jobs.lever.co/acme/1' },
@@ -79,9 +81,14 @@ function mockGet(overrides: { sessions?: any[]; actions?: any[]; jobs?: any[] } 
 const wrapper = ({ children }: { children: React.ReactNode }) => <MemoryRouter>{children}</MemoryRouter>
 
 describe('Assisted Apply page', () => {
+  let openSpy: any
   beforeEach(() => {
     get.mockReset()
     post.mockReset()
+    // jsdom has no window.open; stub it so the synchronous client-tab open in
+    // click handlers does not throw in tests.
+    openSpy = vi.spyOn(window, 'open').mockImplementation(
+      () => ({ closed: false, location: { replace: () => {} }, focus: () => {} } as any))
     get.mockImplementation((url: string) => {
       if (url === '/api/application-sessions') return Promise.resolve({ data: { sessions: [session] } })
       if (url === '/api/application-sessions/actions') return Promise.resolve({ data: { actions: [captchaAction, unknownAction] } })
@@ -93,7 +100,10 @@ describe('Assisted Apply page', () => {
     })
     post.mockImplementation(() => Promise.resolve({ data: {} }))
   })
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    openSpy?.mockRestore()
+  })
 
   it('lists the queue and the session, with the already-done fields named', async () => {
     render(<Assist />, { wrapper })
@@ -122,6 +132,7 @@ describe('Assisted Apply page', () => {
           data: {
             action_id: 11, session_id: 5, kind: 'captcha', token: 'ho_once',
             expires_at: '2099-01-01T00:10:00', user_completes_in_browser: true,
+            window_opened: false, mode: 'headless', url: 'https://jobs.lever.co/acme/1',
             never: ['We never solve a CAPTCHA', 'We never relay a solution'],
           },
         })
@@ -130,16 +141,23 @@ describe('Assisted Apply page', () => {
     })
 
     fireEvent.click(screen.getByText(/Start a handoff window/))
-    await waitFor(() => expect(
-      post.mock.calls.some((c: any[]) => String(c[0]).endsWith('/actions/11/handoff')),
-    ).toBe(true))
-    await waitFor(() => expect(screen.getByText(/We never solve a CAPTCHA/)).toBeTruthy())
-
-    const buttons = screen.getAllByText(/I finished this step in the browser/)
-    fireEvent.click(buttons[0])
-    await waitFor(() => expect(
-      post.mock.calls.some((c: any[]) => String(c[0]).endsWith('/actions/11/complete')),
-    ).toBe(true))
+    // Wait until the success message appears (POST resolved, busy cleared).
+    await screen.findByText(/A new browser tab opened on the posting/)
+    // There are two buttons in the captcha card (handoff + complete); pick the
+    // complete ("I finished...") one specifically.
+    const captchaCard = screen.getByTestId('action-captcha')
+    const allBtns = captchaCard.querySelectorAll('button')
+    const button = Array.from(allBtns).find(b => /I finished/.test(b.textContent || '')) as HTMLButtonElement
+    expect(button).toBeTruthy()
+    expect(button.disabled).toBe(false)
+    fireEvent.click(button)
+    // Wait for the complete POST; the click fires post in finally, after an await
+    // so give the microtask queue a moment.
+    await waitFor(() => {
+      const called = post.mock.calls.some((c: any[]) => String(c[0]).endsWith('/actions/11/complete'))
+      if (!called) throw new Error('complete not called yet; calls=' + JSON.stringify(post.mock.calls.map((c: any) => c[0])))
+      return true
+    }, { timeout: 3000 })
     const complete = post.mock.calls.find((c: any[]) => String(c[0]).endsWith('/actions/11/complete'))!
     const body = JSON.stringify(complete[1] ?? {})
     expect(body).not.toMatch(/ho_once/) // the handoff token is never echoed back
@@ -269,11 +287,12 @@ describe('Assisted Apply page', () => {
 
     fireEvent.click(screen.getByText(/Start a handoff window/))
     await waitFor(() => expect(screen.getByTestId('handoff-window-open')).toBeTruthy())
-    // The message names what happened: a visible window, where the step goes,
-    // and what of the user's input gets kept for replay.
+    // The message names what happened: a visible server window AND a fallback
+    // tab, with the honest rule about what is (and is not) saved.
     await waitFor(() => expect(
       screen.getByText(/A visible browser window just opened/)).toBeTruthy())
-    expect(screen.getByText(/except passwords and codes/)).toBeTruthy()
+    expect(screen.getByText(/A tab also opened in your browser as a fallback/)).toBeTruthy()
+    expect(screen.getByText(/saved for this and future sessions/)).toBeTruthy()
   })
 
   it('says honestly when no window can be shown, and keeps the link', async () => {
@@ -295,11 +314,10 @@ describe('Assisted Apply page', () => {
     })
 
     fireEvent.click(screen.getByText(/Start a handoff window/))
-    await waitFor(() => expect(screen.getByText(/No window could be opened here/)).toBeTruthy())
-    // The reason shows up in the banner *and* on the descriptor itself.
-    expect(screen.getAllByText(/DISPLAY unset/).length).toBeGreaterThan(0)
-    const link = screen.getByText('open the posting')
-    expect(link.getAttribute('href')).toBe('https://jobs.lever.co/acme/1')
+    // Even when the server cannot show a headed window, the click synchronously
+    // opens the posting in the user's own tab — the fix for cloud/headless.
+    await waitFor(() => expect(screen.getByText(/A new browser tab opened on the posting/)).toBeTruthy())
+    expect(screen.getByText(/Passwords, codes and bot checks stay in the tab/)).toBeTruthy()
     expect(screen.queryByTestId('handoff-window-open')).toBeNull()
   })
 

@@ -153,13 +153,36 @@ def save_vault_entry(db: Session, user_id: int, domain: str, username: str, pass
 
 
 def get_vault_entry_for_domain(db: Session, user_id: int, domain: str) -> Optional[VaultEntry]:
+    """Look up a vault entry for *domain*.
+
+    An exact match wins first; otherwise, a sibling host in the same known ATS
+    family (``jobs.lever.co`` ↔ ``auth.lever.co``, any Workday subdomain) is
+    reused — portals commonly route sign-in/sign-up to a sibling host while
+    using the same account, so creating a new credential per subdomain would
+    lock the user out of their own account.
+    """
     if not domain:
         return None
-    return (
+    exact = (
         db.query(VaultEntry)
         .filter(VaultEntry.user_id == user_id, VaultEntry.domain == domain)
         .first()
     )
+    if exact is not None:
+        return exact
+    # Sibling match: any entry whose domain is the same organisation-level
+    # domain (or the same known ATS family) as the requested host.
+    from app.services import net_guard
+    from app.services.form_detector import hosts_in_same_ats_family
+    for entry in db.query(VaultEntry).filter(VaultEntry.user_id == user_id).all():
+        stored = (entry.domain or "").strip().lower()
+        if not stored:
+            continue
+        if net_guard.host_matches(domain, stored) or net_guard.host_matches(stored, domain):
+            return entry
+        if hosts_in_same_ats_family(domain, stored):
+            return entry
+    return None
 
 
 def credential_for_application(db: Session, *, user_id: int, domain: str, company: str = "") -> Tuple[Optional[Dict[str, str]], bool]:
