@@ -50,7 +50,7 @@ from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.models.models import ApplicationSession, Job, User
 from app.services import browser_session as sessions
-from app.services import live_browser, net_guard
+from app.services import form_fill, live_browser, net_guard
 from app.services.autofill import assisted_apply_available, browser_launch_kwargs, browser_launch_plan
 from app.services.field_classifier import classify_form
 from app.services.form_detector import VAULT_DOMAINS, hosts_in_same_ats_family
@@ -101,12 +101,45 @@ CONTROL_ROLES: Tuple[str, ...] = ("button", "link", "menuitem", "tab")
 OBSERVE_SCRIPT = """
 () => {
   const out = {url: location.href, host: location.host, title: document.title, fields: []};
+  const radioGroups = {};
   const nodes = document.querySelectorAll('input, select, textarea');
   for (const el of nodes) {
     const type = (el.getAttribute('type') || el.tagName.toLowerCase()).toLowerCase();
     if (['hidden', 'submit', 'button', 'image', 'reset', 'search'].includes(type)) continue;
     const label = el.labels && el.labels.length ? el.labels[0].innerText
       : (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name || '');
+    // Radio buttons are one question with N options — observe the *group* as a
+    // single field, with the option labels, or the queue asks the same question
+    // once per dot and the answer has nowhere to land.
+    if (type === 'radio') {
+      const key = el.name || el.id || '';
+      if (!key) continue;
+      let g = radioGroups[key];
+      if (!g) {
+        const fieldset = el.closest('fieldset');
+        const legend = fieldset ? fieldset.querySelector('legend') : null;
+        g = radioGroups[key] = {
+          name: key,
+          label: ((legend && legend.innerText) || el.getAttribute('aria-label') || '').trim().slice(0, 200),
+          type: 'radio',
+          required: false,
+          options: [],
+          autocomplete: el.getAttribute('autocomplete') || '',
+          value_present: false,
+          filled_by_user: false,
+          classes: Array.from(el.classList).slice(0, 8),
+        };
+      }
+      g.required = g.required || el.required || el.getAttribute('aria-required') === 'true';
+      const opt = (label || el.value || '').trim();
+      if (opt && g.options.length < 24 && g.options.indexOf(opt) === -1) g.options.push(opt);
+      if (el.checked) {
+        // For a ticked radio the page holds an answer (the picked option).
+        g.value_present = true;
+        if (!g.label) g.label = opt.slice(0, 200) || key;
+      }
+      continue;
+    }
     let options = [];
     if (el.tagName.toLowerCase() === 'select') {
       options = Array.from(el.options || []).slice(0, 24).map(o => (o.text || '').trim());
@@ -119,11 +152,20 @@ OBSERVE_SCRIPT = """
       required: el.required || el.getAttribute('aria-required') === 'true',
       options: options,
       autocomplete: el.getAttribute('autocomplete') || '',
-      value_present: !!(value && String(value).trim().length),
+      // A checkbox's DOM `value` attribute is a constant ("on") even when it is
+      // unticked — for boolean controls "has a value" must mean *checked*, or an
+      // untouched box reads as already-filled and the question reaches the user
+      // as an empty text input.
+      value_present: type === 'checkbox' ? !!el.checked
+        : !!(value && String(value).trim().length),
       filled_by_user: false,
       classes: Array.from(el.classList).slice(0, 8),
     });
     if (out.fields.length >= 120) break;
+  }
+  for (const key of Object.keys(radioGroups)) {
+    if (out.fields.length >= 120) break;
+    out.fields.push(radioGroups[key]);
   }
   const markers = [];
   if (document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .g-recaptcha, [data-sitekey]')) markers.push('captcha');
@@ -723,14 +765,24 @@ class PlaywrightDriver:
                     recorded.append({"name": name, "status": "no_selector"})
                     continue
             try:
-                await locator.fill(str(instruction.get("value") or ""), timeout=5000)
+                # Type-aware typing: a checkbox is ticked/unticked, a radio gets
+                # its picked option, a select gets its option, text is filled.
+                # ``fill()`` for everything cannot tick a box — the page then
+                # silently keeps whatever it had while the pass reports "filled".
+                action = await form_fill.apply_field_value(
+                    self._page, selector,
+                    field_type=str(instruction.get("type") or verdict.field_type or "text"),
+                    value=instruction.get("value"),
+                    options=verdict.options or instruction.get("options") or None,
+                    timeout=5000,
+                )
             except Exception as exc:
                 recorded.append({"name": name, "status": f"error:{type(exc).__name__}"})
                 continue
             # Field name only — a value can be personal data, and for a password
             # field it would be the credential. The driver never logs values.
-            log.debug("assisted fill: '%s' filled via %s", name, selector)
-            recorded.append({"name": name, "status": "filled"})
+            log.debug("assisted fill: '%s' %s via %s", name, action, selector)
+            recorded.append({"name": name, "status": "filled", "action": action})
         return recorded
 
     async def controls(self) -> Dict[str, Any]:
@@ -864,50 +916,65 @@ async def ai_map_unknown_fields(
     *,
     profile_keys: Sequence[str],
     profile_sample: Mapping[str, Any],
+    db: Optional[Session] = None,
+    user_id: Optional[int] = None,
 ) -> Dict[str, str]:
     """
-    Ask the form_detect AI to map currently-unmapped fields to canonical
-    profile keys *during a live pass*. Returns {field_name: profile_key} for
-    the fields the AI was confident enough about; unknown fields are simply
-    omitted, so the caller falls back to the existing ``unknown_field``
-    pause.
+    Map currently-unmapped fields to canonical profile keys *during a live
+    pass*. Returns {field_name: profile_key} for the fields that were mapped
+    with confidence; unknown fields are simply omitted, so the caller falls
+    back to the existing ``unknown_field`` pause.
 
-    The AI sees field names, labels, types and select option summaries —
-    never values the user typed, never a password, never the page body. A
-    failure (timeout, AI offline, malformed response) raises so the caller
-    can pause honestly instead of silently guessing.
+    Two engines answer the same typed question ("which profile key does this
+    field ask for?"), in the owner's configured order:
+
+    * **Laya** (the local decision engine, when the owner routed field mapping
+      to it) — one batched forward pass over every field, calibrated per-field
+      confidence, nothing to parse;
+    * **the form_detect LLM** (always the fallback in ``auto`` mode) — for the
+      fields Laya would not claim, and for all of them whenever Laya is not
+      routed or not installed.
+
+    Both see field names, labels, types and select option summaries — never
+    values the user typed, never a password, never the page body. A failure of
+    every routed engine raises so the caller can pause honestly instead of
+    silently guessing; fields one engine mapped are never re-asked of the
+    other.
     """
-    from app.services.ai_client import chat_completion, fit_prompt_part, input_budget_chars  # noqa: PLC0415
-    from app.services.form_detector import KNOWN_FIELDS as _AI_KNOWN  # noqa: PLC0415
-
-    _SECRET_TYPES = {"password", "hidden", "file"}
-    sentinel_by_name: Dict[str, Mapping[str, Any]] = {}
-    unmapped: List[Dict[str, Any]] = []
-    for f in observation.get("fields") or []:
-        if not isinstance(f, Mapping):
-            continue
-        name = str(f.get("name") or "").strip()
-        ftype = str(f.get("type") or "").lower()
-        if not name or ftype in _SECRET_TYPES:
-            continue
-        # Only fields the classifier would otherwise flag unknown: no
-        # obvious-name mapping already exists. We intentionally do not feed
-        # the AI the obvious ones — that budget is for the hard cases.
-        label = str(f.get("label") or "").strip()[:200]
-        if not label:
-            continue
-        if _looks_obvious(name, label):
-            continue
-        options = [str(o).strip() for o in (f.get("options") or [])[:12] if str(o).strip()]
-        sentinel_by_name[name] = f
-        unmapped.append({"name": name[:120], "label": label, "type": ftype[:30],
-                         "options": options})
+    unmapped, sentinel_by_name = _collect_unmapped_fields(observation)
     if not unmapped:
         return {}
 
+    from app.services.form_detector import KNOWN_FIELDS as _AI_KNOWN  # noqa: PLC0415
+
     allowed = sorted(set(_AI_KNOWN) | set(profile_keys or []))
+    out: Dict[str, str] = {}
+
+    # 1. Laya — batched typed decisions over every unmapped field at once.
+    from app.services import laya  # noqa: PLC0415
+
+    if laya.should_attempt(db, user_id, "field_mapping"):
+        try:
+            out = await _laya_map_fields(unmapped, allowed, sample=profile_sample,
+                                        db=db, user_id=user_id)
+        except laya.LayaUnavailable as exc:
+            log.warning("assisted: laya field mapping unavailable (%s)", getattr(exc, "code", "?"))
+            out = {}
+        if laya.is_strict(db, user_id):
+            # Laya-only: the fields it would not claim stay unmapped and pause
+            # as ``unknown_field`` — honest, and never an engine switch the
+            # owner turned off.
+            return out
+        unmapped = [f for f in unmapped if f["name"] not in out]
+        if not unmapped:
+            return out
+
+    # 2. The form_detect LLM for whatever is still unmapped.
+    from app.services.ai_client import chat_completion, fit_prompt_part, input_budget_chars  # noqa: PLC0415
+
     fields_json, _ = fit_prompt_part(
-        json.dumps(unmapped[:60]), input_budget_chars(), label="form_detect.live_fields")
+        json.dumps(unmapped[:60]), input_budget_chars(db=db, user_id=user_id),
+        label="form_detect.live_fields")
     sample_keys = sorted(str(k) for k in (profile_sample or {}).keys())[:40]
     prompt = (
         "You are helping auto-fill a job application form. For each field below, "
@@ -917,9 +984,17 @@ async def ai_map_unknown_fields(
         "Return JSON {\"mapping\": {\"<field_name>\": \"<key or null>\"}}.\n"
         "Fields: " + fields_json
     )
-    data = await chat_completion("form_detect_live", prompt, temperature=0, stream=False)
+    try:
+        data = await chat_completion("form_detect_live", prompt, temperature=0, stream=False,
+                                     db=db, user_id=user_id)
+    except Exception:
+        if out:
+            # Laya already mapped a trusted subset: hand those back and let the
+            # rest take the ordinary unknown_field pause instead of failing the
+            # whole pass — a partial honest answer beats an outage.
+            return out
+        raise
     mapping = (data or {}).get("mapping") if isinstance(data, dict) else {}
-    out: Dict[str, str] = {}
     if not isinstance(mapping, dict):
         return out
     for name, key in mapping.items():
@@ -938,6 +1013,98 @@ async def ai_map_unknown_fields(
             continue
         if skey in allowed:
             out[sname] = skey
+    return out
+
+
+def _collect_unmapped_fields(
+    observation: Mapping[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Mapping[str, Any]]]:
+    """The fields worth mapping + their sentinels (secret/obvious ones filtered)."""
+    _SECRET_TYPES = {"password", "hidden", "file"}
+    sentinel_by_name: Dict[str, Mapping[str, Any]] = {}
+    unmapped: List[Dict[str, Any]] = []
+    for f in observation.get("fields") or []:
+        if not isinstance(f, Mapping):
+            continue
+        name = str(f.get("name") or "").strip()
+        ftype = str(f.get("type") or "").lower()
+        if not name or ftype in _SECRET_TYPES:
+            continue
+        # Only fields the classifier would otherwise flag unknown: no
+        # obvious-name mapping already exists. We intentionally do not feed
+        # the mapper the obvious ones — that budget is for the hard cases.
+        label = str(f.get("label") or "").strip()[:200]
+        if not label:
+            continue
+        if _looks_obvious(name, label):
+            continue
+        options = [str(o).strip() for o in (f.get("options") or [])[:12] if str(o).strip()]
+        sentinel_by_name[name] = f
+        unmapped.append({"name": name[:120], "label": label, "type": ftype[:30],
+                         "options": options})
+    return unmapped, sentinel_by_name
+
+
+async def _laya_map_fields(
+    unmapped: Sequence[Mapping[str, Any]],
+    allowed: Sequence[str],
+    *,
+    sample: Mapping[str, Any],
+    db: Optional[Session] = None,
+    user_id: Optional[int] = None,
+) -> Dict[str, str]:
+    """One batched Laya pass: one ``choice`` question per unmapped field."""
+    from app.services import laya  # noqa: PLC0415
+    from app.services.form_detector import KNOWN_FIELDS as _AI_KNOWN  # noqa: PLC0415
+
+    criteria: Dict[str, str] = {}
+    for key in allowed:
+        hints = _AI_KNOWN.get(key) or ()
+        criteria[key] = ", ".join(str(h) for h in list(hints)[:6]) or str(key)
+    criteria["unmapped"] = "none of these keys fits this field"
+
+    sample_keys = sorted(str(k) for k in (sample or {}).keys())[:40]
+    state = ("A job application form's fields must be mapped to profile keys. "
+             "The candidate's profile has keys: " + ", ".join(sample_keys) + ".")
+    questions: Dict[str, Any] = {}
+    by_qkey: Dict[str, str] = {}
+    for index, field in enumerate(list(unmapped)[:40]):
+        qkey = f"field_{index}"
+        by_qkey[qkey] = str(field.get("name") or "")
+        questions[qkey] = {
+            "type": "choice",
+            "instructions": (
+                f"Which profile key does the form field named {field.get('name')!r} ask for? "
+                f"Its label is: {field.get('label')}"
+                + (f". Its options are: {', '.join(str(o) for o in (field.get('options') or []))}"
+                   if field.get("options") else "")
+            ),
+            "criteria": criteria,
+        }
+    result = await laya.predict(questions, state)
+    answers = result.get("answers")
+    if not isinstance(answers, Mapping):
+        answers = {}
+    out: Dict[str, str] = {}
+    floor = laya.confidence_floor(db, user_id)
+    for qkey, name in by_qkey.items():
+        answer = answers.get(qkey)
+        if not isinstance(answer, Mapping):
+            continue
+        chosen = str(answer.get("choice") or "").strip()
+        if chosen not in criteria or chosen == "unmapped":
+            continue
+        confidence = answer.get("confidence")
+        if not isinstance(confidence, (int, float)):
+            probs = answer.get("probs")
+            if not isinstance(probs, Mapping):
+                probs = {}
+            confidence = float(probs.get(chosen, 0.0)) if probs else 0.0
+        if float(confidence) < floor:
+            continue
+        if _ai_key_sensitivity(chosen) in ("credential", "secret", "mfa", "captcha", "legal"):
+            continue
+        out[name] = chosen
     return out
 
 
@@ -1417,6 +1584,8 @@ async def run_pass(
                         observation,
                         profile_keys=profile_keys_hint,
                         profile_sample=values,
+                        db=db,
+                        user_id=user.id,
                     )
                 except Exception as exc:  # pragma: no cover - surfaced as pause
                     log.warning("assisted: live AI field-mapping failed (%s)", type(exc).__name__)

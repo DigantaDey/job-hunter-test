@@ -874,6 +874,7 @@ export const AUTOFILL_VALUE_SOURCES = [
 
 export const SCORE_SOURCES = [
   'ai',
+  'laya',
   'preliminary',
   'pending',
   'rejected',
@@ -974,6 +975,7 @@ export type MatchRequirementBasis = (typeof MATCH_REQUIREMENT_BASIS)[number]
  */
 export const SCORE_SOURCE_LABELS: Record<string, string> = {
   ai: 'AI verdict',
+  laya: 'Laya verdict (local decision engine)',
   preliminary: 'Keyword estimate',
   pending: 'Not scored yet (AI offline)',
   rejected: 'AI answer rejected by the accuracy guard',

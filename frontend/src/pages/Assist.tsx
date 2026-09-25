@@ -22,6 +22,7 @@
 import { useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import client, { apiError } from '../api/client'
+import AnswerField, { collectAnswers, type AnswerFieldSpec } from '../components/AnswerField'
 import {
   AlertTriangle, CheckCircle, Clock, ExternalLink, Hand, Loader2,
   LogIn, Pause, Play, RefreshCw, ShieldCheck, XCircle,
@@ -208,7 +209,10 @@ export default function Assist() {
   const [jobs, setJobs] = useState<any[]>([])
   const [jobId, setJobId] = useState(() => searchParams.get('job') || '')
   const [browserRuntime, setBrowserRuntime] = useState<BrowserRuntime | null>(null)
-  const [answers, setAnswers] = useState<Record<number, string>>({})
+  // Answers keyed by action id, then by the portal's own field name — one
+  // control per field, each with the control its *type* calls for (a checkbox
+  // question gets a tick box, an option question gets the options).
+  const [answers, setAnswers] = useState<Record<number, Record<string, string>>>({})
   const [descriptors, setDescriptors] = useState<Record<number, any>>({})
   const [busy, setBusy] = useState<number | 'start' | null>(null)
   const [msg, setMsg] = useState('')
@@ -362,14 +366,33 @@ export default function Assist() {
   /** Close an item. A handoff item records only *that* the human finished it. */
   const complete = async (action: Action) => {
     if (action.session_id === null) return
-    const text = (answers[action.id] || '').trim()
     setBusy(action.id); setMsg(''); setErr('')
     try {
+      // A handoff step (sign-in / code / bot check) closes with a note only —
+      // the value was typed in the browser and the API refuses secret-looking
+      // payloads (`422 restricted_field`). An answerable item sends exactly the
+      // answers for its fields: tick boxes as explicit "true"/"false" (an
+      // unticked box the user just saved is the answer "no"), option and text
+      // controls as the chosen/typed value.
+      let body: { answers?: Record<string, string>; note?: string }
+      if (actsInBrowser(action.kind) || !(action.fields?.length ?? 0)) {
+        body = { note: 'done in the browser' }
+      } else {
+        const fields = (action.fields || []).slice(0, 8) as AnswerFieldSpec[]
+        const values = { ...(answers[action.id] || {}) }
+        for (const field of fields) {
+          if (String(field.type || '').toLowerCase() === 'checkbox' && values[field.name] === undefined) {
+            values[field.name] = 'false'
+          }
+        }
+        const payload = collectAnswers(fields, values)
+        body = Object.keys(payload).length ? { answers: payload } : { note: 'done in the browser' }
+      }
       await client.post(
         `/api/application-sessions/${action.session_id}/actions/${action.id}/complete`,
-        text ? { answers: { [action.fields[0]?.name || 'answer']: text } } : { note: 'done in the browser' },
+        body,
       )
-      setAnswers(prev => ({ ...prev, [action.id]: '' }))
+      setAnswers(prev => ({ ...prev, [action.id]: {} }))
       setMsg('Step recorded — the run continues from the checkpoint, never from the top.')
       await load()
     } catch (e: any) {
@@ -377,6 +400,13 @@ export default function Assist() {
     } finally {
       setBusy(null)
     }
+  }
+
+  /** Whether an answerable item has something to save (a tick box is always answerable). */
+  const canSave = (action: Action) => {
+    const values = answers[action.id] || {}
+    return (action.fields || []).some((f: any) =>
+      String(f.type || '').toLowerCase() === 'checkbox' || String(values[f.name] ?? '').trim())
   }
 
   const live = sessions.filter(isLive)
@@ -544,15 +574,28 @@ export default function Assist() {
               )}
 
               {!handoff && (a.fields?.length ?? 0) > 0 && (
-                <div className="flex flex-wrap items-center gap-2">
-                  <input
-                    className="input flex-1 min-w-[16rem]"
-                    placeholder="Your answer for this field (never a password or code)"
-                    value={answers[a.id] || ''}
-                    onChange={e => setAnswers(prev => ({ ...prev, [a.id]: e.target.value }))}
-                    aria-label={`Answer for action ${a.id}`}
-                  />
-                  <button className="btn" onClick={() => complete(a)} disabled={busy === a.id || !(answers[a.id] || '').trim()}>
+                <div className="space-y-2">
+                  {/* One control per field, each for the field's own type: a
+                      checkbox gets a tick box, an option question gets the
+                      portal's own options, a date gets a date picker — never a
+                      free-text box standing in for one of those. */}
+                  <div className="flex flex-wrap items-end gap-2">
+                    {(a.fields || []).slice(0, 8).map((f: any, i: number) => (
+                      <AnswerField
+                        key={f.name || i}
+                        field={f as AnswerFieldSpec}
+                        value={answers[a.id]?.[f.name] ?? (String(f.type || '').toLowerCase() === 'checkbox' ? 'false' : '')}
+                        onChange={v => setAnswers(prev => ({
+                          ...prev,
+                          [a.id]: { ...(prev[a.id] || {}), [f.name]: v },
+                        }))}
+                        ariaLabel={(a.fields?.length ?? 0) === 1 ? `Answer for action ${a.id}` : undefined}
+                        className="flex-1 min-w-[16rem] input"
+                        disabled={busy === a.id}
+                      />
+                    ))}
+                  </div>
+                  <button className="btn" onClick={() => complete(a)} disabled={busy === a.id || !canSave(a)}>
                     {busy === a.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} Save answer
                   </button>
                 </div>

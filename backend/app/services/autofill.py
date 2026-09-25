@@ -53,7 +53,7 @@ from urllib.parse import urlsplit
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import inc
-from app.services import net_guard
+from app.services import form_fill, net_guard
 from app.services.form_detector import VAULT_DOMAINS as ATS_VAULT_DOMAINS
 from app.services.form_detector import hosts_in_same_ats_family
 from app.services.reliability import autofill_failure_reason
@@ -151,12 +151,14 @@ def build_autofill_plan(
             "type": field.get("type", "text"),
             "required": bool(field.get("required")),
             "profile_key": key,
+            "options": [str(o) for o in (field.get("options") or [])][:24],
             "value": value,
             "value_source": source if value not in (None, "") else "unknown",
         }
         fields.append(entry)
         if entry["required"] and value in (None, ""):
-            missing.append({"name": name, "label": entry["label"], "type": entry["type"]})
+            missing.append({"name": name, "label": entry["label"], "type": entry["type"],
+                            "options": entry["options"], "profile_key": key})
 
     return {
         "portal_type": schema.get("portal_type", "custom"),
@@ -938,22 +940,23 @@ async def _fill_field(page, field: Dict[str, Any],
             _diag(diagnostics, {"step": "field", "field": name, "selector": selector,
                                 "outcome": "no_match"})
             continue
-        if fill_type == "file":
-            await locator.set_input_files(field["value"])
-            action = "file"
-        elif fill_type == "select" or field.get("options"):
-            try:
-                await locator.select_option(label=str(field["value"]))
-            except Exception:
-                await locator.select_option(str(field["value"]))
-            action = "select"
-        elif fill_type == "checkbox":
-            if str(field["value"]).lower() in ("true", "yes", "1"):
-                await locator.check()
-            action = "checkbox"
-        else:
-            await locator.fill(str(field["value"]))
-            action = "fill"
+        # One typed-value executor for every control kind (checkbox → check/
+        # uncheck, radio → the picked option, select → its option, file →
+        # upload, text → fill). The old inline branches could not untick a box
+        # the user answered "no" to and never matched a radio group at all.
+        try:
+            action = await form_fill.apply_field_value(
+                page, selector,
+                field_type=fill_type or "text",
+                value=field.get("value"),
+                options=field.get("options") or None,
+            )
+        except Exception:
+            log.debug("autofill field '%s': %s could not take the value (%s)",
+                      name, selector, fill_type or "text")
+            _diag(diagnostics, {"step": "field", "field": name, "selector": selector,
+                                "type": fill_type or "text", "outcome": "value_rejected"})
+            raise
         # Field name + selector only: the value can be personal data (and for a
         # password field it is the vault credential), so it is never logged.
         log.debug("autofill field '%s' (%s): %s matched %s", name, fill_type or "text", selector, action)

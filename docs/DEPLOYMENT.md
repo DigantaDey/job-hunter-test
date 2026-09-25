@@ -128,6 +128,28 @@ No Playwright browser download? A system Chrome/Chromium/Edge is discovered
 
 ---
 
+### Local decision engine (Laya)
+
+Docker builds leave Laya out by default. `--build-arg WITH_LAYA=1` bakes the optional
+typed-decision stack (CPU torch + transformers) into the image, and `LAYA_WARMUP=1` (the
+default whenever `WITH_LAYA=1`) also pre-downloads its Hugging Face checkpoints into
+`HF_HOME=/opt/laya-cache`, so ranking/classification decisions run **fully offline** —
+roughly 2–3 GB more image. `LAYA_WARMUP=0` builds the package only and the weights then
+download at first use. The compose files pass both through from the environment
+(`WITH_LAYA=1`, optionally `LAYA_WARMUP=0`); plain `docker build` needs the explicit flag:
+
+```bash
+docker build --build-arg WITH_LAYA=1 -t jobhunter:laya .
+```
+
+CI builds this variant and proves its checkpoints load with networking disabled as the
+unprivileged runtime user (`python backend/scripts/warm_laya.py --check`, which forces
+Hugging Face offline so it can only pass on a truly baked cache). With the package absent —
+or `LAYA_ENABLED=false` in `.env` — every decision falls back to the AI gateway exactly as
+before. On bare metal, `./run.sh` installs **and warms** Laya by default (`LAYA_WARMUP=0`
+skips the one-off download, `WITH_LAYA=0` omits the package entirely). Rebuild and recreate
+API **and worker** containers after changing any `WITH_*`/`LAYA_*` build arg.
+
 ## 3. Reverse proxy (nginx)
 
 ```nginx

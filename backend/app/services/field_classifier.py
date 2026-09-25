@@ -188,6 +188,10 @@ class FieldVerdict:
     blocks: bool = True
     #: Which ``USER_ACTION_KINDS`` a pause on this field raises.
     pause_kind: str = "unknown_field"
+    #: The portal's own option labels (a ``select``/``radio`` control). Shipped
+    #: to the queue UI so an option question gets a picker, not a text box —
+    #: structure only, exactly what the page itself declared.
+    options: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.classification not in FIELD_CLASSIFICATIONS:  # pragma: no cover - guarded
@@ -219,6 +223,7 @@ class FieldVerdict:
             "question": self.question,
             "blocks": self.blocks,
             "pause_kind": self.pause_kind,
+            "options": list(self.options),
         }
 
 
@@ -456,6 +461,7 @@ def classify_field(
             sensitivity=sensitivity or _sensitivity_for(key),
             profile_key=key, reason=reason, question=question or label,
             blocks=blocks, pause_kind=pause_kind,
+            options=tuple(options),
         )
 
     # 0. Controls we never touch.

@@ -1030,8 +1030,15 @@ def record_user_answers(
     checkpoint = dict(session.checkpoint or {})
     fields = dict(checkpoint.get("fields") or {})
     accepted: List[str] = []
-    for name, value in (answers or {}).items():
-        name = str(name)
+    # A checkbox answer arrives as a JSON boolean from the UI. Normalise it once
+    # here, in one vocabulary ("true"/"false"): an explicit "false" is an
+    # *answer* ("leave it unticked"), and must survive as a real value instead
+    # of collapsing into the empty string that means "unanswered".
+    normalized: Dict[str, Any] = {
+        str(name): ("true" if value else "false") if isinstance(value, bool) else value
+        for name, value in (answers or {}).items()
+    }
+    for name, value in normalized.items():
         entry = dict(fields.get(name) or {})
         entry.update({
             "status": "answered",
@@ -1054,8 +1061,8 @@ def record_user_answers(
         touched = False
         for row in rows:
             key = str(row.get("name") or "")
-            if key in remaining and key in answers:
-                row["value"] = answers[key]
+            if key in remaining and key in normalized:
+                row["value"] = normalized[key]
                 remaining.discard(key)
                 touched = True
         if touched:
@@ -1066,12 +1073,12 @@ def record_user_answers(
     # An answer the user gave us for a named field is a confirmed value for this
     # session (and only this session): it may be typed on the next pass, and it
     # is never asked for twice.
-    remember_values(session, {name: answers[name] for name in accepted if name in answers})
+    remember_values(session, {name: normalized[name] for name in accepted if name in normalized})
     # ...and, when it is not a credential or a restricted identifier, for
     # *future* sessions against this host too: an answer the human already
     # gave once is the definition of something worth replaying.
     for name in accepted:
-        value = answers.get(name)
+        value = normalized.get(name)
         if value in (None, ""):
             continue
         verdict = _verdict_for_observation_field({"name": name, "label": "", "type": "text"},

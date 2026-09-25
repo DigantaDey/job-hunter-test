@@ -23,8 +23,9 @@ import { EmptyState, ErrorState, LoadingBlock, SectionCard, SectionSkeleton } fr
  * `GET|POST /api/ai/config` and `PUT /api/admin/flags` all 403 a member token.
  *
  * Sections: AI provider configuration (default + per-workflow overrides + token
- * budgets), source health, queue health, usage & cost, failure rates,
- * application-automation health, and the global feature flags.
+ * budgets), the local decision engine (Laya) routing, source health, queue
+ * health, usage & cost, failure rates, application-automation health, and the
+ * global feature flags.
  */
 
 type Overview = any
@@ -94,6 +95,8 @@ export default function AdminConsole() {
   const [busyOp, setBusyOp] = useState<string | null>(null)
   const [wfBusy, setWfBusy] = useState<string | null>(null)
   const [aiForm, setAiForm] = useState({ base_url: '', model: '', api_key: '', rpm: 60, timeout: 300, max_input_tokens: 0, max_output_tokens: 0, provider: 'openai_compatible' })
+  const [layaForm, setLayaForm] = useState({ mode: 'auto', for_ranking: true, for_classification: true, for_field_mapping: true })
+  const [layaSaving, setLayaSaving] = useState(false)
   const mounted = useRef(true)
 
   const load = async () => {
@@ -134,6 +137,14 @@ export default function AdminConsole() {
           max_input_tokens: budgetValue(data.ai.max_input_tokens, data.ai.platform_max_input_tokens ?? 0),
           max_output_tokens: budgetValue(data.ai.max_output_tokens, data.ai.platform_max_output_tokens ?? 0),
           provider: data.ai.provider || 'openai_compatible',
+        })
+      }
+      if (data?.laya) {
+        setLayaForm({
+          mode: data.laya.mode || 'auto',
+          for_ranking: data.laya.for_ranking !== false,
+          for_classification: data.laya.for_classification !== false,
+          for_field_mapping: data.laya.for_field_mapping !== false,
         })
       }
     } catch (e) {
@@ -193,6 +204,15 @@ export default function AdminConsole() {
 
   const patchWf = (wf: string, patch: Partial<WorkflowOverrideDraft>) => {
     setWfConfig(prev => ({ ...prev, [wf]: { ...(prev[wf] || {}), ...patch } }))
+  }
+
+  const saveLaya = async () => {
+    setLayaSaving(true); setNotice(null)
+    try {
+      await client.put('/api/settings', { laya: { ...layaForm } })
+      flash('ok', 'Decision engine routing saved', 4000)
+      void load()
+    } catch (e) { flash('err', apiError(e)) } finally { setLayaSaving(false) }
   }
 
   const saveWf = async (wf: string) => {
@@ -382,6 +402,73 @@ export default function AdminConsole() {
           />
         </div>
 
+      </SectionCard>
+
+      {/* ── Local decision engine (Laya) ──────────────────────────────────── */}
+      <SectionCard title="Local decision engine (Laya)" icon={Cpu}
+                   aside={
+                     <span className={`text-[10px] px-2 py-0.5 rounded-full ${
+                       settings?.laya?.installed
+                         ? settings?.laya?.platform_enabled
+                           ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                           : 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300'
+                         : 'bg-zinc-200 text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300'}`}
+                       data-testid="laya-status">
+                       {!settings?.laya?.installed ? 'not installed'
+                         : settings?.laya?.platform_enabled ? 'installed' : 'operator-disabled'}
+                     </span>
+                   }>
+        <p className="text-xs text-zinc-500 dark:text-zinc-400 leading-relaxed">
+          Laya is a self-hosted <b>typed-decision</b> model (Apache 2.0, one forward pass in
+          milliseconds): it answers choice / yes-no / rubric-score questions and can never return
+          malformed JSON — the failure mode that made ranking slow and unreliable on the AI gateway.
+          It takes the decision-shaped work (job ranking, company-size classification, form-field
+          mapping); anything that must <i>write</i> text (resumes, emails) stays on the AI gateway above.
+        </p>
+        <div className="mt-3 text-[11px] mono text-zinc-500" data-testid="laya-runtime">
+          {!settings?.laya?.installed
+            ? <>Not installed — <span className="mono">WITH_LAYA=1 ./run.sh</span> or <span className="mono">pip install -r backend/requirements-laya.txt</span> ships it alongside the app.</>
+            : !settings?.laya?.platform_enabled
+              ? 'The operator turned all Laya routing off (LAYA_ENABLED=false) — the AI gateway answers everything.'
+              : `Installed — device ${settings?.laya?.device || 'auto'}, long-document budget ${settings?.laya?.max_len || 8192} tokens.`}
+          {settings?.laya?.load_error ? ` Last load error: ${settings.laya.load_error}` : ''}
+        </div>
+        <div className="mt-3 grid md:grid-cols-2 gap-3">
+          <div>
+            <label className="text-xs mono font-medium">Routing mode</label>
+            <select value={layaForm.mode} disabled={!settings?.laya?.platform_enabled}
+                    onChange={e => setLayaForm({ ...layaForm, mode: e.target.value })}
+                    className="w-full mt-1 border rounded-xl px-3 py-2.5 text-sm mono bg-white dark:bg-zinc-900 dark:border-zinc-700 disabled:opacity-50">
+              <option value="auto">Auto — Laya first, AI escalates low-confidence answers</option>
+              <option value="laya_only">Laya only — never fall back to the AI gateway</option>
+              <option value="llm_only">AI only — never consult Laya</option>
+            </select>
+            <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
+              Auto is the safe default: a shrug from the decision engine escalates to the AI gateway,
+              and with Laya absent every decision simply goes where it went before.
+            </div>
+          </div>
+          <div className="space-y-2">
+            <label className="text-xs mono font-medium">Answer with Laya for</label>
+            {([
+              ['for_ranking', 'Job ranking & match scoring'],
+              ['for_classification', 'Company-size classification (discovery)'],
+              ['for_field_mapping', 'Form-field mapping (assisted/auto apply)'],
+            ] as const).map(([key, label]) => (
+              <label key={key} className="flex items-center gap-2 text-sm p-2 rounded-xl border dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800">
+                <input type="checkbox" checked={(layaForm as any)[key] !== false} disabled={!settings?.laya?.platform_enabled}
+                       onChange={e => setLayaForm({ ...layaForm, [key]: e.target.checked })} />
+                <span>{label}</span>
+              </label>
+            ))}
+          </div>
+          <div className="md:col-span-2">
+            <button onClick={() => void saveLaya()} disabled={layaSaving || !settings?.laya?.platform_enabled}
+                    className="px-4 py-2.5 rounded-full bg-blue-600 text-white text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50">
+              <Save className="w-4 h-4" /> {layaSaving ? 'Saving…' : 'Save decision engine settings'}
+            </button>
+          </div>
+        </div>
       </SectionCard>
 
       {/* ── Health at a glance ────────────────────────────────────────────── */}

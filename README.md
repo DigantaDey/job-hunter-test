@@ -67,10 +67,12 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 ```
 
 `./run.sh` also installs Python Playwright and Chromium by default. Use
-`WITH_AUTOFILL=0 ./run.sh` for a browser-free install, or `AUTO_INSTALL=0 ./run.sh`
-to skip all installation. The frontend npm package is not a substitute for the
-backend Python package. Installing the browser does not enable automatic submission;
-see the Assisted Apply settings below.
+`WITH_AUTOFILL=0 ./run.sh` for a browser-free install, `WITH_LAYA=0 ./run.sh` to omit the
+optional local decision engine (Laya) — which is also warmed with a one-off model download
+(`LAYA_WARMUP=0 ./run.sh` keeps Laya but skips the download) — or `AUTO_INSTALL=0 ./run.sh`
+to skip all installation.
+The frontend npm package is not a substitute for the backend Python package. Installing the
+browser does not enable automatic submission; see the Assisted Apply settings below.
 
 Generate the two secrets once:
 
@@ -195,6 +197,35 @@ unless you explicitly override with `ALLOW_SQLITE_IN_PROD=true`.
 
 Per-user settings (AI keys, SMTP, sources, thresholds) live in the app under **Settings** and are
 stored encrypted where they are secret.
+
+### Local decision engine (Laya)
+
+Ranking, company-size classification and form-field mapping are *typed decisions* (a rubric
+score, a choice among declared options), not writing tasks. They can be answered by **Laya** —
+a self-hosted, Apache-2.0 decision model (`pip install -r backend/requirements-laya.txt`, or
+`WITH_LAYA=1 ./run.sh`) that returns calibrated typed answers in one forward pass and is
+structurally unable to return malformed JSON (the main cause of AI failures in ranking). Anything
+that must *write* text (tailored resumes, emails, interview prep) always stays on the AI gateway.
+
+`./run.sh` installs **and warms** Laya by default: `backend/scripts/warm_laya.py` pre-downloads
+the `english` + `multilingual` checkpoints into the Hugging Face cache once (a marker skips it on
+later starts), so decisions work offline and the first one is instant. `LAYA_WARMUP=0` skips the
+download; `WITH_LAYA=0` omits the package. Docker images leave Laya out entirely — build with
+`--build-arg WITH_LAYA=1` to bake it in (`LAYA_WARMUP=1`, the default there, also bakes the
+weights for fully-offline containers; see `docs/DEPLOYMENT.md`).
+
+Routing is owner-configured in **Admin → Local decision engine (Laya)**:
+
+* **Auto** — Laya first; the AI gateway escalates low-confidence answers, and answers everything
+  when Laya is not installed (the pre-Laya behaviour, byte for byte);
+* **Laya only** — never fall back to the AI gateway for these decisions; an engine outage is
+  reported honestly (the same "pending / unavailable" surfaces an AI outage gets);
+* **AI only** — Laya is never consulted.
+
+Per-task opt-ins (ranking / classification / field mapping) sit next to the mode, and
+`LAYA_ENABLED=false` is the operator ceiling that turns all routing off. Verdicts answered by
+Laya carry their own provenance (`score_source=laya`, its own badge in the UI) — never presented
+as an AI verdict.
 
 ---
 

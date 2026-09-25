@@ -18,7 +18,7 @@
  * `/resume` route rather than silently continuing.
  */
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import client from '../../api/client'
 import Assist from '../Assist'
@@ -347,5 +347,100 @@ describe('Assisted Apply page', () => {
     })
     fireEvent.click(screen.getByText(/Run a pass/))
     await waitFor(() => expect(screen.getByText(/window is still open/)).toBeTruthy())
+  })
+
+  // ---------------------------------------------------------------------- //
+  // Typed answer controls — the control matches the field's own type.
+  // ---------------------------------------------------------------------- //
+  const checkboxAction = {
+    id: 21, session_id: 5, job_id: 3, kind: 'legal_question', status: 'pending',
+    title: 'Legal / eligibility question', instructions: 'We stopped rather than guess. Please answer: Remote',
+    reason: 'legal_or_eligibility_question:terms',
+    fields: [{ name: 'remote_ok', label: 'Are you open to remote work?', type: 'checkbox', required: true, options: [] }],
+    handoff: {}, occurrences: 1, created_at: '2026-09-19T10:00:00',
+    job: { title: 'Backend Engineer', company: 'Acme', url: 'https://jobs.lever.co/acme/1' },
+  }
+  const selectAction = {
+    id: 22, session_id: 5, job_id: 3, kind: 'sensitive_field', status: 'pending',
+    title: 'Personal question', instructions: 'We stopped rather than guess. Please answer: Pronouns',
+    reason: 'restricted_field_asked_every_time',
+    fields: [{ name: 'pronouns', label: 'Pronouns', type: 'select', required: true,
+               options: ['she/her', 'they/them', 'Prefer not to say'] }],
+    handoff: {}, occurrences: 1, created_at: '2026-09-19T10:00:00',
+    job: { title: 'Backend Engineer', company: 'Acme', url: 'https://jobs.lever.co/acme/1' },
+  }
+
+  it('renders a checkbox question as a tick box — never a text input', async () => {
+    mockGet({ actions: [checkboxAction] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByTestId('action-legal_question')).toBeTruthy())
+    const card = screen.getByTestId('action-legal_question')
+    expect(within(card).getByRole('checkbox')).toBeTruthy()
+    expect(within(card).queryByRole('textbox')).toBeNull()
+    // The question is visible next to its tick box (and in the field list).
+    expect(within(card).getAllByText(/Are you open to remote work/).length).toBeGreaterThan(0)
+  })
+
+  it('saves the tick box state as an explicit true/false answer', async () => {
+    mockGet({ actions: [checkboxAction] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByTestId('action-legal_question')).toBeTruthy())
+    const card = screen.getByTestId('action-legal_question')
+
+    // Ticked → "true".
+    fireEvent.click(within(card).getByRole('checkbox'))
+    fireEvent.click(within(card).getByText(/Save answer/))
+    await waitFor(() => expect(
+      post.mock.calls.some((c: any[]) => String(c[0]).endsWith('/actions/21/complete'))).toBe(true))
+    expect(post.mock.calls.find((c: any[]) => String(c[0]).endsWith('/actions/21/complete'))![1])
+      .toEqual({ answers: { remote_ok: 'true' } })
+
+    // Unticked and saved → the answer is the explicit "no", not silence.
+    post.mockClear()
+    fireEvent.click(within(card).getByRole('checkbox')) // tick…
+    fireEvent.click(within(card).getByRole('checkbox')) // …and untick again
+    fireEvent.click(within(card).getByText(/Save answer/))
+    await waitFor(() => expect(
+      post.mock.calls.some((c: any[]) => String(c[0]).endsWith('/actions/21/complete'))).toBe(true))
+    expect(post.mock.calls.find((c: any[]) => String(c[0]).endsWith('/actions/21/complete'))![1])
+      .toEqual({ answers: { remote_ok: 'false' } })
+  })
+
+  it('renders an option question as the portal\'s own options, not free text', async () => {
+    mockGet({ actions: [selectAction] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByTestId('action-sensitive_field')).toBeTruthy())
+    const card = screen.getByTestId('action-sensitive_field')
+    expect(within(card).queryByRole('textbox')).toBeNull()
+    const picker = within(card).getByRole('combobox') as HTMLSelectElement
+    expect(within(card).getByRole('option', { name: 'they/them' })).toBeTruthy()
+    expect(within(card).getByRole('option', { name: 'Prefer not to say' })).toBeTruthy()
+    fireEvent.change(picker, { target: { value: 'they/them' } })
+    fireEvent.click(within(card).getByText(/Save answer/))
+    await waitFor(() => expect(
+      post.mock.calls.some((c: any[]) => String(c[0]).endsWith('/actions/22/complete'))).toBe(true))
+    expect(post.mock.calls.find((c: any[]) => String(c[0]).endsWith('/actions/22/complete'))![1])
+      .toEqual({ answers: { pronouns: 'they/them' } })
+  })
+
+  it('collects every field of a multi-field item in one save', async () => {
+    const multiFieldAction = {
+      ...checkboxAction, id: 23, kind: 'unknown_field', title: 'Two fields',
+      fields: [
+        { name: 'nickname', label: 'Preferred name', type: 'text', required: false, options: [] },
+        { name: 'remote_ok', label: 'Are you open to remote work?', type: 'checkbox', required: true, options: [] },
+      ],
+    }
+    mockGet({ actions: [multiFieldAction] })
+    render(<Assist />, { wrapper })
+    await waitFor(() => expect(screen.getByTestId('action-unknown_field')).toBeTruthy())
+    const card = screen.getByTestId('action-unknown_field')
+    fireEvent.change(within(card).getByRole('textbox'), { target: { value: 'Ada' } })
+    fireEvent.click(within(card).getByRole('checkbox'))
+    fireEvent.click(within(card).getByText(/Save answer/))
+    await waitFor(() => expect(
+      post.mock.calls.some((c: any[]) => String(c[0]).endsWith('/actions/23/complete'))).toBe(true))
+    expect(post.mock.calls.find((c: any[]) => String(c[0]).endsWith('/actions/23/complete'))![1])
+      .toEqual({ answers: { nickname: 'Ada', remote_ok: 'true' } })
   })
 })

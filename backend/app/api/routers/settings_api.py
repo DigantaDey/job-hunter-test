@@ -41,9 +41,15 @@ def _sanitize_settings_for_member(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     data["ai"] = {"configured": is_configured(db=data.pop("_db_marker", None) or None, user_id=None)
                   } if False else {"configured": data.get("ai", {}).get("configured", False)}
+    # Decision-engine routing is owner infrastructure too: a member gets the
+    # one bit worth knowing (is the local engine answering) and nothing editable.
+    laya_doc = data.get("laya", {}) or {}
+    data["laya"] = {"mode": laya_doc.get("mode", "auto"),
+                    "installed": bool(laya_doc.get("installed")),
+                    "platform_enabled": bool(laya_doc.get("platform_enabled"))}
     writable = {
         category: keys for category, keys in data.get("_meta", {}).get("writable", {}).items()
-        if category != "ai"
+        if category not in ("ai", "laya")
     }
     if "_meta" in data:
         data["_meta"]["writable"] = writable
@@ -63,14 +69,21 @@ def get_settings(user: CurrentUser, db: DbSession):
 
 @router.put("/settings")
 def put_settings(payload: Dict[str, Any], request: Request, user: CurrentUser, db: DbSession):
-    # Authorisation, not UX: the AI provider category is owner-configured. A
-    # member writing *any* other category is fine; the moment the payload
-    # touches "ai" the request is refused before anything is applied.
+    # Authorisation, not UX: the AI provider category and the local decision
+    # engine (Laya) routing are owner-configured. A member writing *any* other
+    # category is fine; the moment the payload touches "ai" or "laya" the
+    # request is refused before anything is applied.
     if "ai" in (payload or {}) and not _is_owner(user):
         raise HTTPException(
             403,
             {"code": "owner_required",
              "message": "AI provider settings are managed by the workspace owner."},
+        )
+    if "laya" in (payload or {}) and not _is_owner(user):
+        raise HTTPException(
+            403,
+            {"code": "owner_required",
+             "message": "The local decision engine (Laya) is configured by the workspace owner."},
         )
     result = apply_updates(db, user, payload)
     if "ai" in payload and "rpm" in (payload["ai"] or {}):
