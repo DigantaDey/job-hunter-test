@@ -98,7 +98,7 @@ type Session = {
 const HANDOFF_KINDS = ['login', 'mfa', 'captcha', 'session_expired']
 
 /** Kinds that hand the *flow itself* over: the assistant stopped on purpose. */
-const TAKEOVER_KINDS = ['review_required']
+const TAKEOVER_KINDS = ['review_required', 'ai_unavailable']
 
 /** True when the way to answer an item is to act in the browser window. */
 const actsInBrowser = (kind: string) => HANDOFF_KINDS.includes(kind) || TAKEOVER_KINDS.includes(kind)
@@ -115,6 +115,7 @@ const STOP_LABEL: Record<string, string> = {
   legal_question: 'a legal or eligibility question',
   session_expired: 'the session expired — sign in again',
   review_required: 'it needs you to finish the flow',
+  ai_unavailable: 'AI field identification is unavailable — fill the highlighted fields yourself',
   waiting_for_you_to_submit: 'the form is filled; submitting is yours to do',
   submit_requires_reservation: 'the Submit button is yours to press',
   flow_cannot_continue_automatically: 'the next step is not one it can take alone',

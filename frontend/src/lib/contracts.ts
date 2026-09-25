@@ -645,6 +645,7 @@ export const USER_ACTION_KINDS = [
   'legal_question',
   'session_expired',
   'review_required',
+  'ai_unavailable',
 ] as const
 export type UserActionKind = (typeof USER_ACTION_KINDS)[number]
 

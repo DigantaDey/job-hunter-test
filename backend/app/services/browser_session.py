@@ -191,6 +191,11 @@ OBSERVATION_FIELD_KEYS: Tuple[str, ...] = (
     "name", "id", "label", "type", "required", "options", "value_present",
     "filled_by_user", "captcha", "classes", "src", "autocomplete", "aria_required",
     "placeholder", "aria_label", "role", "data_sitekey",
+    # Set server-side by the live-pass AI mapper (never sent from the browser):
+    "ai_mapped_key",
+    # Classifier/record helpers set server-side too — keep them on the field so
+    # subsequent classify_form passes see them:
+    "profile_key", "signature", "legal", "sensitive", "eeo",
 )
 
 MAX_OBSERVED_FIELDS = 120
@@ -272,6 +277,13 @@ class SessionPolicy:
     #: fields. Default False — a password is typed only when this says so.
     create_accounts: bool = False
 
+    #: The user opted in to AI assistance during live passes: when a field is
+    #: unrecognised the pass may consult the ``form_detect`` AI to map it to a
+    #: canonical profile key or suggest a value, before pausing for the user.
+    #: An AI outage is surfaced as a pause (``ai_unavailable``) rather than
+    #: silently downgrading to a guess — exactly the contract Settings states.
+    ai_assist: bool = False
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "ttl_minutes": self.ttl_minutes,
@@ -284,6 +296,7 @@ class SessionPolicy:
             "allow_submit": self.allow_submit,
             "dry_run": self.dry_run,
             "create_accounts": self.create_accounts,
+            "ai_assist": self.ai_assist,
         }
 
 
@@ -333,6 +346,10 @@ def effective_policy(db: Session, user_id: int) -> SessionPolicy:
         settings.browser_create_accounts_enabled
         and get_setting(db, user_id, "browser", "create_accounts", False) is True
     )
+    ai_assist = bool(
+        settings.browser_ai_assist_enabled
+        and get_setting(db, user_id, "browser", "ai_assist", False) is True
+    )
     return SessionPolicy(
         ttl_minutes=ttl,
         max_live_sessions=max_live,
@@ -345,6 +362,7 @@ def effective_policy(db: Session, user_id: int) -> SessionPolicy:
         allow_submit=allow_submit,
         dry_run=not allow_submit,
         create_accounts=create_accounts,
+        ai_assist=ai_assist,
     )
 
 
@@ -1479,6 +1497,10 @@ def _handoff_instructions(kind: str, session: ApplicationSession) -> str:
     if kind == "mfa":
         return (f"Open {host} in your browser and enter the verification code yourself. "
                 "The code is never sent to us and never stored.")
+    if kind == "ai_unavailable":
+        return (f"Open {host} in your browser and fill the highlighted fields yourself. "
+                "AI-assisted field identification is temporarily unavailable; we did not "
+                "guess any values rather than risk filling the wrong thing.")
     return (f"Open {host} in your browser and sign in yourself. "
             "Your password is never typed by automation and never stored by this session.")
 
@@ -1614,6 +1636,7 @@ def _action_title(kind: str) -> str:
         "legal_question": "A legal question needs your answer",
         "session_expired": "Re-authenticate the browser session",
         "review_required": "Review the prepared application",
+        "ai_unavailable": "AI field identification is unavailable",
     }.get(kind, "Your input is needed")
 
 
@@ -1637,6 +1660,8 @@ def _handoff_payload(session: ApplicationSession, kind: str) -> Dict[str, Any]:
             "captcha": "complete the bot check yourself in the browser window",
             "review_required": ("continue this application yourself in the browser window — "
                                 "the assistant has done everything it is allowed to do"),
+            "ai_unavailable": ("fill the highlighted fields yourself in the browser window — "
+                               "AI field identification is temporarily unavailable"),
         }.get(kind, "answer in the app"),
         "never": [
             "we never ask you for your password",

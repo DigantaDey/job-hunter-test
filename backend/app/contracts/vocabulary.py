@@ -615,6 +615,7 @@ USER_ACTION_KINDS: Tuple[str, ...] = (
     "legal_question",   # attestation / consent / eligibility statement
     "session_expired",  # the session must be re-authenticated to continue
     "review_required",  # the plan is ready and wants a human look before submit
+    "ai_unavailable",   # AI field-mapping is offline — user fills the fields
 )
 
 #: ``application_actions.status``.
