@@ -750,6 +750,34 @@ class Settings(BaseSettings):
     metrics_max_series_per_metric: int = 512
 
     # ------------------------------------------------------------------ #
+    # Owner-only AI log (exact requests + how Laya is doing)
+    #
+    # Every provider call stores the outbound body it actually sent (per
+    # attempt) and a bounded excerpt of the answer; every Laya forward pass
+    # stores status, checkpoint, confidence against the floor and latency.
+    # Both tables are read by the owner-only ``/api/admin/ai/*`` routes and
+    # nothing else, and both are pruned on write. Off means the gateway is
+    # byte-for-byte what it was before: no extra row, no extra query.
+    # ------------------------------------------------------------------ #
+    ai_log_enabled: bool = True
+    #: How long a logged call/decision survives. These rows are diagnostic, not
+    #: accounting — the AI credit ledger is the permanent record — so a week is
+    #: enough to answer "why did *that* verdict look wrong?" and short enough
+    #: that prompt bodies never accumulate.
+    ai_log_retention_days: int = Field(default=7, ge=1, le=90)
+    #: Per-attempt clip on a stored request body. A scoring prompt carries the
+    #: JD plus the profile tail and can reach ~100k characters; 20k keeps the
+    #: whole prompt for every workflow that is not a long-document one, and the
+    #: clip is marked in the stored payload when it bites.
+    ai_log_prompt_chars: int = Field(default=20000, ge=1000, le=200000)
+    #: Clip on the stored answer excerpt (enough to see the JSON shape and the
+    #: first verdicts, not enough to store a generated resume twice).
+    ai_log_response_chars: int = Field(default=2000, ge=200, le=50000)
+    #: Rows deleted per prune sweep, so a first sweep on a long-neglected table
+    #: never holds a write transaction open.
+    ai_log_prune_batch: int = Field(default=500, ge=50, le=5000)
+
+    # ------------------------------------------------------------------ #
     # Backups
     # ------------------------------------------------------------------ #
     backup_dir: str = "./backups"

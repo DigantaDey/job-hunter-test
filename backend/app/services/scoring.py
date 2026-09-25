@@ -446,7 +446,10 @@ async def laya_score_detailed(
         }
         for dim in RUBRIC_WEIGHTS
     }
-    result = await laya.predict(questions, state, force_long=True)
+    # ``task``/``db``/``user_id`` write the owner-only decision log row: the
+    # one place that answers "how is the local engine doing on ranking".
+    result = await laya.predict(questions, state, force_long=True,
+                                task="ranking", db=db, user_id=user_id)
 
     breakdown: Dict[str, int] = {}
     confidences: List[float] = []

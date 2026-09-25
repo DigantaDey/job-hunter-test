@@ -68,6 +68,7 @@ async def laya_company_size(company: str, jd: str, *, db=None, user_id=None) -> 
         },
         db=db,
         user_id=user_id,
+        task="classification",
     )
     if answer is None:
         from app.services.laya import LayaUnavailable

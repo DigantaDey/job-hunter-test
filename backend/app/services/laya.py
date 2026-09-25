@@ -203,6 +203,13 @@ def status() -> Dict[str, Any]:
     }
 
 
+#: Decision-log status vocabulary (mirrors ``app.services.ai_log.LAYA_STATUSES``).
+LAYA_STATUS_OK = "ok"
+LAYA_STATUS_TIMEOUT = "timeout"
+LAYA_STATUS_PARKED = "parked"
+LAYA_STATUS_ERROR = "error"
+
+
 # --------------------------------------------------------------------------- #
 # Settings resolution (env ceiling → owner settings → task opt-in)
 # --------------------------------------------------------------------------- #
@@ -264,13 +271,107 @@ def confidence_floor(db=None, user_id: Optional[int] = None) -> float:
 # Prediction + answer normalisation
 # --------------------------------------------------------------------------- #
 async def predict(questions: Mapping[str, Any], state: Any, *,
-                  force_long: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
+                  force_long: bool = False, timeout: Optional[float] = None,
+                  task: str = "", db: Any = None, user_id: Optional[int] = None) -> Dict[str, Any]:
     """One forward pass: answer *questions* over *state*. Raw ``system_one`` payload.
 
     Runs the (sync, CPU/GPU-bound) engine off the event loop, bounded by
     ``LAYA_TIMEOUT_SECONDS``. Raises :class:`LayaUnavailable` on any engine
     failure — the caller decides between fallback and honest unavailability.
+
+    When ``db``/``user_id`` are given, the pass is written to the owner-only
+    decision log (``app.services.ai_log``) — status, checkpoint, latency,
+    calibrated confidence against the active floor, and the compact verdict per
+    question. That is what makes "how is Laya doing" a query instead of a log
+    grep; it is best-effort and can never fail or slow the decision itself.
     """
+    started = time.perf_counter()
+    try:
+        result = await _predict_locked(questions, state, force_long=force_long,
+                                       timeout=timeout, task=task)
+    except LayaUnavailable as exc:
+        _record_decision(db, user_id, task=task, status=_status_for_code(exc.code),
+                         questions=len(questions), error=str(exc),
+                         latency_ms=int((time.perf_counter() - started) * 1000), floor=True)
+        raise
+    _record_decision(db, user_id, task=task, status=LAYA_STATUS_OK,
+                     questions=len(questions), result=result,
+                     latency_ms=int((time.perf_counter() - started) * 1000), floor=True)
+    return result
+
+
+def _status_for_code(code: str) -> str:
+    """Map an engine failure code onto the decision log's status vocabulary."""
+    if code == "timeout":
+        return LAYA_STATUS_TIMEOUT
+    if code == "engine_parked":
+        return LAYA_STATUS_PARKED
+    return LAYA_STATUS_ERROR
+
+
+def _record_decision(db: Any, user_id: Optional[int], *, task: str, status: str,
+                     questions: int, latency_ms: int, result: Optional[Mapping[str, Any]] = None,
+                     error: str = "", floor: bool = False) -> None:
+    """Write one owner-only decision row (never raises, never imports eagerly)."""
+    if db is None or user_id is None:
+        return
+    try:
+        from app.services import ai_log  # noqa: PLC0415 - owner-only log, optional
+
+        confidence = _mean_confidence(result) if result is not None else None
+        active_floor = confidence_floor(db, user_id) if floor else None
+        if status == LAYA_STATUS_OK and confidence is not None and active_floor is not None \
+                and confidence < active_floor and not is_strict(db, user_id):
+            # The engine answered but below the bar: in ``auto`` mode this is
+            # exactly the pass the LLM takes over from.
+            status = ai_log.LAYA_LOW_CONFIDENCE
+        routing = (result or {}).get("routing")
+        model = str((routing or {}).get("model") or "") if isinstance(routing, Mapping) else ""
+        ai_log.record_laya_decision(
+            db, user_id=user_id, task=task, status=status, model=model, questions=questions,
+            confidence=confidence, floor=active_floor, strict=is_strict(db, user_id),
+            latency_ms=latency_ms, answers=_verdict_summary(result), error=error,
+        )
+    except Exception as exc:  # pragma: no cover - observability never fails a decision
+        log.debug("laya: decision log write failed: %s", exc)
+
+
+def _mean_confidence(result: Optional[Mapping[str, Any]]) -> Optional[float]:
+    """Mean calibrated confidence across the answers of one pass."""
+    if not isinstance(result, Mapping):
+        return None
+    confidences = [
+        float(answer["confidence"])
+        for answer in (result.get("answers") or {}).values()
+        if isinstance(answer, Mapping) and isinstance(answer.get("confidence"), (int, float))
+    ]
+    if not confidences:
+        return None
+    return max(0.0, min(1.0, sum(confidences) / len(confidences)))
+
+
+def _verdict_summary(result: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Compact per-question verdict — choice / level / confidence, never the state."""
+    if not isinstance(result, Mapping):
+        return {}
+    summary: Dict[str, Any] = {}
+    for key, answer in list((result.get("answers") or {}).items())[:40]:
+        if not isinstance(answer, Mapping):
+            continue
+        entry: Dict[str, Any] = {}
+        for field_name in ("choice", "answer", "level", "score", "confidence"):
+            value = answer.get(field_name)
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                entry[field_name] = round(float(value), 3) if isinstance(value, float) else value
+        if entry:
+            summary[str(key)[:40]] = entry
+    return summary
+
+
+async def _predict_locked(questions: Mapping[str, Any], state: Any, *,
+                          force_long: bool = False, timeout: Optional[float] = None,
+                          task: str = "") -> Dict[str, Any]:
+    """The engine call itself (see :func:`predict`, which records it)."""
     router = _get_router()
     if parked():
         inc("jobhunter_laya_predict_total", result="parked")
@@ -372,7 +473,8 @@ def _noul_probability(answer: Any) -> Optional[float]:
 async def choice(state: Any, key: str, instructions: str,
                  criteria: Mapping[str, str], *,
                  db=None, user_id: Optional[int] = None,
-                 min_confidence: Optional[float] = None) -> Optional[Dict[str, Any]]:
+                 min_confidence: Optional[float] = None,
+                 task: str = "") -> Optional[Dict[str, Any]]:
     """Answer one ``choice`` question. ``{answer, confidence, probabilities}`` or ``None``.
 
     ``None`` means "Laya did not answer with enough confidence" — the caller
@@ -383,7 +485,7 @@ async def choice(state: Any, key: str, instructions: str,
     if not criteria:
         return None
     questions = {key: {"type": "choice", "instructions": instructions, "criteria": dict(criteria)}}
-    result = await predict(questions, state)
+    result = await predict(questions, state, task=task, db=db, user_id=user_id)
     answer = _answers_of(result).get(key)
     if not isinstance(answer, Mapping):
         return None

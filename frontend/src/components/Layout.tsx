@@ -50,6 +50,7 @@ const USER_NAV = [
 
 const ADMIN_NAV = [
   { to: '/admin', label: 'Admin console', icon: ShieldCheck },
+  { to: '/admin/ai', label: 'AI log', icon: ScrollText },
   { to: '/admin/audit', label: 'Audit log', icon: ScrollText },
   { to: '/admin/plans', label: 'Plans & users', icon: Users },
 ]

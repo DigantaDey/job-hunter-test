@@ -12,4 +12,4 @@ export function isOwner(user: SessionUser | null | undefined): boolean {
 }
 
 /** The admin routes — mounted behind <RequireOwner> in App.tsx. */
-export const ADMIN_ROUTES = ['/admin', '/admin/audit', '/admin/plans'] as const
+export const ADMIN_ROUTES = ['/admin', '/admin/ai', '/admin/audit', '/admin/plans'] as const

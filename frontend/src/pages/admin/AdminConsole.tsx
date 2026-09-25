@@ -26,7 +26,9 @@ import { EmptyState, ErrorState, LoadingBlock, SectionCard, SectionSkeleton } fr
  * budgets), the local decision engine (Laya) routing, source health, queue
  * health, usage & cost, failure rates, application-automation health, the
  * shared job pool (live corpus + aggregates for postings retention has already
- * deleted), and the global feature flags.
+ * deleted), and the global feature flags. The two diagnostics that need their
+ * own page live at `/admin/ai`: the exact request sent for every AI call and
+ * the decision engine's health (how Laya is doing).
  */
 
 type Overview = any
@@ -293,6 +295,7 @@ export default function AdminConsole() {
           </p>
         </div>
         <div className="flex gap-2">
+          <Link to="/admin/ai" className="text-xs px-3 py-2 rounded-full border dark:border-zinc-700">AI log</Link>
           <Link to="/admin/audit" className="text-xs px-3 py-2 rounded-full border dark:border-zinc-700">Audit log</Link>
           <Link to="/admin/plans" className="text-xs px-3 py-2 rounded-full border dark:border-zinc-700">Plans & users</Link>
         </div>

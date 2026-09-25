@@ -24,6 +24,7 @@ import Packets from './pages/Packets'
 import Assist from './pages/Assist'
 import Tracking from './pages/Tracking'
 import AdminConsole from './pages/admin/AdminConsole'
+import AdminAILogs from './pages/admin/AdminAILogs'
 import AdminAudit from './pages/admin/AdminAudit'
 import AdminPlans from './pages/admin/AdminPlans'
 import { AuthProvider, useAuth } from './context/AuthContext'
@@ -124,6 +125,7 @@ export function AppRoutes() {
           }
         >
           <Route path="/admin" element={<RoutePage><AdminConsole /></RoutePage>} />
+          <Route path="/admin/ai" element={<RoutePage><AdminAILogs /></RoutePage>} />
           <Route path="/admin/audit" element={<RoutePage><AdminAudit /></RoutePage>} />
           <Route path="/admin/plans" element={<RoutePage><AdminPlans /></RoutePage>} />
         </Route>

@@ -1081,7 +1081,7 @@ async def _laya_map_fields(
             ),
             "criteria": criteria,
         }
-    result = await laya.predict(questions, state)
+    result = await laya.predict(questions, state, task="field_mapping", db=db, user_id=user_id)
     answers = result.get("answers")
     if not isinstance(answers, Mapping):
         answers = {}

@@ -2003,3 +2003,101 @@ class JobPoolMetric(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+# --------------------------------------------------------------------------- #
+# Owner-only AI observability (v2.3)
+#
+# Two append-only logs behind the owner console (``/api/admin/*``):
+#
+# * :class:`AICallRecord` — what was *actually sent* to a provider (the request
+#   bodies, the parameters, the outcome) so an owner can answer "why is this
+#   verdict wrong / slow / expensive" without turning on debug logging and
+#   reproducing it.
+# * :class:`LayaDecision` — one row per local-engine forward pass, so "how is
+#   Laya doing" is a query rather than a log grep.
+#
+# Both are bounded by ``AI_LOG_RETENTION_DAYS`` (pruned on write) and both carry
+# a ``user_id`` FK, so account erasure reaches them through the same
+# schema-derived plan as every other tenant table: a person's prompts are their
+# data, and "delete my account" has to delete them.
+# --------------------------------------------------------------------------- #
+class AICallRecord(Base):
+    """One AI provider call as it went on the wire — **owner-only**.
+
+    ``request`` holds the outbound bodies (one entry per attempt, so an
+    escalation is visible as an escalation), already passed through the same
+    secret scrubber the live prompt got; headers are never stored, so the API
+    key is not in this table. ``response`` keeps a bounded excerpt of what came
+    back, which is what makes a guardrail rejection or a truncated answer
+    diagnosable after the fact.
+    """
+
+    __tablename__ = "ai_call_records"
+    __table_args__ = (
+        Index("ix_ai_call_created", "created_at"),
+        Index("ix_ai_call_user_created", "user_id", "created_at"),
+        Index("ix_ai_call_workflow_created", "workflow", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    workflow: Mapped[str] = mapped_column(String(40), default="", nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), default="", nullable=True)
+    model: Mapped[str] = mapped_column(String(120), default="", nullable=True)
+    #: Provider endpoint the request went to (config, not a credential).
+    base_url: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    #: ``ok`` or ``error``.
+    status: Mapped[str] = mapped_column(String(16), default="ok", nullable=False, index=True)
+    #: Machine reason for a failure (``truncated_response``, ``timeout``, …).
+    reason: Mapped[str] = mapped_column(String(60), default="", nullable=True)
+    http_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    #: ``{"url": …, "params": {…}, "attempts": [{"attempt": n, "body": {…}}]}``.
+    request: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: Bounded excerpt of the model's answer (may be empty on a hard failure).
+    response: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class LayaDecision(Base):
+    """One local-engine forward pass — **owner-only**.
+
+    ``status`` is ``ok`` when the engine answered at all, ``timeout`` /
+    ``error`` / ``parked`` when it did not, and ``low_confidence`` when it
+    answered below ``floor`` (which is what makes ``auto`` mode escalate to the
+    LLM). ``answers`` keeps the compact verdict per question — the choice, the
+    rubric level, the calibrated confidence — never the state that was scored,
+    which is already in the AI call log if the LLM was asked instead.
+    """
+
+    __tablename__ = "laya_decisions"
+    __table_args__ = (
+        Index("ix_laya_decision_created", "created_at"),
+        Index("ix_laya_decision_user_created", "user_id", "created_at"),
+        Index("ix_laya_decision_task_created", "task", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    #: ``ranking`` / ``classification`` / ``field_mapping``.
+    task: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="ok", nullable=False, index=True)
+    #: ``english`` / ``multilingual`` — which checkpoint answered.
+    model: Mapped[str] = mapped_column(String(48), default="", nullable=True)
+    questions: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    floor: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    #: ``laya_only`` was in force (a low-confidence answer stands rather than escalating).
+    strict: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: Compact per-question verdict (choice / level / confidence) — no state text.
+    answers: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)

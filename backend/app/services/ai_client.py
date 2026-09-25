@@ -37,6 +37,7 @@ Guarantees (in order of importance):
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import random
@@ -1240,6 +1241,74 @@ def _invalid_json_error(content: str, finish_reason: Optional[str], current_max_
         f"invalid_json: model did not return valid JSON (preview: {content[:300]!r})",
         reason=REASON_INVALID_JSON, retryable=True)
 
+#: How many attempts' request bodies the owner-only log keeps per call.
+_MAX_LOGGED_ATTEMPTS = 3
+
+
+def _request_envelope(url: str, sent: List[Dict[str, Any]], *, temperature: float,
+                      json_mode: bool, stream: bool, max_tokens: int,
+                      attempts: int) -> Dict[str, Any]:
+    """The owner-facing shape of one call's outbound request(s)."""
+    return {
+        "url": str(url or ""),
+        "params": {"temperature": temperature, "json_mode": bool(json_mode),
+                   "stream": bool(stream), "max_tokens": int(max_tokens or 0),
+                   "attempts": int(attempts or 1)},
+        "attempts": list(sent),
+    }
+
+
+def _answer_excerpt(text: Optional[str], parsed: Optional[Dict[str, Any]]) -> str:
+    """A bounded excerpt of the answer, whichever shape it arrived in."""
+    if text:
+        return text
+    if parsed is not None:
+        try:
+            return json.dumps(parsed, default=str, ensure_ascii=False)
+        except Exception:  # pragma: no cover
+            return str(parsed)
+    return ""
+
+
+def _log_ai_call(db, *, user_id: Optional[int], workflow: str, model: str, provider: str,
+                 base_url: str, success: bool, error: str, latency_ms: int,
+                 prompt_tokens: int, completion_tokens: int, total_tokens: int,
+                 estimated_cost_usd: float, meta: Optional[Dict[str, Any]],
+                 request: Optional[Dict[str, Any]], response: str) -> None:
+    """Hand one finished call to the owner-only log (never raises)."""
+    try:
+        from app.services import ai_log  # noqa: PLC0415 - keeps the import graph flat
+
+        info: Dict[str, Any] = dict(meta or {})
+        http_status = info.get("http_status")
+        try:
+            attempts = max(1, int(info["attempts"])) if info.get("attempts") is not None else 1
+        except (TypeError, ValueError):
+            attempts = 1
+        ai_log.record_call(
+            db,
+            user_id=user_id,
+            workflow=workflow,
+            status=ai_log.STATUS_OK if success else ai_log.STATUS_ERROR,
+            model=model,
+            provider=provider,
+            base_url=base_url,
+            reason=str(info.get("reason") or ("ok" if success else "error")),
+            http_status=int(http_status) if isinstance(http_status, int) else None,
+            attempts=attempts,
+            latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            estimated_cost_usd=estimated_cost_usd,
+            request=request,
+            response=response,
+            error=error,
+        )
+    except Exception as exc:  # pragma: no cover - observability must never fail a call
+        log.debug("ai_client: call log write failed: %s", exc)
+
+
 def track_ai_usage(
     db=None,
     user_id: Optional[int] = None,
@@ -1252,12 +1321,21 @@ def track_ai_usage(
     latency_ms: int = 0,
     error: str = "",
     meta: Optional[Dict[str, Any]] = None,
+    request: Optional[Dict[str, Any]] = None,
+    response: str = "",
+    provider: str = "",
+    base_url: str = "",
 ) -> None:
     """Record every outcome; only successful calls consume AI entitlements.
 
     Workflow quotas belong to completed business units, not provider calls (a
     business unit can involve retries or multiple guarded calls). Observed
     tokens, including failed attempts, spend the daily provider safety budget.
+
+    ``request`` (the bodies actually sent, one per attempt) and ``response`` feed
+    the owner-only call log (``app.services.ai_log``) — the ledger answers "how
+    much", the log answers "what exactly". Both writes are best-effort and
+    bounded: see that module's docstring.
     """
     if total_tokens == 0:
         total_tokens = prompt_tokens + completion_tokens
@@ -1266,6 +1344,13 @@ def track_ai_usage(
 
     if db is None or user_id is None:
         return
+    _log_ai_call(
+        db, user_id=user_id, workflow=workflow, model=model, provider=provider,
+        base_url=base_url, success=success, error=error, latency_ms=latency_ms,
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+        total_tokens=total_tokens, estimated_cost_usd=cost, meta=meta,
+        request=request, response=response,
+    )
     try:
         from app.core.entitlements import increment_usage
         from app.models.models import AICreditLedger, utcnow
@@ -1318,8 +1403,18 @@ async def chat_completion(
     cfg = resolved.cfg
     db, user_id = resolved.db, resolved.user_id
     call_started = time.perf_counter()
-    usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    usage_totals: Dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     failure_meta: Dict[str, Any] = {}
+    #: Diagnostics for the owner-only call log. Declared *before* the try so a
+    #: preflight failure (no key, breaker open, budget exhausted) — which never
+    #: reaches the payload build below — is still logged as a call that has an
+    #: endpoint-less request body and no answer, rather than as an unbound name.
+    url: str = ""
+    sent_requests: List[Dict[str, Any]] = []
+    last_content: str = ""
+    attempt = 0
+    current_max_tokens = 0
+    json_mode_active = json_mode
     try:
         if ai_config:
             merged_provider = ai_config.get("provider") or cfg.get("provider")
@@ -1404,7 +1499,6 @@ async def chat_completion(
         max_tokens_key = "max_tokens"
         payload: Dict[str, Any] = {}
         headers: Dict[str, str] = {}
-        url: str = ""
         if is_google:
             payload = _translate_to_google_payload(messages, system, temperature, current_max_tokens, json_mode)
             url = _build_google_url(cfg, stream=stream)
@@ -1440,6 +1534,17 @@ async def chat_completion(
         streaming_timeout = httpx.Timeout(effective_timeout if effective_timeout <= 1800 else 1800, connect=10, read=read_timeout, write=60, pool=60)
         last_error: Optional[str] = None
         http_client = await get_http_client()
+        # The payload dict is mutated in place by the escalation/fix-up paths,
+        # so ``_capture_request`` stores a deep copy at send time; only the last
+        # :data:`_MAX_LOGGED_ATTEMPTS` are kept, which is enough to show what a
+        # retry changed without storing an unbounded list of near-identical
+        # prompts.
+        def _capture_request() -> None:
+            try:
+                sent_requests.append({"attempt": attempt, "body": copy.deepcopy(payload)})
+                del sent_requests[:-_MAX_LOGGED_ATTEMPTS]
+            except Exception:  # pragma: no cover - capture is best-effort
+                pass
         parsed_result: Optional[Dict[str, Any]] = None
         text_result: Optional[str] = None
         final_error: Optional[AIClientError] = None
@@ -1447,6 +1552,8 @@ async def chat_completion(
         plain_retries = 0
         fixups = 0
         attempt = 0
+        # ``last_content`` (the last answer the model produced, used as the
+        # failure record's excerpt) is declared above the try.
         while attempt < attempts:
             attempt += 1
             await rate_limiter.wait_and_acquire(1)
@@ -1471,6 +1578,7 @@ async def chat_completion(
             try:
                 if stream:
                     async with _sem():
+                        _capture_request()
                         try:
                             async with http_client.stream("POST", url, headers=headers, json=payload, timeout=streaming_timeout) as response:
                                 if response.status_code != 200:
@@ -1550,6 +1658,7 @@ async def chat_completion(
                                         raise AIClientError(last_error, retryable=True) from exc
                                     extracted = _extract_content(data)
                                     content = extracted["content"]
+                                    last_content = content or last_content
                                     finish_reason = extracted["finish_reason"]
                                     reasoning = extracted["reasoning"]
                                     p_tok, c_tok, t_tok = _read_usage(data, prompt, content)
@@ -1634,6 +1743,7 @@ async def chat_completion(
                                                 data = fallback_data
                                                 extracted = _extract_content(data)
                                                 content = extracted["content"]
+                                                last_content = content or last_content
                                                 finish_reason = extracted["finish_reason"]
                                                 reasoning = extracted["reasoning"]
                                                 p_tok, c_tok, t_tok = _read_usage(data, prompt, content)
@@ -1701,6 +1811,7 @@ async def chat_completion(
                                     # Already handled json fallback above, but if still empty, treat as empty_response
                                     pass
                                 content = "".join(content_parts)
+                                last_content = content or last_content
                                 reasoning = "".join(reasoning_parts)
                                 # If SSE was empty (handler returned JSON), fallback already handled via content_type branch above; if we reach here with empty content, it means handler returned SSE empty
                                 data = {"choices": [{"message": {"content": content, "reasoning_content": reasoning}, "finish_reason": finish_reason}], "usage": usage_data}
@@ -1790,6 +1901,7 @@ async def chat_completion(
                     # end streaming sem
                 else:
                     async with _sem():
+                        _capture_request()
                         if is_google:
                             response = await http_client.post(url, headers=headers, json=payload, timeout=client_timeout)
                         else:
@@ -1939,6 +2051,7 @@ async def chat_completion(
                 raise AIClientError(last_error, retryable=True) from exc
             extracted = _extract_content(data)
             content = extracted["content"]
+            last_content = content or last_content
             finish_reason = extracted["finish_reason"]
             reasoning = extracted["reasoning"]
             p_tok, c_tok, t_tok = _read_usage(data, prompt, content)
@@ -2032,6 +2145,12 @@ async def chat_completion(
             user_id=user_id,
             workflow=workflow,
             model=cfg["model"],
+            provider=str(cfg.get("provider") or ""),
+            base_url=str(cfg.get("base_url") or ""),
+            request=_request_envelope(url, sent_requests, temperature=temperature,
+                                      json_mode=json_mode_active, stream=stream,
+                                      max_tokens=current_max_tokens, attempts=attempt),
+            response=_answer_excerpt(text_result, parsed_result),
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
@@ -2054,9 +2173,18 @@ async def chat_completion(
     except AIClientError as exc:
         track_ai_usage(
             db=db, user_id=user_id, workflow=workflow, model=cfg["model"],
+            provider=str(cfg.get("provider") or ""), base_url=str(cfg.get("base_url") or ""),
+            request=_request_envelope(url, sent_requests, temperature=temperature,
+                                      json_mode=json_mode_active, stream=stream,
+                                      max_tokens=current_max_tokens,
+                                      attempts=int(failure_meta.get("attempts") or attempt)),
+            response=_answer_excerpt(last_content, None),
             **usage_totals, success=False, error=str(exc),
             latency_ms=int((time.perf_counter() - call_started) * 1000),
-            meta={**failure_meta, **exc.meta},
+            # ``reason``/``http_status`` make the owner-only log filterable by
+            # *why* a call failed, not just that it did.
+            meta={**failure_meta, **exc.meta, "reason": exc.reason,
+                  "http_status": exc.status or failure_meta.get("http_status")},
         )
         raise
     finally:

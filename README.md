@@ -197,7 +197,8 @@ are available in Chrome and Apple Passwords CSV formats.
 | Funding | `GET /api/funding/{companies,providers,context}`, `POST /api/funding/refresh`, `POST /api/funding/{name}/process` |
 | Me (user surface) | `GET /api/me/dashboard` — the tenant-scoped aggregate the home page renders (profile completeness, discovery status, top matches with reasons, review/attention queues, applications in progress, interview activity, weekly outcome report, follow-up reminders) — and `GET /api/me/assistant`, the sanitized assistant-availability signal (no provider URL, key, model or usage on it) |
 | Settings | `GET/PUT /api/settings` (the `ai` category is owner-only: members get `{"configured": bool}` and cannot write it), `GET /api/settings/ai/status` *(owner)*, `GET /api/settings/runtime` *(owner)*, `GET/POST/DELETE /api/ai/config` *(owner)* |
-| Admin (owner only) | `GET /api/admin/overview` (sources, queues, usage & cost, failure rates, automation health), `GET /api/admin/audit`, `GET/PUT /api/admin/flags`, `GET /api/admin/users`, `PUT /api/admin/users/{id}/{plan,role}` — every route 403s non-owners with `owner_required` |
+| Admin (owner only) | `GET /api/admin/overview` (sources, queues, usage & cost, failure rates, automation health, shared job pool, AI-log and Laya rollups), `GET /api/admin/audit`, `GET/PUT /api/admin/flags`, `GET /api/admin/users`, `PUT /api/admin/users/{id}/{plan,role}` — every route 403s non-owners with `owner_required` |
+| Admin — AI log (owner only) | `GET /api/admin/ai/calls` (list, filter by workflow/status/user), `GET /api/admin/ai/calls/{id}` (**the exact request body per attempt** + answer excerpt), `GET /api/admin/ai/stats`, `GET /api/admin/laya/decisions`, `GET /api/admin/laya/stats` — rendered at **Admin → AI log** (`/admin/ai`); nothing here is reachable from a user surface |
 | Ops | `GET /api/health`, `/api/health/live`, `/api/health/ready`, `/api/metrics`, `/api/meta`, `/api/logs`, `/api/dashboard/summary`, `GET /api/ops/status` *(owner)*, `GET/POST /api/ops/queue/*` *(owner)* |
 | Tracking | `GET /api/track/open/{token}.png`, `GET/POST /api/track/unsubscribe/{token}`, `POST /api/track/events` |
 
@@ -208,6 +209,10 @@ Interactive docs: `/api/docs`. Machine-readable spec: `/api/openapi.json`.
 ## 5. Configuration
 
 Everything is environment-driven; see [`.env.example`](.env.example) for the annotated list. The
+owner-only AI log is `AI_LOG_ENABLED` (on by default; `false` restores the previous behaviour
+exactly), pruned to `AI_LOG_RETENTION_DAYS` (7) with bodies clipped to `AI_LOG_PROMPT_CHARS`
+(20000) and answers to `AI_LOG_RESPONSE_CHARS` (2000) — diagnostics, not accounting: the AI credit
+ledger remains the permanent record. The
 values you must set in production are `SECRET_KEY`, `ENCRYPTION_KEY`, `DATABASE_URL`,
 `CORS_ORIGINS`, `ALLOWED_HOSTS` and (for real outreach) the `EMAIL_*` block. The config validator
 refuses to boot in `ENVIRONMENT=production` with placeholder secrets, wildcard CORS or SQLite
@@ -259,7 +264,7 @@ as an AI verdict.
 
 ```bash
 # backend — hermetic: temp SQLite, no network, no AI key
-cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 1400 tests
+cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 1419 tests
 
 # lint
 ruff check backend
@@ -274,7 +279,9 @@ image and audits dependencies (pip-audit + npm audit).
 
 Test coverage includes: auth/tenancy isolation, vault encryption + re-keying, queue leasing and
 worker execution, discovery/source adapters, the shared job pool (retention/deletion aggregates,
-the owner-only snapshot, instant match and its idempotency), form detection, autofill planning, resume generation
+the owner-only snapshot, instant match and its idempotency), the owner-only AI log (the body stored
+is the body sent, failures with reason/status, the Laya status vocabulary, retention, clipping and
+masking, member 403 on every route), form detection, autofill planning, resume generation
 + fact guard + diff/polish, outreach compliance gates, suppression/unsubscribe/open tracking,
 funding providers (including the anti-fabrication guard), GDPR export/delete under **enforced** foreign keys
 (the schema's FKs are checked, not disabled), metrics and health.
@@ -300,6 +307,10 @@ funding providers (including the anti-fabrication guard), GDPR export/delete und
   per-user link (`job_pool_seen`) is a normal owned row that account erasure deletes, and the pool's
   owner-facing aggregates are counters. A deployment that must not share postings between tenants sets
   `JOB_POOL_ENABLED=false` and gets the pre-pool product.
+* **The AI log is owner-only, bounded and scrubber-first.** It stores the request *bodies* we sent
+  (never headers, so never the API key) after the gateway's secret scrubber, clipped and pruned on
+  write; a member gets 403 on every `/api/admin/ai/*` route. It is a diagnostic aid for the operator,
+  not an export surface — the credit ledger stays the accounting record.
 * **Compliance sign-off is still a human step.** `docs/COMPLIANCE.md` documents the built-in
   controls and the questions your counsel should answer before you enable automation for real
   users.
