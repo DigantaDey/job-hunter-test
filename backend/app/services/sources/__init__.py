@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.services.reliability import count
@@ -168,7 +169,7 @@ async def fetch_all(
     since_hours: int = 24 * 7,
     sources: Optional[List[str]] = None,
     board_tokens: Optional[List[str]] = None,
-    timeout_seconds: float = 45.0,
+    timeout_seconds: Optional[float] = None,
 ) -> Tuple[List[Posting], Dict[str, Any]]:
     """
     Fan out across sources concurrently. Individual source failures degrade
@@ -190,6 +191,14 @@ async def fetch_all(
     :func:`app.services.discovery._classify_empty_run` reads, so swallowing the
     distinction here would have made an empty board look like a quiet market.
     """
+    if timeout_seconds is None:
+        # The per-source budget is an operator knob (``DISCOVERY_FETCH_TIMEOUT_
+        # SECONDS``), resolved here rather than by the caller so the fan-out's
+        # default behaviour is one value in one place.
+        try:
+            timeout_seconds = float(getattr(settings, "discovery_fetch_timeout_seconds", 45.0) or 45.0)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            timeout_seconds = 45.0
     selected = available_source_ids() if sources is None else sources
     requested = [s for s in selected if s in ADAPTERS]
     report: Dict[str, Any] = {

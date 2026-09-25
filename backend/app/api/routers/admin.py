@@ -9,7 +9,8 @@ there is no code path that relaxes it.
 What lives here (and deliberately nowhere on the user surface):
 
 * ``GET  /admin/overview``        — source health, queue health, usage & cost,
-  failure rates, application-automation health, accounts and plan mix.
+  failure rates, application-automation health, accounts and plan mix, and the
+  shared job pool's aggregates (live entries + pruned/deleted counters).
 * ``GET  /admin/audit``           — the cross-user audit trail (the self-scoped
   ``/api/account/audit`` stays available to every user for their own actions).
 * ``GET/PUT /admin/flags``        — global feature flags and their consumers.
@@ -38,7 +39,7 @@ from app.models.models import (
 )
 from app.services import flags as feature_flags
 from app.services import http as http_client
-from app.services import net_guard, robots
+from app.services import job_pool, net_guard, robots
 from app.services.ai_client import breaker_snapshot
 from app.services.billing import create_or_update_subscription_manual
 from app.services.funding_sources import provider_status
@@ -163,6 +164,12 @@ def overview(user: CurrentUser, db: DbSession) -> Dict[str, Any]:
             "owners": int(owners or 0),
             "plans": {plan: int(n) for plan, n in plan_rows},
         },
+        # Shared job pool, owner-only: what the cross-user corpus currently
+        # holds (live entries, sources, contributors) and what it no longer
+        # holds (aggregate counters for pruned/deleted postings — the only
+        # thing retention keeps). Route-level ``require_owner`` is the access
+        # rule; nothing here is exposed on a user surface.
+        "job_pool": job_pool.metrics_snapshot(db),
         "flags": feature_flags.all_flags(db),
     }
 

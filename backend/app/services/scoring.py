@@ -11,6 +11,7 @@ from app.services.ai_guardrails import (
     GuardrailError,
     SchemaSpec,
     run_guarded_task,
+    schema_output_budget,
     strip_ai_artifacts,
 )
 
@@ -250,10 +251,6 @@ RUBRIC_WEIGHTS = {
     "education": 0.08,
 }
 
-#: Starting output budget for a scoring verdict (the user's configured output
-#: ceiling still caps it and any escalation).
-SCORING_OUTPUT_TOKENS = 1200
-
 SCORE_SCHEMA = SchemaSpec([
     FieldSpec("score", "float", minimum=0, maximum=100),
     FieldSpec("reason", "str", min_length=20, max_length=600),
@@ -264,6 +261,21 @@ SCORE_SCHEMA = SchemaSpec([
     FieldSpec("recommendation", "str", choices=["HIGH PRIORITY", "GOOD FIT", "MODERATE", "LOW"]),
     FieldSpec("recommendation_reason", "str", min_length=10, max_length=400),
 ])
+
+#: Per-item caps for the schema's list fields — ``(count, chars per item)``, the
+#: same limits the prompt states. They are metadata for the budget below.
+SCORE_LIST_CAPS = {"strengths": (15, 80), "missing_skills": (12, 80), "evidence": (8, 300)}
+
+#: Starting output budget for a scoring verdict (the user's configured output
+#: ceiling still caps it, and any escalation).
+#:
+#: Derived from the schema rather than picked by hand (v2.3): at 1200 it could
+#: not hold ``SCORE_SCHEMA``'s own maxima — reason ≤600 chars, recommendation
+#: reason ≤400, up to 15 strengths / 12 missing skills / 8 evidence quotes — so
+#: every verdict on a busy run was cut off, escalated 1200 → 2400 → 4800 and
+#: retried, exactly the chain in the operator logs. The ceiling is not a spend:
+#: a model that answers in 600 tokens still bills 600.
+SCORING_OUTPUT_TOKENS = schema_output_budget(SCORE_SCHEMA, SCORE_LIST_CAPS)
 
 #: How far the model may move the score away from the deterministic anchor
 #: before the guardrail treats it as unjustified.

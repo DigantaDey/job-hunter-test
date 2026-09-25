@@ -1869,3 +1869,137 @@ class AutomationSubmissionCounter(Base):
     rejected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # refusals recorded (unmetered)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+# --------------------------------------------------------------------------- #
+# Shared job pool — cross-user discovery, 7-day retention, aggregates only
+# --------------------------------------------------------------------------- #
+class JobPoolEntry(Base):
+    """One posting in the shared, cross-user discovery pool.
+
+    Every discovery run folds the postings it scanned in here, so the next user
+    does not have to wait for a slow live fan-out to see the market: the pool is
+    the union of what *everyone's* runs have seen, deduplicated by canonical
+    identity and bounded by ``JOB_POOL_RETENTION_DAYS`` (7 by default).
+
+    Three deliberate properties:
+
+    * **No tenant column.** A posting is public market data, not user data —
+      sharing it is the product feature. The *link* to a person lives in
+      :class:`JobPoolSeen`, which carries the ``user_id`` FK so account erasure
+      (``app.services.erasure`` derives its plan from the schema) reaches it
+      automatically.
+    * **Bounded.** ``expires_at`` is ``last_seen_at + retention``; nothing in
+      here outlives the retention window, and the pruner deletes rather than
+      archives.
+    * **Compact.** The row carries what matching needs (title, company,
+      description, location, timestamps) and *not* the source payload
+      (``jobs.raw_payload`` stays on the user's own row) — so the pool is a
+      matching index, not a second copy of every tenant's board.
+    """
+
+    __tablename__ = "job_pool_entries"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_job_pool_dedupe"),
+        Index("ix_job_pool_expiry", "expires_at"),
+        Index("ix_job_pool_last_seen", "last_seen_at"),
+        Index("ix_job_pool_source", "source", "expires_at"),
+        Index("ix_job_pool_company_norm", "company_name_normalized"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    #: Canonical identity (``source:external_id`` or ``company|title``) — the
+    #: same key ``jobs.dedupe_key`` uses, so a pool match merges with a row the
+    #: user already has instead of duplicating it.
+    dedupe_key: Mapped[str] = mapped_column(String(300), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    company: Mapped[str] = mapped_column(String(200), nullable=False)
+    company_name_normalized: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    location: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    url: Mapped[str] = mapped_column(String(1000), default="", nullable=True)
+    source: Mapped[str] = mapped_column(String(64), default="unknown", nullable=True)
+    external_id: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(16), default="", nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    title_normalized: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    #: Salary / remote / industry — the compact matching extras, never forms or
+    #: autofill plans (those belong to a user's own row).
+    extra: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    #: ``last_seen_at + JOB_POOL_RETENTION_DAYS``. The pruner deletes on this.
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    #: How many times any run has seen this posting (a market signal, and the
+    #: value folded into :class:`JobPoolMetric` when the row is pruned).
+    times_seen: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    #: Distinct contributors, maintained with :class:`JobPoolSeen`.
+    users_seen: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: Set by a source (a closed listing) or by the pruner; expired rows are
+    #: never offered as matches.
+    expired: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+class JobPoolSeen(Base):
+    """Which user has seen which pool entry — the erasure-reachable link.
+
+    One row per (entry, user): it is what makes ``users_seen`` a *distinct user*
+    count instead of a scan count, and it is the reason the account-erasure plan
+    covers the pool without a second hand-written table list (the ``user_id`` FK
+    is all ``app.services.erasure`` needs).
+    """
+
+    __tablename__ = "job_pool_seen"
+    __table_args__ = (
+        UniqueConstraint("entry_id", "user_id", name="uq_job_pool_seen_entry_user"),
+        Index("ix_job_pool_seen_user", "user_id"),
+        Index("ix_job_pool_seen_entry", "entry_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    entry_id: Mapped[int] = mapped_column(Integer, ForeignKey("job_pool_entries.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class JobPoolMetric(Base):
+    """Aggregate-only record of a job the pool no longer stores.
+
+    When a pool entry is pruned (retention reached, or the posting disappeared)
+    the *content* goes: no title, no description, no URL, no payload — only
+    counters that answer "how big is the market we saw, and how fast does it
+    churn". ``metric_key`` is a SHA-256 of the canonical key, so the row is not a
+    re-identification handle either. The one descriptive field kept is the
+    public company name, and only because it is the aggregation dimension for
+    the churn report (``gone.companies``); the pin test
+    (``tests/test_job_pool.py::test_metric_rows_carry_no_job_content``) fails if
+    anything else from the posting is ever added here.
+
+    Owner-only by construction: the only reader is ``/api/admin/*``.
+    """
+
+    __tablename__ = "job_pool_metrics"
+    __table_args__ = (
+        UniqueConstraint("metric_key", name="uq_job_pool_metric_key"),
+        Index("ix_job_pool_metric_last_seen", "last_seen_at"),
+        Index("ix_job_pool_metric_source", "source"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    #: SHA-256 hex of the entry's canonical key — aggregate identity without content.
+    metric_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    company_name_normalized: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    #: ``expired`` (retention window elapsed) or ``deleted`` (source said the
+    #: posting is gone) — the two ways an entry leaves the pool.
+    reason: Mapped[str] = mapped_column(String(24), default="expired", nullable=False)
+    times_seen: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    distinct_users: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: Whole days between first and last sighting (the posting's observed life).
+    days_live: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)

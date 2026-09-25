@@ -50,6 +50,8 @@ from app.models.models import (
     InterviewPrep,
     Job,
     JobEvent,
+    JobPoolEntry,
+    JobPoolSeen,
     MatchFeedback,
     MatchResult,
     Notification,
@@ -121,6 +123,10 @@ CHILD_TABLES: dict[str, type] = {
     "profile_field_history": ProfileFieldHistory,
     # Multi-stage matching: the versioned explained verdict + user feedback.
     "match_results": MatchResult,
+    # Shared job pool (v2.3): the entry itself is ownerless market data, but the
+    # *seen* link is the user's — deleting the account must delete the link, or
+    # the erasure would leave behind a record of what this person was shown.
+    "job_pool_seen": JobPoolSeen,
     # Browser-assisted applications (v2.2.21, docs/contracts/12): the session,
     # its human-action queue and the duplicate-submission ledger.
     "application_sessions": ApplicationSession,
@@ -482,6 +488,17 @@ def _seed_every_child_table(db, user: User) -> dict:
                            follow_up_at=datetime.utcnow() + timedelta(days=5),
                            note="Send the thank-you note")
     db.commit()
+    # Shared job pool seam: written through the service, like tracking above —
+    # the entry upsert and the per-user seen link are the pool's invariants.
+    from app.services import job_pool
+
+    job_pool.record_candidates(db, [{
+        "title": "Staff Backend Engineer", "company": "Erase Me Ltd",
+        "description": "Python, Postgres, FastAPI.", "url": "https://example.com/erase-me",
+        "source": "test", "external_id": "erase-me-1", "dedupe_key": "test:erase-me-1",
+        "canonical_id": "test:erase-me-1",
+    }], user_id=user.id)
+
     vault = save_vault_entry(db, user.id, domain="jobs.lever.co", username="me@example.com",
                              password="correct-horse-battery", origin="manual")
 

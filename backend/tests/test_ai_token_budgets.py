@@ -42,6 +42,9 @@ def _wire() -> list:
     return conftest.ScriptedAIHandler.behavior["requests"]
 
 
+from app.services.scoring import SCORING_OUTPUT_TOKENS  # noqa: E402
+
+
 def _set_tokens(client, auth, **kwargs) -> None:
     payload = {"ai": kwargs}
     saved = client.put("/api/settings", json=payload, headers=auth)
@@ -537,9 +540,11 @@ def test_pro_plus_long_jd_gets_the_ai_verdict(client, auth, db, provider_owner):
     _profile(db, member_id)
     job_id = _job(db, member_id, _long_jd())
     # Four wire attempts: the model burns the budget thinking three times, so
-    # only the 4th (1200 → 4800 → 19200 → 76800) can answer. Every one of those
-    # steps past 16000 was impossible under the old clamp — the escalation
-    # stopped there and the call died `truncated_response`.
+    # only the 4th can answer. The chain starts at the workflow's own budget
+    # (``SCORING_OUTPUT_TOKENS``, sized from ``SCORE_SCHEMA`` in v2.3) and
+    # escalates ×4 per empty/``length`` answer up to the hard stop — every step
+    # past 16000 was impossible under the old clamp, and the call died
+    # ``truncated_response``.
     # (v2.3) Retry budgets are owner-level: the owner raises the platform
     # default and the Pro+ member inherits it; their own budgets come from the
     # plan (unlimited), not from a member-editable field.
@@ -557,8 +562,12 @@ def test_pro_plus_long_jd_gets_the_ai_verdict(client, auth, db, provider_owner):
               if any("score how well this candidate" in str(m.get("content") or "").lower()
                      for m in r.get("messages") or [])]
     budgets = [_wire_max_tokens(r) for r in scored]
-    assert budgets == [1200, 4800, 19200, 76800], \
-        f"the verdict needed the unclamped escalation, wire said {budgets}"
+    # Properties, not a frozen chain: the first attempt is the workflow's own
+    # schema-sized budget, every retry asks for strictly more, and the last one
+    # is past the old 16000 clamp the bug report was about.
+    assert budgets[0] == SCORING_OUTPUT_TOKENS, budgets
+    assert budgets == sorted(budgets) and len(set(budgets)) == len(budgets), budgets
+    assert budgets[-1] > 16000, f"the escalation stayed clamped, wire said {budgets}"
     # And the whole job description went out — no client-side truncation.
     longest = max(len(str(m.get("content") or "")) for m in scored[-1]["messages"])
     assert longest > 20000, longest

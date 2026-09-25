@@ -42,6 +42,7 @@ no stubs on the wire path.
 """
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -461,20 +462,46 @@ async def test_outage_mid_slice_pauses_the_run_and_persists_nothing(
     assert item.attempts == 0, "neither the claim nor the pause may consume a failure attempt"
     assert (item.payload or {}).get("paused_count") == 1
     assert _jobs(db, pro["id"]) == [], "a paused attempt must persist no job rows"
-    assert len(_scoring_calls()) == 4, "3 good verdicts + the attempt that hit the outage"
+    # The slice runs **concurrently** (``DISCOVERY_AI_CONCURRENCY``), so the
+    # outage is discovered while the rest of the slice is already in flight: the
+    # paused attempt advertises up to the whole slice and never retries a
+    # candidate. (Sequential execution made this exactly 4 — "3 good verdicts +
+    # the one that hit the outage" — which is a fact about serialisation, not
+    # about the pause contract.)
+    paused_attempt_calls = len(_scoring_calls())
+    assert 1 <= paused_attempt_calls <= RESCORE_TOP, paused_attempt_calls
 
     # The provider recovers; the watchdog drains the paused run.
     _set_recovery()
     import app.services.ai_client as ai_client
+    from app.services.ai_client import ai_availability
 
     ai_client._PING_CACHE.clear()  # the 60s probe cache must not mask recovery
     item.scheduled_at = datetime.utcnow() - timedelta(seconds=1)  # the pause backoff elapsed
     db.commit()
-    assert await watchdog.watchdog_cycle() == 1
+    # The real watchdog is a *loop*: a probe that lands while the provider is
+    # still tearing down the cancelled slice's connections is a "not yet", and
+    # the next cycle drains. Asserting on a single sweep made this test depend
+    # on that race; polling a bounded number of cycles asserts the contract that
+    # matters — leftover paused work is resumed once the provider answers —
+    # without pretending one probe is instantaneous.
+    state: Optional[str] = None
+    drained = 0
+    for _ in range(20):
+        state, drained = await watchdog.check_and_drain(db, pro["id"])
+        if drained:
+            break
+        ai_client._PING_CACHE.clear()  # the probe cache must not mask this cycle
+        await asyncio.sleep(0.25)
+    assert drained == 1, (
+        f"the watchdog never drained the paused run: state={state} "
+        f"availability={await ai_availability(db, pro['id'])} "
+        f"breakers={ai_client.breaker_snapshot()}")
     _sync(db)
     db.refresh(item)
     assert item.status == "queued", item.status
 
+    calls_before_resume = len(_scoring_calls())
     await _run(item.id)
 
     _sync(db)
@@ -494,7 +521,8 @@ async def test_outage_mid_slice_pauses_the_run_and_persists_nothing(
     # that hit the outage); the resumed run scored the whole slice again.
     # Duplicated *work* — and duplicated spend, which is what a hard dependency
     # costs — but never duplicated rows.
-    assert len(_scoring_calls()) == 4 + RESCORE_TOP, len(_scoring_calls())
+    assert len(_scoring_calls()) - calls_before_resume == RESCORE_TOP, (
+        "the resumed run scores the whole slice exactly once")
 
 
 # --------------------------------------------------------------------------- #
@@ -593,7 +621,9 @@ async def test_needs_action_failure_dead_letters_with_the_diagnosis(
     assert (item.payload or {}).get("paused_count") is None, "it never paused"
     assert "api key" in (item.error or "").lower(), item.error
     assert _jobs(db, pro["id"]) == [], "nothing is persisted before the AI call succeeds"
-    assert len(_scoring_calls()) == 1, "a blocked key must not be retried"
+    # One call per candidate, all in flight at once: a blocked key is never
+    # *retried*, and the concurrent slice cannot fan out past its own size.
+    assert 1 <= len(_scoring_calls()) <= RESCORE_TOP, len(_scoring_calls())
 
 
 # --------------------------------------------------------------------------- #

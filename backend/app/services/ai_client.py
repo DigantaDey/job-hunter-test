@@ -484,6 +484,37 @@ def _breaker(workflow: str) -> Breaker:
     return _breakers.setdefault(workflow or "default", Breaker())
 
 
+def slice_failure_baseline(workflow: str) -> int:
+    """Consecutive failures on *workflow*'s breaker right now.
+
+    Half of the bounded-parallel accounting pair: a caller that runs N verdicts
+    in flight takes this before the slice and hands it to
+    :func:`collapse_slice_failures` if the slice fails.
+    """
+    return int(_breaker(workflow).failures)
+
+
+def collapse_slice_failures(workflow: str, baseline: int) -> None:
+    """Count one failed parallel slice as **one** consecutive failure.
+
+    A batch that issues N verdicts in flight records N failures when the
+    provider is down — so the breaker opens after ``AI_BREAKER_FAILURES``/N
+    failed batches instead of after N of them. That is not a theoretical
+    difference: an open breaker makes :func:`ai_availability` report
+    ``transient_outage`` regardless of a green probe, and the watchdog then
+    refuses to drain *paused* work until the cooldown elapses — a fresh outage
+    would delay every user's resumed run by up to ``AI_BREAKER_COOLDOWN_SECONDS``.
+
+    The sequential slice this replaced recorded exactly one failure per batch
+    (the first candidate's — the loop stopped there), so the parallel one keeps
+    that accounting: the breaker is left as it was, plus one failure for the
+    attempt that failed.
+    """
+    breaker = _breaker(workflow)
+    if breaker.failures > baseline + 1:
+        breaker.failures = baseline + 1
+
+
 def _sem() -> asyncio.Semaphore:
     global _semaphore, _semaphore_loop
     loop = asyncio.get_running_loop()

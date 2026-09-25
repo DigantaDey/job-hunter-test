@@ -16,13 +16,25 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, DbSession
 from app.core import audit
-from app.models.models import CandidateProfile, ProfileFieldProvenance
+from app.models.models import CandidateProfile, ProfileFieldProvenance, User
 from app.services import candidate_profile as cp_service
 
 router = APIRouter(prefix="/profile", tags=["candidate-profile"])
+
+
+def _after_review_hook(db: Session, user: User, profile_id: int) -> None:
+    """Post-commit pool hook shared by the review endpoints.
+
+    Imported lazily so the router does not pull the discovery graph in unless a
+    review actually happens. The hook itself never raises.
+    """
+    from app.services import job_pool
+
+    job_pool.maybe_instant_match_after_review(db, user, profile_id)
 
 
 class ExtractRequest(BaseModel):
@@ -154,6 +166,11 @@ def resolve_field(request: Request, user: CurrentUser, db: DbSession, body: Reso
 
     db.commit()
 
+    # Onboarding is finished the moment the last field is resolved: hand the
+    # profile to the shared pool for instant matches and queue the live run.
+    # Idempotent per (profile, document), and failure-isolated by the hook.
+    _after_review_hook(db, user, body.profile_id)
+
     # Audit
     audit.audit(db, "profile.review_completed", user=user, target=body.path, request=request, detail={"action": body.action, "profile_id": body.profile_id})
 
@@ -180,6 +197,11 @@ def correct_field_endpoint(request: Request, user: CurrentUser, db: DbSession, b
         raise HTTPException(404, {"code": "field_needs_review", "message": str(exc)}) from exc
 
     db.commit()
+
+    # A correction can be the change that activates the profile — match the
+    # corrected document against the pool before answering.
+    _after_review_hook(db, user, body.profile_id)
+
     audit.audit(db, "profile.updated", user=user, target=body.path, request=request, detail={"profile_id": body.profile_id, "field": body.path})
 
     updated_profile, provenance_list = cp_service.get_profile_with_provenance(db, user.id, body.profile_id)

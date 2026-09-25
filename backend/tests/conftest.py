@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterator, List
 
 _TMP = tempfile.mkdtemp(prefix="jobhunter-test-")
@@ -629,8 +629,49 @@ def _stub_funding_extract(prompt: str) -> Dict[str, Any]:
 # ``behavior["fail_after"]`` good responses it starts returning
 # ``behavior["status"]``, so a test can watch a pipeline get partway through,
 # hit an outage, recover, and finish without duplicates. No outbound network.
+#
+# **Threaded, but serialised.** The product issues AI calls *concurrently* (a
+# discovery run's scoring slice runs several verdicts in flight), and these
+# scripts answer from shared counters — so the server must neither wedge its
+# accept loop on a half-open connection (which a single-threaded ``HTTPServer``
+# did: its teardown then hung forever) nor let two handlers race the counters
+# ("serve N good responses, then go down" has to mean exactly that). One
+# connection thread per client plus one lock around ``handle_one_request`` gives
+# both: real concurrency on the wire, a strictly sequential decision.
 # --------------------------------------------------------------------------- #
-class ScriptedAIHandler(BaseHTTPRequestHandler):
+class _ProviderServer(ThreadingHTTPServer):
+    """Threaded accept loop, one-request-at-a-time handling, daemon threads."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.request_lock = threading.Lock()
+
+
+class _SerializedRequests:
+    """Serialise the request decision across connection threads.
+
+    The lock is **per server** (an attribute on the instance), not a class
+    attribute: a client that abandons a response mid-write must not be able to
+    hold a later test's server hostage.
+    """
+
+    #: Bound the hold on that lock: a socket that stops being read/written (a
+    #: client that cancelled a request) times out instead of parking a handler
+    #: thread — and the lock — indefinitely.
+    timeout = 15
+
+    def handle_one_request(self) -> None:
+        lock = getattr(self.server, "request_lock", None)
+        if lock is None:  # pragma: no cover - only when used with a plain server
+            return super().handle_one_request()
+        with lock:
+            return super().handle_one_request()
+
+
+class ScriptedAIHandler(_SerializedRequests, BaseHTTPRequestHandler):
     behavior: Dict[str, Any] = {}
 
     def log_message(self, *a):  # silence
@@ -800,7 +841,7 @@ class ScriptedAIHandler(BaseHTTPRequestHandler):
 
 
 
-class FakeGoogleHandler(BaseHTTPRequestHandler):
+class FakeGoogleHandler(_SerializedRequests, BaseHTTPRequestHandler):
     """A minimal Google AI Studio (Generative Language) fake.
 
     Handles:
@@ -944,7 +985,7 @@ def google_provider():
     """
     FakeGoogleHandler.behavior = {"requests": [], "good": 0, "status": 503, "fail_after": None, "delay": 0.0, "override": [], "VALID_KEY": "test-google-key"}
     FakeGoogleHandler.VALID_KEY = "test-google-key"
-    server = HTTPServer(("127.0.0.1", 0), FakeGoogleHandler)
+    server = _ProviderServer(("127.0.0.1", 0), FakeGoogleHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}/v1beta"
@@ -1019,7 +1060,7 @@ def ai_provider():
     ScriptedAIHandler.behavior = {"requests": [], "good": 0, "status": 503,
                                   "fail_after": None, "delay": 0.0,
                                   "override": []}
-    server = HTTPServer(("127.0.0.1", 0), ScriptedAIHandler)
+    server = _ProviderServer(("127.0.0.1", 0), ScriptedAIHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield f"http://127.0.0.1:{server.server_address[1]}/v1"

@@ -460,6 +460,41 @@ class Settings(BaseSettings):
     per_host_min_interval_seconds: float = 1.0
     max_concurrent_fetches: int = 4
     max_ats_boards_per_run: int = 12
+    #: Per-source fetch budget inside one discovery fan-out. Discovery's value is
+    #: breadth: a source that cannot answer inside this window is reported as
+    #: ``timeout`` in the run report (visible, with the per-source error) rather
+    #: than holding the whole run open. Raise it on a slow network if the
+    #: report shows healthy sources timing out.
+    discovery_fetch_timeout_seconds: float = Field(default=45.0, ge=5.0, le=300.0)
+
+    # ------------------------------------------------------------------ #
+    # Shared job pool (cross-user discovery)
+    #
+    # Every discovery run folds the postings it scanned into one shared pool;
+    # a new user is matched against that pool *immediately* (no network) while
+    # their own live run is still fetching. The pool is deliberately bounded:
+    # nothing older than ``job_pool_retention_days`` is kept, and a pruned
+    # posting leaves an aggregate-only metrics row (owner-visible) behind.
+    # ------------------------------------------------------------------ #
+    #: Master switch. Off means discovery behaves exactly as before: no pool
+    #: reads, no pool writes, no instant match. (A deployment that must not
+    #: share postings between tenants turns this off.)
+    job_pool_enabled: bool = True
+    #: Retention window. Postings older than this are pruned by content and
+    #: folded into ``job_pool_metrics`` (aggregates only, owner-visible).
+    job_pool_retention_days: int = Field(default=7, ge=1, le=60)
+    #: Rows touched by one pruning pass — bounds the delete on a hot table.
+    job_pool_prune_batch: int = Field(default=500, ge=10, le=5000)
+    #: Postings one discovery run may contribute to the pool.
+    job_pool_ingest_limit: int = Field(default=300, ge=10, le=2000)
+    #: Pool matches one discovery run may add to the run's candidate batch.
+    job_pool_candidates_per_run: int = Field(default=60, ge=0, le=500)
+    #: Jobs the instant match (onboarding completion) may put on a fresh board.
+    job_pool_instant_match_limit: int = Field(default=25, ge=0, le=100)
+    #: AI scoring / classification tasks a discovery run may keep in flight.
+    #: The AI gateway's own semaphore (``AI_MAX_CONCURRENCY``) is the hard
+    #: bound; this is how many calls discovery hands it at once.
+    discovery_ai_concurrency: int = Field(default=4, ge=1, le=16)
     include_demo_pool: bool = False
     enabled_sources: List[str] = Field(default_factory=list)
     http_user_agent: str = "JobHunterAI/2.0 (+https://github.com/jobhunter-ai)"

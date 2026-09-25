@@ -38,12 +38,14 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import inc
 from app.models.models import Job, User
+from app.services import job_pool
 from app.services import sources as source_registry
 from app.services.classifier import ai_company_size, deterministic_company_size
 from app.services.company_normalize import normalize_company_name
 from app.services.demo_pool import demo_jobs
 from app.services.events import record_job_event
 from app.services.form_detector import detect_form_structure
+from app.services.job_insert import build_job_row
 from app.services.reliability import count, duration
 from app.services.scoring import preliminary_score, score_job
 from app.services.user_settings import get_setting
@@ -53,6 +55,14 @@ log = get_logger("app.discovery")
 AI_RESCORE_TOP = 12
 AI_CLASSIFY_TOP = 5
 FORM_DETECT_TOP = 8
+
+#: Provenance labels that mean "a model or the local decision engine produced
+#: this verdict" — as opposed to the deterministic pre-rank. The run report
+#: counts the *engine-scored* rows, not the ``ai`` rows only: since Laya answers
+#: the ranking rubric in one forward pass, a run where every job has a real
+#: verdict can legitimately have ``scored=0`` under the old, AI-only count — a
+#: number that read as "nothing was scored" while nothing was wrong.
+ENGINE_SCORE_SOURCES = ("ai", "laya")
 
 #: The only two reasons the AI top slice may be skipped, reported verbatim in
 #: the run's ``ai_rescore.skipped`` (``None`` means the slice ran). They are a
@@ -83,7 +93,7 @@ WHY_NO_FRESH_POSTINGS = "no_fresh_postings"
 WHY_JOBS_CAP_REACHED = "jobs_cap_reached"
 
 
-def _canonical_key(posting: Dict[str, Any]) -> str:
+def canonical_key(posting: Dict[str, Any]) -> str:
     """Canonical job identity used to merge duplicates.
 
     Prefer the adapter's ``canonical_id`` / ``dedupe_key`` (``source:external_id``
@@ -104,9 +114,14 @@ def _canonical_key(posting: Dict[str, Any]) -> str:
     return f"{company}|{title}".lower()[:280]
 
 
+#: Historical private name — kept as an alias so nothing that imports it (the
+#: pool, tests) has to know about the rename.
+_canonical_key = canonical_key
+
+
 def _lookup_keys(posting: Dict[str, Any]) -> List[str]:
     """Canonical key plus the two historical shapes, for matching existing rows."""
-    canonical = _canonical_key(posting)
+    canonical = canonical_key(posting)
     keys = [canonical]
     external = str(posting.get("external_id") or "").strip().lower()[:280]
     if external and external not in keys:
@@ -248,6 +263,12 @@ async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[
     (``handlers.handle_discovery``) sets it from the user's profile *and* their
     ``can_use_advanced_matching`` entitlement, so a free-tier batch never
     reaches the loop below.
+
+    The top slice runs **in parallel** (bounded by ``DISCOVERY_AI_CONCURRENCY``,
+    and hard-bounded by the gateway's own ``AI_MAX_CONCURRENCY`` semaphore and
+    RPM limiter): a sequential slice is what turned a twelve-candidate batch
+    into minutes of wall clock. The failure contract is unchanged — any verdict
+    failing raises, so the run pauses and re-executes as a whole.
     """
     for candidate in candidates:
         score, reason = preliminary_score(profile_data, candidate["description"])
@@ -258,13 +279,111 @@ async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[
     if not use_ai or not profile_data:
         return
     ranked = sorted(candidates, key=lambda c: c["score"], reverse=True)[:AI_RESCORE_TOP]
-    for candidate in ranked:
-        result = await score_job(profile_data, candidate["description"], db=db, user_id=user_id,
-                                 persona=persona, allow_preliminary=False)
+    results = await _run_ai_slice(
+        ranked,
+        lambda candidate, session: score_job(
+            profile_data, candidate["description"], db=session, user_id=user_id,
+            persona=persona, allow_preliminary=False,
+        ),
+        workflow="scoring",
+        per_task_sessions=db is not None and user_id is not None,
+    )
+    for candidate, result in zip(ranked, results, strict=False):
+        if result is None:  # pragma: no cover - _run_ai_slice raises instead
+            continue
         candidate["score"] = result["score"]
         candidate["score_reason"] = result["reason"]
         candidate["score_source"] = result["score_source"]
         candidate["score_detail"] = result.get("detail") or {}
+
+
+def _ai_concurrency() -> int:
+    """How many verdicts a discovery run keeps in flight.
+
+    The gateway's own semaphore (``AI_MAX_CONCURRENCY``) and the RPM limiter stay
+    the *hard* bounds; this just stops discovery from serialising a batch that
+    the gateway was always willing to run in parallel. That serialisation was a
+    large part of "discovery is slow": twelve scoring verdicts at ~30 s each is
+    six minutes of wall clock for work that can be done four at a time.
+    """
+    try:
+        configured = int(getattr(settings, "discovery_ai_concurrency", 4) or 4)
+    except (TypeError, ValueError):
+        configured = 4
+    return max(1, min(configured, 16))
+
+
+async def _run_ai_slice(
+    candidates: List[Dict[str, Any]],
+    call,
+    *,
+    workflow: str,
+    per_task_sessions: bool = True,
+) -> List[Optional[Dict[str, Any]]]:
+    """Run one AI verdict per candidate, bounded and parallel; keep the contract.
+
+    Two things this must not change, because the product depends on both:
+
+    * **The hard dependency still raises.** A transient outage in any verdict
+      propagates out of the run (the queued item pauses and re-executes) — the
+      successful verdicts are discarded rather than persisted, exactly as the
+      sequential loop behaved. Nothing is written before this point, so a
+      resumed run produces the same rows.
+    * **Fail fast, cancel the rest.** The run is going to fail either way, so
+      the first failing verdict cancels every candidate that has not started
+      yet: an outage cannot fan out into "one failed call per candidate", and
+      cannot open the AI gateway's breaker on a burst of failures from a single
+      faulty run (the breaker needs ``AI_BREAKER_FAILURES`` consecutive
+      failures, and a cancelled slice only ever records the calls already on the
+      wire).
+    * **One session per in-flight verdict.** The AI gateway writes to the
+      session it is handed (usage ledger, entitlement reads); a session is not
+      safe to share between coroutines that each await, so each task opens its
+      own and closes it (also on cancellation — the ``finally`` runs). The run's
+      own session stays untouched until the slice has finished.
+    """
+    if not candidates:
+        return []
+    from app.db import SessionLocal  # noqa: PLC0415 - keep the import graph flat
+    from app.services import ai_client  # noqa: PLC0415 - cycle-free at call time
+
+    #: One logical batch, one consecutive failure (see
+    #: ``ai_client.collapse_slice_failures``): the in-flight verdicts of a slice
+    #: that just lost its provider must not fan out into a breaker-opening storm
+    #: — that would delay the watchdog's resume of *paused* work for the whole
+    #: cooldown.
+    failure_baseline = ai_client.slice_failure_baseline(workflow)
+    semaphore = asyncio.Semaphore(_ai_concurrency())
+
+    async def one(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        async with semaphore:
+            session = SessionLocal() if per_task_sessions else None
+            try:
+                return await call(candidate, session)
+            finally:
+                if session is not None:
+                    session.close()
+
+    tasks = [asyncio.create_task(one(candidate)) for candidate in candidates]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    failure: Optional[BaseException] = None
+    for task in done:
+        exc = task.exception()
+        if exc is not None and failure is None:
+            failure = exc
+    if pending:
+        for task in pending:
+            task.cancel()
+        # Reap the cancelled tasks so no "exception was never retrieved" warning
+        # (and no half-finished session) leaks out of the slice.
+        await asyncio.gather(*pending, return_exceptions=True)
+    if failure is not None:
+        ai_client.collapse_slice_failures(workflow, failure_baseline)
+        inc("jobhunter_discovery_ai_slice_total", workflow=workflow, result="failed")
+        raise failure
+    inc("jobhunter_discovery_ai_slice_total", workflow=workflow, result="ok",
+        value=len(candidates))
+    return [task.result() for task in tasks]
 
 
 async def discover_for_user(db: Session, user: User, **kwargs: Any) -> Dict[str, Any]:
@@ -410,12 +529,52 @@ async def _run_discovery(
         postings.extend(demo_jobs(keywords, freshness_hours, limit=max(6, limit // 2)))
         report["demo_pool"] = True
 
+    # ---------------- shared pool (coverage + latency) ----------------
+    # Two things happen here, both bounded and both optional (``JOB_POOL_ENABLED``):
+    #
+    #   * **Retention runs.** One bounded pruning pass folds anything past its
+    #     7-day window into aggregate-only metrics and drops the content. Doing
+    #     it on the discovery path means a deployment that runs discovery at all
+    #     self-maintains the pool — no cron required — and the batch cap keeps
+    #     the delete cheap even when the pool is large.
+    #   * **The pool offers candidates.** Live entries this user does not
+    #     already have, ranked by the same deterministic pre-rank, are added to
+    #     the batch *before* dedupe/freshness/merge run, so a pool match is
+    #     treated exactly like a fetched posting. This is where coverage comes
+    #     from beyond the source fan-out: a posting the user's own adapters never
+    #     returned is still discoverable because another run saw it.
+    pool_report: Dict[str, Any] = {"enabled": job_pool.enabled(),
+                                   "retention_days": job_pool.retention_days()}
+    pool_offered: List[Dict[str, Any]] = []
+    if job_pool.enabled():
+        try:
+            pruned = job_pool.prune(db)
+            pool_report["pruned"] = int(pruned.get("pruned") or 0)
+        except Exception as exc:  # noqa: BLE001 - retention must not fail a run
+            db.rollback()
+            log.warning("discovery: pool pruning failed for user %s: %s", user.id, exc)
+        try:
+            limit_per_run = max(0, int(getattr(settings, "job_pool_candidates_per_run", 60) or 0))
+            if limit_per_run:
+                pool_offered = job_pool.candidates_for_user(
+                    db, user.id, profile=profile_data or None, keywords=keywords,
+                    limit=limit_per_run,
+                )
+                postings.extend(pool_offered)
+            pool_report["offered"] = len(pool_offered)
+            pool_report["live_entries"] = job_pool.live_entry_count(db)
+        except Exception as exc:  # noqa: BLE001 - the pool is supplementary
+            db.rollback()
+            log.warning("discovery: pool read failed for user %s: %s", user.id, exc)
+    if pool_report.get("enabled"):
+        report["pool"] = pool_report
+
     # ---------------- de-duplicate within the batch ----------------
     unique: List[Dict[str, Any]] = []
     seen: set[str] = set()
     seen_hash: set[str] = set()
     for posting in postings:
-        key = _canonical_key(posting)
+        key = canonical_key(posting)
         posting["dedupe_key"] = key
         posting.setdefault("canonical_id", key)
         if key in seen:
@@ -440,6 +599,33 @@ async def _run_discovery(
     expired_dropped = len(unique) - len(live_unique)
     if expired_dropped:
         report["expired_dropped"] = expired_dropped
+        # A source that marks a posting closed/expired is telling us the market
+        # lost it. In the shared pool that means content out, aggregates kept
+        # (``job_pool_metrics``, reason ``deleted``) — the same route retention
+        # takes, immediately — so the pool never advertises a dead listing and
+        # never keeps one either. Freshness-window drops are *not* deletions:
+        # they are still live postings, just older than this user asked for.
+        if job_pool.enabled():
+            withdrawn = [p for p in unique if _is_expired_candidate(p, started)
+                         and not (p.get("extra") or {}).get("job_pool")]
+            for posting in withdrawn:
+                try:
+                    job_pool.record_posting_deleted(
+                        db, dedupe_key=canonical_key(posting),
+                        source=str(posting.get("source") or ""),
+                        company_name_normalized=str(posting.get("company_name_normalized")
+                                                    or normalize_company_name(posting.get("company") or "")),
+                        commit=False,
+                    )
+                except Exception as exc:  # noqa: BLE001 - the pool is supplementary
+                    db.rollback()
+                    log.warning("discovery: pool deletion record failed for user %s: %s", user.id, exc)
+            if withdrawn:
+                try:
+                    db.commit()  # one commit for the batch, like the ingest path
+                except Exception as exc:  # noqa: BLE001
+                    db.rollback()
+                    log.warning("discovery: pool deletion commit failed for user %s: %s", user.id, exc)
     fresh = [p for p in live_unique if not p.get("posted_at") or p["posted_at"] >= cutoff]
     older = [p for p in live_unique if p.get("posted_at") and p["posted_at"] < cutoff]
     if len(fresh) < max(3, limit // 3) and older:
@@ -448,6 +634,31 @@ async def _run_discovery(
             posting["freshness_relaxed"] = True
             fresh.append(posting)
         report["freshness_relaxed"] = True
+
+    # ---------------- pool write (cross-user coverage) ----------------
+    # Everything this run scanned is folded into the shared pool — except the
+    # candidates the pool itself supplied (re-recording those would inflate
+    # ``times_seen`` for a posting this run did not fetch). This is the other
+    # half of the coverage story: the *next* user's board can contain what this
+    # run found, without waiting for their own fan-out.
+    if job_pool.enabled():
+        from_pool = {id(candidate) for candidate in pool_offered}
+        # ``live_unique``, not ``unique``: a posting a source marked closed was
+        # just withdrawn from the pool above, and re-ingesting it here would put
+        # a dead listing straight back — the pool would advertise what the run
+        # already knows is gone. Freshness-window drops *are* ingested: they are
+        # live postings, just older than this user asked for, and they are
+        # exactly the coverage the next user benefits from.
+        contribution = [candidate for candidate in live_unique if id(candidate) not in from_pool]
+        if contribution:
+            try:
+                recorded = job_pool.record_candidates(db, contribution, user_id=int(user.id))
+                pool_report["ingested"] = int(recorded.get("created") or 0)
+                pool_report["refreshed"] = int(recorded.get("updated") or 0)
+                pool_report["contributors"] = int(recorded.get("contributors") or 0)
+            except Exception as exc:  # noqa: BLE001 - the pool is supplementary
+                db.rollback()
+                log.warning("discovery: pool write failed for user %s: %s", user.id, exc)
 
     # Newest first. This is the only ordering that is known *before* scoring —
     # ``score`` does not exist on a candidate until ``_score_candidates`` runs
@@ -504,6 +715,19 @@ async def _run_discovery(
                 job = by_hash.get(str(candidate.get("content_hash") or ""))
             if job is None:
                 continue
+            if _is_expired_candidate(candidate, merged_now) and job_pool.enabled() \
+                    and not (candidate.get("extra") or {}).get("job_pool"):
+                # Same signal, second half: an existing row whose posting the
+                # source now marks closed is withdrawn from the shared pool too.
+                try:
+                    job_pool.record_posting_deleted(
+                        db, dedupe_key=canonical_key(candidate),
+                        source=str(candidate.get("source") or job.source or ""),
+                        company_name_normalized=str(job.company_name_normalized or ""),
+                    )
+                except Exception as exc:  # noqa: BLE001 - the pool is supplementary
+                    db.rollback()
+                    log.warning("discovery: pool deletion record failed for user %s: %s", user.id, exc)
             _merge_existing_job(job, candidate, merged_now)
             # A re-seen posting refreshes the existing row: counted as an
             # update, never as a new job, so "jobs found" cannot be inflated by
@@ -526,19 +750,35 @@ async def _run_discovery(
                             db=db, user_id=user.id, persona=persona_context)
 
     ranked = sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)[:limit * 2]
-    for index, candidate in enumerate(ranked):
-        if index < AI_CLASSIFY_TOP and profile_data:
-            # AI verdict — a hard dependency: on outage this raises and the
-            # queued run pauses (re-executed when the provider is back).
-            size, confidence = await ai_company_size(candidate["company"], candidate["description"],
-                                                     db=db, user_id=user.id)
-        else:
+    ai_classified = ranked[:AI_CLASSIFY_TOP] if profile_data else []
+    #: ``id()`` of the candidates that already have an engine verdict, so the
+    #: deterministic bulk-labelling pass below cannot overwrite one (and cannot
+    #: skip a candidate just because a source happened to supply a size).
+    verdicts: set[int] = set()
+    if ai_classified:
+        # AI verdict — a hard dependency: on outage this raises and the queued
+        # run pauses (re-executed when the provider is back). Bounded-parallel
+        # for the same reason the scoring slice is (see ``_run_ai_slice``).
+        sizes = await _run_ai_slice(
+            ai_classified,
+            lambda candidate, session: ai_company_size(candidate["company"],
+                                                       candidate["description"],
+                                                       db=session, user_id=user.id),
+            workflow="classify",
+            per_task_sessions=db is not None and user.id is not None,
+        )
+        for candidate, verdict in zip(ai_classified, sizes, strict=False):
+            if verdict is None:  # pragma: no cover - _run_ai_slice raises instead
+                continue
+            candidate["company_size"], candidate["company_size_confidence"] = verdict
+            verdicts.add(id(candidate))
+    for candidate in ranked:
+        if id(candidate) not in verdicts:
             # Bulk slice (beyond the AI top-N): deterministic, source-data-first
             # labelling — provenance-labelled, never an AI substitute.
-            size = deterministic_company_size({"size": candidate.get("company_size")}, candidate)
-            confidence = 0.55
-        candidate["company_size"] = size
-        candidate["company_size_confidence"] = confidence
+            candidate["company_size"] = deterministic_company_size(
+                {"size": candidate.get("company_size")}, candidate)
+            candidate["company_size_confidence"] = 0.55
 
     # ---------------- persist ----------------
     # One commit per row, not one commit for the batch: the AI verdicts for
@@ -555,47 +795,12 @@ async def _run_discovery(
     for candidate in ranked[:batch_limit]:
         if _is_expired_candidate(candidate, seen_at):
             continue
-        incoming_raw = candidate.get("raw")
-        raw_payload: Dict[str, Any] = dict(incoming_raw) if isinstance(incoming_raw, dict) else {}
-        job = Job(
-            user_id=user.id,
-            title=candidate["title"],
-            company=candidate["company"],
-            # SQL-side company filter identity (see Job model / migration
-            # e5f6a7b8c9d0) — stored at import time, not derived per query.
-            company_name_normalized=candidate.get("company_name_normalized")
-            or normalize_company_name(candidate["company"]),
-            location=candidate.get("location", ""),
-            description=candidate.get("description", ""),
-            url=candidate.get("url", ""),
-            source=candidate.get("source", "unknown"),
-            external_id=candidate.get("external_id", ""),
-            dedupe_key=candidate["dedupe_key"],
-            status="discovered",
-            score=float(candidate.get("score", 0.0)),
-            score_reason=candidate.get("score_reason", ""),
-            score_source=str(candidate.get("score_source") or "preliminary"),
-            score_detail=candidate.get("score_detail") or ({"ai_error": candidate["ai_error"]}
-                                                           if candidate.get("ai_error") else {}),
-            persona_id=persona_id,
-            company_size=candidate.get("company_size", "unknown"),
-            company_info={"confidence": candidate.get("company_size_confidence", 0.0),
-                          "industry": candidate.get("industry", "")},
-            posted_at=candidate.get("posted_at"),
-            freshness_hours=freshness_hours,
-            extra={"salary": candidate.get("salary", ""), "remote": candidate.get("remote", False),
-                   "freshness_relaxed": candidate.get("freshness_relaxed", False), "forms": {},
-                   **({"search_discovery": candidate["extra"]["search_discovery"]}
-                      if (candidate.get("extra") or {}).get("search_discovery") else {})},
-            first_seen_at=seen_at,
-            last_seen_at=seen_at,
-            last_verified_at=seen_at,
-            expired=False,
-            source_kind=str(candidate.get("source_kind") or "")[:16],
-            content_hash=str(candidate.get("content_hash") or "")[:64],
-            title_normalized=str(candidate.get("title_normalized") or candidate["title"]).strip().lower()[:300],
-            raw_payload=dict(raw_payload),
-        )
+        # The row mapping lives in one place (``job_insert.build_job_row``) so a
+        # pool-sourced row and a live-sourced row are the same shape — they are
+        # merged by identity on the next run, and a drifted column would show the
+        # same posting twice.
+        job = build_job_row(candidate, user_id=user.id, freshness_hours=freshness_hours,
+                            persona_id=persona_id, now=seen_at)
         db.add(job)
         try:
             db.commit()
@@ -667,10 +872,17 @@ async def _run_discovery(
     ai_rescore: Dict[str, Any] = {
         "enabled": ai_enabled,
         "skipped": None if ai_enabled else str(ai_rescore_skipped or AI_RESCORE_NO_PROFILE),
-        # Rows, not calls: a candidate the model could not verdict (guardrail
-        # rejection, no text to score) is not an AI-scored job, and a run whose
+        # Rows, not calls: a candidate no engine could verdict (guardrail
+        # rejection, no text to score) is not a scored job, and a run whose
         # insert lost a uniqueness race created nothing to score.
-        "scored": sum(1 for job in created if str(job.score_source or "") == "ai"),
+        #
+        # "scored" counts **engine verdicts** — the model *or* the local Laya
+        # decision engine (:data:`ENGINE_SCORE_SOURCES`). It used to count
+        # ``score_source == "ai"`` only, which reads as "nothing was scored" on a
+        # run where Laya answered every rubric question in one forward pass — a
+        # report that contradicts the board it describes.
+        "scored": sum(1 for job in created
+                      if str(job.score_source or "") in ENGINE_SCORE_SOURCES),
     }
     # The returned report *is* the run report built at the top of this function
     # (v2.2.4). It used to be two dicts: ``report`` carried ``started_at``,
@@ -702,14 +914,24 @@ async def _run_discovery(
          "score": job.score, "location": job.location, "url": job.url}
         for job in created
     ]
+    # The pool block closes the coverage story (v2.3): a run says how many pool
+    # entries it was offered (and how many of those it added), how many postings
+    # it contributed back, and how many entries retention pruned while it ran.
+    # Absent when the pool is switched off — nothing to claim.
+    if pool_report.get("enabled"):
+        pool_report["live_entries"] = pool_report.get("live_entries") or job_pool.live_entry_count(db)
+        report["pool"] = pool_report
     log.info(
-        "discovery: %s scanned, %s inserted in %.1fs (ai_rescore enabled=%s skipped=%s scored=%s)%s%s",
+        "discovery: %s scanned, %s inserted in %.1fs (ai_rescore enabled=%s skipped=%s scored=%s)%s%s%s",
         report["scanned"], report["inserted"], elapsed,
         ai_rescore["enabled"], ai_rescore["skipped"] or "-", ai_rescore["scored"],
         f" insert_errors={len(insert_errors)}" if insert_errors else "",
         f" why_empty={why_empty}" if why_empty else "",
+        f" pool={pool_report.get('offered', 0)}/{pool_report.get('ingested', 0)}"
+        if pool_report.get("enabled") else "",
         extra={"extra_fields": {"user_id": user.id, **{k: report[k] for k in ("scanned", "fresh", "inserted")},
                                 "ai_rescore": ai_rescore,
+                                **(report.get("pool") or {}),
                                 **({"why_empty": why_empty} if why_empty else {})}},
     )
     return report

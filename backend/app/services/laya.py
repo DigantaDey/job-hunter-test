@@ -43,7 +43,7 @@ import asyncio
 import importlib.util
 import threading
 import time
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -79,6 +79,27 @@ LONG_STATE_CHARS = 1500
 _lock = threading.Lock()
 _router: Any = None
 _load_error: Optional[str] = None
+
+#: One process-wide lock around ``router.predict`` itself (``_lock`` only guards
+#: construction). The engine is a *single* torch model: running two forward
+#: passes on it at once is what produced the Metal
+#: ``MTLCommandBufferStatusCommitted`` assertion on macOS (two command buffers on
+#: one device) and thrashes memory anywhere else. Callers queue; the per-call
+#: ``LAYA_TIMEOUT_SECONDS`` budget still bounds the wait, so a saturated engine
+#: reports ``timeout`` rather than corrupting the process.
+_predict_lock = threading.Lock()
+
+#: Consecutive engine failures before it is parked, and for how long. A discovery
+#: run scores up to ``AI_RESCORE_TOP`` candidates; without this, an engine that
+#: is down (crash, missing GPU, OOM) costs the run one ``LAYA_TIMEOUT_SECONDS``
+#: timeout *per candidate* before every one of them falls back to the LLM — the
+#: 25-minute run in the v2.3 report. Parked means "do not retry yet": auto mode
+#: uses the LLM path (the pre-Laya behaviour), ``laya_only`` reports the same
+#: ``LayaUnavailable`` immediately instead of waiting out another timeout.
+_FAILURE_THRESHOLD = 3
+_FAILURE_COOLDOWN_SECONDS = 120.0
+_failures = 0
+_last_failure: Optional[float] = None
 
 
 class LayaUnavailable(RuntimeError):
@@ -129,11 +150,46 @@ def _get_router() -> Any:
 
 
 def reset_for_tests() -> None:
-    """Forget the cached router (test fixtures swap fake ``laya`` modules)."""
-    global _router, _load_error
+    """Forget the cached router and failure state (fixtures swap fake modules)."""
+    global _router, _load_error, _failures, _last_failure
     with _lock:
         _router = None
         _load_error = None
+        _failures = 0
+        _last_failure = None
+
+
+def _record_failure() -> None:
+    """Count a failed forward pass (timeout, crash, bad payload)."""
+    global _failures, _last_failure
+    with _lock:
+        _failures += 1
+        _last_failure = time.monotonic()
+
+
+def _record_success() -> None:
+    global _failures, _last_failure
+    with _lock:
+        _failures = 0
+        _last_failure = None
+
+
+def _failure_state() -> Tuple[int, Optional[float]]:
+    with _lock:
+        return _failures, _last_failure
+
+
+def parked() -> bool:
+    """True while the engine is benched after repeated failures.
+
+    ``engine_parked`` is a distinct reason from ``timeout`` / ``predict_failed``:
+    the UI and the run report can say "the local engine is parked for Ns" instead
+    of pretending every candidate hit a fresh timeout.
+    """
+    failures, last = _failure_state()
+    if failures < _FAILURE_THRESHOLD or last is None:
+        return False
+    return (time.monotonic() - last) < _FAILURE_COOLDOWN_SECONDS
 
 
 def status() -> Dict[str, Any]:
@@ -216,6 +272,9 @@ async def predict(questions: Mapping[str, Any], state: Any, *,
     failure — the caller decides between fallback and honest unavailability.
     """
     router = _get_router()
+    if parked():
+        inc("jobhunter_laya_predict_total", result="parked")
+        raise LayaUnavailable("engine_parked", "the engine is parked after repeated failures")
     max_len = int(settings.laya_max_len or 0)
     long_state = force_long
     if not long_state:
@@ -233,29 +292,35 @@ async def predict(questions: Mapping[str, Any], state: Any, *,
         kwargs["max_len"] = max_len
 
     def _run() -> Dict[str, Any]:
-        return router.predict(state, dict(questions), **kwargs)
+        with _predict_lock:
+            return router.predict(state, dict(questions), **kwargs)
 
     started = time.perf_counter()
     budget = float(timeout or settings.laya_timeout or 20.0)
     try:
         result = await asyncio.wait_for(asyncio.to_thread(_run), timeout=budget)
     except asyncio.TimeoutError as exc:
+        _record_failure()
         inc("jobhunter_laya_predict_total", result="timeout")
         raise LayaUnavailable("timeout", f"laya did not answer within {budget:.0f}s") from exc
     except LayaUnavailable:
         raise
     except Exception as exc:
+        _record_failure()
         inc("jobhunter_laya_predict_total", result="error")
         raise LayaUnavailable("predict_failed", f"{type(exc).__name__}: {exc}") from exc
-    inc("jobhunter_laya_predict_total", result="ok")
     duration_ms = (time.perf_counter() - started) * 1000
     if not isinstance(result, dict):
+        _record_failure()
+        inc("jobhunter_laya_predict_total", result="error")
         raise LayaUnavailable("bad_payload", "laya returned a non-dict payload")
+    inc("jobhunter_laya_predict_total", result="ok")
     routing = result.get("routing")
     if not isinstance(routing, Mapping):
         routing = {}
     log.debug("laya: %d question(s) in %.0fms via %s", len(questions), duration_ms,
               routing.get("model") or "default")
+    _record_success()
     result["_meta"] = {"duration_ms": duration_ms, "model": routing.get("model")}
     return result
 
