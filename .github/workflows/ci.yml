@@ -166,8 +166,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build production image (Laya decision engine, pre-warmed)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: jobhunter:ci-laya
+          load: true
+          build-args: |
+            WITH_AUTOFILL=0
+            WITH_LAYA=1
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Smoke test Chromium as the runtime user
         run: docker run --rm --network none --entrypoint python jobhunter:ci-autofill /app/backend/scripts/check_browser.py
+
+      - name: Smoke test Laya checkpoints offline as the runtime user
+        run: docker run --rm --network none --entrypoint python jobhunter:ci-laya /app/backend/scripts/warm_laya.py --check
 
   security:
     name: Security scanning (fail on critical)

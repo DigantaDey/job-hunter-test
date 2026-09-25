@@ -5,6 +5,7 @@
 #   AUTO_INSTALL=0 ./run.sh     # skip all dependency installation
 #   WITH_AUTOFILL=0 ./run.sh    # omit the optional browser stack
 #   WITH_LAYA=0 ./run.sh        # omit the optional local decision engine (Laya)
+#   LAYA_WARMUP=0 ./run.sh      # keep Laya but skip the one-off model download
 #
 # For production use docker-compose.prod.yml (see docs/DEPLOYMENT.md).
 set -euo pipefail
@@ -34,7 +35,16 @@ if [ "$AUTO_INSTALL" = "1" ]; then
     # Optional by contract: a failed install (no torch wheel for this platform,
     # an offline mirror) must not stop the app from starting — every Laya route
     # degrades to the LLM path when the package is absent.
-    if ! "$PYTHON_BIN" -m pip install -q -r backend/requirements-laya.txt; then
+    if "$PYTHON_BIN" -m pip install -q -r backend/requirements-laya.txt; then
+      # Warm the model cache once so ranking/classification work offline and the
+      # first decision is instant. Non-fatal: a failed or skipped warm-up just
+      # means the checkpoints download on first use (LAYA_WARMUP=0 skips it).
+      if [ "${LAYA_WARMUP:-1}" = "1" ]; then
+        echo "→ Warming the Laya model cache (one-off Hugging Face download of its checkpoints)…"
+        "$PYTHON_BIN" backend/scripts/warm_laya.py --if-needed \
+          || echo "  ! Laya warm-up failed — checkpoints will download on first use (auto mode falls back to the AI gateway meanwhile)."
+      fi
+    else
       echo "  ! Laya did not install — decision work will use the AI gateway instead (WITH_LAYA=0 silences this)."
     fi
   fi

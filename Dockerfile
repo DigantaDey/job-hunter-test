@@ -32,7 +32,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY backend/requirements.txt backend/requirements-autofill.txt /app/backend/
+COPY backend/requirements.txt backend/requirements-autofill.txt backend/requirements-laya.txt /app/backend/
+# The warm-up script is copied early so the (expensive) Laya weight layer below
+# only rebuilds when the script or requirements-laya.txt change, not on every
+# backend code change (COPY backend/ further down would invalidate it).
+COPY backend/scripts/warm_laya.py /app/backend/scripts/warm_laya.py
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
 # Assisted Apply's browser: WITH_AUTOFILL=1 bakes Playwright plus a Chromium
@@ -46,16 +50,33 @@ RUN if [ "$WITH_AUTOFILL" = "1" ]; then \
         && chmod -R 755 /opt/ms-playwright; \
     fi
 
+# Local decision engine (Laya): WITH_LAYA=1 bakes the optional typed-decision
+# stack (CPU torch + transformers). LAYA_WARMUP=1 (the default whenever
+# WITH_LAYA=1) also pre-downloads the Hugging Face checkpoints into $HF_HOME so
+# ranking/classification run fully offline — roughly 2–3 GB more image. Plain
+# `docker build` leaves Laya out; opt in with --build-arg WITH_LAYA=1 (compose:
+# set WITH_LAYA=1). LAYA_WARMUP=0 builds package-only and the weights then
+# download at first use.
+ARG WITH_LAYA=0
+ARG LAYA_WARMUP=1
+ENV HF_HOME=/opt/laya-cache
+RUN if [ "$WITH_LAYA" = "1" ]; then \
+        pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+        && pip install --no-cache-dir -r /app/backend/requirements-laya.txt \
+        && if [ "$LAYA_WARMUP" = "1" ]; then python /app/backend/scripts/warm_laya.py; fi; \
+    fi
+
 COPY backend/ /app/backend/
 COPY --from=web /web/dist /app/frontend/dist
 
 # Run as an unprivileged user; the writable data directories are chowned to it.
-# Also ensure the playwright browser cache is readable by the unprivileged user
-# when WITH_AUTOFILL=1 baked the browser in as root.
+# Also ensure the playwright browser cache and the Laya model cache are readable
+# (and writable, for a lazy first-use download) by the unprivileged user when
+# WITH_AUTOFILL=1 / WITH_LAYA=1 baked them in as root.
 RUN useradd --create-home --uid 10001 jobhunter \
-    && mkdir -p /app/backend/uploads /app/backend/generated /app/backend/artifacts/screenshots /opt/ms-playwright \
-    && chown -R jobhunter:jobhunter /app /opt/ms-playwright \
-    && chmod -R 755 /opt/ms-playwright
+    && mkdir -p /app/backend/uploads /app/backend/generated /app/backend/artifacts/screenshots /opt/ms-playwright /opt/laya-cache \
+    && chown -R jobhunter:jobhunter /app /opt/ms-playwright /opt/laya-cache \
+    && chmod -R 755 /opt/ms-playwright /opt/laya-cache
 USER jobhunter
 
 EXPOSE 8000

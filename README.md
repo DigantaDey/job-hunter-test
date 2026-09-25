@@ -68,7 +68,9 @@ cd frontend && npm install && npm run dev   # http://localhost:5173, proxies /ap
 
 `./run.sh` also installs Python Playwright and Chromium by default. Use
 `WITH_AUTOFILL=0 ./run.sh` for a browser-free install, `WITH_LAYA=0 ./run.sh` to omit the
-optional local decision engine (Laya), or `AUTO_INSTALL=0 ./run.sh` to skip all installation.
+optional local decision engine (Laya) — which is also warmed with a one-off model download
+(`LAYA_WARMUP=0 ./run.sh` keeps Laya but skips the download) — or `AUTO_INSTALL=0 ./run.sh`
+to skip all installation.
 The frontend npm package is not a substitute for the backend Python package. Installing the
 browser does not enable automatic submission; see the Assisted Apply settings below.
 
@@ -204,6 +206,13 @@ a self-hosted, Apache-2.0 decision model (`pip install -r backend/requirements-l
 `WITH_LAYA=1 ./run.sh`) that returns calibrated typed answers in one forward pass and is
 structurally unable to return malformed JSON (the main cause of AI failures in ranking). Anything
 that must *write* text (tailored resumes, emails, interview prep) always stays on the AI gateway.
+
+`./run.sh` installs **and warms** Laya by default: `backend/scripts/warm_laya.py` pre-downloads
+the `english` + `multilingual` checkpoints into the Hugging Face cache once (a marker skips it on
+later starts), so decisions work offline and the first one is instant. `LAYA_WARMUP=0` skips the
+download; `WITH_LAYA=0` omits the package. Docker images leave Laya out entirely — build with
+`--build-arg WITH_LAYA=1` to bake it in (`LAYA_WARMUP=1`, the default there, also bakes the
+weights for fully-offline containers; see `docs/DEPLOYMENT.md`).
 
 Routing is owner-configured in **Admin → Local decision engine (Laya)**:
 

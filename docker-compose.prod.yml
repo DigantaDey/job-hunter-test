@@ -32,6 +32,10 @@ services:
       args:
         # Assisted Apply's browser ships with the deployment by default.
         WITH_AUTOFILL: "${WITH_AUTOFILL:-1}"
+        # Local decision engine (Laya): set WITH_LAYA=1 to bake it (plus its
+        # model weights, LAYA_WARMUP=0 to skip) into the image.
+        WITH_LAYA: "${WITH_LAYA:-0}"
+        LAYA_WARMUP: "${LAYA_WARMUP:-1}"
     restart: unless-stopped
     depends_on:
       db:
@@ -85,6 +89,10 @@ services:
       args:
         # Assisted Apply's browser ships with the deployment by default.
         WITH_AUTOFILL: "${WITH_AUTOFILL:-1}"
+        # Local decision engine (Laya): set WITH_LAYA=1 to bake it (plus its
+        # model weights, LAYA_WARMUP=0 to skip) into the image.
+        WITH_LAYA: "${WITH_LAYA:-0}"
+        LAYA_WARMUP: "${LAYA_WARMUP:-1}"
     restart: unless-stopped
     depends_on:
       api:
@@ -123,6 +131,10 @@ services:
       args:
         # Assisted Apply's browser ships with the deployment by default.
         WITH_AUTOFILL: "${WITH_AUTOFILL:-1}"
+        # Local decision engine (Laya): set WITH_LAYA=1 to bake it (plus its
+        # model weights, LAYA_WARMUP=0 to skip) into the image.
+        WITH_LAYA: "${WITH_LAYA:-0}"
+        LAYA_WARMUP: "${LAYA_WARMUP:-1}"
     profiles: ["ops"]
     depends_on:
       db:
@@ -152,6 +164,10 @@ services:
       args:
         # Assisted Apply's browser ships with the deployment by default.
         WITH_AUTOFILL: "${WITH_AUTOFILL:-1}"
+        # Local decision engine (Laya): set WITH_LAYA=1 to bake it (plus its
+        # model weights, LAYA_WARMUP=0 to skip) into the image.
+        WITH_LAYA: "${WITH_LAYA:-0}"
+        LAYA_WARMUP: "${LAYA_WARMUP:-1}"
     restart: unless-stopped
     depends_on:
       db:

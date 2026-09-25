@@ -13,6 +13,10 @@ services:
         # Assisted Apply needs Playwright + Chromium inside the image; set to
         # "0" for the minimal dev image.
         WITH_AUTOFILL: "1"
+        # Local decision engine (Laya): set to "1" to bake it (plus its model
+        # weights) into the dev image; LAYA_WARMUP=0 skips the baked weights.
+        WITH_LAYA: "${WITH_LAYA:-0}"
+        LAYA_WARMUP: "${LAYA_WARMUP:-1}"
     ports:
       - "8000:8000"
     env_file:
