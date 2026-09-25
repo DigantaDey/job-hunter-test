@@ -1082,7 +1082,9 @@ async def _laya_map_fields(
             "criteria": criteria,
         }
     result = await laya.predict(questions, state)
-    answers = result.get("answers") if isinstance(result.get("answers"), Mapping) else {}
+    answers = result.get("answers")
+    if not isinstance(answers, Mapping):
+        answers = {}
     out: Dict[str, str] = {}
     floor = laya.confidence_floor(db, user_id)
     for qkey, name in by_qkey.items():
@@ -1094,7 +1096,9 @@ async def _laya_map_fields(
             continue
         confidence = answer.get("confidence")
         if not isinstance(confidence, (int, float)):
-            probs = answer.get("probs") if isinstance(answer.get("probs"), Mapping) else {}
+            probs = answer.get("probs")
+            if not isinstance(probs, Mapping):
+                probs = {}
             confidence = float(probs.get(chosen, 0.0)) if probs else 0.0
         if float(confidence) < floor:
             continue

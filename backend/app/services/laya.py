@@ -100,7 +100,7 @@ def installed() -> bool:
         return False
 
 
-def _get_router():
+def _get_router() -> Any:
     """Build (once) and return the Laya Router. Raises :class:`LayaUnavailable`."""
     global _router, _load_error
     with _lock:
@@ -251,7 +251,9 @@ async def predict(questions: Mapping[str, Any], state: Any, *,
     duration_ms = (time.perf_counter() - started) * 1000
     if not isinstance(result, dict):
         raise LayaUnavailable("bad_payload", "laya returned a non-dict payload")
-    routing = result.get("routing") if isinstance(result.get("routing"), Mapping) else {}
+    routing = result.get("routing")
+    if not isinstance(routing, Mapping):
+        routing = {}
     log.debug("laya: %d question(s) in %.0fms via %s", len(questions), duration_ms,
               routing.get("model") or "default")
     result["_meta"] = {"duration_ms": duration_ms, "model": routing.get("model")}
@@ -260,7 +262,7 @@ async def predict(questions: Mapping[str, Any], state: Any, *,
 
 def _answers_of(result: Mapping[str, Any]) -> Dict[str, Any]:
     answers = result.get("answers")
-    return answers if isinstance(answers, Mapping) else {}
+    return dict(answers) if isinstance(answers, Mapping) else {}
 
 
 def _probabilities_of(answer: Mapping[str, Any]) -> Dict[str, float]:
