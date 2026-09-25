@@ -39,13 +39,65 @@ def deterministic_company_size(company_info: Dict[str, Any], job: Dict[str, Any]
     return "small"
 
 
+async def laya_company_size(company: str, jd: str, *, db=None, user_id=None) -> Tuple[str, float]:
+    """Company size from the local Laya decision engine, or the LLM's turn.
+
+    A single ``choice`` question over four declared buckets — the textbook
+    shape for a typed decision model: one forward pass, calibrated confidence,
+    no generated text to parse. Returns ``(size, confidence)`` or raises
+    :class:`app.services.laya.LayaUnavailable` when the engine cannot answer;
+    the caller decides between LLM fallback (``auto``) and an honest outage
+    (``laya_only``).
+    """
+    from app.services import laya  # noqa: PLC0415 - optional engine
+
+    if not laya.should_attempt(db, user_id, "classification"):
+        from app.services.laya import LayaUnavailable
+
+        raise LayaUnavailable("not_routed", "classification is not routed to laya")
+    state = f"Company: {company}\nJob posting:\n{(jd or '')[:8000]}"
+    answer = await laya.choice(
+        state,
+        "company_size",
+        "Which size bucket best describes the company hiring for this job?",
+        {
+            "big": "enterprise or public company, 5000+ employees, Fortune 500",
+            "medium": "500-5000 employees, scaleup, unicorn, large private company",
+            "small": "50-500 employees, established small company, agency, SMB",
+            "startup": "under 50 employees, seed or Series A/B, stealth, newly founded",
+        },
+        db=db,
+        user_id=user_id,
+    )
+    if answer is None:
+        from app.services.laya import LayaUnavailable
+
+        raise LayaUnavailable("low_confidence", "laya did not answer the size question confidently")
+    return str(answer["answer"]), float(answer["confidence"])
+
+
 async def ai_company_size(company: str, jd: str, ai_config=None, *, db=None, user_id=None) -> Tuple[str, float]:
-    """Classify company size with the model.
+    """Classify company size — Laya first when the owner routed it here, then the model.
 
     Raises ``AIClientError`` when AI is unavailable — callers either surface
     it (sync endpoints → pausable 503) or treat it as the discovery-run AI
     outage (the job keeps ``size='unknown'`` and its ``ai_error`` diagnosis).
     """
+    from app.services import laya  # noqa: PLC0415 - optional engine
+
+    if laya.should_attempt(db, user_id, "classification"):
+        try:
+            return await laya_company_size(company, jd, db=db, user_id=user_id)
+        except laya.LayaUnavailable as exc:
+            if laya.is_strict(db, user_id):
+                # The owner asked for Laya-only decisions: an engine outage is
+                # the verdict's outage, reported — never silently handed to the
+                # engine they switched off.
+                from app.services.ai_client import AIClientError
+
+                raise AIClientError(f"laya_unavailable: {exc}", reason="laya_unavailable",
+                                    retryable=True) from exc
+            # auto mode: fall through to the LLM path — the pre-Laya behaviour.
     budget = input_budget_chars(db=db, user_id=user_id, ai_config=ai_config)
     safe_jd, _truncated = fit_prompt_part(jd, budget, label="classify.jd")
     prompt = f"""Classify company size for "{company}" based on job description.

@@ -721,6 +721,7 @@ export function matchLabel(document: TrackingDocument | null | undefined): strin
   if (!match || match.score === null || match.score === undefined) return 'No match score recorded'
   const band = match.band ? ` (${match.band})` : ''
   const source = match.score_source === 'ai' ? 'AI verified'
+    : match.score_source === 'laya' ? 'Laya (local decision engine)'
     : match.score_source === 'preliminary' ? 'keyword estimate' : match.score_source || 'unscored source'
   return `${match.score}${band} — ${source}`
 }

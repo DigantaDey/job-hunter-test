@@ -282,7 +282,8 @@ async def _prepare_application(
             request = UserInputRequest(
                 user_id=user.id,
                 job_id=job.id,
-                fields=[{"name": f["name"], "label": f["label"], "type": f["type"], "required": True, "value": ""}
+                fields=[{"name": f["name"], "label": f["label"], "type": f["type"], "required": True,
+                         "options": f.get("options") or [], "value": ""}
                         for f in plan["missing_required"]],
                 status="pending",
             )

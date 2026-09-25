@@ -3,6 +3,7 @@ import client, { apiError } from '../api/client'
 import { useAIWork } from '../context/AIWorkContext'
 import { AI_QUEUE_POLL_MS } from '../hooks/useAIQueue'
 import { StateIcon } from '../components/AIWorkChip'
+import AnswerField, { collectAnswers, initialAnswerValue, type AnswerFieldSpec } from '../components/AnswerField'
 import { describeRow, deriveState, toneClasses } from '../lib/aiWork'
 import { Layers, Bot, Search, Send, Clock, CheckCircle, AlertTriangle, Pause, Play, ArrowRight, UserCheck } from 'lucide-react'
 
@@ -281,22 +282,32 @@ export default function Queues(){
 }
 
 function InputForm({req, onSubmit}: any){
-  const [values, setValues] = useState<Record<string,any>>({})
+  const [values, setValues] = useState<Record<string,string>>({})
   useEffect(()=>{
-    const init:any={}
-    req.fields.forEach((f:any)=> init[f.name]=f.value || '')
+    const init: Record<string,string> = {}
+    req.fields.forEach((f: any) => {
+      const spec = f as AnswerFieldSpec
+      const prior = f.value === true ? 'true' : f.value === false ? 'false' : (f.value || '')
+      init[f.name] = String(prior || initialAnswerValue(spec))
+    })
     setValues(init)
   },[req])
   return (
     <div className="mt-3 space-y-2">
       {req.fields.map((f:any)=> (
-        <div key={f.name}>
-          <label className="text-xs mono">{f.label} {f.required && <span className="text-red-500">*</span>}</label>
-          {f.type==='select' ? <select value={values[f.name]||''} onChange={e=>setValues({...values,[f.name]:e.target.value})} className="w-full mt-1 border rounded-xl px-3 py-2 min-h-[44px] text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500"><option value="">Select…</option><option>Yes</option><option>No</option></select>
-            : <input value={values[f.name]||''} onChange={e=>setValues({...values,[f.name]:e.target.value})} placeholder={f.label} className="w-full mt-1 border rounded-xl px-3 py-2 min-h-[44px] text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500"/>}
-        </div>
+        <AnswerField
+          key={f.name}
+          field={f as AnswerFieldSpec}
+          value={values[f.name] ?? initialAnswerValue(f as AnswerFieldSpec)}
+          onChange={v => setValues(prev => ({ ...prev, [f.name]: v }))}
+          ariaLabel={f.label || f.name}
+          className="w-full"
+        />
       ))}
-      <button onClick={()=>onSubmit(values)} className="px-4 py-2 min-h-[44px] rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm font-medium inline-flex items-center gap-2 focus:outline-none focus:ring-2 focus:ring-blue-500">Submit & re-queue <ArrowRight className="w-4 h-4"/></button>
+      <button
+        onClick={() => onSubmit(collectAnswers(req.fields as AnswerFieldSpec[], values))}
+        className="px-4 py-2 min-h-[44px] rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm font-medium inline-flex items-center gap-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+      >Submit & re-queue <ArrowRight className="w-4 h-4"/></button>
     </div>
   )
 }

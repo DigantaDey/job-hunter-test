@@ -777,6 +777,7 @@ ANSWER_REUSE_SCOPES: Tuple[str, ...] = (
 #: These are the values already in the codebase; the docs define each one.
 SCORE_SOURCES: Tuple[str, ...] = (
     "ai",                 # guardrail-verified model verdict
+    "laya",               # the local typed-decision engine (owner-routed) — typed rubric verdict, not generated text
     "preliminary",        # deterministic keyword/TF-IDF estimate — labelled, never shown as an AI score
     "pending",            # AI offline; not scored yet
     "rejected",           # the model answered, the accuracy guardrail refused it

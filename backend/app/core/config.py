@@ -667,6 +667,31 @@ class Settings(BaseSettings):
     browser_ai_assist_enabled: bool = True
 
     # ------------------------------------------------------------------ #
+    # Local decision engine (Laya)
+    # ------------------------------------------------------------------ #
+    #: Server ceiling for the self-hosted Laya decision engine (`pip install
+    #: laya`). When off, nobody reaches Laya — the LLM gateway answers every
+    #: decision exactly as before. When on, the owner's Settings → decision
+    #: engine mode (auto / laya_only / llm_only) plus per-task opt-ins decide
+    #: which of the typed decisions (ranking, classification, field mapping)
+    #: go to Laya. Everything degrades to the LLM path when the package is
+    #: absent, so this flag being on costs nothing but a find_spec().
+    laya_enabled: bool = True
+    #: torch device for the checkpoints ("" = let Laya pick: cuda when
+    #: available, else cpu).
+    laya_device: str = ""
+    #: Long-document token budget (Laya's ``max_len``). 8192 is Laya's own
+    #: recommended ceiling for documents as long as a job description plus a
+    #: profile; below it the multilingual checkpoint truncates silently.
+    laya_max_len: int = 8192
+    #: Bound on one decision call. Laya answers in tens of milliseconds when
+    #: warm; this only ever trips on a cold checkpoint load going wrong.
+    laya_timeout: float = 30.0
+    #: Below this calibrated probability an ``auto``-mode answer is escalated
+    #: to the LLM instead of trusted. ``laya_only`` trusts any answer.
+    laya_confidence_floor: float = 0.55
+
+    # ------------------------------------------------------------------ #
     # Observability
     # ------------------------------------------------------------------ #
     log_level: str = "INFO"

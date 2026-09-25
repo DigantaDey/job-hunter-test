@@ -1,8 +1,9 @@
 import json
 import math
 import re
-from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple  # noqa: F401
 
+from app.core.metrics import inc
 from app.services.ai_client import fit_prompt_part, input_budget_chars
 from app.services.ai_guardrails import (
     AIUnavailableError,
@@ -360,6 +361,174 @@ def _merge_breakdown(ai_breakdown: Any, anchor: Dict[str, Any]) -> Tuple[Dict[st
     return {k: int(merged.get(k, 0)) for k in RUBRIC_WEIGHTS}, ("ai" if provided else "derived")
 
 
+# --------------------------------------------------------------------------- #
+# Laya (local typed-decision engine) scoring
+# --------------------------------------------------------------------------- #
+#: The ordinal rubric every dimension is scored on. Five levels, stated in the
+#: question spec — Laya answers the *level*, we map it onto 0-100. These exact
+#: words are the "tiny spec" the decision model reads, so they carry the whole
+#: definition of each level.
+LAYA_LEVELS: Tuple[str, ...] = (
+    "no evidence in the profile",
+    "weak evidence, significant gaps",
+    "partial match, some gaps",
+    "strong match with minor gaps",
+    "exceptional match",
+)
+
+#: One instruction per rubric dimension — what the question is *about*.
+LAYA_DIM_INSTRUCTIONS: Dict[str, str] = {
+    "skills": "Do the candidate's evidenced skills cover the technologies this job requires?",
+    "experience": "Does the candidate's experience cover the responsibilities this job lists?",
+    "seniority": "Does the candidate's level match the level this job asks for?",
+    "domain": "Does the candidate's industry/domain background match this job's domain?",
+    "location": "Is location/remote work feasible for this candidate given the job?",
+    "education": "Does the candidate's education match what the job requires?",
+}
+
+
+async def laya_score_detailed(
+    profile: Dict[str, Any],
+    jd: str,
+    *,
+    db=None,
+    user_id: Optional[int] = None,
+    persona: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """A full scoring verdict from the local Laya engine — or ``None``.
+
+    ``None`` means "Laya is not the answer here": the owner did not route
+    ranking to it, the engine is unavailable, or (in ``auto`` mode) the answers
+    were not confident enough to stand alone — the caller then takes the LLM
+    path, which is exactly the pre-Laya behaviour. In ``laya_only`` mode a
+    confident-enough *or* low-confidence answer stands (it is calibrated and
+    the owner asked to leave the LLM out of it), but an engine failure still
+    raises :class:`LayaUnavailable` so the caller can report the outage
+    honestly instead of guessing.
+
+    One forward pass answers all six rubric questions ("10 questions batched:
+    72 ms"), then the numbers are combined deterministically: the weighted
+    score, the recommendation band (:data:`BANDS` — in code, so nothing can
+    re-grade itself) and the anchor cross-check are computed here, not asked.
+    """
+    from app.services import laya  # noqa: PLC0415 - optional engine, no import cost here
+
+    if not laya.should_attempt(db, user_id, "ranking"):
+        return None
+    if not (jd or "").strip() or not _extract_profile_text(profile or {}).strip():
+        return None
+
+    persona_block = ""
+    if persona:
+        persona_block = "CANDIDATE TARGET (persona):\n" + json.dumps(persona, default=str)[:2000] + "\n"
+    state = (
+        persona_block
+        + "CANDIDATE PROFILE:\n" + json.dumps(profile, indent=1, default=str)[:12000]
+        + "\nJOB DESCRIPTION:\n" + (jd or "")[:12000]
+    )
+    questions = {
+        f"dim_{dim}": {
+            "type": "score",
+            "instructions": LAYA_DIM_INSTRUCTIONS[dim],
+            "criteria": list(LAYA_LEVELS),
+        }
+        for dim in RUBRIC_WEIGHTS
+    }
+    result = await laya.predict(questions, state, force_long=True)
+
+    breakdown: Dict[str, int] = {}
+    confidences: List[float] = []
+    level_words: List[str] = []
+    span = float(len(LAYA_LEVELS) - 1)
+    for dim in RUBRIC_WEIGHTS:
+        raw = (result.get("answers") or {}).get(f"dim_{dim}")
+        parsed = _laya_parse_ordinal(raw, LAYA_LEVELS)
+        if parsed is None:
+            return None
+        breakdown[dim] = int(round(parsed["expected"] / span * 100))
+        confidences.append(parsed["confidence"])
+        level_words.append(f"{dim} {LAYA_LEVELS[parsed['level']].split(' in ')[0].split(',')[0]}")
+
+    confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    if confidence < laya.confidence_floor(db, user_id) and not laya.is_strict(db, user_id):
+        # auto mode: a shrug from the decision engine is not a verdict — the
+        # LLM path (with its guardrails and evidence) gets the last word.
+        inc("jobhunter_laya_decisions_total", task="ranking", result="escalated")
+        return None
+
+    score = max(0.0, min(100.0, sum(breakdown[d] * w for d, w in RUBRIC_WEIGHTS.items())))
+    anchor = _anchor_breakdown(profile, jd)
+    delta = round(score - anchor["overall"], 1)
+    warnings: List[Dict[str, Any]] = []
+    if abs(delta) > ANCHOR_TOLERANCE:
+        warnings.append({"code": "anchor_divergence", "severity": "warning", "field": "score",
+                         "value": delta,
+                         "message": f"Laya score is {delta:+.0f} from the deterministic anchor ({anchor['overall']})."})
+    inc("jobhunter_laya_decisions_total", task="ranking", result="answered")
+    return {
+        "overall": int(round(score)),
+        "score": score,
+        "reason": ("Local decision engine (Laya), one forward pass: "
+                   + "; ".join(level_words) + "."),
+        "breakdown": breakdown,
+        "breakdown_source": "laya",
+        "weights": RUBRIC_WEIGHTS,
+        "strong_matches": [str(v)[:80] for v in (anchor.get("strong_matches") or [])][:15],
+        "missing_weak": [str(v)[:80] for v in (anchor.get("missing_weak") or [])][:12],
+        # Laya cannot quote text — it is a decision model, not a writer. The
+        # evidence slot stays empty rather than filled with a paraphrase the
+        # guardrail would rightly reject; the deterministic anchor's matched
+        # terms (above) are what the verdict was bounded by.
+        "evidence": [],
+        "recommendation": _band(score),
+        "recommendation_reason": (
+            f"Weighted rubric score {score:.0f}/100 from the local decision engine "
+            f"(confidence {confidence:.2f}); the recommendation band follows the score."),
+        "anchor": {"overall": anchor["overall"], "coverage": anchor["coverage"],
+                   "similarity": anchor["similarity"], "delta": delta},
+        "guardrail": {"passed": True, "engine": "laya", "confidence": round(confidence, 3),
+                      "issues": warnings, "checks": ["typed_output_only", "band_follows_score"]},
+        "source": "laya",
+    }
+
+
+def _laya_parse_ordinal(raw: Any, labels: Sequence[str]) -> Optional[Dict[str, Any]]:
+    """Normalise one Laya ``score`` answer: argmax level + expected position."""
+    if not isinstance(raw, Mapping):
+        return None
+    probs: Dict[int, float] = {}
+    for key in ("probs", "probabilities", "distribution"):
+        blob = raw.get(key)
+        if isinstance(blob, Mapping):
+            for k, v in blob.items():
+                if str(k).isdigit() and isinstance(v, (int, float)):
+                    probs[int(k)] = float(v)
+            break
+        if isinstance(blob, Sequence) and not isinstance(blob, (str, bytes)):
+            probs = {i: float(v) for i, v in enumerate(blob) if isinstance(v, (int, float))}
+            break
+    score_raw = raw.get("score", raw.get("answer", raw.get("level")))
+    level: Optional[int] = None
+    if isinstance(score_raw, (int, float)):
+        level = int(round(float(score_raw)))
+    elif isinstance(score_raw, str) and score_raw.strip() in labels:
+        level = list(labels).index(score_raw.strip())
+    expected: Optional[float] = None
+    if probs:
+        total = sum(probs.values()) or 1.0
+        expected = sum(i * v for i, v in probs.items()) / total
+        if level is None:
+            level = max(probs.items(), key=lambda iv: iv[1])[0]
+    if level is None or expected is None:
+        return None
+    level = max(0, min(len(labels) - 1, level))
+    confidence = raw.get("confidence")
+    if not isinstance(confidence, (int, float)):
+        confidence = probs.get(level, max(probs.values()) if probs else 0.0)
+    return {"level": level, "expected": max(0.0, min(float(len(labels) - 1), expected)),
+            "confidence": max(0.0, min(1.0, float(confidence)))}
+
+
 async def ai_score_detailed(
     profile: Dict[str, Any],
     jd: str,
@@ -382,6 +551,37 @@ async def ai_score_detailed(
         detail["source"] = "insufficient_data"
         detail["reason"] = "Not enough profile or job text to score"
         return detail
+
+    # Local decision engine first (owner-routed): one forward pass, typed
+    # answers, no JSON to malformed. ``None`` means "not this time" — the LLM
+    # path below is the fallback and is exactly the pre-Laya behaviour. In
+    # ``laya_only`` mode an engine failure is the verdict's failure: it is
+    # reported (AIUnavailableError → "pending"), never papered over with a
+    # guess or a silent engine switch the owner turned off.
+    from app.services import laya  # noqa: PLC0415
+
+    if laya.should_attempt(db, user_id, "ranking"):
+        try:
+            laya_detail = await laya_score_detailed(profile, jd, db=db, user_id=user_id,
+                                                    persona=persona)
+        except laya.LayaUnavailable as exc:
+            inc("jobhunter_laya_decisions_total", task="ranking", result="unavailable")
+            if laya.is_strict(db, user_id):
+                raise AIUnavailableError(
+                    "laya_unavailable", workflow="scoring", detail=str(exc),
+                    state="blocked_needs_action",
+                    context={"laya_code": exc.code},
+                ) from exc
+            laya_detail = None
+        if laya_detail is not None:
+            if db is not None and user_id is not None:
+                try:
+                    from app.core.entitlements import increment_usage  # noqa: PLC0415
+
+                    increment_usage(db, user_id, "job_analysis_per_month", 1)
+                except Exception:  # pragma: no cover - accounting never blocks a verdict
+                    pass
+            return laya_detail
 
     anchor = _anchor_breakdown(profile, jd)
     budget = input_budget_chars(db=db, user_id=user_id)
@@ -478,7 +678,8 @@ async def ai_score(
 ) -> Tuple[float, str]:
     """Back-compatible ``(score, reason)`` wrapper over :func:`ai_score_detailed`."""
     detail = await ai_score_detailed(profile, jd, ai_config, db=db, user_id=user_id, persona=persona)
-    reason = (f"AI {detail['score']:.0f}/100 ({detail['recommendation']}): {detail['reason']} "
+    label = "Laya" if str(detail.get("source") or "") == "laya" else "AI"
+    reason = (f"{label} {detail['score']:.0f}/100 ({detail['recommendation']}): {detail['reason']} "
               f"| anchor {detail['anchor']['overall']} (coverage {detail['anchor']['coverage']}%)")
     return float(detail["score"]), reason[:900]
 
@@ -499,6 +700,8 @@ async def score_job(
     keyword-overlap estimate as an AI verdict:
 
     * ``ai``          — guardrail-verified model score (the only "real" score);
+    * ``laya``        — the local typed-decision engine (owner-routed; one
+      forward pass over the rubric, no generated text to mistrust);
     * ``pending``     — AI unreachable; carries the full diagnosis to show the user;
     * ``preliminary`` — deterministic pre-rank, only when the caller opts in
       (bulk discovery, where scoring 200 postings with the model is not viable);
@@ -519,8 +722,9 @@ async def score_job(
             # ``preliminary_score_detailed`` already returns for it.
             return {"score": float(detail["score"]), "reason": str(detail["reason"]),
                     "score_source": "insufficient_data", "detail": detail, "error": None}
-        return {"score": float(detail["score"]), "reason": f"AI: {detail['reason']}",
-                "score_source": "ai", "detail": detail, "error": None}
+        return {"score": float(detail["score"]),
+                "reason": f"{'Laya (local decision engine)' if str(detail.get('source') or '') == 'laya' else 'AI'}: {detail['reason']}",
+                "score_source": str(detail.get("source") or "ai"), "detail": detail, "error": None}
     except AIUnavailableError as exc:
         if not allow_preliminary:
             raise

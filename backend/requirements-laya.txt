@@ -1,0 +1,5 @@
+# Optional: the local typed-decision engine (Laya) — ranking, classification
+# and form-field mapping as fast typed decisions instead of LLM calls.
+#   WITH_LAYA=1 ./run.sh installs this; LAYA_ENABLED=false disables all routing.
+# Apache 2.0, self-hosted; pulls torch + transformers on install.
+laya>=0.3.20

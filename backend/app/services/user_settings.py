@@ -164,6 +164,23 @@ def defaults() -> Dict[str, Dict[str, Any]]:
             "ai_for_resume": True,
             "ai_for_emails": True,
         },
+        "laya": {
+            # The local typed-decision engine (Laya). Owner-configured, like the
+            # AI provider category: which engine answers the *decision-shaped*
+            # work (ranking, classification, field mapping) is an infrastructure
+            # choice, not a per-member preference.
+            #
+            #   mode: auto       — Laya first, the LLM escalates low-confidence
+            #                      answers (and answers everything if Laya is
+            #                      not installed);
+            #         laya_only  — Laya only where feasible; an engine outage is
+            #                      reported honestly, never handed to the LLM;
+            #         llm_only   — the pre-Laya behaviour, Laya never consulted.
+            "mode": "auto",
+            "for_ranking": True,
+            "for_classification": True,
+            "for_field_mapping": True,
+        },
         "automation": {
             # Auto mode (v2.2): the scheduler only enqueues work for users who
             # switched it on. Off by default — nothing runs automatically that
@@ -190,6 +207,9 @@ WRITABLE_KEYS: Dict[str, set] = {
     "funding": {"context_notes", "industries", "freshness_days", "provider", "include_unverified"},
     "compliance": {"automation_acknowledged", "outreach_acknowledged", "rate_limit_per_day"},
     "workflows": {"ai_for_discovery", "ai_for_scoring", "ai_for_resume", "ai_for_emails"},
+    # Owner-configured (PUT gate in settings_api): routing for the local
+    # typed-decision engine (Laya).
+    "laya": {"mode", "for_ranking", "for_classification", "for_field_mapping"},
     # `auto_mode` is writable on every tier (turning scheduling *off* is never
     # restricted); turning it *on* is tier-gated in ``apply_updates``.
     "automation": {"auto_mode"},
@@ -621,6 +641,16 @@ def grouped(db: Session, user: User, *, reveal_secrets: bool = False) -> Dict[st
     browser["create_accounts_available"] = settings.browser_create_accounts_enabled
     browser["ai_assist_available"] = settings.browser_ai_assist_enabled
 
+    # Same one-predicate rule as the toggles above: the settings UI describes
+    # the decision engine with exactly the facts the routing code uses — the
+    # env ceiling, whether the package is installed, and any load error.
+    try:
+        from app.services import laya as laya_service  # noqa: PLC0415
+
+        result.setdefault("laya", {}).update(laya_service.status())
+    except Exception as exc:  # pragma: no cover - a status read never breaks settings
+        log.warning("laya status could not be resolved: %s", exc)
+
     return result
 
 
@@ -713,7 +743,10 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
                 raise HTTPException(400, f"Unknown settings key '{category}.{key}'")
             if (category, key) in {("automation", "auto_mode"),
                                    ("browser", "create_accounts"),
-                                   ("browser", "ai_assist")}:
+                                   ("browser", "ai_assist"),
+                                   ("laya", "for_ranking"),
+                                   ("laya", "for_classification"),
+                                   ("laya", "for_field_mapping")}:
                 # Coerce strictly. Storing the *string* "false" would be truthy
                 # to the scheduler, i.e. a user who turned auto mode off would
                 # keep consuming quota on a switch that looks off. For the two
@@ -729,6 +762,17 @@ def apply_updates(db: Session, user: User, payload: Dict[str, Any]) -> Dict[str,
                          "fields": [key]},
                     )
                 value = coerced
+            if category == "laya" and key == "mode":
+                # The routing mode is a closed vocabulary — a typo must not
+                # silently become "whatever the code defaults to next restart".
+                value = str(value or "").strip()
+                if value not in ("auto", "laya_only", "llm_only"):
+                    raise HTTPException(
+                        400,
+                        {"code": "invalid_setting_value",
+                         "message": "'laya.mode' must be one of: auto, laya_only, llm_only",
+                         "fields": ["mode"]},
+                    )
             if key in {"rpm", "port", "freshness_hours", "daily_limit", "max_retries",
                        "daily_application_limit", "rate_limit_per_day"}:
                 try:

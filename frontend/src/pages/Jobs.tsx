@@ -16,6 +16,7 @@ import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader
 function SourceBadge({ source }: { source?: string }) {
   const map: Record<string, { label: string; cls: string; title: string }> = {
     ai: { label: 'AI verified', cls: 'bg-emerald-600 text-white', title: 'Guardrail-checked model score' },
+    laya: { label: 'Laya (local)', cls: 'bg-blue-600 text-white', title: 'Local decision engine — typed rubric verdict from the self-hosted Laya model, one forward pass' },
     preliminary: { label: 'estimate', cls: 'bg-zinc-200 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-200', title: 'Keyword-overlap pre-rank — not an AI verdict' },
     pending: { label: 'AI pending', cls: 'bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300', title: 'The model could not be reached' },
     rejected: { label: 'rejected', cls: 'bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300', title: 'The model answered but failed the accuracy guardrail' },
