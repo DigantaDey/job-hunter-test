@@ -35,6 +35,7 @@ Four rules are deliberate:
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -52,7 +53,13 @@ log = get_logger("app.ai_log")
 #: process) is enough to keep the tables bounded without adding a DELETE to the
 #: hot path of every verdict.
 _PRUNE_INTERVAL_SECONDS = 300.0
-_last_prune_at: float = 0.0
+#: ``None`` — not ``0.0`` — is the "never swept" sentinel. ``time.monotonic()``
+#: counts from boot, so a numeric zero means "300 s ago" only on a machine that
+#: has been up longer than the interval: on a freshly booted container (CI's
+#: runners, a new pod) ``now - 0.0`` is *smaller* than the interval and the first
+#: sweep would be skipped until uptime passed it. Retention must not depend on
+#: how long the host has been up.
+_last_prune_at: Optional[float] = None
 
 #: Status vocabulary for a stored call.
 STATUS_OK = "ok"
@@ -280,10 +287,8 @@ def record_laya_decision(
 def maybe_prune(db: Session) -> int:
     """Rate-limited retention sweep; returns rows removed (0 when skipped)."""
     global _last_prune_at
-    import time
-
     now = time.monotonic()
-    if now - _last_prune_at < _PRUNE_INTERVAL_SECONDS:
+    if _last_prune_at is not None and now - _last_prune_at < _PRUNE_INTERVAL_SECONDS:
         return 0
     _last_prune_at = now
     try:
@@ -296,7 +301,7 @@ def maybe_prune(db: Session) -> int:
 def reset_prune_clock() -> None:
     """Test/CLI helper — the next write prunes immediately."""
     global _last_prune_at
-    _last_prune_at = 0.0
+    _last_prune_at = None
 
 
 def prune(db: Session, *, now: Optional[datetime] = None, batch: Optional[int] = None,

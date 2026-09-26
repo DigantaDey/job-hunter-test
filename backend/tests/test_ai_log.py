@@ -388,6 +388,33 @@ def test_a_write_is_what_triggers_the_sweep(db, owner_id):
     assert db.query(AICallRecord).count() == 1
 
 
+def test_the_first_sweep_does_not_depend_on_host_uptime(db, owner_id, monkeypatch):
+    """`time.monotonic()` counts from *boot*, so "never swept" is not 0.0.
+
+    With a numeric sentinel, a machine that booted less than the prune interval
+    ago computes `now - 0.0 < interval` and quietly skips its first sweep —
+    which is exactly what a fresh CI runner (or a new pod) does. Retention must
+    not depend on how long the host has been up.
+    """
+    import time as time_module
+
+    db.add(AICallRecord(user_id=owner_id, workflow="parse", status="ok",
+                        created_at=datetime.utcnow() - timedelta(days=30)))
+    db.commit()
+    ai_log.reset_prune_clock()
+
+    # Five seconds of uptime — the interval is 300.
+    monkeypatch.setattr(time_module, "monotonic", lambda: 5.0)
+    assert ai_log.maybe_prune(db) == 1, "a freshly booted host must still prune"
+    # …and the rate limit itself still holds.
+    db.add(AICallRecord(user_id=owner_id, workflow="parse", status="ok",
+                        created_at=datetime.utcnow() - timedelta(days=30)))
+    db.commit()
+    assert ai_log.maybe_prune(db) == 0
+    _sync(db)
+    assert db.query(AICallRecord).count() == 1
+
+
 def test_long_bodies_are_clipped_and_marked(db, owner_id, monkeypatch):
     monkeypatch.setattr(ai_log, "_prompt_chars", lambda: 1000)
     monkeypatch.setattr(ai_log, "_response_chars", lambda: 200)
