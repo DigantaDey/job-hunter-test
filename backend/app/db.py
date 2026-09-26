@@ -28,16 +28,45 @@ os.makedirs(settings.upload_dir, exist_ok=True)
 os.makedirs(settings.generated_dir, exist_ok=True)
 
 
+def _sqlite_is_in_memory(url: str) -> bool:
+    """True for an in-memory SQLite URL (``sqlite:///:memory:``, bare ``sqlite://``).
+
+    In-memory databases run on ``SingletonThreadPool``/``StaticPool`` — a single
+    shared connection — which rejects pool-sizing arguments outright, so they
+    must never receive them. Every other SQLite URL (a file) runs on
+    ``QueuePool`` and takes the full pool configuration.
+    """
+    if not str(url).startswith("sqlite"):
+        return False
+    path = str(url).split("://", 1)[-1] if "://" in str(url) else str(url)
+    path = path.lstrip("/")
+    return not path or path.startswith(":memory:")
+
+
 def _engine_kwargs() -> dict:
+    """Build ``create_engine`` arguments from the pool settings.
+
+    The pool shape (``DB_POOL_SIZE``, ``DB_MAX_OVERFLOW``, ``DB_POOL_RECYCLE``,
+    ``DB_POOL_TIMEOUT``) applies to **every** pooled engine, file-based SQLite
+    included. It used to be applied only on the non-SQLite branch, so the
+    default SQLite deployment silently ran SQLAlchemy's own defaults —
+    ``size 5 overflow 10, timeout 30`` — no matter what ``.env`` said, and a
+    burst of concurrent HTTP requests (a browser hard refresh) could exhaust
+    the pool: ``QueuePool limit of size 5 overflow 10 reached, connection
+    timed out``. In-memory SQLite is the one exception: its single-connection
+    pool takes no sizing (see :func:`_sqlite_is_in_memory`).
+    """
     kwargs: dict = {"pool_pre_ping": True, "future": True}
     if IS_SQLITE:
         kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
-    else:
-        kwargs.update(
-            pool_size=settings.db_pool_size,
-            max_overflow=settings.db_max_overflow,
-            pool_recycle=settings.db_pool_recycle,
-        )
+        if _sqlite_is_in_memory(settings.database_url):
+            return kwargs
+    kwargs.update(
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_recycle=settings.db_pool_recycle,
+        pool_timeout=settings.db_pool_timeout,
+    )
     return kwargs
 
 

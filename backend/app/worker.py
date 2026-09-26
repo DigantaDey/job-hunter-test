@@ -306,16 +306,20 @@ class Worker:
 
     async def _expire_user_actions(self) -> None:
         """Close user-action-required states whose waiting window has passed."""
-        from app.services.reliability import expire_user_actions
 
-        db = SessionLocal()
-        try:
-            expire_user_actions(db)
-        except Exception as exc:  # pragma: no cover - DB hiccup
-            db.rollback()
-            log.warning("user-action expiry sweep failed: %s: %s", type(exc).__name__, exc)
-        finally:
-            db.close()
+        def _sweep() -> None:
+            # Thread-owned session: the sweep is synchronous DB work, and a
+            # pool wait on the event loop would stall every in-flight request.
+            db = SessionLocal()
+            try:
+                expire_user_actions(db)
+            except Exception as exc:  # pragma: no cover - DB hiccup
+                db.rollback()
+                log.warning("user-action expiry sweep failed: %s: %s", type(exc).__name__, exc)
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_sweep)
         self._last_user_action_sweep = time.monotonic()
 
     def _should_reap(self) -> bool:
@@ -327,18 +331,27 @@ class Worker:
         return False
 
     async def _do_reap(self) -> None:
-        db = SessionLocal()
-        try:
-            recover_stalled(
-                db,
-                pipelines=self.pipelines,
-                safety_margin_seconds=self.reaper_safety,
-            )
-        except Exception as exc:  # pragma: no cover - DB hiccup
-            log.error("reaper failed: %s", exc)
-        finally:
-            db.close()
-        self._run_subscription_expiry_pass()
+        def _sweep() -> None:
+            # Thread-owned session: reaping (like claiming) waits on the pool
+            # when the database is saturated, and that wait must never freeze
+            # the event loop.
+            db = SessionLocal()
+            try:
+                recover_stalled(
+                    db,
+                    pipelines=self.pipelines,
+                    safety_margin_seconds=self.reaper_safety,
+                )
+            except Exception as exc:  # pragma: no cover - DB hiccup
+                log.error("reaper failed: %s", exc)
+            finally:
+                db.close()
+            # Also synchronous DB work: same thread, same "never block the
+            # loop" rule (its internal 24h throttle and failure isolation are
+            # unchanged).
+            self._run_subscription_expiry_pass()
+
+        await asyncio.to_thread(_sweep)
 
     def _heartbeat_interval(self) -> float:
         """How often a running item's lease is renewed (seconds).
@@ -369,20 +382,32 @@ class Worker:
         retrying through transient DB errors: a hiccup is not a lost lease.
         """
         interval = self._heartbeat_interval()
+        # Read the row's identity here, on the loop: the renew itself runs in
+        # a worker thread (a saturated pool waits DB_POOL_TIMEOUT for a free
+        # connection, and blocking the loop for that long froze HTTP serving
+        # during the reported exhaustion), and the row belongs to the handler's
+        # session — its attributes are read from the thread that owns the
+        # event loop, never from a worker thread mid-renew.
+        item_id = int(item.id)
         while True:
             await asyncio.sleep(interval)
-            db = SessionLocal()
-            try:
+
+            def _renew_once() -> bool:
+                # The session is created, used and closed entirely inside one
+                # worker thread: no wait here can freeze the event loop, and a
+                # cancelled await can never close a session a thread still owns.
+                db = SessionLocal()
                 try:
-                    still_ours = renew(db, item, worker=self.worker_id)
-                except asyncio.CancelledError:  # pragma: no cover - cooperative cancel
-                    raise
-                except Exception as exc:  # noqa: BLE001 - the next beat retries
-                    log.warning("lease heartbeat for item %s failed: %s: %s",
-                                item.id, type(exc).__name__, exc)
-                    continue
-            finally:
-                db.close()
+                    return bool(renew(db, item_id, worker=self.worker_id))
+                finally:
+                    db.close()
+
+            try:
+                still_ours = await asyncio.to_thread(_renew_once)
+            except Exception as exc:  # noqa: BLE001 - the next beat retries
+                log.warning("lease heartbeat for item %s failed: %s: %s",
+                            item_id, type(exc).__name__, exc)
+                continue
             if not still_ours:
                 inc("jobhunter_worker_lease_lost_total", pipeline=str(item.pipeline or ""))
                 log.warning("queue item %s (%s) is no longer held by this worker — the lease "
@@ -542,14 +567,28 @@ class Worker:
             if self._should_expire_user_actions():
                 await self._expire_user_actions()
 
+            # The session is created here — deliberately outside every
+            # try/except: a DB failure at this point must crash the slot so the
+            # supervisor respawns it. The claim itself runs in a worker thread
+            # because it *blocks for up to DB_POOL_TIMEOUT* waiting for a free
+            # connection when the pool is saturated — on the loop that wait
+            # froze the whole process (every in-flight HTTP response stalled
+            # for 30s per attempt, which is how a hard-refresh burst took the
+            # API down with it). The thread owns the session's close, so a
+            # cancellation mid-claim never closes a session a thread is using.
             db = SessionLocal()
             try:
-                item = claim(db, pipelines=self.pipelines)
+
+                def _claim_once(claim_db=db):  # bind this iteration's session (no late lookup)
+                    try:
+                        return claim(claim_db, pipelines=self.pipelines)
+                    finally:
+                        claim_db.close()
+
+                item = await asyncio.to_thread(_claim_once)
             except Exception as exc:  # pragma: no cover - DB hiccup
                 log.error("claim failed: %s", exc)
                 item = None
-            finally:
-                db.close()
 
             if item is None:
                 await asyncio.sleep(self.poll_interval)

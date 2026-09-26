@@ -6,6 +6,16 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed — a burst of HTTP requests could exhaust the database pool, and waiting on the pool froze the whole process
+
+One hard browser refresh produced the whole failure chain in a single log: `worker claim failed`, `AI watchdog cycle failed` and `lease heartbeat for item 8 failed`, each carrying the same error — `QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 30.00` — with no HTTP request completing in between.
+
+**The pool was never the size the settings said it was.** `DB_POOL_SIZE=10` / `DB_MAX_OVERFLOW=20` sit directly under the SQLite default in `.env.example`, but `_engine_kwargs()` applied them only on the non-SQLite branch of the engine factory: the default file-based SQLite deployment silently ran SQLAlchemy's own defaults — `size 5 overflow 10`, a 30-second wait — which is exactly the text of the error. The pool settings (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_RECYCLE`, and the new `DB_POOL_TIMEOUT`, default 30) now apply to **every** pooled engine, file SQLite included, so the shipped 10 + 20 = 30 connections are what the process actually gets — headroom for the observed worst case (an AI-scoring discovery wave holding its sessions across awaited calls, plus the refresh's fan-out of concurrent requests). In-memory SQLite keeps its single shared connection: its pool class takes no sizing arguments, so it is explicitly excluded.
+
+**Waiting for a connection no longer freezes the API.** The pool's wait happens inside synchronous SQLAlchemy calls — and the worker's periodic calls ran directly on the shared event loop. With the pool full, `claim` blocked the loop for the entire 30-second timeout, the watchdog's first query blocked it again 30 seconds later, the lease heartbeat again after that: the loop could not advance a single HTTP response for the whole window, which is what turned a refresh burst into a dead page. The claim, the lease-heartbeat renew, the watchdog's user listing, the reaper and the user-action sweep now run in worker threads (`asyncio.to_thread`): a saturated pool stalls one background call instead of every in-flight request, the loop keeps serving the connections that *are* available, and the pool drains. Session lifecycles stay race-free (the thread owns the session it closes), and the crash contract is unchanged — a `SessionLocal()` failure outside every `try` still kills the slot so the supervisor logs and respawns it.
+
+Covered by `backend/tests/test_db_pool_sizing_and_loop_blocking.py` (**8 tests** — the pool arguments on file SQLite, a real `QueuePool` built and sized from them, in-memory SQLite excluded, other dialects unchanged, the live engine matching the settings, and the claim / lease-heartbeat / watchdog database calls proven to run off the event loop) alongside the existing worker crash-respawn and pause/resume suites.
+
 ### Fixed — the AI provider and Laya are no longer stopped while the model is still thinking
 
 One theme across four reports of "AI call errors": both engines were being cut off or counted as broken *during* a healthy thinking phase — the reasoning model's silent think window on the streamed path, and the local decision engine's long forward pass.

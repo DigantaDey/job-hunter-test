@@ -266,6 +266,12 @@ class Settings(BaseSettings):
     db_pool_size: int = 10
     db_max_overflow: int = 20
     db_pool_recycle: int = 1800
+    #: Seconds a checkout waits for a free connection before the pool raises
+    #: ``QueuePool limit of size N overflow M reached, connection timed out``
+    #: (``DB_POOL_TIMEOUT``). Kept in sync with the sizing settings so the
+    #: whole pool shape — size, overflow, recycle and wait budget — is
+    #: configurable, on every dialect including SQLite.
+    db_pool_timeout: int = Field(default=30, ge=1)
 
     # ------------------------------------------------------------------ #
     # Workers / queue

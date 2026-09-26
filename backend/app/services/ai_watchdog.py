@@ -69,7 +69,15 @@ async def watchdog_cycle() -> int:
     db = SessionLocal()
     total_drained = 0
     try:
-        for user_id in users_with_paused_work(db):
+        # The cycle's first query is a fresh pool checkout — the exact spot
+        # where an exhausted pool waits DB_POOL_TIMEOUT (30 s) for a free
+        # connection. It used to run on the event loop, so during the reported
+        # saturation one watchdog cycle froze the whole process for 30 s and
+        # every in-flight HTTP response stalled with it. Run it off the loop;
+        # the connection it opens is then held for the rest of the cycle (the
+        # probe and the drain below reuse it), so no later step waits again.
+        user_ids = await asyncio.to_thread(users_with_paused_work, db)
+        for user_id in user_ids:
             _state, drained = await check_and_drain(db, user_id)
             total_drained += drained
     finally:
