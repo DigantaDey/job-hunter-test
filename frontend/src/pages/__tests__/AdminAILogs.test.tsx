@@ -81,7 +81,7 @@ function installGets(overrides: { laya?: Record<string, unknown>; stats?: Record
         enabled: true,
         retention_days: 7,
         totals: { decisions: 20, ok: 15, low_confidence: 3, timeout: 1, error: 0, parked: 1,
-                  avg_latency_ms: 74, avg_confidence: 0.83 },
+                  busy: 2, avg_latency_ms: 74, avg_confidence: 0.83 },
         by_task: [
           { task: 'ranking', total: 12, statuses: { ok: 10, low_confidence: 2 }, avg_latency_ms: 72 },
           { task: 'classification', total: 5, statuses: { ok: 4, timeout: 1 }, avg_latency_ms: 90 },
@@ -109,6 +109,7 @@ describe('Admin AI log: how Laya is doing', () => {
     expect(screen.getByTestId('laya-low-confidence').textContent).toBe('3')
     expect(screen.getByTestId('laya-timeouts').textContent).toBe('1')
     expect(screen.getByTestId('laya-parked').textContent).toBe('1')
+    expect(screen.getByTestId('laya-busy').textContent).toBe('2')
     expect(screen.getByText(/avg latency 74ms/)).toBeTruthy()
 
     const tasks = screen.getByTestId('laya-tasks')

@@ -985,7 +985,7 @@ async def ai_map_unknown_fields(
         "Fields: " + fields_json
     )
     try:
-        data = await chat_completion("form_detect_live", prompt, temperature=0, stream=False,
+        data = await chat_completion("form_detect_live", prompt, temperature=0, stream=True,
                                      db=db, user_id=user_id)
     except Exception:
         if out:

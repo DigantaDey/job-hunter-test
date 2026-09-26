@@ -11,9 +11,9 @@ slow or expensive, and neither is answerable from the aggregate ledger alone:
   verdict, a guardrail rejection or a truncation after the fact.
 * **"How is the local engine doing?"** — :func:`record_laya_decision` stores one
   row per forward pass as :class:`~app.models.models.LayaDecision`: task,
-  status (``ok`` / ``low_confidence`` / ``timeout`` / ``error`` / ``parked``),
-  checkpoint, question count, calibrated confidence against the configured
-  floor, and latency. The counters were already there; this is the history.
+  status (``ok`` / ``low_confidence`` / ``timeout`` / ``error`` / ``parked`` /
+  ``busy``), checkpoint, question count, calibrated confidence against the
+  configured floor, and latency. The counters were already there; this is the history.
 
 Four rules are deliberate:
 
@@ -71,6 +71,9 @@ LAYA_LOW_CONFIDENCE = "low_confidence"
 LAYA_TIMEOUT = "timeout"
 LAYA_ERROR = "error"
 LAYA_PARKED = "parked"
+#: The caller gave up while its pass was still queued behind a running one —
+#: queue pressure, never an engine failure (it must not park the engine).
+LAYA_BUSY = "busy"
 
 
 # --------------------------------------------------------------------------- #
@@ -511,7 +514,7 @@ def laya_stats(db: Session, *, window_hours: int = 24) -> Dict[str, Any]:
     )
     by_task: Dict[str, Dict[str, Any]] = {}
     totals = {"decisions": 0, "ok": 0, "low_confidence": 0, "timeout": 0, "error": 0,
-              "parked": 0, "avg_latency_ms": 0.0, "avg_confidence": 0.0}
+              "parked": 0, "busy": 0, "avg_latency_ms": 0.0, "avg_confidence": 0.0}
     latency_weight = 0.0
     confidence_sum = 0.0
     confidence_count = 0
