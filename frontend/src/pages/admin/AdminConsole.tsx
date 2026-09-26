@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import client, { apiError } from '../../api/client'
 import {
-  Activity, AlertTriangle, Bot, CheckCircle, Cpu, DollarSign, Eye, EyeOff, Gauge, Globe, Key,
+  Activity, AlertTriangle, Bot, CheckCircle, Cpu, Database, DollarSign, Eye, EyeOff, Gauge, Globe, Key,
   Layers, RefreshCw, Save, ShieldCheck, ToggleRight, TrendingUp, Zap,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
@@ -24,8 +24,11 @@ import { EmptyState, ErrorState, LoadingBlock, SectionCard, SectionSkeleton } fr
  *
  * Sections: AI provider configuration (default + per-workflow overrides + token
  * budgets), the local decision engine (Laya) routing, source health, queue
- * health, usage & cost, failure rates, application-automation health, and the
- * global feature flags.
+ * health, usage & cost, failure rates, application-automation health, the
+ * shared job pool (live corpus + aggregates for postings retention has already
+ * deleted), and the global feature flags. The two diagnostics that need their
+ * own page live at `/admin/ai`: the exact request sent for every AI call and
+ * the decision engine's health (how Laya is doing).
  */
 
 type Overview = any
@@ -277,6 +280,10 @@ export default function AdminConsole() {
   const automation = overview?.automation_health ?? {}
   const accounts = overview?.accounts ?? {}
   const sources = overview?.sources ?? {}
+  // Shared job pool (v2.3): the cross-user corpus's size, and — for postings
+  // retention has already dropped — aggregate counters only. Owner-only by
+  // construction: the endpoint behind it requires the owner role.
+  const pool = overview?.job_pool ?? {}
 
   return (
     <div className="space-y-6" data-testid="admin-console">
@@ -288,6 +295,7 @@ export default function AdminConsole() {
           </p>
         </div>
         <div className="flex gap-2">
+          <Link to="/admin/ai" className="text-xs px-3 py-2 rounded-full border dark:border-zinc-700">AI log</Link>
           <Link to="/admin/audit" className="text-xs px-3 py-2 rounded-full border dark:border-zinc-700">Audit log</Link>
           <Link to="/admin/plans" className="text-xs px-3 py-2 rounded-full border dark:border-zinc-700">Plans & users</Link>
         </div>
@@ -581,6 +589,55 @@ export default function AdminConsole() {
           <div className="mt-3 text-[11px] mono text-zinc-500">
             Accounts: {accounts.active_users ?? 0} active • {accounts.owners ?? 0} owner(s) • plans {Object.entries(accounts.plans || {}).map(([p, n]) => `${p}: ${n}`).join(' • ') || 'none yet'}
           </div>
+        </SectionCard>
+
+        <SectionCard title="Shared job pool" icon={Database}>
+          {pool.enabled === false || pool.enabled === undefined ? (
+            <EmptyState title="Pool disabled"
+                        hint="JOB_POOL_ENABLED=false — discovery reads and writes nothing shared, exactly as before v2.3." />
+          ) : (
+            <div data-testid="job-pool">
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div className="p-3 rounded-xl bg-zinc-50 dark:bg-zinc-800/60">
+                  <div className="text-xl font-semibold mono">{pool.live_entries ?? 0}</div>
+                  <div className="text-[10px] text-zinc-500">live postings</div>
+                </div>
+                <div className="p-3 rounded-xl bg-zinc-50 dark:bg-zinc-800/60">
+                  <div className="text-xl font-semibold mono">{pool.contributors ?? 0}</div>
+                  <div className="text-[10px] text-zinc-500">contributors</div>
+                </div>
+                <div className="p-3 rounded-xl bg-zinc-50 dark:bg-zinc-800/60">
+                  <div className="text-xl font-semibold mono">{pool.distinct_companies ?? 0}</div>
+                  <div className="text-[10px] text-zinc-500">companies</div>
+                </div>
+              </div>
+              <div className="mt-3 text-[11px] mono text-zinc-500">
+                Retention {pool.retention_days ?? 7}d • added in {pool.window_days ?? 30}d {pool.added_in_window ?? 0}
+                {(pool.by_source || []).length > 0 && <> • by source {(pool.by_source as any[]).slice(0, 6).map(x => `${x.source}: ${x.entries}`).join(' • ')}</>}
+              </div>
+              <div className="mt-3 text-xs font-medium">Gone — aggregated only</div>
+              {(pool.gone?.all_time_by_reason || []).length === 0 ? (
+                <div className="text-[11px] text-zinc-500 mt-1">Nothing pruned yet.</div>
+              ) : (
+                <ul className="mt-1 space-y-1 text-[11px] mono text-zinc-500" data-testid="job-pool-gone">
+                  {(pool.gone.all_time_by_reason as any[]).map(row => (
+                    <li key={row.reason}>
+                      {row.reason}: {row.entries} posting(s) • seen {row.times_seen}× • up to {row.max_distinct_users} user(s)
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {(pool.gone?.companies || []).length > 0 && (
+                <div className="mt-2 text-[11px] mono text-zinc-500">
+                  Churn by company: {(pool.gone.companies as any[]).slice(0, 5).map(c => `${c.company}: ${c.entries}`).join(' • ')}
+                </div>
+              )}
+              <div className="mt-3 text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
+                Content for pruned or withdrawn postings is deleted — what remains are counters, a hashed
+                identity and the public company name, and it is only ever read here.
+              </div>
+            </div>
+          )}
         </SectionCard>
 
         <SectionCard title="Global feature flags" icon={Gauge}>

@@ -161,6 +161,7 @@ Automation policy evaluation ──→ Decision (allowed/mode/blockers/limits)
 | Application packets | Covered by schema-derived erasure plan | ✅ Covered |
 | Profile field provenance/history | Covered by schema-derived erasure plan; test seeds these tables | ✅ Covered |
 | Leftover verification | `count_user_rows` post-deletion; leftovers logged as ERROR | ✅ Covered |
+| Owner-only AI log rows | `ai_call_records` / `laya_decisions` carry a real `user_id` FK, so the schema-derived plan already deletes them; the seed in `test_deletion_integrity.py` pins it | ✅ Covered |
 
 ### 2.4 Source-Specific Policy
 
@@ -251,6 +252,9 @@ keeping only the field name, classification, and status.
 - Error logs: no automatic purge (operator-controlled)
 - Onboarding sessions: persist for account lifetime; deleted with account
 - Application sessions: `DEFAULT_TTL_MINUTES = 45`; terminal sessions swept lazily
+- Owner-only AI log: `AI_LOG_RETENTION_DAYS` (7) — pruned on write (batched, rate-limited),
+  `AI_LOG_ENABLED=false` disables it entirely; request bodies are clipped, secret-scrubbed and
+  header-free (no API key, ever), and the only reader is the owner-only `/api/admin/ai/*` surface
 
 ### 4.5 LOW — Source adapter for Workday lacks explicit ToS reference (NOTED)
 

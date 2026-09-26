@@ -135,6 +135,24 @@ was attempted), `all_sources_failed` (an outage, with the per-source errors) or 
 verdict; `GET /api/jobs/discovery/last-run` serves it and the Jobs page renders it, so an empty board
 is never a reason-less "no fresh jobs".
 
+Every run also feeds the **shared job pool** and reads from it: the postings it scanned are folded into
+one cross-user corpus (same canonical identity as the board, so a pool row merges with a live row rather
+than duplicating it), and the pool offers back live entries this user does not have yet — coverage the
+run's own adapters could not produce, at zero fetch cost. Retention is hard: nothing older than
+`JOB_POOL_RETENTION_DAYS` (7 by default) survives, and pruning deletes the posting's *content* —
+title, description, URL, payload — leaving only an aggregate row (counters, a SHA-256 identity, the
+public company name as the churn dimension) in `job_pool_metrics`. The same route is taken the moment a
+posting is reported withdrawn, so "deleted jobs keep aggregated metrics only" is the retention rule, not
+a second code path. Those aggregates are owner-only: they ride on `GET /api/admin/overview`
+(`job_pool`, rendered as **Admin → Shared job pool**) and nothing on the user surface exposes them.
+`JOB_POOL_ENABLED=false` restores the pre-pool behaviour exactly — no reads, no writes, no matching.
+
+Finishing onboarding starts matching immediately: the moment the resume extraction lands (or a review
+decision activates the profile), the pool's best current matches are written to the board with
+deterministic `preliminary` scores — no network, no provider calls, honestly labelled — and the user's
+own live discovery run is queued behind them. The hook is idempotent per (profile, document) and never
+fails the onboarding step.
+
 **Applications** — a job's apply flow detects the portal (Greenhouse/Lever/Workday/custom), detects
 required fields from the real HTML, maps them from your profile, and either:
 * reuses a previously approved tailored resume (JD similarity ≥ 0.85),
@@ -179,7 +197,8 @@ are available in Chrome and Apple Passwords CSV formats.
 | Funding | `GET /api/funding/{companies,providers,context}`, `POST /api/funding/refresh`, `POST /api/funding/{name}/process` |
 | Me (user surface) | `GET /api/me/dashboard` — the tenant-scoped aggregate the home page renders (profile completeness, discovery status, top matches with reasons, review/attention queues, applications in progress, interview activity, weekly outcome report, follow-up reminders) — and `GET /api/me/assistant`, the sanitized assistant-availability signal (no provider URL, key, model or usage on it) |
 | Settings | `GET/PUT /api/settings` (the `ai` category is owner-only: members get `{"configured": bool}` and cannot write it), `GET /api/settings/ai/status` *(owner)*, `GET /api/settings/runtime` *(owner)*, `GET/POST/DELETE /api/ai/config` *(owner)* |
-| Admin (owner only) | `GET /api/admin/overview` (sources, queues, usage & cost, failure rates, automation health), `GET /api/admin/audit`, `GET/PUT /api/admin/flags`, `GET /api/admin/users`, `PUT /api/admin/users/{id}/{plan,role}` — every route 403s non-owners with `owner_required` |
+| Admin (owner only) | `GET /api/admin/overview` (sources, queues, usage & cost, failure rates, automation health, shared job pool, AI-log and Laya rollups), `GET /api/admin/audit`, `GET/PUT /api/admin/flags`, `GET /api/admin/users`, `PUT /api/admin/users/{id}/{plan,role}` — every route 403s non-owners with `owner_required` |
+| Admin — AI log (owner only) | `GET /api/admin/ai/calls` (list, filter by workflow/status/user), `GET /api/admin/ai/calls/{id}` (**the exact request body per attempt** + answer excerpt), `GET /api/admin/ai/stats`, `GET /api/admin/laya/decisions`, `GET /api/admin/laya/stats` — rendered at **Admin → AI log** (`/admin/ai`); nothing here is reachable from a user surface |
 | Ops | `GET /api/health`, `/api/health/live`, `/api/health/ready`, `/api/metrics`, `/api/meta`, `/api/logs`, `/api/dashboard/summary`, `GET /api/ops/status` *(owner)*, `GET/POST /api/ops/queue/*` *(owner)* |
 | Tracking | `GET /api/track/open/{token}.png`, `GET/POST /api/track/unsubscribe/{token}`, `POST /api/track/events` |
 
@@ -190,6 +209,10 @@ Interactive docs: `/api/docs`. Machine-readable spec: `/api/openapi.json`.
 ## 5. Configuration
 
 Everything is environment-driven; see [`.env.example`](.env.example) for the annotated list. The
+owner-only AI log is `AI_LOG_ENABLED` (on by default; `false` restores the previous behaviour
+exactly), pruned to `AI_LOG_RETENTION_DAYS` (7) with bodies clipped to `AI_LOG_PROMPT_CHARS`
+(20000) and answers to `AI_LOG_RESPONSE_CHARS` (2000) — diagnostics, not accounting: the AI credit
+ledger remains the permanent record. The
 values you must set in production are `SECRET_KEY`, `ENCRYPTION_KEY`, `DATABASE_URL`,
 `CORS_ORIGINS`, `ALLOWED_HOSTS` and (for real outreach) the `EMAIL_*` block. The config validator
 refuses to boot in `ENVIRONMENT=production` with placeholder secrets, wildcard CORS or SQLite
@@ -197,6 +220,14 @@ unless you explicitly override with `ALLOW_SQLITE_IN_PROD=true`.
 
 Per-user settings (AI keys, SMTP, sources, thresholds) live in the app under **Settings** and are
 stored encrypted where they are secret.
+
+Discovery is bounded by three knobs an operator can tune without a code change:
+`MAX_CONCURRENT_FETCHES` (fan-out width), `DISCOVERY_FETCH_TIMEOUT_SECONDS` (per-source budget
+inside one run — a slower source is reported as `timeout` in the run report instead of stalling the
+run) and `DISCOVERY_AI_CONCURRENCY` (scoring/classification verdicts in flight; the AI gateway's
+`AI_MAX_CONCURRENCY` stays the hard bound). `JOB_POOL_*` sizes the shared pool: retention,
+prune batch, ingest cap, how many pool candidates a run is offered, and how many jobs the
+onboarding instant match may add.
 
 ### Local decision engine (Laya)
 
@@ -233,7 +264,7 @@ as an AI verdict.
 
 ```bash
 # backend — hermetic: temp SQLite, no network, no AI key
-cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 249 tests
+cd backend && PYTHONPATH=. ../.venv/bin/python -m pytest tests/ -q     # 1419 tests
 
 # lint
 ruff check backend
@@ -247,7 +278,10 @@ Alembic migrations on a fresh database, typechecks and builds the frontend, buil
 image and audits dependencies (pip-audit + npm audit).
 
 Test coverage includes: auth/tenancy isolation, vault encryption + re-keying, queue leasing and
-worker execution, discovery/source adapters, form detection, autofill planning, resume generation
+worker execution, discovery/source adapters, the shared job pool (retention/deletion aggregates,
+the owner-only snapshot, instant match and its idempotency), the owner-only AI log (the body stored
+is the body sent, failures with reason/status, the Laya status vocabulary, retention, clipping and
+masking, member 403 on every route), form detection, autofill planning, resume generation
 + fact guard + diff/polish, outreach compliance gates, suppression/unsubscribe/open tracking,
 funding providers (including the anti-fabrication guard), GDPR export/delete under **enforced** foreign keys
 (the schema's FKs are checked, not disabled), metrics and health.
@@ -269,6 +303,14 @@ funding providers (including the anti-fabrication guard), GDPR export/delete und
   proposes role mailboxes and marks them unverified; it never invents a personal address.
 * **Email deliverability is your responsibility.** Configure SPF/DKIM/DMARC for the sending domain;
   the app supplies the unsubscribe header/footer, suppression list and rate limiting.
+* **The shared job pool shares public postings, not people.** Entries carry no tenant column; the
+  per-user link (`job_pool_seen`) is a normal owned row that account erasure deletes, and the pool's
+  owner-facing aggregates are counters. A deployment that must not share postings between tenants sets
+  `JOB_POOL_ENABLED=false` and gets the pre-pool product.
+* **The AI log is owner-only, bounded and scrubber-first.** It stores the request *bodies* we sent
+  (never headers, so never the API key) after the gateway's secret scrubber, clipped and pruned on
+  write; a member gets 403 on every `/api/admin/ai/*` route. It is a diagnostic aid for the operator,
+  not an export surface — the credit ledger stays the accounting record.
 * **Compliance sign-off is still a human step.** `docs/COMPLIANCE.md` documents the built-in
   controls and the questions your counsel should answer before you enable automation for real
   users.

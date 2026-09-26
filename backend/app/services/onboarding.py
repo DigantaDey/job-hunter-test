@@ -952,6 +952,38 @@ def _resume_upsert(db: Session, user_id: int, document: ResumeDocument,
     return resume
 
 
+def _instant_match_after_onboarding(db: Session, user: User, profile: Optional[Any]) -> None:
+    """Hand a finished onboarding profile to the shared job pool.
+
+    One call does both halves of the contract: the pool's current best matches
+    are written to the user's board immediately, and the full live discovery run
+    is queued behind them, so "instant matches while live discovery processes"
+    is the product's own pipeline — not a second, private path.
+
+    Never raises: onboarding completion must not depend on matching. A failure
+    leaves the marker unwritten, so the next profile change retries the hook.
+    """
+    if profile is None:
+        return
+    try:
+        from app.services import job_pool  # noqa: PLC0415
+
+        report = job_pool.maybe_instant_match(
+            db,
+            user,
+            profile_document=dict(getattr(profile, "document", None) or {}),
+            persona_id=getattr(profile, "persona_id", None),
+            trigger="onboarding",
+        )
+    except Exception as exc:  # noqa: BLE001 - matching must not fail onboarding
+        log.warning("instant match after onboarding failed for user %s: %s", user.id, exc)
+        return
+    if report:
+        log.info("onboarding instant match for user %s: inserted=%s skipped=%s queued=%s",
+                 user.id, report.get("inserted"), report.get("skipped"),
+                 report.get("discovery_queued"))
+
+
 def apply_extraction_success(
     db: Session,
     user: User,
@@ -980,6 +1012,7 @@ def apply_extraction_success(
     profile = _profile_upsert(db, user.id, extraction, profile_data, layout, resume.id)
 
     # --- v2 candidate profile with provenance ---
+    candidate_profile: Optional[Any] = None
     try:
         from app.services import candidate_profile as cp_service
 
@@ -1000,7 +1033,7 @@ def apply_extraction_success(
             .first()
         )
         if not existing_cand:
-            cp_service.persist_candidate_profile(
+            candidate_profile = cp_service.persist_candidate_profile(
                 db,
                 user.id,
                 fields,
@@ -1010,6 +1043,8 @@ def apply_extraction_success(
                 source_extraction_id=extraction.id,
                 persona_id=None,
             )
+        else:
+            candidate_profile = existing_cand
     except Exception as exc:  # pragma: no cover - candidate profile is additive, must not break legacy flow
         log.warning("failed to create candidate profile v2 for extraction %s: %s", extraction.id, exc)
 
@@ -1070,6 +1105,12 @@ def apply_extraction_success(
                           "profile_id": profile.id, "field_count": extraction.field_count},
                  message="Resume extracted — profile ready to review")
     db.commit()
+
+    # Onboarding just reached its terminal state: match the shared pool *now*
+    # (no network, deterministic preliminary scores) and queue the user's own
+    # live discovery run for the background. Best-effort by contract — see
+    # ``_instant_match_after_onboarding``.
+    _instant_match_after_onboarding(db, user, candidate_profile)
 
     _notify_once(
         db, user.id, "profile_review_required",

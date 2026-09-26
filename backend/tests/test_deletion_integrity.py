@@ -24,6 +24,7 @@ from app.api.routers import resumes as resumes_api
 from app.core.config import settings
 from app.db import engine
 from app.models.models import (
+    AICallRecord,
     AICreditLedger,
     ApiKey,
     ApplicationAction,
@@ -50,6 +51,9 @@ from app.models.models import (
     InterviewPrep,
     Job,
     JobEvent,
+    JobPoolEntry,
+    JobPoolSeen,
+    LayaDecision,
     MatchFeedback,
     MatchResult,
     Notification,
@@ -105,6 +109,11 @@ CHILD_TABLES: dict[str, type] = {
     "subscriptions": Subscription,
     "billing_events": BillingEvent,
     "ai_credit_ledger": AICreditLedger,
+    # Owner-only AI observability (v2.3): the bodies we sent (which can quote
+    # the user's own profile/resume text) and the engine's verdicts about their
+    # documents. Diagnostic, but still the user's data — erasure must reach it.
+    "ai_call_records": AICallRecord,
+    "laya_decisions": LayaDecision,
     "usage_counters": UsageCounter,
     "notifications": Notification,
     "interview_preps": InterviewPrep,
@@ -121,6 +130,10 @@ CHILD_TABLES: dict[str, type] = {
     "profile_field_history": ProfileFieldHistory,
     # Multi-stage matching: the versioned explained verdict + user feedback.
     "match_results": MatchResult,
+    # Shared job pool (v2.3): the entry itself is ownerless market data, but the
+    # *seen* link is the user's — deleting the account must delete the link, or
+    # the erasure would leave behind a record of what this person was shown.
+    "job_pool_seen": JobPoolSeen,
     # Browser-assisted applications (v2.2.21, docs/contracts/12): the session,
     # its human-action queue and the duplicate-submission ledger.
     "application_sessions": ApplicationSession,
@@ -381,6 +394,18 @@ def _seed_every_child_table(db, user: User) -> dict:
                      kind="invoice.paid"),
         AICreditLedger(user_id=user.id, workflow="scoring", model="gpt-x", prompt_tokens=100,
                        completion_tokens=20, total_tokens=120, estimated_cost_usd=0.01),
+        AICallRecord(user_id=user.id, workflow="scoring", provider="openai_compatible",
+                     model="gpt-x", base_url="https://api.example/v1", status="ok",
+                     attempts=1, latency_ms=420, prompt_tokens=100, completion_tokens=20,
+                     total_tokens=120,
+                     request={"url": "https://api.example/v1/chat/completions",
+                              "params": {"temperature": 0.2},
+                              "attempts": [{"attempt": 1, "body": {"messages": [
+                                  {"role": "user", "content": "score this candidate"}]}}]},
+                     response='{"score": 88}'),
+        LayaDecision(user_id=user.id, task="ranking", status="ok", model="english",
+                     questions=6, confidence=0.91, floor=0.55, strict=False, latency_ms=72,
+                     answers={"dim_skills": {"score": 4, "confidence": 0.91}}),
         SearchBudget(key=f"user:{user.id}:test", user_id=user.id, used=1,
                      expires_at=datetime.utcnow() + timedelta(days=1)),
         SearchUsage(user_id=user.id, provider="brave", query_hash="a" * 64,
@@ -482,6 +507,17 @@ def _seed_every_child_table(db, user: User) -> dict:
                            follow_up_at=datetime.utcnow() + timedelta(days=5),
                            note="Send the thank-you note")
     db.commit()
+    # Shared job pool seam: written through the service, like tracking above —
+    # the entry upsert and the per-user seen link are the pool's invariants.
+    from app.services import job_pool
+
+    job_pool.record_candidates(db, [{
+        "title": "Staff Backend Engineer", "company": "Erase Me Ltd",
+        "description": "Python, Postgres, FastAPI.", "url": "https://example.com/erase-me",
+        "source": "test", "external_id": "erase-me-1", "dedupe_key": "test:erase-me-1",
+        "canonical_id": "test:erase-me-1",
+    }], user_id=user.id)
+
     vault = save_vault_entry(db, user.id, domain="jobs.lever.co", username="me@example.com",
                              password="correct-horse-battery", origin="manual")
 

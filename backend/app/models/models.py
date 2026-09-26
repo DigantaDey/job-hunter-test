@@ -1869,3 +1869,235 @@ class AutomationSubmissionCounter(Base):
     rejected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # refusals recorded (unmetered)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+# --------------------------------------------------------------------------- #
+# Shared job pool — cross-user discovery, 7-day retention, aggregates only
+# --------------------------------------------------------------------------- #
+class JobPoolEntry(Base):
+    """One posting in the shared, cross-user discovery pool.
+
+    Every discovery run folds the postings it scanned in here, so the next user
+    does not have to wait for a slow live fan-out to see the market: the pool is
+    the union of what *everyone's* runs have seen, deduplicated by canonical
+    identity and bounded by ``JOB_POOL_RETENTION_DAYS`` (7 by default).
+
+    Three deliberate properties:
+
+    * **No tenant column.** A posting is public market data, not user data —
+      sharing it is the product feature. The *link* to a person lives in
+      :class:`JobPoolSeen`, which carries the ``user_id`` FK so account erasure
+      (``app.services.erasure`` derives its plan from the schema) reaches it
+      automatically.
+    * **Bounded.** ``expires_at`` is ``last_seen_at + retention``; nothing in
+      here outlives the retention window, and the pruner deletes rather than
+      archives.
+    * **Compact.** The row carries what matching needs (title, company,
+      description, location, timestamps) and *not* the source payload
+      (``jobs.raw_payload`` stays on the user's own row) — so the pool is a
+      matching index, not a second copy of every tenant's board.
+    """
+
+    __tablename__ = "job_pool_entries"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_job_pool_dedupe"),
+        Index("ix_job_pool_expiry", "expires_at"),
+        Index("ix_job_pool_last_seen", "last_seen_at"),
+        Index("ix_job_pool_source", "source", "expires_at"),
+        Index("ix_job_pool_company_norm", "company_name_normalized"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    #: Canonical identity (``source:external_id`` or ``company|title``) — the
+    #: same key ``jobs.dedupe_key`` uses, so a pool match merges with a row the
+    #: user already has instead of duplicating it.
+    dedupe_key: Mapped[str] = mapped_column(String(300), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    company: Mapped[str] = mapped_column(String(200), nullable=False)
+    company_name_normalized: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    location: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    url: Mapped[str] = mapped_column(String(1000), default="", nullable=True)
+    source: Mapped[str] = mapped_column(String(64), default="unknown", nullable=True)
+    external_id: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(16), default="", nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    title_normalized: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    #: Salary / remote / industry — the compact matching extras, never forms or
+    #: autofill plans (those belong to a user's own row).
+    extra: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    #: ``last_seen_at + JOB_POOL_RETENTION_DAYS``. The pruner deletes on this.
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    #: How many times any run has seen this posting (a market signal, and the
+    #: value folded into :class:`JobPoolMetric` when the row is pruned).
+    times_seen: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    #: Distinct contributors, maintained with :class:`JobPoolSeen`.
+    users_seen: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: Set by a source (a closed listing) or by the pruner; expired rows are
+    #: never offered as matches.
+    expired: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+class JobPoolSeen(Base):
+    """Which user has seen which pool entry — the erasure-reachable link.
+
+    One row per (entry, user): it is what makes ``users_seen`` a *distinct user*
+    count instead of a scan count, and it is the reason the account-erasure plan
+    covers the pool without a second hand-written table list (the ``user_id`` FK
+    is all ``app.services.erasure`` needs).
+    """
+
+    __tablename__ = "job_pool_seen"
+    __table_args__ = (
+        UniqueConstraint("entry_id", "user_id", name="uq_job_pool_seen_entry_user"),
+        Index("ix_job_pool_seen_user", "user_id"),
+        Index("ix_job_pool_seen_entry", "entry_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    entry_id: Mapped[int] = mapped_column(Integer, ForeignKey("job_pool_entries.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class JobPoolMetric(Base):
+    """Aggregate-only record of a job the pool no longer stores.
+
+    When a pool entry is pruned (retention reached, or the posting disappeared)
+    the *content* goes: no title, no description, no URL, no payload — only
+    counters that answer "how big is the market we saw, and how fast does it
+    churn". ``metric_key`` is a SHA-256 of the canonical key, so the row is not a
+    re-identification handle either. The one descriptive field kept is the
+    public company name, and only because it is the aggregation dimension for
+    the churn report (``gone.companies``); the pin test
+    (``tests/test_job_pool.py::test_metric_rows_carry_no_job_content``) fails if
+    anything else from the posting is ever added here.
+
+    Owner-only by construction: the only reader is ``/api/admin/*``.
+    """
+
+    __tablename__ = "job_pool_metrics"
+    __table_args__ = (
+        UniqueConstraint("metric_key", name="uq_job_pool_metric_key"),
+        Index("ix_job_pool_metric_last_seen", "last_seen_at"),
+        Index("ix_job_pool_metric_source", "source"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    #: SHA-256 hex of the entry's canonical key — aggregate identity without content.
+    metric_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+    company_name_normalized: Mapped[str] = mapped_column(String(200), default="", nullable=True)
+    #: ``expired`` (retention window elapsed) or ``deleted`` (source said the
+    #: posting is gone) — the two ways an entry leaves the pool.
+    reason: Mapped[str] = mapped_column(String(24), default="expired", nullable=False)
+    times_seen: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    distinct_users: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: Whole days between first and last sighting (the posting's observed life).
+    days_live: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=True)
+
+
+# --------------------------------------------------------------------------- #
+# Owner-only AI observability (v2.3)
+#
+# Two append-only logs behind the owner console (``/api/admin/*``):
+#
+# * :class:`AICallRecord` — what was *actually sent* to a provider (the request
+#   bodies, the parameters, the outcome) so an owner can answer "why is this
+#   verdict wrong / slow / expensive" without turning on debug logging and
+#   reproducing it.
+# * :class:`LayaDecision` — one row per local-engine forward pass, so "how is
+#   Laya doing" is a query rather than a log grep.
+#
+# Both are bounded by ``AI_LOG_RETENTION_DAYS`` (pruned on write) and both carry
+# a ``user_id`` FK, so account erasure reaches them through the same
+# schema-derived plan as every other tenant table: a person's prompts are their
+# data, and "delete my account" has to delete them.
+# --------------------------------------------------------------------------- #
+class AICallRecord(Base):
+    """One AI provider call as it went on the wire — **owner-only**.
+
+    ``request`` holds the outbound bodies (one entry per attempt, so an
+    escalation is visible as an escalation), already passed through the same
+    secret scrubber the live prompt got; headers are never stored, so the API
+    key is not in this table. ``response`` keeps a bounded excerpt of what came
+    back, which is what makes a guardrail rejection or a truncated answer
+    diagnosable after the fact.
+    """
+
+    __tablename__ = "ai_call_records"
+    __table_args__ = (
+        Index("ix_ai_call_created", "created_at"),
+        Index("ix_ai_call_user_created", "user_id", "created_at"),
+        Index("ix_ai_call_workflow_created", "workflow", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    workflow: Mapped[str] = mapped_column(String(40), default="", nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), default="", nullable=True)
+    model: Mapped[str] = mapped_column(String(120), default="", nullable=True)
+    #: Provider endpoint the request went to (config, not a credential).
+    base_url: Mapped[str] = mapped_column(String(300), default="", nullable=True)
+    #: ``ok`` or ``error``.
+    status: Mapped[str] = mapped_column(String(16), default="ok", nullable=False, index=True)
+    #: Machine reason for a failure (``truncated_response``, ``timeout``, …).
+    reason: Mapped[str] = mapped_column(String(60), default="", nullable=True)
+    http_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    #: ``{"url": …, "params": {…}, "attempts": [{"attempt": n, "body": {…}}]}``.
+    request: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    #: Bounded excerpt of the model's answer (may be empty on a hard failure).
+    response: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class LayaDecision(Base):
+    """One local-engine forward pass — **owner-only**.
+
+    ``status`` is ``ok`` when the engine answered at all, ``timeout`` /
+    ``error`` / ``parked`` when it did not, and ``low_confidence`` when it
+    answered below ``floor`` (which is what makes ``auto`` mode escalate to the
+    LLM). ``answers`` keeps the compact verdict per question — the choice, the
+    rubric level, the calibrated confidence — never the state that was scored,
+    which is already in the AI call log if the LLM was asked instead.
+    """
+
+    __tablename__ = "laya_decisions"
+    __table_args__ = (
+        Index("ix_laya_decision_created", "created_at"),
+        Index("ix_laya_decision_user_created", "user_id", "created_at"),
+        Index("ix_laya_decision_task_created", "task", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    #: ``ranking`` / ``classification`` / ``field_mapping``.
+    task: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="ok", nullable=False, index=True)
+    #: ``english`` / ``multilingual`` — which checkpoint answered.
+    model: Mapped[str] = mapped_column(String(48), default="", nullable=True)
+    questions: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    floor: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    #: ``laya_only`` was in force (a low-confidence answer stands rather than escalating).
+    strict: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: Compact per-question verdict (choice / level / confidence) — no state text.
+    answers: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)

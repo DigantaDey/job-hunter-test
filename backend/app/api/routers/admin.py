@@ -9,7 +9,8 @@ there is no code path that relaxes it.
 What lives here (and deliberately nowhere on the user surface):
 
 * ``GET  /admin/overview``        — source health, queue health, usage & cost,
-  failure rates, application-automation health, accounts and plan mix.
+  failure rates, application-automation health, accounts and plan mix, and the
+  shared job pool's aggregates (live entries + pruned/deleted counters).
 * ``GET  /admin/audit``           — the cross-user audit trail (the self-scoped
   ``/api/account/audit`` stays available to every user for their own actions).
 * ``GET/PUT /admin/flags``        — global feature flags and their consumers.
@@ -36,9 +37,9 @@ from app.models.models import (
     Subscription,
     User,
 )
+from app.services import ai_log, job_pool, net_guard, robots
 from app.services import flags as feature_flags
 from app.services import http as http_client
-from app.services import net_guard, robots
 from app.services.ai_client import breaker_snapshot
 from app.services.billing import create_or_update_subscription_manual
 from app.services.funding_sources import provider_status
@@ -163,6 +164,18 @@ def overview(user: CurrentUser, db: DbSession) -> Dict[str, Any]:
             "owners": int(owners or 0),
             "plans": {plan: int(n) for plan, n in plan_rows},
         },
+        # Shared job pool, owner-only: what the cross-user corpus currently
+        # holds (live entries, sources, contributors) and what it no longer
+        # holds (aggregate counters for pruned/deleted postings — the only
+        # thing retention keeps). Route-level ``require_owner`` is the access
+        # rule; nothing here is exposed on a user surface.
+        "job_pool": job_pool.metrics_snapshot(db),
+        # The two answers the owner console exists for, owner-only like
+        # everything here: "what exactly did we send?" (a 24h rollup of the
+        # call log — the bodies themselves are on /admin/ai/calls/{id}) and
+        # "how is Laya doing?" (status mix, latency and confidence per task).
+        "ai_log": ai_log.call_stats(db, window_hours=24),
+        "laya": ai_log.laya_stats(db, window_hours=24),
         "flags": feature_flags.all_flags(db),
     }
 
@@ -309,3 +322,88 @@ def set_user_role(
     audit.audit(db, "admin.role_set", user=owner, target=f"user:{user_id}",
                 detail={"from": previous, "to": role, "email": target.email}, request=request)
     return {"ok": True, "user_id": user_id, "role": role, "previous": previous}
+
+
+# --------------------------------------------------------------------------- #
+# Owner-only AI log: the exact request sent, and how Laya is doing
+#
+# Both surfaces are diagnostic and both are ``require_owner`` at the router
+# level above — there is no per-user or public variant of either. Everything
+# below is read-only; nothing here can change what a call sends.
+# --------------------------------------------------------------------------- #
+@router.get("/ai/calls")
+def admin_ai_calls(
+    user: CurrentUser,
+    db: DbSession,
+    workflow: Optional[str] = Query(None, description="Exact workflow, e.g. scoring"),
+    status: Optional[str] = Query(None, description="ok | error"),
+    user_id: Optional[int] = Query(None, description="Only calls made on behalf of this account"),
+    before_id: Optional[int] = Query(None, description="Page: records with a smaller id"),
+    limit: int = Query(50, ge=1, le=200),
+) -> Dict[str, Any]:
+    """Newest-first page of logged AI calls — metadata plus a prompt preview.
+
+    The full request bodies for one call come from ``/admin/ai/calls/{id}``.
+    """
+    items = ai_log.recent_calls(db, limit=limit, workflow=workflow, status=status,
+                                user_id=user_id, before_id=before_id)
+    return {
+        "items": items,
+        "limit": limit,
+        "next_before_id": items[-1]["id"] if len(items) == limit and items else None,
+        "enabled": ai_log.enabled(),
+        "retention_days": ai_log.retention_days(),
+    }
+
+
+@router.get("/ai/calls/{record_id}")
+def admin_ai_call_detail(record_id: int, user: CurrentUser, db: DbSession) -> Dict[str, Any]:
+    """One call with the exact bodies sent (per attempt) and the answer excerpt."""
+    record = ai_log.get_call(db, record_id)
+    if record is None:
+        raise HTTPException(404, "No AI call logged with that id")
+    return record
+
+
+@router.get("/ai/stats")
+def admin_ai_stats(
+    user: CurrentUser,
+    db: DbSession,
+    window_hours: int = Query(24, ge=1, le=720),
+) -> Dict[str, Any]:
+    """Volume, failures-by-reason, tokens, cost and latency over a window."""
+    return ai_log.call_stats(db, window_hours=window_hours)
+
+
+@router.get("/laya/decisions")
+def admin_laya_decisions(
+    user: CurrentUser,
+    db: DbSession,
+    task: Optional[str] = Query(None, description="ranking | classification | field_mapping"),
+    status: Optional[str] = Query(None, description="ok | low_confidence | timeout | error | parked"),
+    user_id: Optional[int] = Query(None),
+    before_id: Optional[int] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+) -> Dict[str, Any]:
+    """Newest-first page of local-engine forward passes, with the verdicts."""
+    items = ai_log.recent_laya_decisions(db, limit=limit, task=task, status=status,
+                                         user_id=user_id, before_id=before_id)
+    return {
+        "items": items,
+        "limit": limit,
+        "next_before_id": items[-1]["id"] if len(items) == limit and items else None,
+        "statuses": ["ok", ai_log.LAYA_LOW_CONFIDENCE, ai_log.LAYA_TIMEOUT,
+                     ai_log.LAYA_ERROR, ai_log.LAYA_PARKED],
+        "enabled": ai_log.enabled(),
+        "retention_days": ai_log.retention_days(),
+    }
+
+
+@router.get("/laya/stats")
+def admin_laya_stats(
+    user: CurrentUser,
+    db: DbSession,
+    window_hours: int = Query(24, ge=1, le=720),
+) -> Dict[str, Any]:
+    """How the engine is doing: per-task status mix, latency, confidence."""
+    return ai_log.laya_stats(db, window_hours=window_hours)

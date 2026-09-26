@@ -36,6 +36,12 @@ OWNER_ONLY_GETS = [
     "/api/admin/audit",
     "/api/admin/flags",
     "/api/admin/users",
+    # v2.3 owner-only diagnostics: the exact AI requests sent and how the local
+    # decision engine is doing. Members see neither.
+    "/api/admin/ai/calls",
+    "/api/admin/ai/stats",
+    "/api/admin/laya/decisions",
+    "/api/admin/laya/stats",
 ]
 
 

@@ -20,6 +20,7 @@ guarantees live here and nowhere else:
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -574,6 +575,52 @@ class FieldSpec:
     minimum: Optional[float] = None
     maximum: Optional[float] = None
     choices: Optional[Sequence[str]] = None
+
+
+#: Characters reserved for JSON syntax/keys/whitespace when a budget is sized
+#: from a schema.
+_SCHEMA_JSON_OVERHEAD_CHARS = 600
+#: Character budget assumed for a field the schema does not bound. Small on
+#: purpose: an unbounded field is a modelling smell, not a licence to reserve a
+#: large ceiling.
+_UNBOUNDED_FIELD_CHARS = 240
+
+
+def schema_output_budget(
+    schema: "SchemaSpec",
+    item_caps: Optional[Dict[str, Tuple[int, int]]] = None,
+    *,
+    reasoning_headroom: float = 2.0,
+    chars_per_token: int = 4,
+    floor: int = 1200,
+) -> int:
+    """A starting ``max_tokens`` that can actually hold this schema's answer.
+
+    Sums each field's own declared cap (``max_length``; for a list field, the
+    ``(count, chars_per_item)`` pair from ``item_caps``), adds JSON syntax
+    overhead, converts to tokens, and doubles it for a model that reasons before
+    it answers.
+
+    A budget *below* this number is a guaranteed truncation: the prompt asks for
+    more than the ceiling permits, so the answer arrives cut, the gateway
+    escalates and retries — three round trips for one verdict, and (at discovery
+    scale) the 1200 → 2400 → 4800 chain operators saw in the logs.
+    """
+    total = _SCHEMA_JSON_OVERHEAD_CHARS
+    caps = item_caps or {}
+    for spec in schema.fields:
+        if spec.kind == "str":
+            total += int(spec.max_length or _UNBOUNDED_FIELD_CHARS)
+        elif spec.kind == "list":
+            count, item = caps.get(spec.name, (1, _UNBOUNDED_FIELD_CHARS))
+            total += int(count) * int(item)
+        elif spec.kind == "dict":
+            total += _UNBOUNDED_FIELD_CHARS
+        else:
+            total += 32  # number / bool / enum: a handful of characters
+    tokens = math.ceil(total / max(1, chars_per_token) * max(1.0, reasoning_headroom))
+    rounded = int(math.ceil(tokens / 100.0) * 100)
+    return max(int(floor), rounded)
 
 
 class SchemaSpec:

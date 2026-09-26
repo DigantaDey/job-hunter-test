@@ -259,3 +259,57 @@ def test_member_settings_document_hides_laya_controls(client, auth, member_auth)
     owner_doc = client.get("/api/settings", headers=auth).json()
     assert "mode" in owner_doc["_meta"]["writable"]["laya"]
     assert owner_doc["laya"]["mode"] == "laya_only"
+
+
+# --------------------------------------------------------------------------- #
+# v2.3 — an engine that is down must not cost a run one timeout per candidate
+# --------------------------------------------------------------------------- #
+def test_repeated_failures_park_the_engine(laya_fake):
+    """Three consecutive failures bench the engine; a success un-benches it.
+
+    Without this, a discovery run scores ``AI_RESCORE_TOP`` candidates against a
+    dead engine and pays ``LAYA_TIMEOUT_SECONDS`` *per candidate* before every
+    one of them falls back — the 25-minute run in the report.
+    """
+    laya_fake(lambda key, q: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    for _ in range(laya_service._FAILURE_THRESHOLD):
+        with pytest.raises(laya_service.LayaUnavailable) as first:
+            run(laya_service.predict({"q": "how big?"}, "state"))
+        assert first.value.code == "predict_failed"
+
+    assert laya_service.parked() is True
+    with pytest.raises(laya_service.LayaUnavailable) as parked_exc:
+        run(laya_service.predict({"q": "how big?"}, "state"))
+    assert parked_exc.value.code == "engine_parked", "the engine must not be retried while parked"
+
+    # A successful pass clears the park (the engine came back).
+    laya_service.reset_for_tests()
+    laya_fake(lambda key, q: _choice("big"))
+    run(laya_service.predict({"q": "how big?"}, "state"))
+    assert laya_service.parked() is False
+
+
+def test_parked_engine_is_reported_not_retried_in_auto_mode(laya_fake):
+    """Auto mode falls back to the LLM (the pre-Laya behaviour) — no exception
+    escapes, and the run's verdict is labelled with the engine that answered."""
+    laya_fake(lambda key, q: (_ for _ in ()).throw(RuntimeError("boom")))
+    for _ in range(laya_service._FAILURE_THRESHOLD):
+        with pytest.raises(laya_service.LayaUnavailable):
+            run(laya_service.predict({"q": "how big?"}, "state"))
+    assert laya_service.parked() is True
+
+    async def _score():
+        # The stand-in scorer (conftest) credits "python" and "fastapi", so the
+        # profile must actually contain them for the guardrail to pass.
+        profile = {"skills": ["python", "fastapi"],
+                   "experience": [{"title": "Backend Engineer", "company": "Paystack"}]}
+        return await scoring.ai_score_detailed(profile, JD)
+
+    detail = run(_score())
+    # The fake 'laya' package cannot answer, so the LLM stand-in does — and the
+    # verdict is never labelled "laya".
+    assert detail.get("source") != "laya"
+
+
+JD = "Backend Engineer. Python, FastAPI, PostgreSQL, AWS, Docker, Kubernetes. 5+ years."
