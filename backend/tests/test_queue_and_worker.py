@@ -68,7 +68,11 @@ def test_claim_is_exclusive_and_priority_ordered(db, owner):
     low = enqueue(db, user_id=user.id, pipeline="discovery", priority=7, dedupe_key="low")
     high = enqueue(db, user_id=user.id, pipeline="discovery", priority=1, dedupe_key="high")
 
-    first = claim(db, pipelines=["discovery"])
+    # ``limits={}``: this test is about claim exclusivity and ordering, so it
+    # opts out of the shipped per-pipeline budget (WORKER_PIPELINE_LIMITS caps
+    # discovery at 1) — that budget is pinned on its own in
+    # test_a_pipeline_budget_bounds_its_own_concurrency below.
+    first = claim(db, pipelines=["discovery"], limits={})
     assert first.id == high.id  # priority wins over arrival order
     assert first.status == "processing"
     # v2.2.2: attempts counts handler *failures*, not claims — a claim takes a
@@ -76,9 +80,9 @@ def test_claim_is_exclusive_and_priority_ordered(db, owner):
     assert first.attempts == 0
     assert first.lease_expires_at > datetime.utcnow()
 
-    second = claim(db, pipelines=["discovery"])
+    second = claim(db, pipelines=["discovery"], limits={})
     assert second.id == low.id
-    assert claim(db, pipelines=["discovery"]) is None
+    assert claim(db, pipelines=["discovery"], limits={}) is None
 
 
 def test_complete_and_stats(db, owner):
@@ -291,6 +295,11 @@ async def test_worker_loop_survives_complete_error_and_keeps_serving(db, owner, 
                     dedupe_key="corrupt-1")
     second = enqueue(db, user_id=user.id, pipeline="discovery", dedupe_key="corrupt-2")
 
+    # The corrupted row is left in ``processing`` with a *live* lease, and the
+    # shipped per-pipeline budget (WORKER_PIPELINE_LIMITS=discovery=1) would
+    # correctly treat that as discovery's one slot being busy — the budget is
+    # not what this test is about, so it claims without one.
+    monkeypatch.setattr(settings, "worker_pipeline_limits", "", raising=False)
     before = metrics.snapshot()
     worker = Worker(pipelines=["discovery"], concurrency=1, poll_interval=0.05)
     worker.running = True

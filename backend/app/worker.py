@@ -28,6 +28,28 @@ per-user cadence sweep, see :mod:`app.services.auto_scheduler`), so scheduled
 work inherits the same crash logging and respawn instead of growing a second,
 weaker loop next to it. The scheduler enqueues into this same queue; the worker
 process that claims the items is unchanged.
+
+Lease honesty (v2.4)
+--------------------
+A claimed item's lease used to be written once, at claim time, and never
+refreshed — so a run longer than ``WORKER_LEASE_SECONDS + WORKER_REAPER_SAFETY_
+SECONDS`` (120 + 300 s by default) was re-queued *while its first copy was still
+running*. Discovery can legitimately exceed that (``AI_TIMEOUT`` per verdict ×
+``AI_RESCORE_TOP`` at ``DISCOVERY_AI_CONCURRENCY``), and the clone re-fetched the
+same sources and re-paid for the same AI verdicts. Three things fix it:
+
+* :meth:`Worker._heartbeat_lease` renews the row's lease every
+  ``WORKER_HEARTBEAT_INTERVAL_SECONDS`` (30 s) while the handler runs, through
+  ``job_queue.renew``'s conditional update — the reaper can then only recover
+  rows whose worker really stopped;
+* the handler runs under a real **soft deadline**
+  (``WORKER_MAX_RUNTIME_SECONDS``, previously declared and never read): it is
+  cancelled and the item is re-queued with an honest error instead of outliving
+  its lease;
+* every terminal transition is fenced on ownership — ``complete`` is a
+  compare-and-set, and the failure/park paths check ``job_queue.owns`` first —
+  so a worker that lost its lease cannot overwrite the outcome of the run that
+  replaced it.
 """
 from __future__ import annotations
 
@@ -55,12 +77,24 @@ from app.services.job_queue import (
     complete,
     fail,
     needs_input,
+    owns,
     recover_stalled,
+    renew,
     worker_id,
 )
 from app.services.reliability import apply_failure, expire_user_actions
 
 log = get_logger("app.worker")
+
+
+class WorkerSoftDeadlineExceeded(Exception):
+    """The handler outlived ``WORKER_MAX_RUNTIME_SECONDS`` and was cancelled.
+
+    Its own type on purpose: an :class:`asyncio.TimeoutError` would be read by
+    the failure classifier as a *provider* timeout (and pause the item as an AI
+    outage), but this is the worker's own deadline — the run was stopped, not the
+    model.
+    """
 
 
 class Worker:
@@ -306,6 +340,89 @@ class Worker:
             db.close()
         self._run_subscription_expiry_pass()
 
+    def _heartbeat_interval(self) -> float:
+        """How often a running item's lease is renewed (seconds).
+
+        Never slower than a third of the lease: two missed beats must not lose a
+        row, and a lease shorter than three beats would be beaten by its own
+        interval.
+        """
+        try:
+            configured = float(getattr(settings, "worker_heartbeat_interval_seconds", 30.0) or 30.0)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            configured = 30.0
+        lease = max(1.0, float(getattr(settings, "worker_lease_seconds", 120) or 120))
+        return max(1.0, min(max(1.0, configured), lease / 3.0))
+
+    def _soft_deadline_seconds(self) -> float:
+        """``WORKER_MAX_RUNTIME_SECONDS`` as a real soft deadline (0 = none)."""
+        try:
+            return max(0.0, float(getattr(settings, "worker_max_runtime_seconds", 0) or 0.0))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return 0.0
+
+    async def _heartbeat_lease(self, item: Any) -> None:
+        """Renew the lease of the item this slot is running, until cancelled.
+
+        Stops (with a warning and a metric) the moment the row is no longer ours
+        — a reaper reclaimed it, or another worker completed it. It keeps
+        retrying through transient DB errors: a hiccup is not a lost lease.
+        """
+        interval = self._heartbeat_interval()
+        while True:
+            await asyncio.sleep(interval)
+            db = SessionLocal()
+            try:
+                try:
+                    still_ours = renew(db, item, worker=self.worker_id)
+                except asyncio.CancelledError:  # pragma: no cover - cooperative cancel
+                    raise
+                except Exception as exc:  # noqa: BLE001 - the next beat retries
+                    log.warning("lease heartbeat for item %s failed: %s: %s",
+                                item.id, type(exc).__name__, exc)
+                    continue
+            finally:
+                db.close()
+            if not still_ours:
+                inc("jobhunter_worker_lease_lost_total", pipeline=str(item.pipeline or ""))
+                log.warning("queue item %s (%s) is no longer held by this worker — the lease "
+                            "was reclaimed; this run's outcome will be discarded",
+                            item.id, item.pipeline)
+                return
+
+    async def _cancel_heartbeat(self, task: asyncio.Task) -> None:
+        """Stop the heartbeat cleanly (never leaks a pending task or a warning)."""
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # pragma: no cover - the heartbeat logs its own errors
+            log.debug("lease heartbeat ended with an error: %s", exc)
+
+    async def _call_handler(self, db, item, handler) -> Any:
+        """Run a handler under the heartbeat and the soft deadline (v2.4).
+
+        ``WORKER_MAX_RUNTIME_SECONDS`` used to be declared and never read. It is
+        now the point at which a run is stopped rather than allowed to outlive
+        its lease (and its own useful result): the handler is cancelled and
+        :class:`WorkerSoftDeadlineExceeded` is raised so the item is re-queued
+        with an honest error, under the failure budget like any other failure.
+        """
+        budget = self._soft_deadline_seconds()
+        heartbeat = asyncio.create_task(self._heartbeat_lease(item))
+        try:
+            if budget <= 0:
+                return await handler(db, item)
+            try:
+                return await asyncio.wait_for(handler(db, item), timeout=budget)
+            except asyncio.TimeoutError as exc:
+                raise WorkerSoftDeadlineExceeded(
+                    f"worker soft deadline exceeded (WORKER_MAX_RUNTIME_SECONDS={budget:g}s)"
+                ) from exc
+        finally:
+            await self._cancel_heartbeat(heartbeat)
+
     async def _run_item(self, item_id: int, pipeline: str) -> None:
         db = SessionLocal()
         try:
@@ -326,7 +443,21 @@ class Worker:
             with LogContext(request_id=f"job-{item.id}", user_id=item.user_id):
                 log.info("processing %s item %s", item.pipeline, item.id)
                 try:
-                    result = await handler(db, item)
+                    result = await self._call_handler(db, item, handler)
+                except WorkerSoftDeadlineExceeded as exc:
+                    # The handler was cancelled mid-flight: roll back anything it
+                    # had queued on the session (a half-written insert must never
+                    # ride along on the failure commit) and re-queue honestly.
+                    db.rollback()
+                    inc("jobhunter_worker_item_deadline_total", pipeline=item.pipeline)
+                    if not owns(db, item, worker=self.worker_id):
+                        log.warning("item %s hit the soft deadline after losing its lease — "
+                                    "leaving the row to its current owner", item.id)
+                        return
+                    log.error("queue item %s (%s) exceeded the soft deadline: %s",
+                              item.id, item.pipeline, exc)
+                    fail(db, item, str(exc), retryable=True)
+                    return
                 except Exception as exc:  # noqa: BLE001 - pipeline failures must not kill the worker
                     # Every exception goes through one classifier
                     # (``services/reliability``), which decides between the
@@ -345,10 +476,26 @@ class Worker:
                     #   sees it instead of waiting through three retries;
                     # * anything the human must answer parks the item in
                     #   ``needs_input`` — never retried, and it expires.
+                    #
+                    # Ownership fence (v2.4): if this worker's lease was
+                    # reclaimed while the handler ran, the row belongs to
+                    # someone else now and none of those transitions may be
+                    # written over the owner's state. Losing a slow run is
+                    # acceptable; two writers on one row is not.
+                    if not owns(db, item, worker=self.worker_id):
+                        inc("jobhunter_worker_lease_lost_total", pipeline=item.pipeline)
+                        log.warning("item %s (%s) failed after its lease was reclaimed — leaving "
+                                    "the row to its current owner: %s", item.id, item.pipeline, exc)
+                        return
                     apply_failure(db, item, exc)
                     return
             if item.status == "processing":
                 if isinstance(result, dict) and result.get("status") == "needs_input":
+                    if not owns(db, item, worker=self.worker_id):
+                        inc("jobhunter_worker_lease_lost_total", pipeline=item.pipeline)
+                        log.warning("item %s (%s) wants user input but its lease was reclaimed — "
+                                    "leaving the row to its current owner", item.id, item.pipeline)
+                        return
                     needs_input(db, item, reason="waiting for user input", result=result)
                 else:
                     # v2.2 auto mode, the quota half: an auto-triggered run
@@ -359,7 +506,22 @@ class Worker:
                     # are counted, and nothing is ever counted twice. Before this
                     # existed the Dashboard's used/limit readout was wired to a
                     # counter nothing incremented.
-                    if dict(item.payload or {}).get("trigger") == "auto":
+                    #
+                    # The compare-and-set below decides *whose* completion this
+                    # is, so the charge happens only for the writer that actually
+                    # finished the row (a reclaimed duplicate must not bill the
+                    # user a second automation run).
+                    # A corrupted payload must not skip the completion (the row
+                    # is finished either way); ``complete`` below is where a
+                    # payload that cannot be merged is reported.
+                    payload = item.payload if isinstance(item.payload, dict) else {}
+                    auto_triggered = payload.get("trigger") == "auto"
+                    finished = complete(
+                        db, item,
+                        result=result if isinstance(result, dict) else {"result": str(result)},
+                        worker=self.worker_id,
+                    )
+                    if finished and auto_triggered:
                         from app.core.entitlements import increment_usage
 
                         try:
@@ -367,7 +529,6 @@ class Worker:
                         except Exception as exc:  # pragma: no cover - never lose the run over the ledger
                             log.warning("could not charge automation quota for item %s: %s",
                                         item.id, exc)
-                    complete(db, item, result=result if isinstance(result, dict) else {"result": str(result)})
         finally:
             db.close()
 

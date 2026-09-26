@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -232,6 +232,14 @@ def _run_summary(source_report: Dict[str, Any], *, freshness_hours: int, fresh_c
     return {
         "configured_sources": [str(source_id) for source_id in (source_report.get("requested") or [])],
         "failed_sources": {str(source_id): str(error) for source_id, error in (source_report.get("errors") or {}).items()},
+        # Sources that answered with only some of their boards (v2.4): a partial
+        # answer is coverage, not an outage, and the block says how much of each
+        # source answered so "nothing fresh" and "half a source answered" cannot
+        # be confused.
+        "partial_sources": {
+            str(source_id): dict(entry)
+            for source_id, entry in (source_report.get("partial") or {}).items()
+        },
         "needs_credentials": list(source_registry.unconfigured_source_ids()),
         "demo_pool_enabled": _demo_pool_enabled(),
         "freshness_window_hours": int(freshness_hours),
@@ -240,12 +248,40 @@ def _run_summary(source_report: Dict[str, Any], *, freshness_hours: int, fresh_c
     }
 
 
-async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[str, Any]], use_ai: bool,
-                            *, db=None, user_id: Optional[int] = None,
-                            persona: Optional[Dict[str, Any]] = None) -> None:
+def _stage_ms(started: float, ended: Optional[float] = None) -> float:
+    """One stage's wall clock in milliseconds, for ``report["stages"]``."""
+    return round(((ended if ended is not None else time.perf_counter()) - started) * 1000.0, 1)
+
+
+def _ai_budget_seconds() -> float:
+    """Wall-clock budget for one run's AI work (``DISCOVERY_AI_BUDGET_SECONDS``).
+
+    ``0`` disables the budget and restores the old, aggregate-unbounded
+    behaviour. Only the *per-call* timeout was ever bounded
+    (``AI_TIMEOUT``): twelve scoring verdicts at ``DISCOVERY_AI_CONCURRENCY``
+    four at a time, then a separate classification stage, is a tail the run's
+    own report could not even measure before v2.4.
     """
-    Preliminary pre-rank for all (deterministic, provenance-labelled
-    ``score_source='preliminary'``); guardrailed AI verdict for the strongest.
+    try:
+        value = float(getattr(settings, "discovery_ai_budget_seconds", 180.0) or 0.0)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        value = 180.0
+    return max(0.0, value)
+
+
+async def _score_candidates(
+    profile_data: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    use_ai: bool,
+    *,
+    db=None,
+    user_id: Optional[int] = None,
+    persona: Optional[Dict[str, Any]] = None,
+    classify_top: int = AI_CLASSIFY_TOP,
+    budget_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Preliminary pre-rank for all, then **one** AI wave for the top slice (v2.4).
 
     Cost control is explicit: scoring 200 postings with the model is not
     viable, so the bulk of a discovery run carries the *preliminary* score and
@@ -264,37 +300,139 @@ async def _score_candidates(profile_data: Dict[str, Any], candidates: List[Dict[
     ``can_use_advanced_matching`` entitlement, so a free-tier batch never
     reaches the loop below.
 
-    The top slice runs **in parallel** (bounded by ``DISCOVERY_AI_CONCURRENCY``,
-    and hard-bounded by the gateway's own ``AI_MAX_CONCURRENCY`` semaphore and
-    RPM limiter): a sequential slice is what turned a twelve-candidate batch
-    into minutes of wall clock. The failure contract is unchanged — any verdict
-    failing raises, so the run pauses and re-executes as a whole.
+    Three properties this must keep, because the product depends on them:
+
+    * **Bounded-parallel.** One logical batch, ``DISCOVERY_AI_CONCURRENCY``
+      verdicts in flight (the gateway's own ``AI_MAX_CONCURRENCY`` and RPM
+      limiter stay the hard bounds), and one session per in-flight verdict —
+      the gateway writes to the session it is handed, and a session is not safe
+      to share between awaiting coroutines.
+    * **One wave, both verdicts** (v2.4). Company-size classification used to be
+      a *second* serial stage over the already-scored top five: every run paid
+      for scoring, then classification, then persistence. The two are
+      independent, so each candidate's two calls now ride the same wave slot —
+      which removes a whole stage from every run.
+    * **Best-first, under a budget** (v2.4). Verdicts are assigned in
+      deterministic pre-rank order and the wave stops when
+      ``DISCOVERY_AI_BUDGET_SECONDS`` is spent. Candidates without a verdict keep
+      the honest ``score_source='preliminary'`` estimate they already carry; the
+      run reports the cut instead of pretending the slice was the whole batch.
+
+    Returns this run's slice accounting — ``scored`` / ``classified`` counts,
+    ``verdicts`` (``id()`` of the candidates that got an AI company-size
+    verdict, so the caller can leave every other row on the deterministic
+    labelling), ``budget_exhausted`` / ``cut``, and the ``pre_rank_ms`` /
+    ``score_ms`` / ``classify_ms`` stage timings. Every number is measured, none
+    is inferred.
     """
+    stats: Dict[str, Any] = {
+        "scored": 0,
+        "classified": 0,
+        "cut": 0,
+        "budget_exhausted": False,
+        "verdicts": set(),
+        "pre_rank_ms": 0.0,
+        "score_ms": 0.0,
+        "classify_ms": 0.0,
+    }
+    pre_rank_started = time.perf_counter()
     for candidate in candidates:
         score, reason = preliminary_score(profile_data, candidate["description"])
         candidate["score"] = score
         candidate["score_reason"] = f"Preliminary keyword estimate: {reason}"
         candidate["score_source"] = "preliminary"
+    stats["pre_rank_ms"] = _stage_ms(pre_rank_started)
 
     if not use_ai or not profile_data:
-        return
+        return stats
     ranked = sorted(candidates, key=lambda c: c["score"], reverse=True)[:AI_RESCORE_TOP]
-    results = await _run_ai_slice(
-        ranked,
-        lambda candidate, session: score_job(
-            profile_data, candidate["description"], db=session, user_id=user_id,
-            persona=persona, allow_preliminary=False,
-        ),
-        workflow="scoring",
-        per_task_sessions=db is not None and user_id is not None,
-    )
+    if not ranked:
+        return stats
+    # *Which* candidates get the size verdict is decided here, from the
+    # deterministic pre-rank — the same ordering the scoring slice uses. It has
+    # to be: the final ranking is not known until the scores come back, and
+    # deciding after them is exactly the serial second stage this removes. The
+    # consequence is deliberate and visible: a candidate that the model's score
+    # would have promoted into the top ``classify_top`` keeps the source-derived
+    # deterministic size (labelled as such) instead of a model verdict.
+    classify_ids = {
+        id(candidate) for candidate in ranked[: max(0, int(classify_top or 0))]
+    }
+    budget = _ai_budget_seconds() if budget_seconds is None else max(0.0, float(budget_seconds))
+    use_sessions = db is not None and user_id is not None
+
+    #: ``(stage, started, ended)`` per call, so each stage's wall clock is
+    #: measured rather than inferred — and so the report can show that scoring
+    #: and classification now overlap instead of adding up serially.
+    timings: List[tuple] = []
+
+    async def verdict(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        from app.db import SessionLocal  # noqa: PLC0415 - keep the import graph flat
+
+        score_session = SessionLocal() if use_sessions else None
+        classify_session = (
+            SessionLocal() if use_sessions and id(candidate) in classify_ids else None
+        )
+        try:
+            async def _score() -> Dict[str, Any]:
+                started = time.perf_counter()
+                try:
+                    return await score_job(
+                        profile_data, candidate["description"], db=score_session,
+                        user_id=user_id, persona=persona, allow_preliminary=False,
+                    )
+                finally:
+                    timings.append(("score", started, time.perf_counter()))
+
+            async def _classify() -> Optional[Tuple[str, float]]:
+                started = time.perf_counter()
+                try:
+                    return await ai_company_size(
+                        candidate["company"], candidate["description"],
+                        db=classify_session, user_id=user_id,
+                    )
+                finally:
+                    timings.append(("classify", started, time.perf_counter()))
+
+            if classify_session is None:
+                return {"score": await _score(), "size": None}
+            score_result, size_result = await asyncio.gather(_score(), _classify())
+            return {"score": score_result, "size": size_result}
+        finally:
+            if score_session is not None:
+                score_session.close()
+            if classify_session is not None:
+                classify_session.close()
+
+    results = await _run_ai_slice(ranked, verdict, workflow="scoring", budget_seconds=budget)
     for candidate, result in zip(ranked, results, strict=False):
-        if result is None:  # pragma: no cover - _run_ai_slice raises instead
+        if result is None:
+            # The run's AI budget ran out before this candidate's verdict: the
+            # preliminary score stays, provenance intact.
+            stats["cut"] += 1
             continue
-        candidate["score"] = result["score"]
-        candidate["score_reason"] = result["reason"]
-        candidate["score_source"] = result["score_source"]
-        candidate["score_detail"] = result.get("detail") or {}
+        score_result = result.get("score") or {}
+        candidate["score"] = score_result.get("score", candidate["score"])
+        candidate["score_reason"] = score_result.get("reason", candidate["score_reason"])
+        candidate["score_source"] = score_result.get("score_source", candidate["score_source"])
+        candidate["score_detail"] = score_result.get("detail") or {}
+        stats["scored"] += 1
+        size_result = result.get("size")
+        if size_result is None:
+            continue
+        candidate["company_size"], candidate["company_size_confidence"] = size_result
+        stats["verdicts"].add(id(candidate))
+        stats["classified"] += 1
+
+    for stage, key in (("score", "score_ms"), ("classify", "classify_ms")):
+        entries = [entry for entry in timings if entry[0] == stage]
+        if entries:
+            stats[key] = round((max(e[2] for e in entries) - min(e[1] for e in entries)) * 1000.0, 1)
+    stats["budget_exhausted"] = stats["cut"] > 0
+    if stats["budget_exhausted"]:
+        log.info("discovery: AI budget of %.0fs spent — %s of %s verdict(s) left preliminary",
+                 budget, stats["cut"], len(ranked))
+    return stats
 
 
 def _ai_concurrency() -> int:
@@ -318,11 +456,11 @@ async def _run_ai_slice(
     call,
     *,
     workflow: str,
-    per_task_sessions: bool = True,
-) -> List[Optional[Dict[str, Any]]]:
+    budget_seconds: Optional[float] = None,
+) -> List[Optional[Any]]:
     """Run one AI verdict per candidate, bounded and parallel; keep the contract.
 
-    Two things this must not change, because the product depends on both:
+    Three things this must not change, because the product depends on both:
 
     * **The hard dependency still raises.** A transient outage in any verdict
       propagates out of the run (the queued item pauses and re-executes) — the
@@ -330,21 +468,26 @@ async def _run_ai_slice(
       sequential loop behaved. Nothing is written before this point, so a
       resumed run produces the same rows.
     * **Fail fast, cancel the rest.** The run is going to fail either way, so
-      the first failing verdict cancels every candidate that has not started
+      the first failing verdict cancels every candidate that has not finished
       yet: an outage cannot fan out into "one failed call per candidate", and
       cannot open the AI gateway's breaker on a burst of failures from a single
       faulty run (the breaker needs ``AI_BREAKER_FAILURES`` consecutive
       failures, and a cancelled slice only ever records the calls already on the
       wire).
-    * **One session per in-flight verdict.** The AI gateway writes to the
-      session it is handed (usage ledger, entitlement reads); a session is not
-      safe to share between coroutines that each await, so each task opens its
-      own and closes it (also on cancellation — the ``finally`` runs). The run's
-      own session stays untouched until the slice has finished.
+    * **Sessions belong to the caller.** ``call(candidate)`` opens and closes
+      whatever session it needs (one per in-flight verdict — the AI gateway
+      writes to the session it is handed, and a session is not safe to share
+      between coroutines that each await).
+
+    ``budget_seconds`` (v2.4) is the run's aggregate AI budget: candidates that
+    finish inside it keep their verdict, the ones still on the wire when it
+    expires are cancelled and answered with ``None`` (the caller leaves their
+    honest preliminary estimate in place). Only *timeouts* are cut this way — a
+    failure still raises. The list is positional and always one entry per
+    candidate.
     """
     if not candidates:
         return []
-    from app.db import SessionLocal  # noqa: PLC0415 - keep the import graph flat
     from app.services import ai_client  # noqa: PLC0415 - cycle-free at call time
 
     #: One logical batch, one consecutive failure (see
@@ -355,17 +498,13 @@ async def _run_ai_slice(
     failure_baseline = ai_client.slice_failure_baseline(workflow)
     semaphore = asyncio.Semaphore(_ai_concurrency())
 
-    async def one(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    async def one(candidate: Dict[str, Any]) -> Any:
         async with semaphore:
-            session = SessionLocal() if per_task_sessions else None
-            try:
-                return await call(candidate, session)
-            finally:
-                if session is not None:
-                    session.close()
+            return await call(candidate)
 
     tasks = [asyncio.create_task(one(candidate)) for candidate in candidates]
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    timeout = None if not budget_seconds or budget_seconds <= 0 else float(budget_seconds)
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION, timeout=timeout)
     failure: Optional[BaseException] = None
     for task in done:
         exc = task.exception()
@@ -381,9 +520,13 @@ async def _run_ai_slice(
         ai_client.collapse_slice_failures(workflow, failure_baseline)
         inc("jobhunter_discovery_ai_slice_total", workflow=workflow, result="failed")
         raise failure
-    inc("jobhunter_discovery_ai_slice_total", workflow=workflow, result="ok",
-        value=len(candidates))
-    return [task.result() for task in tasks]
+    if pending:
+        # The run's own budget expired, not the provider's: the verdicts that
+        # landed are kept, the rest are reported as cut (never silently).
+        inc("jobhunter_discovery_ai_slice_total", workflow=workflow, result="budget_cut",
+            value=len(pending))
+    inc("jobhunter_discovery_ai_slice_total", workflow=workflow, result="ok", value=len(done))
+    return [None if task.cancelled() else task.result() for task in tasks]
 
 
 async def discover_for_user(db: Session, user: User, **kwargs: Any) -> Dict[str, Any]:
@@ -404,8 +547,13 @@ async def discover_for_user(db: Session, user: User, **kwargs: Any) -> Dict[str,
     try:
         report = await _run_discovery(db, user, **kwargs)
         inserted = int(report.get("inserted") or 0)
-        degraded = bool(report.get("insert_errors")) or bool(
-            (report.get("sources") or {}).get("errors"))
+        sources = report.get("sources") or {}
+        # A partial source (some boards answered, some were dropped inside the
+        # fetch budget) degrades the run's label exactly like a failed source:
+        # the board is real, the coverage is not complete, and the series that
+        # reads "ok" is the one an operator trusts.
+        degraded = bool(report.get("insert_errors")) or bool(sources.get("errors")) \
+            or bool(sources.get("partial"))
         outcome = "ok" if inserted and not degraded else ("partial" if inserted else "empty")
         return report
     finally:
@@ -474,12 +622,27 @@ async def _run_discovery(
     jobs_remaining: Optional[int] = None if jobs_limit <= 0 else max(0, jobs_limit - jobs_used)
     if jobs_limit > 0:
         report["jobs_cap"] = {"used": jobs_used, "limit": jobs_limit}
+    #: Per-stage wall clock (v2.4). ``elapsed_seconds`` alone made every latency
+    #: argument an inference: it says a run took 400 s, never that 320 of them
+    #: were the AI tail. Each key is measured around its own block below, so the
+    #: fields are facts about this run — and ``score_ms`` / ``classify_ms``
+    #: deliberately overlap now that both verdicts ride one wave.
+    stages: Dict[str, float] = {
+        "fetch_ms": 0.0,
+        "pool_ms": 0.0,
+        "pre_rank_ms": 0.0,
+        "score_ms": 0.0,
+        "classify_ms": 0.0,
+        "persist_ms": 0.0,
+        "forms_ms": 0.0,
+    }
     if jobs_remaining == 0:
         report["sources"] = {}
         report["scanned"] = 0
         report["fresh"] = 0
         report["inserted"] = 0
         report["elapsed_seconds"] = round((datetime.utcnow() - started).total_seconds(), 2)
+        report["stages"] = dict(stages)
         report["summary"] = _run_summary({}, freshness_hours=freshness_hours, fresh_count=0)
         report["why_empty"] = WHY_JOBS_CAP_REACHED
         report["jobs"] = []
@@ -490,6 +653,7 @@ async def _run_discovery(
     # ---------------- fetch ----------------
     postings: List[Dict[str, Any]] = []
     source_report: Dict[str, Any] = {}
+    fetch_started = time.perf_counter()
     if live_enabled:
         fetched, source_report = await source_registry.fetch_all(
             keywords,
@@ -523,6 +687,7 @@ async def _run_discovery(
                 # Search is supplementary. A provider/cache failure must never
                 # discard direct-adapter postings or leak provider exception text.
                 report["search"] = {"errors": [{"code": "unavailable"}], "validated": 0}
+    stages["fetch_ms"] = _stage_ms(fetch_started)
     report["sources"] = source_report
 
     if _demo_pool_enabled():
@@ -546,6 +711,7 @@ async def _run_discovery(
     pool_report: Dict[str, Any] = {"enabled": job_pool.enabled(),
                                    "retention_days": job_pool.retention_days()}
     pool_offered: List[Dict[str, Any]] = []
+    pool_started = time.perf_counter()
     if job_pool.enabled():
         try:
             pruned = job_pool.prune(db)
@@ -659,6 +825,9 @@ async def _run_discovery(
             except Exception as exc:  # noqa: BLE001 - the pool is supplementary
                 db.rollback()
                 log.warning("discovery: pool write failed for user %s: %s", user.id, exc)
+    # Pool read *and* write (v2.4): both are the shared-pool stage of this run —
+    # the retention pass and the candidate read above, the contribution below.
+    stages["pool_ms"] = _stage_ms(pool_started)
 
     # Newest first. This is the only ordering that is known *before* scoring —
     # ``score`` does not exist on a candidate until ``_score_candidates`` runs
@@ -740,42 +909,34 @@ async def _run_discovery(
             log.warning("discovery merge of existing jobs failed: %s", exc)
         report["duplicates_merged"] = len(to_merge)
 
-    # ---------------- score / classify ----------------
+    # ---------------- score + classify (one wave, v2.4) ----------------
     # The batch slice gets exactly what the per-job path (``/intelligence``)
-    # gives the model: this run's session, the owning user (so the AI gateway
+    # gives the model: its own session, the owning user (so the AI gateway
     # resolves *their* key, budgets and ledger) and the persona context, so a
     # persona-scoped run scores against the track. ``use_ai`` is the plan gate
     # the caller applied by passing (or withholding) ``profile``.
-    await _score_candidates(profile_data, candidates, use_ai=bool(profile_data),
-                            db=db, user_id=user.id, persona=persona_context)
-
-    ranked = sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)[:limit * 2]
-    ai_classified = ranked[:AI_CLASSIFY_TOP] if profile_data else []
-    #: ``id()`` of the candidates that already have an engine verdict, so the
+    #
+    # Company-size classification used to be a second, *serial* stage here —
+    # scoring's wave, then classification's — so every run paid both in turn.
+    # Both verdicts are now assigned in one wave (see ``_score_candidates``),
+    # under one aggregate budget, and the accounting it returns says what
+    # happened: how many rows got a verdict, and how many the budget cut.
+    ai_stats = await _score_candidates(profile_data, candidates, use_ai=bool(profile_data),
+                                       db=db, user_id=user.id, persona=persona_context)
+    stages["pre_rank_ms"] = float(ai_stats.get("pre_rank_ms") or 0.0)
+    stages["score_ms"] = float(ai_stats.get("score_ms") or 0.0)
+    stages["classify_ms"] = float(ai_stats.get("classify_ms") or 0.0)
+    #: ``id()`` of the candidates that already have an AI size verdict, so the
     #: deterministic bulk-labelling pass below cannot overwrite one (and cannot
     #: skip a candidate just because a source happened to supply a size).
-    verdicts: set[int] = set()
-    if ai_classified:
-        # AI verdict — a hard dependency: on outage this raises and the queued
-        # run pauses (re-executed when the provider is back). Bounded-parallel
-        # for the same reason the scoring slice is (see ``_run_ai_slice``).
-        sizes = await _run_ai_slice(
-            ai_classified,
-            lambda candidate, session: ai_company_size(candidate["company"],
-                                                       candidate["description"],
-                                                       db=session, user_id=user.id),
-            workflow="classify",
-            per_task_sessions=db is not None and user.id is not None,
-        )
-        for candidate, verdict in zip(ai_classified, sizes, strict=False):
-            if verdict is None:  # pragma: no cover - _run_ai_slice raises instead
-                continue
-            candidate["company_size"], candidate["company_size_confidence"] = verdict
-            verdicts.add(id(candidate))
+    verdicts: set[int] = set(ai_stats.get("verdicts") or set())
+
+    ranked = sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)[:limit * 2]
     for candidate in ranked:
         if id(candidate) not in verdicts:
-            # Bulk slice (beyond the AI top-N): deterministic, source-data-first
-            # labelling — provenance-labelled, never an AI substitute.
+            # Bulk slice (beyond the AI top-N, plus anything the run's AI budget
+            # cut short): deterministic, source-data-first labelling —
+            # provenance-labelled, never an AI substitute.
             candidate["company_size"] = deterministic_company_size(
                 {"size": candidate.get("company_size")}, candidate)
             candidate["company_size_confidence"] = 0.55
@@ -786,6 +947,7 @@ async def _run_discovery(
     # race against a concurrent run is the common one) must be skipped — with
     # its failure recorded — and the rest of the batch must land. The old
     # batch commit discarded every good job because of one conflict.
+    persist_started = time.perf_counter()
     created: List[Job] = []
     insert_errors: List[Dict[str, Any]] = []
     # Clamp to the storage headroom (``None`` = unlimited): a nearly-full
@@ -826,22 +988,43 @@ async def _run_discovery(
     except Exception as e:
         log.debug("usage increment failed: %s", e)
 
+    # One commit for the whole board's events (v2.4). Each event used to commit
+    # on its own (``record_job_event(commit=True)``) — a second commit per
+    # created row on top of the per-row insert commit — so a few-thousand-row
+    # board paid thousands of extra round trips *after* the work was done. The
+    # per-row insert commits stay (one bad row must not discard the batch); the
+    # audit trail is now one write.
     for job in created:
-        db.refresh(job)
         record_job_event(
             db, user_id=user.id, job_id=job.id, stage="discovered", status="success",
             message=f"Discovered from {job.source} (score {job.score:.0f})",
             meta={"source": job.source, "posted_at": job.posted_at.isoformat() if job.posted_at else None},
+            commit=False,
         )
-    # v2.2.5 linkage — keep has_open_positions fresh via the shared matcher both directions.
+    if created:
+        try:
+            db.commit()
+        except Exception as exc:  # noqa: BLE001 - the board is already saved
+            db.rollback()
+            log.warning("discovery event batch failed for user %s: %s", user.id, exc)
+    # v2.2.5 linkage — keep has_open_positions fresh via the shared matcher both
+    # directions. Since v2.4 the discovery side is *targeted*: this run only
+    # added jobs, and adding a job can only turn a flag from False to True, so
+    # the check is one IN query over the companies this run created (the stale
+    # ``name_normalized`` column, no full-board scan) instead of loading every
+    # ``Job`` row the user owns. Deleting a job is still the full sweep's job,
+    # which is the only direction that can clear a flag.
     if created:
         try:
             from app.services.funding_radar import refresh_funding_has_open_positions
-            refresh_funding_has_open_positions(db, int(user.id))
+            refresh_funding_has_open_positions(db, int(user.id),
+                                               company_names=[job.company for job in created])
         except Exception as exc:  # noqa: BLE001
             log.warning("has_open_positions sync (discovery) failed for user %s: %s", user.id, exc)
+    stages["persist_ms"] = _stage_ms(persist_started)
 
     # ---------------- form structure for the best new jobs ----------------
+    forms_started = time.perf_counter()
     form_tasks = [detect_form_structure(job.url, job.source, use_ai=False) for job in created[:FORM_DETECT_TOP]]
     if form_tasks:
         results = await asyncio.gather(*form_tasks, return_exceptions=True)
@@ -857,8 +1040,14 @@ async def _run_discovery(
                 message=f"Form structure via {schema.get('detection_source')} "
                         f"({len(schema.get('fields') or [])} fields, confidence {schema.get('ai_confidence')})",
                 meta={"detection_source": schema.get("detection_source"), "portal": schema.get("portal_type")},
+                commit=False,
             )
-        db.commit()
+        try:
+            db.commit()
+        except Exception as exc:  # noqa: BLE001 - the board is already saved
+            db.rollback()
+            log.warning("discovery form-event batch failed for user %s: %s", user.id, exc)
+    stages["forms_ms"] = _stage_ms(forms_started)
 
     elapsed = (datetime.utcnow() - started).total_seconds()
     inc("jobhunter_discovery_runs_total", result="ok")
@@ -884,6 +1073,15 @@ async def _run_discovery(
         "scored": sum(1 for job in created
                       if str(job.score_source or "") in ENGINE_SCORE_SOURCES),
     }
+    # The per-run AI budget (v2.4) is reported only when it actually cut
+    # something, so a run inside its budget keeps the exact ``ai_rescore`` block
+    # the UI has always read. When it does cut, it says so: how many verdicts the
+    # budget dropped and what the budget was — an operator must never have to
+    # infer "the model only scored nine of twelve" from a score distribution.
+    if ai_stats.get("budget_exhausted"):
+        ai_rescore["budget_exhausted"] = True
+        ai_rescore["cut"] = int(ai_stats.get("cut") or 0)
+        ai_rescore["budget_seconds"] = _ai_budget_seconds()
     # The returned report *is* the run report built at the top of this function
     # (v2.2.4). It used to be two dicts: ``report`` carried ``started_at``,
     # ``keywords``, ``demo_pool`` and ``freshness_relaxed`` and was then dropped
@@ -894,6 +1092,13 @@ async def _run_discovery(
     report["fresh"] = len(fresh)
     report["inserted"] = len(created)
     report["elapsed_seconds"] = round(elapsed, 2)
+    # Where the seconds went (v2.4) — measured around each stage, never inferred.
+    # ``score_ms`` and ``classify_ms`` overlap by design (both verdicts ride one
+    # wave now), and the stages need not sum to ``elapsed_seconds``: dedupe,
+    # merging and the ledger are real work between them.
+    report["stages"] = {
+        key: round(float(value), 1) for key, value in stages.items()
+    }
     report["ai_rescore"] = ai_rescore
     # Why the board gained nothing (v2.2.4). Classified here, once, from the
     # per-source report above — the endpoint only reads it back. ``summary`` is

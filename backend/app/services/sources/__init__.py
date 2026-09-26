@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -71,17 +71,37 @@ def unconfigured_source_ids() -> List[str]:
     return [s["id"] for s in list_sources() if s["available"] and s.get("requires_key") and not s.get("configured")]
 
 
-async def _fetch_with_retry(adapter: Source, *, keywords, limit, since_hours, board_tokens) -> List[Posting]:
-    """Apply the adapter's retry policy around ``fetch``. Gated/auth errors never retry."""
+async def _fetch_with_retry(adapter: Source, *, keywords, limit, since_hours, board_tokens,
+                            budget_seconds: Optional[float] = None,
+                            report: Optional[Dict[str, Any]] = None) -> List[Posting]:
+    """Apply the adapter's retry policy around ``fetch``. Gated/auth errors never retry.
+
+    ``budget_seconds`` / ``report`` are passed through to adapters that declare
+    ``budgeted_fetch`` (:class:`~app.services.sources.adapters._BoardSource`):
+    those self-bound their own fan-out and return what they already have, which
+    is what turns a wide source into a reported ``partial`` instead of a
+    discarded ``timeout``. Each retry gets the *remaining* share of the window,
+    so a retry can never double the source's budget.
+    """
     policy = adapter.retry_policy
     attempts = max(1, int(policy.max_attempts or 1))
+    deadline = (time.monotonic() + float(budget_seconds)) if budget_seconds else None
     last_error: Optional[SourceError] = None
     for attempt in range(1, attempts + 1):
         try:
             await throttle.acquire_source(adapter)
-            postings = await adapter.fetch(
-                keywords=keywords, limit=limit, since_hours=since_hours, board_tokens=board_tokens,
-            )
+            remaining = None
+            if deadline is not None:
+                remaining = max(1.0, deadline - time.monotonic())
+            if getattr(adapter, "budgeted_fetch", False):
+                postings = await cast(Any, adapter.fetch)(
+                    keywords=keywords, limit=limit, since_hours=since_hours,
+                    board_tokens=board_tokens, budget_seconds=remaining, report=report,
+                )
+            else:
+                postings = await adapter.fetch(
+                    keywords=keywords, limit=limit, since_hours=since_hours, board_tokens=board_tokens,
+                )
             return [adapter.canonicalize(p) for p in (postings or [])]
         except asyncio.CancelledError:  # pragma: no cover - cooperative cancel
             raise
@@ -105,6 +125,8 @@ async def fetch_from_source(
     limit: int = 15,
     since_hours: int = 24 * 7,
     board_tokens: Optional[List[str]] = None,
+    budget_seconds: Optional[float] = None,
+    report: Optional[Dict[str, Any]] = None,
 ) -> List[Posting]:
     adapter = ADAPTERS.get(source_id)
     if not adapter:
@@ -116,7 +138,7 @@ async def fetch_from_source(
     try:
         postings = await _fetch_with_retry(
             adapter, keywords=keywords, limit=limit, since_hours=since_hours,
-            board_tokens=board_tokens or [],
+            board_tokens=board_tokens or [], budget_seconds=budget_seconds, report=report,
         )
     except SourceError as exc:
         latency = (time.perf_counter() - started) * 1000.0
@@ -204,6 +226,10 @@ async def fetch_all(
     report: Dict[str, Any] = {
         "requested": requested, "ok": {}, "errors": {}, "skipped": {},
         "error_codes": {}, "merged": 0, "expired": 0, "total": 0,
+        #: Sources whose fan-out was cut short (v2.4) but whose answered boards
+        #: were kept — ``{source_id: {boards_total, boards_answered, kept, reason}}``.
+        #: A partial source is *not* an error: it contributed what it had.
+        "partial": {},
     }
     if not requested:
         # Same shape as the fan-out below (``total`` included) so a reader — the
@@ -212,23 +238,29 @@ async def fetch_all(
         return [], report
 
     per_source_limit = max(4, min(25, limit // max(1, len(requested)) + 5))
+    #: The budget handed *down* to a source is the outer window minus a small
+    #: reserve: a board source then returns what it has and reports itself
+    #: partial before the registry's ``wait_for`` cancels everything it fetched.
+    inner_budget = max(1.0, float(timeout_seconds) - 2.0)
 
     async def run(source_id: str):
+        partial: Dict[str, Any] = {}
         try:
             postings = await asyncio.wait_for(
                 fetch_from_source(source_id, keywords, limit=per_source_limit,
-                                  since_hours=since_hours, board_tokens=board_tokens),
+                                  since_hours=since_hours, board_tokens=board_tokens,
+                                  budget_seconds=inner_budget, report=partial),
                 timeout=timeout_seconds,
             )
-            return source_id, postings, None, None
+            return source_id, postings, None, None, partial
         except SourceError as exc:
-            return source_id, [], str(exc), exc.code
+            return source_id, [], str(exc), exc.code, partial
         except asyncio.TimeoutError:
-            return source_id, [], "timeout", "timeout"
+            return source_id, [], "timeout", "timeout", partial
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("source %s failed: %s", source_id, exc)
             classified = classify_error(exc)
-            return source_id, [], f"{type(exc).__name__}: {exc}", classified.code
+            return source_id, [], f"{type(exc).__name__}: {exc}", classified.code, partial
 
     results = await asyncio.gather(*(run(s) for s in requested), return_exceptions=True)
 
@@ -239,11 +271,16 @@ async def fetch_all(
         if isinstance(result, BaseException):  # pragma: no cover - gather-level
             log.warning("source fan-out task failed: %s", result)
             continue
-        source_id, postings, error, error_code = result
+        source_id, postings, error, error_code, partial = result
         if error:
             report["errors"][source_id] = error
             if error_code:
                 report["error_codes"][source_id] = error_code
+            # A source that failed *after* answering some boards still
+            # contributes nothing here (the adapter raises only when it has
+            # nothing), but the partial counts stay visible for the operator.
+            if partial.get("partial"):
+                report["partial"][source_id] = {**partial, "kept": 0}
             continue
         kept = 0
         for posting in postings:
@@ -255,6 +292,13 @@ async def fetch_all(
             collected.append(posting)
             kept += 1
         report["ok"][source_id] = kept
+        if partial.get("partial"):
+            # Non-destructive fan-out (v2.4): the source answered with some of
+            # its boards instead of being reported as ``timeout`` with nothing
+            # kept, and the report says exactly how many answered and how many
+            # were dropped — so the coverage doubt is a number, not a guess.
+            report["partial"][source_id] = {**partial, "kept": kept}
+            inc("jobhunter_source_partial_total", source=source_id)
 
     merged, merge_count = _merge_by_canonical(collected)
     report["merged"] = merge_count

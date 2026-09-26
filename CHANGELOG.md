@@ -6,6 +6,68 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed — a run longer than its lease was reaped mid-flight, and everything after persistence was serial
+
+Seven defects, one theme: the work was measured by nothing, so every part of the tail was allowed to grow
+unbounded and the parts that were bounded bounded the wrong thing.
+
+**The reaper was cloning live runs.** `WORKER_LEASE_SECONDS` (120) was never renewed and `recover_stalled()`
+re-queues anything past `lease + WORKER_REAPER_SAFETY_SECONDS` (300) — but a discovery run legitimately takes
+longer than 7 minutes (AI scoring worst case ~15 min, plus the classification wave), so a healthy run was
+re-queued and *a second worker started the same run from scratch*. `_run_item` now heartbeats the lease
+(`job_queue.renew()`, every `WORKER_HEARTBEAT_INTERVAL_SECONDS` — 30 s, clamped to lease/3) for as long as the
+handler is alive, and completion is a **compare-and-swap** on `locked_by` + `status`: `complete(..., worker=…)`
+only writes if this worker still owns the row, a worker whose lease was reclaimed is now *fenced* — its result
+is discarded, `jobhunter_queue_complete_conflicts_total` counts the loss, and the quota it would have charged is
+not charged twice. A config knob that never did anything becomes the real bound: `WORKER_MAX_RUNTIME_SECONDS`
+(900) is now a **soft deadline** — the heartbeat notices and the item fails deliberately with
+`WORKER_MAX_RUNTIME_SECONDS` in the error (`jobhunter_worker_item_deadline_total`) instead of being killed by a
+reclaimer. The whole path is pinned in `tests/test_discovery_latency_and_leases.py` (heartbeat vs reaper, both
+reclaim races, the deadline).
+
+**Stage timings first, because the rest was unmeasurable.** Every run report now carries
+`report["stages"]` = `fetch_ms` / `pool_ms` / `pre_rank_ms` / `score_ms` / `classify_ms` / `persist_ms` /
+`forms_ms`, so "the tail" is a number per stage rather than an argument.
+
+**The AI tail was unbounded in aggregate.** The five classification questions were a *second serial stage* after
+the twelve score verdicts; they are now folded into the same bounded-parallel wave (one scoring slice, so one
+round of provider pressure and half the wall clock). And because a wave of verdicts still has no ceiling,
+`DISCOVERY_AI_BUDGET_SECONDS` (180) is a per-run budget: verdicts are assigned best-first (the pre-rank order),
+and when the budget is spent the remainder stays honestly `score_source="preliminary"` with
+`ai_rescore.budget_exhausted` / `cut` / `budget_seconds` in the report — a slow provider now costs a ranked run,
+never an unbounded one. `0` disables the budget; `DISCOVERY_AI_CONCURRENCY` still bounds the wave itself.
+
+**A source timeout threw away boards that had already answered.** `_BoardSource` fetches each board with its own
+budget (`DISCOVERY_BOARD_TIMEOUT_SECONDS`, 20 s) and the fan-out is **non-destructive**: a timeout returns the
+boards that did reply instead of discarding the whole source, labelled `partial` with the counts
+(`report["partial"][source]` → `boards_total` / `answered` / `dropped` / `timed_out` / `reason`,
+`jobhunter_source_boards_total`, `jobhunter_source_partial_total`, and `partial_sources` in the run summary).
+One slow board no longer costs the four fast ones.
+
+**Search discovery was fully serial whenever `JOB_SEARCH_PROVIDERS` was set** — every query across every
+provider awaited one at a time, then a serial crawl of up to twelve pages, which is why the same run took
+minutes with two providers configured. Queries now fan out under a bounded gather (`_SEARCH_CONCURRENCY`, 4;
+the divisor keeps the configured per-run query budget shared, so `search_queries_per_run` still means what it
+said and the shared attempt budget is honoured under a lock), fragments merge in query order, and the crawl
+runs in waves of the same width with FIFO order, visited set and page budget unchanged.
+
+**Everything shared two worker slots.** `WORKER_PIPELINE_LIMITS` (default `discovery=1`) caps how many
+concurrent leases one pipeline may hold — the total worker concurrency is not raised — so a discovery run can
+no longer occupy both slots and starve email/forms work behind it. `claim()` counts only **live** leases.
+
+**The tail after persistence was doing per-row work.** The per-job `record_job_event` calls are one batch with
+`commit=False` and a single commit at the end, and the funding flag no longer loads every `Job` row: it is
+computed from the run's own created set through a targeted `name_normalized IN (…)` refresh
+(`funding_radar.refresh_funding_has_open_positions(..., company_names=…)`), which sets the flag on the
+companies this run actually touched and leaves unrelated rows untouched (clearing still requires the full sweep,
+`company_names=None`).
+
+Covered by `backend/tests/test_discovery_latency_and_leases.py` (**23 tests** — lease renewal vs the reaper,
+CAS fencing on completion and on the failure path, the soft deadline, the stage-timing contract, one AI wave,
+the budget cut, partial board fan-out, bounded-parallel search with its page budget intact, the per-pipeline
+slot budget, the batched event commit, and the targeted funding refresh), plus the updated
+`tests/test_queue_and_worker.py` / `tests/test_discovery_empty_board.py` for the new report keys.
+
 ### Added — owner-only AI log: the exact request sent, and how Laya is doing
 
 Two questions the deployment could not answer from the aggregate ledger, both asked while diagnosing the slow, failing verdicts: *"what exactly did we send the model?"* and *"is the local decision engine actually healthy?"* The credit ledger answers **how much**; it cannot answer either.

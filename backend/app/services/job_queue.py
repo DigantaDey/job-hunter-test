@@ -6,6 +6,14 @@ rolling deploy, a crash or a restart silently loses in-flight work. This queue
 persists every unit of work in ``pipeline_jobs`` and gives workers:
 
 * atomic claim with a lease (``status=processing`` + ``lease_expires_at``);
+* a **lease heartbeat** (:func:`renew`) — the worker extends its own lease while
+  the handler runs, so :func:`recover_stalled` only ever recovers rows whose
+  worker really stopped instead of cloning a merely slow one;
+* an **ownership-fenced completion** (:func:`complete` is a compare-and-set on
+  ``status``/``locked_by``, and :func:`owns` is the same probe for the failure
+  paths), so an outcome can never overwrite the row a second worker now holds;
+* **per-pipeline slot budgets** (:func:`pipeline_limits`, ``WORKER_PIPELINE_LIMITS``)
+  so one minutes-long pipeline cannot occupy every worker slot;
 * retries with exponential backoff and a dead-letter state (``dead``);
 * stall recovery — expired leases are re-queued;
 * dedupe keys so re-running discovery/apply cannot double-enqueue;
@@ -43,11 +51,11 @@ import os
 import socket
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -63,10 +71,29 @@ PIPELINES = ("discovery", "application", "email", "funding", "ai", "extraction",
              "browser_session")
 
 
+#: The process-wide worker identity, minted once (see :func:`worker_id`).
+_PROCESS_WORKER_ID: Optional[str] = None
+
+
 def worker_id() -> str:
+    """This worker's stable identity, used as the lease owner (``locked_by``).
+
+    **Stable for the life of the process** (v2.4). It used to mint a fresh
+    ``host-pid-random`` string on every call, which was harmless only while
+    nothing ever compared it: the lease was written at claim time and never read
+    back. Now that the worker *renews* its own lease (:func:`renew`) and
+    :func:`complete` is a compare-and-set on ``locked_by``, a per-call identity
+    would have every claim immediately refuse its own heartbeat — the worker
+    would fence itself out of its own row. ``WORKER_ID`` still wins when an
+    operator sets it (one identity per container, which is what makes the value
+    readable in ``pipeline_jobs.locked_by``).
+    """
+    global _PROCESS_WORKER_ID
     if settings.worker_id:
         return settings.worker_id
-    return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    if _PROCESS_WORKER_ID is None:
+        _PROCESS_WORKER_ID = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    return _PROCESS_WORKER_ID
 
 
 def _note_dedupe(scope: str) -> None:
@@ -167,20 +194,131 @@ def enqueue(
     return item
 
 
-def claim(db: Session, *, pipelines: Sequence[str], lease_seconds: Optional[int] = None) -> Optional[PipelineJob]:
+#: Parsed ``WORKER_PIPELINE_LIMITS`` keyed by the raw setting, so an operator's
+#: string is parsed once per value (and the "unknown pipeline" warning is logged
+#: once per value too, not once per claim).
+_PIPELINE_LIMITS_CACHE: Dict[str, Dict[str, int]] = {}
+
+
+def pipeline_limits(configured: Optional[Mapping[str, int]] = None) -> Dict[str, int]:
+    """Per-pipeline slot budgets: ``{"discovery": 1, ...}``.
+
+    ``WORKER_PIPELINE_LIMITS`` is a comma-separated ``pipeline=count`` list
+    (``"discovery=1,application=2"``). ``configured`` overrides the setting for
+    one call — that is what tests and a standalone worker use.
+
+    A budget is the maximum number of rows of that pipeline that may be
+    ``processing`` at once **across the deployment**, not per worker: that is
+    what stops a minutes-long discovery run from holding half the platform's
+    job slots (``WORKER_CONCURRENCY``) while everyone else's email/application
+    work waits behind it. ``0`` (or a negative count) means *no budget* for
+    that pipeline, and an unlisted pipeline has none either — the pre-v2.4
+    behaviour, exactly.
+
+    Unknown pipeline names are ignored (with one warning per distinct setting):
+    a typo must not silently cap nothing, and it must not raise inside a claim.
+    """
+    if configured is not None:
+        return {
+            str(name): int(count)
+            for name, count in configured.items()
+            if str(name) in PIPELINES and int(count or 0) > 0
+        }
+    raw = str(getattr(settings, "worker_pipeline_limits", "") or "").strip()
+    if not raw:
+        return {}
+    cached = _PIPELINE_LIMITS_CACHE.get(raw)
+    if cached is not None:
+        return dict(cached)
+    parsed: Dict[str, int] = {}
+    unknown: List[str] = []
+    for token in raw.split(","):
+        name, _, value = token.partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        if name not in PIPELINES:
+            unknown.append(name)
+            continue
+        try:
+            count = int((value or "").strip())
+        except ValueError:
+            unknown.append(name)
+            continue
+        if count > 0:
+            parsed[name] = count
+    if unknown:
+        log.warning("WORKER_PIPELINE_LIMITS ignores %s (not a pipeline and/or not a count): %s",
+                    ", ".join(sorted(set(unknown))), raw)
+    _PIPELINE_LIMITS_CACHE[raw] = dict(parsed)
+    return parsed
+
+
+def _pipelines_at_capacity(
+    db: Session,
+    *,
+    pipelines: Sequence[str],
+    limits: Mapping[str, int],
+) -> List[str]:
+    """Pipelines in ``pipelines`` whose processing rows already fill their budget.
+
+    One grouped ``COUNT`` over indexed columns; skipped entirely (no query at
+    all) when no limit applies to the requested pipelines, so a deployment that
+    configures none pays exactly what it paid before this existed.
+    """
+    scoped = [p for p in pipelines if int(limits.get(p, 0) or 0) > 0]
+    if not scoped:
+        return []
+    now = datetime.utcnow()
+    rows = (
+        db.query(PipelineJob.pipeline, func.count(PipelineJob.id))
+        .filter(
+            PipelineJob.status == "processing",
+            PipelineJob.pipeline.in_(scoped),
+            # Only *live* leases occupy a slot: a row whose lease has expired is
+            # not being served (its worker died, or its heartbeat is failing),
+            # the reaper is about to re-queue it, and letting it hold the budget
+            # would stall the whole pipeline for the lease + safety margin. A
+            # live worker renews its lease every ``WORKER_HEARTBEAT_INTERVAL_
+            # SECONDS``, so a healthy run never looks expired.
+            or_(PipelineJob.lease_expires_at.is_(None), PipelineJob.lease_expires_at > now),
+        )
+        .group_by(PipelineJob.pipeline)
+        .all()
+    )
+    counts: Dict[str, int] = {str(pipeline): int(count or 0) for pipeline, count in rows}
+    return [p for p in scoped if int(counts.get(p, 0) or 0) >= int(limits[p])]
+
+
+def claim(db: Session, *, pipelines: Sequence[str], lease_seconds: Optional[int] = None,
+          limits: Optional[Mapping[str, int]] = None) -> Optional[PipelineJob]:
     """Atomically claim the next runnable item (priority, then arrival order).
 
     Claiming takes a lease only — it does **not** increment ``attempts``,
     which counts handler failures (see :func:`fail` and the module
     docstring). A pause/resume or crash/re-queue cycle therefore costs the
     item nothing.
+
+    ``limits`` is the per-pipeline slot budget (:func:`pipeline_limits`,
+    defaulting to the ``WORKER_PIPELINE_LIMITS`` setting): a pipeline whose
+    processing rows already fill its budget is filtered out of the *query*, so
+    the next claim is the highest-priority runnable item of a pipeline that has
+    a free slot — a blocked discovery queue never starves the email queue
+    behind it, and a claim that finds nothing returns ``None`` instead of
+    overshooting the budget.
     """
     now = datetime.utcnow()
     lease = timedelta(seconds=lease_seconds or settings.worker_lease_seconds)
+    scope = [p for p in pipelines if p in PIPELINES] or list(pipelines)
+    effective_limits = pipeline_limits(limits)
+    blocked = _pipelines_at_capacity(db, pipelines=scope, limits=effective_limits)
+    runnable = [p for p in scope if p not in blocked]
+    if not runnable:
+        return None
     candidate_id = (
         db.query(PipelineJob.id)
         .filter(
-            PipelineJob.pipeline.in_(list(pipelines)),
+            PipelineJob.pipeline.in_(runnable),
             PipelineJob.status == "queued",
             PipelineJob.scheduled_at <= now,
         )
@@ -247,16 +385,141 @@ def claim_item(db: Session, item_id: int, *, lease_seconds: Optional[int] = None
     return db.query(PipelineJob).populate_existing().filter(PipelineJob.id == item_id).first()
 
 
-def complete(db: Session, item: PipelineJob, *, result: Optional[Dict[str, Any]] = None) -> None:
-    item.status = "done"
-    item.finished_at = datetime.utcnow()
-    item.lease_expires_at = None
-    item.locked_by = ""
-    item.error = ""
-    if result is not None:
-        item.payload = {**(item.payload or {}), "result": result}
+def renew(db: Session, item: Any, *, worker: Optional[str] = None,
+          lease_seconds: Optional[int] = None) -> bool:
+    """Extend the lease of a row this worker still owns — the v2.4 heartbeat.
+
+    One conditional ``UPDATE``: it only lands while the row is still
+    ``processing`` **and** still locked by this worker, and the rowcount is the
+    answer. That is what makes renewing safe to interleave with the reaper: if
+    the lease was lost (the reaper re-queued the row, another worker claimed it),
+    the update changes nothing and reports ``False`` — the caller stops renewing
+    and its eventual outcome is discarded by the compare-and-set in
+    :func:`complete`.
+
+    Without this, ``WORKER_LEASE_SECONDS`` was a hard lie for long work: the
+    lease was written once at claim time and never refreshed, so any run longer
+    than ``lease + WORKER_REAPER_SAFETY_SECONDS`` (120 + 300 s out of the box)
+    was re-queued *while its first copy was still running* — the same sources
+    fetched twice, the same AI verdicts paid for twice, on exactly the runs that
+    were already slow. Returns ``True`` when the lease was extended.
+
+    ``item`` is the claimed row or its id — the heartbeat runs in its *own*
+    session (see ``worker._heartbeat_lease``), where the row object belongs to the
+    handler's session, so the identity is read from the object and the update is
+    addressed by primary key.
+    """
+    now = datetime.utcnow()
+    item_id = int(item.id) if isinstance(item, PipelineJob) else int(item)
+    pipeline = str(getattr(item, "pipeline", "") or "")
+    owner = str(worker or getattr(item, "locked_by", "") or worker_id())
+    lease = timedelta(seconds=lease_seconds or settings.worker_lease_seconds)
+    updated = (
+        db.query(PipelineJob)
+        .filter(
+            PipelineJob.id == item_id,
+            PipelineJob.status == "processing",
+            PipelineJob.locked_by == owner,
+        )
+        .update(
+            {
+                PipelineJob.lease_expires_at: now + lease,
+                PipelineJob.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+    )
     db.commit()
+    if not updated:
+        return False
+    # Keep the in-session row honest about its own lease (the UPDATE bypassed the
+    # identity map) — but only when it really lives in this session; the
+    # heartbeat's own session must not touch the handler's object.
+    if isinstance(item, PipelineJob) and object_session(item) is db:
+        db.refresh(item, attribute_names=["lease_expires_at", "updated_at"])
+    inc("jobhunter_queue_lease_renewed_total", pipeline=pipeline)
+    return True
+
+
+def owns(db: Session, item: PipelineJob, *, worker: Optional[str] = None) -> bool:
+    """Is this row still *this worker's* in-flight item?
+
+    A cheap, read-only ownership probe (two columns by primary key) for the
+    transitions that have no compare-and-set of their own: the failure record
+    (:func:`fail`), a park (:func:`needs_input`) and a pause. A worker whose
+    lease was reclaimed while the handler ran must not write *any* of them over
+    the state the new owner is writing — losing a slow run is acceptable, two
+    workers editing one row's outcome is not.
+
+    ``worker`` defaults to the row's own ``locked_by`` (the identity the claim
+    wrote), which is why a row claimed by another process — the reaper's winner,
+    or a pre-v2.4 row — is still answerable.
+    """
+    owner = str(worker or item.locked_by or worker_id())
+    row = (
+        db.query(PipelineJob.status, PipelineJob.locked_by)
+        .filter(PipelineJob.id == item.id)
+        .first()
+    )
+    if row is None:
+        return False
+    status, locked_by = row[0], str(row[1] or "")
+    return status == "processing" and locked_by == owner
+
+
+def complete(db: Session, item: PipelineJob, *, result: Optional[Dict[str, Any]] = None,
+             worker: Optional[str] = None) -> bool:
+    """Finish a run — as a compare-and-set on the row's ownership.
+
+    The outcome is only written while the row is still ``processing`` and still
+    locked by the identity that produced it. ``False`` means this worker no
+    longer owns the row (the reaper re-queued it, or a second worker already
+    finished it) and **nothing was written**: the run's result is discarded
+    instead of overwriting whatever the current owner wrote. Before v2.4 the
+    write was unconditional — two copies of one run both finished, and the last
+    writer's ``payload.result`` won, silently.
+
+    ``worker`` is the identity that must still hold the row. The worker passes
+    its own id explicitly: after a handler commits, ``item.locked_by`` has been
+    re-read from the database and would otherwise describe whoever owns the row
+    *now* — the fence has to compare against the identity that ran the work, not
+    against a value the reclaim may have already overwritten.
+
+    Returns ``True`` when this call is the one that completed the row.
+    """
+    now = datetime.utcnow()
+    owner = str(worker or item.locked_by or worker_id())
+    values: Dict[Any, Any] = {
+        PipelineJob.status: "done",
+        PipelineJob.finished_at: now,
+        PipelineJob.lease_expires_at: None,
+        PipelineJob.locked_by: "",
+        PipelineJob.error: "",
+        PipelineJob.updated_at: now,
+    }
+    if result is not None:
+        values[PipelineJob.payload] = {**(item.payload or {}), "result": result}
+    updated = (
+        db.query(PipelineJob)
+        .filter(
+            PipelineJob.id == item.id,
+            PipelineJob.status == "processing",
+            PipelineJob.locked_by == owner,
+        )
+        .update(values, synchronize_session=False)
+    )
+    db.commit()
+    if not updated:
+        log.warning("queue item %s (%s) no longer held by this worker — outcome discarded "
+                    "(the row was reclaimed and is owned elsewhere)", item.id, item.pipeline)
+        inc("jobhunter_queue_complete_conflicts_total", pipeline=item.pipeline)
+        return False
+    # Keep the in-session row honest (the UPDATE bypassed the identity map) so
+    # callers that read ``item.status`` / ``item.payload`` after completing see
+    # the row they just wrote.
+    db.refresh(item)
     inc("jobhunter_queue_completed_total", pipeline=item.pipeline)
+    return True
 
 
 #: Safety valve: a paused item is re-run by the watchdog whenever the probe is
