@@ -4,13 +4,15 @@ Web-search backend for the funding radar (v2.2.6).
 Why this exists
 ---------------
 The direct SEC EDGAR path fetches ``https://efts.sec.gov/LATEST/search-index``,
-and ``efts.sec.gov``'s robots.txt disallows automated access to it. With
-``RESPECT_ROBOTS_TXT=true`` (the default) that made every funding scan fail with
-``PermissionError: robots.txt disallows …`` — an honest verdict, but a dead
-radar. When a search engine is configured, scans discover funding events
-through the search API instead and never touch ``efts.sec.gov`` at all; the
-direct EDGAR path remains the verified fallback **when no search provider is
-configured** (the robots check is never disabled for it).
+whose robots.txt answers ``403`` — a WAF-style forbidden body, not a crawl
+policy — which the robots client maps (per the exclusion spec) to "disallow
+every URL on this host". With ``RESPECT_ROBOTS_TXT=true`` (the default) that
+made every funding scan fail with ``PermissionError: robots.txt disallows …``
+before a single filing was fetched. When a search engine is configured, scans
+discover funding events through the search API instead and never touch
+``efts.sec.gov`` at all; the direct EDGAR path remains the keyless fallback
+**when no search provider is configured**, as an RPC (SEC's declared-User-Agent
+rules govern it — see :mod:`app.services.funding_sources`).
 
 Interface
 ---------
@@ -102,9 +104,9 @@ def search_hint() -> str:
         return (f"FUNDING_SEARCH_PROVIDER='{raw}' is not one of "
                 f"tavily|stub — the search path stays off")
     if not raw and not key:
-        return ("Set FUNDING_SEARCH_PROVIDER=tavily and FUNDING_SEARCH_API_KEY to scan via a "
-                "web search API — without it scans use direct SEC EDGAR, which efts.sec.gov's "
-                "robots.txt may block (scan_failed with provider_errors.sec_edgar)")
+        return ("Set FUNDING_SEARCH_PROVIDER=tavily and FUNDING_SEARCH_API_KEY for web-search "
+                "coverage (worldwide, incl. India) — without it scans use direct SEC EDGAR "
+                "Form D filings only, which cover the US market")
     return ""
 
 

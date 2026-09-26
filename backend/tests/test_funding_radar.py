@@ -58,6 +58,9 @@ async def test_sec_edgar_provider_parses_filings(monkeypatch):
     async def fake_request(method, url, **kwargs):
         assert "efts.sec.gov" in url
         assert kwargs["params"]["forms"] == "D"
+        # The RPC contract: robots.txt never gates this call (the reported
+        # PermissionError) — see also the integration test below.
+        assert kwargs.get("respect_robots") is False
         return FakeResponse({
             "hits": {"hits": [
                 {"_id": "0001234567-24-000123:primary_doc.xml",
@@ -1082,16 +1085,19 @@ def test_migration_upgrades_a_real_2_1_1_database(tmp_path):
 
 # =========================================================================== #
 # 7. Web-search provider path (v2.2.6) — efts.sec.gov is bypassed when a
-#    search engine is configured; the direct EDGAR path stays honest when not.
+#    search engine is configured; the direct EDGAR path runs as an RPC when not.
 #
 #  Contract under test:
 #  1. With FUNDING_SEARCH_* configured, a scan that used to hit the blocked
 #     EDGAR endpoint runs through the search API instead — zero requests to
 #     efts.sec.gov, scan_status=ok, events extracted from snippets with a
 #     citation (url/snippet from the cited result row, never from the model).
-#  2. Without a configured search provider, the direct EDGAR path keeps its
-#     robots check: robots-blocked → scan_failed + provider_errors.sec_edgar
-#     (an honest 200 body, never a 500, never a fake empty radar).
+#  2. Without a configured search provider, the direct EDGAR path is an RPC:
+#     robots.txt is never consulted (efts.sec.gov serves a 403 *body*, not a
+#     crawl policy, and gating on it killed every default scan with
+#     PermissionError — the reported bug), and an API failure stays honest —
+#     scan_failed + provider_errors.sec_edgar, never a 500, never a fake
+#     empty radar.
 #  3. Search-provider failures are data: provider_errors.search on the scan
 #     report; transport failures retry once, 4xx never.
 #  4. The history contract is unchanged (persist_funding_scan stores
@@ -1299,22 +1305,144 @@ async def test_search_provider_failure_is_provider_errors_search(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_robots_blocked_edgar_without_search_key_stays_honest(monkeypatch):
-    """Acceptance 2: no search key + robots block → scan_failed, never a 500."""
-    import app.services.robots as robots
+async def test_sec_edgar_rpc_is_not_gated_by_robots_and_stays_honest(monkeypatch):
+    """The reported bug: default config (no search key) + ``efts.sec.gov``
+    robots.txt → every scan died with ``PermissionError: robots.txt disallows
+    fetching https://efts.sec.gov/LATEST/search-index``.
 
-    async def disallowed(url, user_agent=None):
+    efts.sec.gov/robots.txt is a WAF-style **403 body**, not a crawl policy —
+    the robots client maps it (per the exclusion spec) to "disallow every URL
+    on this host". The EDGAR full-text endpoint is SEC's own JSON API, so the
+    call is an **RPC** (the same doctrine as the search provider's): robots.txt
+    is never consulted, while the SSRF guard, the declared User-Agent, the
+    cache and the provider timeout all still apply. Honesty survives: an API
+    failure is provider_errors.sec_edgar on an honest report — never a 500,
+    never a fake empty radar.
+    """
+    import httpx
+
+    import app.services.http as http
+    import app.services.robots as robots
+    from app.core.config import settings
+
+    consults: list = []
+
+    async def denying_can_fetch(url, user_agent=None):
+        consults.append(url)
         return False
 
-    monkeypatch.setattr(robots, "can_fetch", disallowed)
-    events, report = await funding_sources.fetch_funding_events(
-        {"funding_focus": ["ai"]}, provider="sec_edgar")
+    monkeypatch.setattr(robots, "can_fetch", denying_can_fetch)
+    # No cache writes: this test must leave the shared HTTP cache as it found it.
+    monkeypatch.setattr(settings, "discovery_cache_seconds", 0)
+
+    class _Transport:
+        """Transport-level fake: the REAL http.request runs above it (URL
+        policy, robots short-circuit, retries) and only the wire is stubbed."""
+
+        def __init__(self, status: int, payload):
+            self.status = status
+            self.payload = payload
+            self.calls: list = []
+
+        async def request(self, method, url, **kwargs):
+            self.calls.append((method, url, kwargs))
+            return httpx.Response(self.status, json=self.payload,
+                                  request=httpx.Request(method, url))
+
+        async def get(self, url, **kwargs):  # robots client uses .get; never reached
+            raise AssertionError(f"unexpected GET {url}")
+
+    wire = _Transport(200, {
+        "hits": {"hits": [
+            {"_id": "0001234567-26-000123:primary_doc.xml",
+             "_source": {"display_names": ["WireFintech Labs (CIK 0001234567)"],
+                         "file_date": (datetime.utcnow() - timedelta(days=3)).strftime("%Y-%m-%d"),
+                         "form_type": "D", "ciks": ["0001234567"]}},
+        ]}
+    })
+
+    async def fake_client():
+        return wire
+
+    monkeypatch.setattr(http, "get_client", fake_client)
+    monkeypatch.setattr(funding_sources, "PROVIDER_RETRY_DELAY_SECONDS", 0.0)
+
     assert funding_search.search_configured() is False  # the default: no key
+    events, report = await funding_sources.fetch_funding_events(
+        {"funding_focus": ["fintech"]}, provider="sec_edgar", limit=5)
+    assert report["scan_status"] == "ok"
+    assert report["counts"]["sec_edgar"] == 1
+    assert events[0].source == "sec_edgar" and events[0].verified is True
+    assert consults == [], "the EDGAR RPC must never consult robots.txt"
+    assert wire.calls and "efts.sec.gov/LATEST/search-index" in wire.calls[0][1]
+
+    # Honesty contract unchanged for real API failures: an HTTP error is an
+    # honest provider error (4xx never retried), never a 500, never a quiet
+    # "no companies this month".
+    forbidden = _Transport(403, None)
+
+    async def forbidden_client():
+        return forbidden
+
+    monkeypatch.setattr(http, "get_client", forbidden_client)
+    events, report = await funding_sources.fetch_funding_events(
+        {"funding_focus": ["fintech"]}, provider="sec_edgar", limit=5)
     assert events == []
     assert report["scan_status"] == "scan_failed"
     assert "sec_edgar" in report["errors"]
-    assert "robots.txt" in report["errors"]["sec_edgar"]
-    assert len(report["errors"]["sec_edgar"]) <= 300
+    assert len(forbidden.calls) == 1, "a 4xx is never retried"
+
+
+def test_search_queries_are_region_aware():
+    """India-hinted contexts get India-angled funding queries (the "why only
+    SEC?" gap on the search path); everyone else keeps the global phrasing."""
+    from app.services.funding_sources import _search_queries
+
+    us = _search_queries({"funding_focus": ["fintech"], "locations": ["Austin, TX"]})
+    assert us == ["fintech startup funding round"]
+
+    india = _search_queries({"funding_focus": ["fintech"], "locations": ["Kolkata, India"]})
+    assert india == ["fintech startup funding round India",
+                     "India startup funding round this month"]
+
+    # Keywords hint too (no locations in the context at all).
+    hinted = _search_queries({"keywords": ["bangalore saas"]})
+    assert hinted == ["bangalore saas startup funding round India",
+                      "India startup funding round this month"]
+
+    # No hint → no "India" anywhere (deterministic, capped as before).
+    plain = _search_queries({"keywords": ["payments"], "roles": ["backend engineer"]})
+    assert plain == ["payments startup funding round",
+                     "backend engineer startup raises funding round"]
+
+
+@pytest.mark.asyncio
+async def test_extract_prompt_teaches_inr_conversion(monkeypatch):
+    """Indian rounds are announced in ₹ crore — the extraction pass must
+    convert them (fixed approximation) instead of returning null amounts."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "funding_search_provider", "tavily")
+    monkeypatch.setattr(settings, "funding_search_api_key", "tvly-inr-test")
+
+    queries: list = []
+
+    async def fake_search(query, *, window_days, limit):
+        queries.append(query)
+        return _search_rows("BharatLedger")
+
+    monkeypatch.setattr(funding_search, "search", fake_search)
+    fake = _script_search_ai(monkeypatch, extract={"companies": []})
+
+    events, report = await funding_sources.fetch_funding_events(
+        {"funding_focus": ["fintech"], "locations": ["Pune, India"]}, provider="sec_edgar")
+    assert report["scan_status"] == "ok" and report["counts"]["search"] == 0
+    assert events == []
+    assert fake.extract_prompts, "the extraction pass must have run"
+    prompt = fake.extract_prompts[0]
+    assert "crore" in prompt and "₹88" in prompt
+    # The India-angled queries actually reached the search provider.
+    assert queries and all("India" in q for q in queries)
 
 
 @pytest.mark.asyncio

@@ -617,13 +617,19 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Funding
     # ------------------------------------------------------------------ #
+    #: Default provider for one funding scan. ``sec_edgar`` because it is the
+    #: only keyless *official* feed of private-placement disclosures — and it
+    #: is US-only (Form D). ``auto`` runs every configured provider; India
+    #: coverage strategies (search path, news feeds, Tracxn/MCA) are laid out
+    #: in ``docs/FUNDING_SOURCES.md``.
     funding_provider: str = "sec_edgar"
     #: Web-search provider for funding scans. When resolved, scans discover
-    #: funding events through a search API instead of the direct SEC EDGAR
-    #: full-text endpoint (``efts.sec.gov``), whose robots.txt disallows
-    #: automated access to ``/LATEST/search-index``. ``tavily`` | ``stub``
-    #: (hermetic, deterministic — tests/dev) | empty (auto: ``tavily`` when
-    #: ``FUNDING_SEARCH_API_KEY`` is set, else the direct sec_edgar path).
+    #: funding events through a search API — worldwide, Indian funding news
+    #: included — instead of the direct SEC EDGAR Form D path (US market
+    #: only). ``tavily`` | ``stub`` (hermetic, deterministic — tests/dev) |
+    #: empty (auto: ``tavily`` when ``FUNDING_SEARCH_API_KEY`` is set, else
+    #: the direct sec_edgar path, which runs as an RPC: efts.sec.gov's
+    #: robots.txt is a 403 body, not a crawl policy — see funding_sources).
     funding_search_provider: str = ""
     funding_search_api_key: str = ""
     sec_edgar_user_agent: str = ""

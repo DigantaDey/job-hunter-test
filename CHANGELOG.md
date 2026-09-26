@@ -6,6 +6,24 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed — the default funding scan died on efts.sec.gov's robots.txt (PermissionError)
+
+**The report.** With default settings (no search-provider key) every funding scan failed with `sec_edgar: PermissionError: robots.txt disallows fetching https://efts.sec.gov/LATEST/search-index` — the radar could never fetch a single Form D filing.
+
+**Mechanism.** `efts.sec.gov/robots.txt` is not a crawl policy at all — it is a WAF-style **403 body** (`{"message":"Forbidden"}`), which the robots client maps (per the exclusion spec) to "disallow every URL on this host". The robots check therefore rejected the request *before it was ever made*, and because the check ran inside the shared HTTP client there was no way around it: the default, keyless radar was dead by construction — an honest verdict, but a verdict that made the feature unusable.
+
+**Fix.** The EDGAR full-text endpoint is SEC's own JSON API — the same URL their EDGAR search UI calls — so the call is a JSON **RPC**, exactly like the search provider's call: robots.txt governs crawling a site's published pages, not a single machine-readable API request. `_sec_edgar` now passes `respect_robots=False` with the reasoning on the call site, while everything else stays in force: the SSRF guard vets the URL, SEC's published automated-access rule is honoured (a declared User-Agent via `SEC_EDGAR_USER_AGENT` / `HTTP_USER_AGENT`, one cached request per scan, no burst), and the provider timeout still bounds it. The honesty contract for real failures is unchanged — an HTTP error is `provider_errors.sec_edgar` on an honest 200 report (`scan_failed` when nothing could be fetched), never a 500, never a fake empty radar; 4xx is never retried. Operator-facing copy that promised the old behavior (`.env.example`, `search_hint()`, config comments, the Funding page's "direct EDGAR" tooltip) now says what actually happens.
+
+Covered by `backend/tests/test_funding_radar.py` (`test_sec_edgar_rpc_is_not_gated_by_robots_and_stays_honest` — robots consulted zero times through the **real** `http.request` with only the wire stubbed, plus the 403-honesty half; `test_sec_edgar_provider_parses_filings` now pins `respect_robots=False` on the wire).
+
+### Added — the funding radar understands the Indian market: region-aware queries, INR amounts, and a source strategy
+
+**Why it looked "SEC-only".** `FUNDING_PROVIDER=sec_edgar` because US Form D is the only *keyless official* feed of private-placement disclosures — and India has no MCA equivalent of Form D with anonymous bulk access. The gap was real but structural, so it needs a strategy, not a hack: **`docs/FUNDING_SOURCES.md`** lays out the five layers (L0 region-aware search → L1 keyless Indian news feeds → L2 licensed registries — Tracxn/Crunchbase, already wired — → L3 official Indian filings (MCA21 PAS-3/CHG-1, exchange announcements, gated on access terms) → L4 labelled demo data), the currency/dedupe/provenance rules, and the phase plan.
+
+**Shipped now (P0).** The search path's queries follow the candidate: when the search context's `locations`/`keywords` point at India (Kolkata, Bengaluru, "Bangalore SaaS", …) every query is suffixed with " India" and a market-angled query of its own is added — Indian publications reporting rounds in ₹ crore only surface for India-phrased queries. The extraction pass now converts **₹ / lakh / crore** amounts to USD at a fixed approximation (₹88/USD, ordering-grade, never another invented rate) instead of returning `null`. Provider labels and hints state coverage honestly (`SEC EDGAR Form D (US, live, keyless)`; the no-search-key hint says "US market only" rather than promising a robots failure).
+
+Covered by `backend/tests/test_funding_radar.py` (`test_search_queries_are_region_aware`, `test_extract_prompt_teaches_inr_conversion`).
+
 ### Fixed — a burst of HTTP requests could exhaust the database pool, and waiting on the pool froze the whole process
 
 One hard browser refresh produced the whole failure chain in a single log: `worker claim failed`, `AI watchdog cycle failed` and `lease heartbeat for item 8 failed`, each carrying the same error — `QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 30.00` — with no HTTP request completing in between.
