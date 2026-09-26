@@ -366,12 +366,34 @@ It joins the denormalised `jobs.score*` columns (one row per job, no N+1) and is
 therefore eventually-consistent with `match_results` by exactly one transaction
 (the projection is written in the same transaction — [06 §8](06-match-result.md)).
 
-### `GET /api/jobs/{job_id}/intelligence` *(shipped, unchanged)*
+### `GET /api/jobs/{job_id}/intelligence` *(shipped, extended — v2.5)*
 
 Keeps its response (it is the per-job scoring endpoint the SPA already calls, and
 its `rubric`/`score_source`/`ai_error`/`upgrade_hint` keys are the origin of the
 shape above). It becomes the *writer* of `match_results` rows and returns
 `match_id` additively.
+
+v2.5 adds two things the reported dead end needed:
+
+* the stored payload is still served verbatim on a plain re-read, but when what
+  was stored has **no engine answer behind it** (`rejected` — the model answered
+  and the accuracy guardrail refused the answer; `pending` — the model was
+  unreachable) the response carries the action that fixes it:
+  `actions.retry = { "allowed": true, "route": "/api/jobs/412/intelligence?refresh=1",
+  "method": "GET", "costs_quota": true }`. That route re-runs scoring; without it
+  the stored rejection was permanent, because the read short-circuits on it.
+* a `rejected` verdict is retried **automatically** before it is ever persisted:
+  the local decision engine is asked once, under the owner's own routing policy
+  (`services/scoring.py` — `_laya_rescue`). If it answers, the verdict is
+  labelled `score_source = "laya"` and keeps the rejection in
+  `guardrail.rescued_from` / `guardrail.rejected_issues`. A below-floor answer is
+  returned only on this last-resort path and is marked `low_confidence = true`
+  (the badge says *Laya (low confidence)*); an engine that is not routed, not
+  installed or down leaves the honest `rejected` verdict in place.
+
+`GET /api/jobs` carries `score_source` beside `score` for the same reason: a row
+whose score could not be produced renders as its provenance ("rejected",
+"AI pending"), never as a `0 score` claim.
 
 ---
 

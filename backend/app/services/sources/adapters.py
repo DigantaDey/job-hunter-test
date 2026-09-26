@@ -8,12 +8,13 @@ an upstream 500 must never break discovery for the other sources.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from defusedxml import ElementTree
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.metrics import inc
 from app.services import http as http_client
 from app.services.sources.base import (
     Posting,
@@ -490,29 +491,122 @@ class USAJobsSource(Source):
 # --------------------------------------------------------------------------- #
 # ATS board APIs (per-company, public boards)
 # --------------------------------------------------------------------------- #
+def _board_budget_seconds() -> float:
+    """Per-board budget inside one board source's fan-out (seconds)."""
+    try:
+        value = float(getattr(settings, "discovery_board_timeout_seconds", 20.0) or 20.0)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        value = 20.0
+    return max(1.0, value)
+
+
 class _BoardSource(Source):
-    """Base for ATS board adapters: fans out over the configured board tokens."""
+    """Base for ATS board adapters: fans out over the configured board tokens.
+
+    The fan-out is **non-destructive** (v2.4). A board source can span
+    ``MAX_ATS_BOARDS_PER_RUN`` boards on one host, spaced by
+    ``PER_HOST_MIN_INTERVAL_SECONDS`` — twelve Greenhouse boards with
+    ``content=true`` realistically want 36–60 s, right at
+    ``DISCOVERY_FETCH_TIMEOUT_SECONDS``. Before this, the registry's
+    ``asyncio.wait_for`` cancelled the *source* and every board that had already
+    answered was thrown away, so a wide but healthy source was reported as
+    ``timeout`` with zero postings kept.
+
+    Now the source is asked for a budget (``budget_seconds``) and honours it
+    itself:
+
+    * every board runs under its own ``DISCOVERY_BOARD_TIMEOUT_SECONDS`` budget,
+      so one hanging board cannot spend the source's whole window;
+    * when the source's budget expires, the boards that already answered are
+      returned and the rest are cancelled — coverage is kept, not discarded;
+    * the caller's ``report`` dict is filled with the honest counts
+      (``boards_total`` / ``boards_answered`` / ``boards_dropped`` / ``reason``)
+      so the run can label the source ``partial`` instead of ``timeout``.
+    """
 
     kind = "board"
     official_feed = True
     token_key: str = ""
     rate_limit_policy = RateLimitPolicy(requests_per_minute=30, min_interval_seconds=0.2)
+    #: This adapter's ``fetch`` accepts the optional ``budget_seconds`` /
+    #: ``report`` keywords (see ``app.services.sources.fetch_from_source``).
+    budgeted_fetch = True
 
     async def boards(self, board_tokens: List[str]) -> List[str]:
         return board_tokens_for(self.id, board_tokens)[: settings.max_ats_boards_per_run]
 
-    async def fetch(self, *, keywords, limit, since_hours, board_tokens) -> List[Posting]:
+    async def _fetch_one_board(self, token: str, limit: int, budget: float) -> Tuple[List[Posting], str]:
+        """One board inside its own budget — never able to spend the source's."""
+        try:
+            return await asyncio.wait_for(self.fetch_board(token, limit), timeout=budget), "ok"
+        except asyncio.TimeoutError:
+            # The board is still on the wire after its own budget: drop it and
+            # let the boards that answered through.
+            log.debug("%s board %s exceeded its %.1fs budget", self.id, token, budget)
+            return [], "timeout"
+        except asyncio.CancelledError:  # pragma: no cover - cooperative cancel
+            raise
+        except Exception as exc:  # noqa: BLE001 - one bad board is not a source failure
+            log.debug("%s board %s failed: %s", self.id, token, exc)
+            return [], "error"
+
+    async def fetch(self, *, keywords, limit, since_hours, board_tokens,
+                    budget_seconds: Optional[float] = None,
+                    report: Optional[Dict[str, Any]] = None) -> List[Posting]:
         tokens = await self.boards(board_tokens)
         if not tokens:
             return []
         per_board = max(5, limit // max(1, len(tokens)) + 5)
-        results = await asyncio.gather(*(self.fetch_board(token, per_board) for token in tokens), return_exceptions=True)
+        board_budget = _board_budget_seconds()
+        budget = float(budget_seconds) if budget_seconds and budget_seconds > 0 else None
+        tasks = {
+            asyncio.create_task(self._fetch_one_board(token, per_board, board_budget)): token
+            for token in tokens
+        }
+        truncated = False
+        if budget is not None:
+            _done, pending = await asyncio.wait(set(tasks), timeout=budget)
+            if pending:
+                truncated = True
+                for task in pending:
+                    task.cancel()
+                # Reap them so no half-finished board leaks a task or a warning.
+                await asyncio.gather(*pending, return_exceptions=True)
+        else:
+            await asyncio.wait(set(tasks))
+
         postings: List[Posting] = []
-        for token, result in zip(tokens, results, strict=False):
-            if isinstance(result, BaseException):
-                log.debug("%s board %s failed: %s", self.id, token, result)
-                continue
-            postings.extend(result)
+        answered = 0
+        timed_out = 0
+        failed = 0
+        dropped = 0
+        for task, _token in tasks.items():
+            status = "dropped"
+            if task.done() and not task.cancelled() and task.exception() is None:
+                board_postings, status = task.result()
+                postings.extend(board_postings)
+            if status == "ok":
+                answered += 1
+            elif status == "timeout":
+                timed_out += 1
+                dropped += 1
+            elif status == "error":
+                failed += 1
+                dropped += 1
+            else:
+                dropped += 1
+            inc("jobhunter_source_boards_total", source=self.id, outcome=status)
+        if report is not None and dropped:
+            report.update({
+                "partial": True,
+                "boards_total": len(tokens),
+                "boards_answered": answered,
+                "boards_dropped": dropped,
+                "boards_timed_out": timed_out,
+                "boards_failed": failed,
+                "reason": ("source_budget" if truncated
+                           else "board_timeout" if timed_out else "board_error"),
+            })
         return [p for p in postings if _relevant(p, keywords)][:limit]
 
     async def fetch_board(self, token: str, limit: int) -> List[Posting]:  # pragma: no cover - overridden

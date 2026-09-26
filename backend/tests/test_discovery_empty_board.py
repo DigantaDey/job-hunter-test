@@ -115,7 +115,7 @@ def _source_report(*, requested: List[str], ok: Optional[Dict[str, int]] = None,
     kept = dict(ok or {})
     failed = dict(errors or {})
     return {"requested": list(requested), "ok": kept, "errors": failed, "skipped": {},
-            "total": sum(kept.values()) if total is None else total}
+            "partial": {}, "total": sum(kept.values()) if total is None else total}
 
 
 def _install_fetch_all(monkeypatch, *, postings: Optional[List[Posting]] = None,
@@ -378,6 +378,10 @@ async def test_summary_block_matches_the_source_report(client, auth, db, monkeyp
     assert report["summary"] == {
         "configured_sources": ["lever", "greenhouse"],
         "failed_sources": {"greenhouse": "timeout"},
+        # v2.4: sources that answered with only some of their boards. Empty here
+        # (this run's fan-out is a fixed report), present on every run so a
+        # reader never has to special-case "the key is missing".
+        "partial_sources": {},
         "needs_credentials": ["adzuna", "jooble"],
         "demo_pool_enabled": False,
         "freshness_window_hours": 72,

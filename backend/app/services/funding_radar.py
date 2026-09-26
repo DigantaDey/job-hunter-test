@@ -57,7 +57,7 @@ no rows to hang it on. It is server-written: it is deliberately not in
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -374,13 +374,49 @@ def find_funding_company(db: Session, user_id: int, company_name: str) -> Option
     )
 
 
-def refresh_funding_has_open_positions(db: Session, user_id: int) -> int:
+def refresh_funding_has_open_positions(db: Session, user_id: int, *,
+                                       company_names: Optional[Sequence[Any]] = None) -> int:
     """Keep FundingCompany.has_open_positions fresh via the shared matcher.
 
     Exact match on the shared normalized name only — no fuzzy, no substring.
-    Called from sync_funding_db and from discovery persistence (both directions).
+    Called from sync_funding_db (full sweep) and from discovery persistence.
+
+    Two shapes, because the two callers know different things (v2.4):
+
+    * ``company_names=None`` — the **full sweep**. Loads the user's jobs and
+      recomputes *both* directions, which is the only way a flag can be
+      *cleared*: it is the only caller that can see a job disappear.
+    * ``company_names=[...]`` — the **targeted** path discovery uses. A run only
+      ever *adds* jobs, so a match can only turn a flag from False to True, and
+      the candidates are exactly the companies this run created. That is one
+      ``IN`` query against the indexed ``name_normalized`` column instead of
+      loading every ``Job`` row the user owns — on a few-thousand-row board the
+      old full scan was a visible tail on every run that inserted anything, for
+      a boolean it already had the answer to.
+
+    Returns the number of rows changed.
     """
-    rows = db.query(FundingCompany).filter(FundingCompany.user_id == int(user_id)).all()
+    query = db.query(FundingCompany).filter(FundingCompany.user_id == int(user_id))
+    if company_names is not None:
+        targets = {normalize_link_name(name) for name in company_names}
+        targets.discard("")
+        if not targets:
+            return 0
+        query = query.filter(FundingCompany.name_normalized.in_(sorted(targets)))
+        rows = query.all()
+        if not rows:
+            return 0
+        changed = 0
+        for fc in rows:
+            norm = normalize_link_name(fc.name)
+            if norm and norm in targets and not fc.has_open_positions:
+                fc.has_open_positions = True
+                changed += 1
+        if changed:
+            db.commit()
+        return changed
+
+    rows = query.all()
     if not rows:
         return 0
     jobs = db.query(Job).filter(Job.user_id == int(user_id)).all()

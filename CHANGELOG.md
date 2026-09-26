@@ -6,6 +6,82 @@ All notable changes to JobHunter AI are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed — a guardrail-rejected score was a permanent dead end, and rapid clicking stopped switching the job
+
+Two reports, both about a surface that did not offer the next step the user had already been told to take.
+
+**The score with no verdict (§1).** Most match panels read *"AI scoring unavailable — this is not an AI verdict … (guardrail_failed)"*, with a fix line that says "Retry" and **no way to retry** — and the dead end was permanent, because the rejected payload is persisted into `job.extra['intelligence']` and every later read served that stored copy. Three changes, in the order the user meets them:
+
+* **The rejection is retried automatically, on the local engine.** When the model's answer fails the accuracy guardrail (the answer *and* its repair pass), the local decision engine is asked once before the pair is written off (`scoring._laya_rescue`). It is asked under the owner's own Laya policy, never around it: `llm_only`, a per-task opt-out or `LAYA_ENABLED=false` leaves the honest `rejected` verdict and the retry affordance; an engine outage reports the outage (`engine_down`); and an answer below the usual confidence floor is returned only on this last-resort path, marked `low_confidence=True` — a *Laya (low confidence)* badge and a panel line that say exactly why it is there. A rescued verdict is labelled `source="laya"` and carries the rejection that produced it (`guardrail.rescued_from = "ai_guardrail_failed"`, `guardrail.rejected_issues`), so nothing about it pretends the model's answer was fine. Costs nothing: the model already answered twice, and repeating the same paid request is what the diagnosis tells the user to stop doing.
+* **The retry the message promised now exists.** The per-job read announces `actions.retry` (`/api/jobs/{id}/intelligence?refresh=1`, `costs_quota: true`) whenever it stored a verdict with no engine answer behind it, and the Jobs panel renders a **Retry scoring** button that follows it, re-runs scoring, refreshes the row — and reports a failed re-score instead of leaving the panel blank. `?refresh=1` is the only path that re-runs; a plain re-read stays free and stable.
+* **The board stops claiming "0 score" for a pair nobody scored.** `GET /api/jobs` carries `score_source` beside the number, and a row whose score could not be produced wears its provenance ("rejected", "AI pending") instead of a literal `0 score`. In the same spirit, the automation policy's `min_match_score` floor now accepts a `laya` verdict (`automation_policy.score_provenance_can_clear_floor`): a typed, calibrated engine verdict is what a confidence floor can be measured against, and a gate that accepted an identical `ai` score while denying a `laya` one was measuring provenance, not confidence.
+
+**Rapid clicking stopped switching the job (§2).** `selectJob` awaited `GET /api/jobs/{id}` and then called `setSelected` unconditionally, so with a few clicks in flight the panel showed whichever response landed last — and because the AI read keeps a request open for minutes (30-minute budget), a burst of clicks also piled up open connections until every later request queued behind them, which is what "clicking stopped working" actually was. The clicked row is now selected **on the click itself** (selection is local state, not a network round trip), every response is stamped with a monotonic click token so a stale one is dropped instead of overwriting a newer selection, superseded reads are aborted, a failed detail read is reported, and the paid breakdown read waits for the clicking to settle — a burst of five clicks costs one call, not five.
+
+Covered by `backend/tests/test_scoring_guardrail_rescue.py` (**12 tests** — the rescue and its provenance, the one-analysis charge, `llm_only`/opt-out refusal, the floor still being the escalation rule while the model works, an engine outage, the announced retry, `?refresh=1` re-running where a plain re-read does not, the retry recovering and persisting a real verdict, the plan gate, `score_source` on the board, and the floor rule) and `frontend/src/pages/__tests__/JobsSelection.test.tsx` (**9 tests** — selection on the click, a late answer for an earlier click losing, a burst of clicks, one breakdown read per burst, a failed detail read, the provenance chip, the retry, the low-confidence marking, and a failed re-score).
+
+### Fixed — a run longer than its lease was reaped mid-flight, and everything after persistence was serial
+
+Seven defects, one theme: the work was measured by nothing, so every part of the tail was allowed to grow
+unbounded and the parts that were bounded bounded the wrong thing.
+
+**The reaper was cloning live runs.** `WORKER_LEASE_SECONDS` (120) was never renewed and `recover_stalled()`
+re-queues anything past `lease + WORKER_REAPER_SAFETY_SECONDS` (300) — but a discovery run legitimately takes
+longer than 7 minutes (AI scoring worst case ~15 min, plus the classification wave), so a healthy run was
+re-queued and *a second worker started the same run from scratch*. `_run_item` now heartbeats the lease
+(`job_queue.renew()`, every `WORKER_HEARTBEAT_INTERVAL_SECONDS` — 30 s, clamped to lease/3) for as long as the
+handler is alive, and completion is a **compare-and-swap** on `locked_by` + `status`: `complete(..., worker=…)`
+only writes if this worker still owns the row, a worker whose lease was reclaimed is now *fenced* — its result
+is discarded, `jobhunter_queue_complete_conflicts_total` counts the loss, and the quota it would have charged is
+not charged twice. A config knob that never did anything becomes the real bound: `WORKER_MAX_RUNTIME_SECONDS`
+(900) is now a **soft deadline** — the heartbeat notices and the item fails deliberately with
+`WORKER_MAX_RUNTIME_SECONDS` in the error (`jobhunter_worker_item_deadline_total`) instead of being killed by a
+reclaimer. The whole path is pinned in `tests/test_discovery_latency_and_leases.py` (heartbeat vs reaper, both
+reclaim races, the deadline).
+
+**Stage timings first, because the rest was unmeasurable.** Every run report now carries
+`report["stages"]` = `fetch_ms` / `pool_ms` / `pre_rank_ms` / `score_ms` / `classify_ms` / `persist_ms` /
+`forms_ms`, so "the tail" is a number per stage rather than an argument.
+
+**The AI tail was unbounded in aggregate.** The five classification questions were a *second serial stage* after
+the twelve score verdicts; they are now folded into the same bounded-parallel wave (one scoring slice, so one
+round of provider pressure and half the wall clock). And because a wave of verdicts still has no ceiling,
+`DISCOVERY_AI_BUDGET_SECONDS` (180) is a per-run budget: verdicts are assigned best-first (the pre-rank order),
+and when the budget is spent the remainder stays honestly `score_source="preliminary"` with
+`ai_rescore.budget_exhausted` / `cut` / `budget_seconds` in the report — a slow provider now costs a ranked run,
+never an unbounded one. `0` disables the budget; `DISCOVERY_AI_CONCURRENCY` still bounds the wave itself.
+
+**A source timeout threw away boards that had already answered.** `_BoardSource` fetches each board with its own
+budget (`DISCOVERY_BOARD_TIMEOUT_SECONDS`, 20 s) and the fan-out is **non-destructive**: a timeout returns the
+boards that did reply instead of discarding the whole source, labelled `partial` with the counts
+(`report["partial"][source]` → `boards_total` / `answered` / `dropped` / `timed_out` / `reason`,
+`jobhunter_source_boards_total`, `jobhunter_source_partial_total`, and `partial_sources` in the run summary).
+One slow board no longer costs the four fast ones.
+
+**Search discovery was fully serial whenever `JOB_SEARCH_PROVIDERS` was set** — every query across every
+provider awaited one at a time, then a serial crawl of up to twelve pages, which is why the same run took
+minutes with two providers configured. Queries now fan out under a bounded gather (`_SEARCH_CONCURRENCY`, 4;
+the divisor keeps the configured per-run query budget shared, so `search_queries_per_run` still means what it
+said and the shared attempt budget is honoured under a lock), fragments merge in query order, and the crawl
+runs in waves of the same width with FIFO order, visited set and page budget unchanged.
+
+**Everything shared two worker slots.** `WORKER_PIPELINE_LIMITS` (default `discovery=1`) caps how many
+concurrent leases one pipeline may hold — the total worker concurrency is not raised — so a discovery run can
+no longer occupy both slots and starve email/forms work behind it. `claim()` counts only **live** leases.
+
+**The tail after persistence was doing per-row work.** The per-job `record_job_event` calls are one batch with
+`commit=False` and a single commit at the end, and the funding flag no longer loads every `Job` row: it is
+computed from the run's own created set through a targeted `name_normalized IN (…)` refresh
+(`funding_radar.refresh_funding_has_open_positions(..., company_names=…)`), which sets the flag on the
+companies this run actually touched and leaves unrelated rows untouched (clearing still requires the full sweep,
+`company_names=None`).
+
+Covered by `backend/tests/test_discovery_latency_and_leases.py` (**23 tests** — lease renewal vs the reaper,
+CAS fencing on completion and on the failure path, the soft deadline, the stage-timing contract, one AI wave,
+the budget cut, partial board fan-out, bounded-parallel search with its page budget intact, the per-pipeline
+slot budget, the batched event commit, and the targeted funding refresh), plus the updated
+`tests/test_queue_and_worker.py` / `tests/test_discovery_empty_board.py` for the new report keys.
+
 ### Added — owner-only AI log: the exact request sent, and how Laya is doing
 
 Two questions the deployment could not answer from the aggregate ledger, both asked while diagnosing the slow, failing verdicts: *"what exactly did we send the model?"* and *"is the local decision engine actually healthy?"* The credit ledger answers **how much**; it cannot answer either.

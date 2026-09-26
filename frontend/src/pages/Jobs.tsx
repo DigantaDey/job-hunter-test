@@ -7,13 +7,13 @@ import { useDiscoveryLastRun } from '../hooks/useDiscoveryLastRun'
 import { useAIWork } from '../context/AIWorkContext'
 import { WorkStatusLine } from '../components/AIWorkChip'
 import TrackingPanel from '../components/TrackingPanel'
-import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader2, Wand2, CheckCircle, AlertCircle, Eye, Brain, Target, MapPin, DollarSign, GraduationCap, Zap, TrendingUp, FileText } from 'lucide-react'
+import { Search, Sparkles, ExternalLink, Award, Building2, Clock, Filter, Loader2, Wand2, CheckCircle, AlertCircle, Eye, Brain, Target, MapPin, DollarSign, GraduationCap, Zap, TrendingUp, FileText, RefreshCw } from 'lucide-react'
 
 /**
  * Where a score came from. The AI verdict and a keyword-overlap estimate are
  * not the same claim, so the label travels with the number.
  */
-function SourceBadge({ source }: { source?: string }) {
+function SourceBadge({ source, lowConfidence }: { source?: string; lowConfidence?: boolean }) {
   const map: Record<string, { label: string; cls: string; title: string }> = {
     ai: { label: 'AI verified', cls: 'bg-emerald-600 text-white', title: 'Guardrail-checked model score' },
     laya: { label: 'Laya (local)', cls: 'bg-blue-600 text-white', title: 'Local decision engine — typed rubric verdict from the self-hosted Laya model, one forward pass' },
@@ -23,9 +23,26 @@ function SourceBadge({ source }: { source?: string }) {
     insufficient_data: { label: 'no data', cls: 'bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300', title: 'Not enough text to score' },
     funding_context: { label: 'funding context', cls: 'bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-300', title: 'Tracked from a funding provider’s own open-position data — there is no job description to score' },
   }
-  const info = map[source || ''] || { label: source || 'unknown', cls: 'bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300', title: '' }
+  let info = map[source || ''] || { label: source || 'unknown', cls: 'bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300', title: '' }
+  if (source === 'laya' && lowConfidence) {
+    // The last-resort answer (v2.5): a real engine verdict below its usual
+    // confidence floor, used only because the model's own answer was refused.
+    info = { label: 'Laya (low confidence)', cls: 'bg-amber-500 text-white',
+             title: 'The local decision engine answered below its usual confidence floor — the model’s answer was rejected by the accuracy guardrail' }
+  }
   return <span title={info.title} className={`text-[10px] px-2 py-0.5 rounded-full font-normal mono ${info.cls}`}>{info.label}</span>
 }
+
+/**
+ * Sources whose number is the score the board row shows.
+ *
+ * Everything else (``rejected`` — the model answered and the guardrail threw
+ * the answer away, ``pending`` — the model was unreachable, ``insufficient_data``,
+ * ``unscored``) has no number to show honestly: rendering its 0 as "0 score"
+ * claims a terrible match where the truth is "no answer". Those rows wear their
+ * provenance badge instead, and the side panel offers the retry.
+ */
+const NUMERIC_SCORE_SOURCES = new Set(['ai', 'laya', 'preliminary'])
 
 export default function Jobs(){
   const navigate = useNavigate()
@@ -35,6 +52,10 @@ export default function Jobs(){
   const [intelligence, setIntelligence] = useState<any>(null)
   const [companyIntel, setCompanyIntel] = useState<any>(null)
   const [busy, setBusy] = useState(false)
+  const [detailError, setDetailError] = useState('')
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [intelError, setIntelError] = useState('')
+  const [intelBusy, setIntelBusy] = useState(false)
   const [discoverBusy, setDiscoverBusy] = useState(false)
   const [outage, setOutage] = useState<AIOutage | null>(null)
   const [resumeChoice, setResumeChoice] = useState('auto')
@@ -48,6 +69,35 @@ export default function Jobs(){
   useEffect(()=>{
     mounted.current = true
     return ()=>{ mounted.current = false }
+  },[])
+
+  /**
+   * Selection identity (v2.5).
+   *
+   * Clicking another job used to leave the panel behind: `selectJob` awaited
+   * the detail read and then called `setSelected` unconditionally, so with a
+   * handful of clicks in flight the panel showed whichever response happened to
+   * land last — and because the AI read keeps a request open for minutes, a
+   * burst of clicks also piled up open connections until every later request
+   * queued behind them (which reads as "clicking stopped working").
+   *
+   * Three things fix it together:
+   *   • the clicked *row* is selected immediately — selection is local state,
+   *     not a network round trip, so the panel switches on the click itself;
+   *   • every response is stamped with a monotonic click token and a stale one
+   *     is dropped instead of overwriting the newer selection;
+   *   • the superseded requests are aborted, so nothing is left holding a
+   *     connection open, and the paid breakdown read waits for the clicks to
+   *     settle (a burst of five costs one call, not five).
+   */
+  const selection = useRef(0)
+  const detailAbort = useRef<AbortController | null>(null)
+  const intelAbort = useRef<AbortController | null>(null)
+  const intelTimer = useRef<number | null>(null)
+  useEffect(()=>()=>{
+    detailAbort.current?.abort()
+    intelAbort.current?.abort()
+    if(intelTimer.current) window.clearTimeout(intelTimer.current)
   },[])
 
   /**
@@ -112,15 +162,78 @@ export default function Jobs(){
     return ()=>clearTimeout(id)
   },[filter.q])
 
-  const selectJob = async (id:number)=>{
-    const {data}=await client.get(`/api/jobs/${id}`)
-    setSelected(data)
-    setIntelligence(null)
-    setCompanyIntel(null)
-    // Fetch intelligence breakdown
-    client.get(`/api/jobs/${id}/intelligence`, { timeout: AI_REQUEST_TIMEOUT_MS }).then(r=>{ if(mounted.current) setIntelligence(r.data) }).catch(()=>{})
-    // Fetch company intel
-    client.get(`/api/company/${encodeURIComponent(data.company)}/intel`, { timeout: AI_REQUEST_TIMEOUT_MS }).then(r=>{ if(mounted.current) setCompanyIntel(r.data) }).catch(()=>{})
+  /**
+   * Read the breakdown for one selection. ``route`` is the server's own retry
+   * route when it announced one (`actions.retry.route`, which is this same read
+   * with `?refresh=1`); otherwise the plain read.
+   */
+  const loadIntelligence = (id:number, token:number, opts:{refresh?:boolean; route?:string} = {})=>{
+    intelAbort.current?.abort()
+    const ctrl = new AbortController()
+    intelAbort.current = ctrl
+    const url = opts.route || `/api/jobs/${id}/intelligence${opts.refresh ? '?refresh=1' : ''}`
+    setIntelBusy(true); setIntelError('')
+    return client.get(url, { timeout: AI_REQUEST_TIMEOUT_MS, signal: ctrl.signal })
+      .then(r=>{ if(mounted.current && selection.current === token) setIntelligence(r.data) })
+      .catch(e=>{
+        if(!mounted.current || selection.current !== token) return
+        if((e as any)?.code === 'ERR_CANCELED') return
+        setIntelError(apiError(e, 'Could not load the match breakdown'))
+      })
+      .finally(()=>{ if(mounted.current && selection.current === token) setIntelBusy(false) })
+  }
+
+  const selectJob = (id:number)=>{
+    const token = ++selection.current
+    const row = jobs.find(j=>j.id===id)
+    // Selected from the row the user clicked, before any request: the panel
+    // follows the click, never the network.
+    if(row) setSelected(row)
+    setDetailError(''); setIntelError(''); setDetailLoading(true)
+    setIntelligence(null); setCompanyIntel(null)
+    if(intelTimer.current) window.clearTimeout(intelTimer.current)
+    detailAbort.current?.abort(); intelAbort.current?.abort()
+    const ctrl = new AbortController()
+    detailAbort.current = ctrl
+    client.get(`/api/jobs/${id}`, { signal: ctrl.signal }).then(r=>{
+      if(!mounted.current || selection.current !== token) return
+      setSelected(r.data); setDetailLoading(false)
+      // Company intel follows the authoritative row.
+      client.get(`/api/company/${encodeURIComponent(r.data.company)}/intel`, { timeout: AI_REQUEST_TIMEOUT_MS })
+        .then(ci=>{ if(mounted.current && selection.current === token) setCompanyIntel(ci.data) }).catch(()=>{})
+    }).catch(e=>{
+      if(!mounted.current || selection.current !== token) return
+      if((e as any)?.code === 'ERR_CANCELED') return
+      setDetailLoading(false)
+      setDetailError(apiError(e, 'Could not load this job'))
+    })
+    // The breakdown is the expensive read (it can run a paid verdict): it waits
+    // for the clicking to settle, so browsing five jobs costs one.
+    intelTimer.current = window.setTimeout(()=>{
+      if(!mounted.current || selection.current !== token) return
+      void loadIntelligence(id, token)
+    }, 250)
+  }
+
+  /**
+   * The retry the diagnosis has always told the user to perform and never
+   * offered (v2.5): re-runs scoring for this job with `?refresh=1`, which is
+   * also what clears the stored "no verdict" payload the read would otherwise
+   * keep serving.
+   */
+  const retryIntelligence = async ()=>{
+    const id = selected?.id
+    if(!id) return
+    const token = selection.current
+    const route = intelligence?.actions?.retry?.route as string | undefined
+    await loadIntelligence(id, token, { refresh: true, route })
+    // The board row carries the score + provenance too — refresh it, and the
+    // list, so the chip stops saying "rejected" once it isn't.
+    load()
+    client.get(`/api/jobs/${id}`).then(r=>{
+      if(!mounted.current || selection.current !== token) return
+      setSelected((prev:any)=> prev && prev.id===r.data.id ? r.data : prev)
+    }).catch(()=>{})
   }
 
   const discover = async()=>{
@@ -173,7 +286,10 @@ export default function Jobs(){
       if (data.pipeline_job_id) work.track({ id: data.pipeline_job_id, pipeline: 'application', key: `apply:${selected.id}` })
       else if (data.status === 'applied') setApplyMsg(data.message || 'Already applied')
       load()
-      const fresh = await client.get(`/api/jobs/${selected.id}`); setSelected(fresh.data)
+      // Guarded like every other refresh on this page: a response that arrives
+      // after the user moved on must not pull the panel back to this job.
+      const fresh = await client.get(`/api/jobs/${selected.id}`)
+      if (mounted.current) setSelected((prev:any)=> prev && prev.id===fresh.data.id ? fresh.data : prev)
     }catch(e:any){ setApplyMsg(apiError(e, 'Apply failed')) }
     finally{ setBusy(false)}
   }
@@ -246,7 +362,11 @@ export default function Jobs(){
                   <div className="text-xs mono text-zinc-500 mt-1 line-clamp-1 break-all">{j.url}</div>
                 </div>
                 <div className="shrink-0 flex flex-col items-end gap-1">
-                  <span className={`text-[11px] px-2 py-1 rounded-full mono border ${j.score>=75?'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950 dark:border-emerald-800 dark:text-emerald-300': j.score>=60?'bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-950':'bg-zinc-100 dark:bg-zinc-800'}`}>{j.score} score</span>
+                  {NUMERIC_SCORE_SOURCES.has(String(j.score_source||'')) ? (
+                    <span className={`text-[11px] px-2 py-1 rounded-full mono border ${j.score>=75?'bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-950 dark:border-emerald-800 dark:text-emerald-300': j.score>=60?'bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-950':'bg-zinc-100 dark:bg-zinc-800'}`}>{j.score} score</span>
+                  ) : (
+                    <SourceBadge source={j.score_source} />
+                  )}
                   <span className={`text-[11px] px-2 py-1 rounded-full mono ${j.status==='applied'?'bg-emerald-600 text-white': j.status==='needs_input'?'bg-amber-500 text-white': j.status==='failed'?'bg-red-500 text-white':'bg-zinc-900 text-white dark:bg-zinc-700'}`}>{j.status}</span>
                 </div>
               </button>
@@ -267,6 +387,8 @@ export default function Jobs(){
                 <a href={selected.url} target="_blank" className="inline-flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400 mt-1">Open original <ExternalLink className="w-3 h-3"/></a>
               </div>
 
+              {detailError && <div className="text-xs mono p-2 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200 flex gap-2"><AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5"/>{detailError}</div>}
+
               <div className="flex flex-wrap gap-2">
                 <span className="text-xs mono px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800">{selected.source}</span>
                 <span className="text-xs mono px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800">{selected.company_size}</span>
@@ -279,7 +401,7 @@ export default function Jobs(){
                 <div className="bg-gradient-to-br from-zinc-50 to-blue-50/30 dark:from-zinc-800 dark:to-blue-950/20 rounded-xl p-4 border dark:border-zinc-700 space-y-3">
                   <div className="flex items-center justify-between">
                     <div className="text-sm font-semibold flex items-center gap-2"><Target className="w-4 h-4"/> Overall Match <span className="text-lg mono">{intelligence.overall || intelligence.score}/100</span>
-                      <SourceBadge source={intelligence.score_source} />
+                      <SourceBadge source={intelligence.score_source} lowConfidence={intelligence.low_confidence} />
                     </div>
                     <span className={`text-[11px] px-2 py-1 rounded-full font-bold ${intelligence.recommendation?.includes('HIGH')?'bg-emerald-600 text-white': intelligence.recommendation?.includes('GOOD')?'bg-blue-600 text-white':'bg-amber-500 text-white'}`}>{intelligence.recommendation}</span>
                   </div>
@@ -308,6 +430,21 @@ export default function Jobs(){
                       <div className="text-red-700 dark:text-red-300 mt-0.5">{intelligence.ai_error.message} ({intelligence.ai_error.reason})</div>
                       {intelligence.ai_error.fix && <div className="text-red-700 dark:text-red-300 mt-0.5"><strong>Fix:</strong> {intelligence.ai_error.fix}</div>}
                       {intelligence.preliminary_score != null && <div className="text-red-600 dark:text-red-400 mt-0.5">Keyword-overlap estimate for reference: {intelligence.preliminary_score}/100</div>}
+                      {intelligence.actions?.retry?.allowed !== false && (
+                        <button onClick={retryIntelligence} disabled={intelBusy} className="mt-2 min-h-[32px] px-3 py-1 rounded-full bg-red-600 text-white font-medium inline-flex items-center gap-1.5 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-1">
+                          {intelBusy ? <Loader2 className="w-3 h-3 animate-spin"/> : <RefreshCw className="w-3 h-3"/>} {intelBusy ? 'Retrying…' : 'Retry scoring'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {intelError && <div className="text-[11px] p-2 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200 mono">{intelError}</div>}
+                  {intelligence.low_confidence && (
+                    <div className="text-[11px] p-2 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 mono text-amber-800 dark:text-amber-200">
+                      <div className="font-medium">Low-confidence local answer — the model's answer was rejected</div>
+                      <div className="mt-0.5">The decision engine scored this pair below its usual confidence floor, so it is only used because the model's own answer failed the accuracy guardrail. Retry for a model verdict.</div>
+                      <button onClick={retryIntelligence} disabled={intelBusy} className="mt-2 min-h-[32px] px-3 py-1 rounded-full bg-amber-600 text-white font-medium inline-flex items-center gap-1.5 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-1">
+                        {intelBusy ? <Loader2 className="w-3 h-3 animate-spin"/> : <RefreshCw className="w-3 h-3"/>} {intelBusy ? 'Retrying…' : 'Retry scoring'}
+                      </button>
                     </div>
                   )}
                   {intelligence.evidence?.length > 0 && (
@@ -338,7 +475,9 @@ export default function Jobs(){
 
               <div>
                 <div className="text-xs mono font-medium">Job description</div>
-                <div className="mt-1 text-sm leading-relaxed text-zinc-700 dark:text-zinc-300 bg-white dark:bg-zinc-900 border dark:border-zinc-800 rounded-xl p-3 max-h-48 overflow-auto">{selected.description}</div>
+                <div className="mt-1 text-sm leading-relaxed text-zinc-700 dark:text-zinc-300 bg-white dark:bg-zinc-900 border dark:border-zinc-800 rounded-xl p-3 max-h-48 overflow-auto">
+                  {(detailLoading && !selected.description) ? <span className="text-zinc-400">Loading…</span> : selected.description}
+                </div>
               </div>
 
               <div className="border-t dark:border-zinc-800 pt-4 space-y-3">

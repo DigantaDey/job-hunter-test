@@ -920,6 +920,22 @@ def effective_elements(
 # --------------------------------------------------------------------------- #
 # The decision
 # --------------------------------------------------------------------------- #
+def score_provenance_can_clear_floor(source: Optional[str]) -> bool:
+    """Can a ``min_match_score`` floor be measured against this provenance?
+
+    An engine verdict is what a confidence floor can be measured against: the
+    model (``ai``), the multi-stage hybrid scorer, or the local decision engine
+    (``laya``). Laya's answer is a typed, calibrated rubric verdict — the same
+    one the board labels "Laya (local)" and the discovery report counts in
+    ``ai_rescore.scored`` — so a floor that accepted an ``ai`` score while
+    denying an identical ``laya`` one was measuring provenance, not confidence
+    (v2.5). ``pending`` keeps its historical pass-through (its score is 0, so
+    the score comparison denies it anyway); a keyword estimate, a guardrail
+    rejection, insufficient text or a never-attempted row is not a floor pass.
+    """
+    return str(source or "") in ("ai", "pending", "hybrid", "laya")
+
+
 def _evaluator(
     db: Session,
     *,
@@ -1086,10 +1102,8 @@ def _evaluator(
     # --- data-confidence floor ------------------------------------------------ #
     minimum = elements.get("min_match_score")
     if minimum is not None and job is not None:
-        score_sources = {"ai", "hybrid"}
         score = float(job.score or 0.0)
-        if job.score_source not in ("ai", "pending") and job.score_source not in score_sources:
-            # Unscored/rejected provenance is not a floor pass.
+        if not score_provenance_can_clear_floor(job.score_source):
             return denied("score_below_floor", score=score, floor=float(minimum))
         if score < float(minimum):
             return denied("score_below_floor", score=score, floor=float(minimum))

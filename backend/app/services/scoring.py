@@ -277,6 +277,11 @@ SCORE_LIST_CAPS = {"strengths": (15, 80), "missing_skills": (12, 80), "evidence"
 #: a model that answers in 600 tokens still bills 600.
 SCORING_OUTPUT_TOKENS = schema_output_budget(SCORE_SCHEMA, SCORE_LIST_CAPS)
 
+#: ``guardrail.rescued_from`` on a Laya verdict that stood in for an answer the
+#: accuracy guardrail rejected (v2.5). A machine-readable marker, so the UI and
+#: the ledger can tell "Laya answered" apart from "Laya answered because the
+#: model's answer was thrown away".
+GUARDRAIL_RESCUE_SOURCE = "ai_guardrail_failed"
 #: How far the model may move the score away from the deterministic anchor
 #: before the guardrail treats it as unjustified.
 ANCHOR_TOLERANCE = 32
@@ -406,6 +411,7 @@ async def laya_score_detailed(
     db=None,
     user_id: Optional[int] = None,
     persona: Optional[Dict[str, Any]] = None,
+    allow_low_confidence: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """A full scoring verdict from the local Laya engine — or ``None``.
 
@@ -422,6 +428,13 @@ async def laya_score_detailed(
     72 ms"), then the numbers are combined deterministically: the weighted
     score, the recommendation band (:data:`BANDS` — in code, so nothing can
     re-grade itself) and the anchor cross-check are computed here, not asked.
+
+    ``allow_low_confidence`` is the *last-resort* mode (v2.5), used only by the
+    guardrail rescue: the floor is an escalation rule ("below this, ask the
+    model"), not a truth rule — and when the model's own answer has already been
+    refused by the accuracy guardrail there is nothing left above the floor. In
+    that one case the engine's own calibrated answer is returned, marked
+    ``low_confidence`` so no surface can present it as an ordinary verdict.
     """
     from app.services import laya  # noqa: PLC0415 - optional engine, no import cost here
 
@@ -465,11 +478,16 @@ async def laya_score_detailed(
         level_words.append(f"{dim} {LAYA_LEVELS[parsed['level']].split(' in ')[0].split(',')[0]}")
 
     confidence = sum(confidences) / len(confidences) if confidences else 0.0
-    if confidence < laya.confidence_floor(db, user_id) and not laya.is_strict(db, user_id):
+    low_confidence = confidence < laya.confidence_floor(db, user_id) and not laya.is_strict(db, user_id)
+    if low_confidence and not allow_low_confidence:
         # auto mode: a shrug from the decision engine is not a verdict — the
         # LLM path (with its guardrails and evidence) gets the last word.
         inc("jobhunter_laya_decisions_total", task="ranking", result="escalated")
         return None
+    if low_confidence:
+        # Returned only because the caller has no model answer left to prefer
+        # (see ``allow_low_confidence``). The mark travels with the verdict.
+        inc("jobhunter_laya_decisions_total", task="ranking", result="low_confidence")
 
     score = max(0.0, min(100.0, sum(breakdown[d] * w for d, w in RUBRIC_WEIGHTS.items())))
     anchor = _anchor_breakdown(profile, jd)
@@ -479,12 +497,19 @@ async def laya_score_detailed(
         warnings.append({"code": "anchor_divergence", "severity": "warning", "field": "score",
                          "value": delta,
                          "message": f"Laya score is {delta:+.0f} from the deterministic anchor ({anchor['overall']})."})
-    inc("jobhunter_laya_decisions_total", task="ranking", result="answered")
+    if not low_confidence:
+        inc("jobhunter_laya_decisions_total", task="ranking", result="answered")
     return {
         "overall": int(round(score)),
         "score": score,
         "reason": ("Local decision engine (Laya), one forward pass: "
-                   + "; ".join(level_words) + "."),
+                   + "; ".join(level_words) + "."
+                   + (" Below its usual confidence floor — returned only because the "
+                      "model's own answer could not be used." if low_confidence else "")),
+        #: True only on the last-resort path (v2.5): a real, calibrated answer
+        #: from the engine, below the floor ``auto`` mode would normally escalate
+        #: from. Surfaces can say so; the score itself is never hidden.
+        "low_confidence": low_confidence,
         "breakdown": breakdown,
         "breakdown_source": "laya",
         "weights": RUBRIC_WEIGHTS,
@@ -502,9 +527,83 @@ async def laya_score_detailed(
         "anchor": {"overall": anchor["overall"], "coverage": anchor["coverage"],
                    "similarity": anchor["similarity"], "delta": delta},
         "guardrail": {"passed": True, "engine": "laya", "confidence": round(confidence, 3),
+                      "low_confidence": low_confidence,
                       "issues": warnings, "checks": ["typed_output_only", "band_follows_score"]},
         "source": "laya",
     }
+
+
+def _charge_job_analysis(db: Any, user_id: Optional[int]) -> None:
+    """One accepted analysis, not one charge per call.
+
+    Shared by the primary Laya path and the guardrail rescue so a rescued
+    verdict is charged exactly once and accounting can never block a verdict.
+    """
+    if db is None or user_id is None:
+        return
+    try:
+        from app.core.entitlements import increment_usage  # noqa: PLC0415
+
+        increment_usage(db, user_id, "job_analysis_per_month", 1)
+    except Exception:  # pragma: no cover - accounting never blocks a verdict
+        pass
+
+
+async def _laya_rescue(
+    profile: Dict[str, Any],
+    jd: str,
+    *,
+    db=None,
+    user_id: Optional[int] = None,
+    persona: Optional[Dict[str, Any]] = None,
+    engine_down: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """A Laya verdict to stand in for an answer the guardrail rejected (v2.5).
+
+    The automatic retry after a guardrail rejection is the *local* engine, not
+    a second paid call: the model already answered twice (the answer and its
+    repair pass) and repeating the same request is what the diagnosis tells the
+    user to stop doing. Laya costs no provider call and cannot return malformed
+    JSON, so it is asked once — and it is asked **under the owner's own usage
+    policy**, the same one that governs the primary path:
+
+    * ``llm_only`` (or a per-task opt-out, or ``LAYA_ENABLED=false``) means the
+      owner routed ranking away from the engine — the honest ``rejected``
+      verdict stands and the caller keeps its retry affordance;
+    * a *below-floor* answer is returned here, marked ``low_confidence``: the
+      floor is the escalation rule ("below this, ask the model"), and the
+      model's answer has just been refused — the alternative is no verdict at
+      all, so the engine's own calibrated answer stands, labelled for what it
+      is. Nothing above the floor is affected (``auto`` mode still prefers the
+      model whenever the model delivers something usable);
+    * ``laya_only`` never reaches the LLM at all, so it never gets here; an
+      engine *outage* is reported as the outage it is (``engine_down`` skips a
+      second timeout: the primary path already waited one out).
+
+    Returns ``None`` when there is nothing to stand in — never a guess.
+    """
+    from app.services import laya  # noqa: PLC0415 - optional engine
+
+    if engine_down:
+        inc("jobhunter_scoring_guardrail_rescue_total", result="engine_down")
+        return None
+    if not laya.should_attempt(db, user_id, "ranking"):
+        # Not a failure: the owner's policy says ranking is not the engine's
+        # job. The metric records it so an operator can tell "policy" apart
+        # from "the engine could not answer".
+        inc("jobhunter_scoring_guardrail_rescue_total", result="not_routed")
+        return None
+    try:
+        detail = await laya_score_detailed(profile, jd, db=db, user_id=user_id, persona=persona,
+                                           allow_low_confidence=True)
+    except laya.LayaUnavailable:
+        inc("jobhunter_scoring_guardrail_rescue_total", result="unavailable")
+        return None
+    if detail is None:
+        # The adapter could not parse the engine's answer at all.
+        inc("jobhunter_scoring_guardrail_rescue_total", result="no_verdict")
+        return None
+    return detail
 
 
 def _laya_parse_ordinal(raw: Any, labels: Sequence[str]) -> Optional[Dict[str, Any]]:
@@ -575,6 +674,10 @@ async def ai_score_detailed(
     # guess or a silent engine switch the owner turned off.
     from app.services import laya  # noqa: PLC0415
 
+    #: Set when the engine itself failed on this pair: the LLM path is the
+    #: ``auto``-mode fallback, and the guardrail rescue below must not make the
+    #: user wait out a second engine timeout for the same outage.
+    laya_down = False
     if laya.should_attempt(db, user_id, "ranking"):
         try:
             laya_detail = await laya_score_detailed(profile, jd, db=db, user_id=user_id,
@@ -588,14 +691,9 @@ async def ai_score_detailed(
                     context={"laya_code": exc.code},
                 ) from exc
             laya_detail = None
+            laya_down = True
         if laya_detail is not None:
-            if db is not None and user_id is not None:
-                try:
-                    from app.core.entitlements import increment_usage  # noqa: PLC0415
-
-                    increment_usage(db, user_id, "job_analysis_per_month", 1)
-                except Exception:  # pragma: no cover - accounting never blocks a verdict
-                    pass
+            _charge_job_analysis(db, user_id)
             return laya_detail
 
     anchor = _anchor_breakdown(profile, jd)
@@ -637,18 +735,45 @@ Job description:
 Return JSON:
 {{"score": number, "reason": "2-3 sentences", "breakdown": {{"skills": n, "experience": n, "seniority": n, "domain": n, "location": n, "education": n}}, "strengths": [], "missing_skills": [], "evidence": [], "recommendation": "HIGH PRIORITY|GOOD FIT|MODERATE|LOW", "recommendation_reason": "why"}}"""
 
-    data, report = await run_guarded_task(
-        "scoring",
-        system=("You are a strict, evidence-bound technical recruiter. You score only what the resume "
-                "proves and you never inflate a score to be encouraging."),
-        prompt=prompt,
-        schema=SCORE_SCHEMA,
-        checks=[_score_checks(profile, jd, anchor)],
-        db=db,
-        user_id=user_id,
-        temperature=0.1,
-        max_tokens=SCORING_OUTPUT_TOKENS,
-    )
+    try:
+        data, report = await run_guarded_task(
+            "scoring",
+            system=("You are a strict, evidence-bound technical recruiter. You score only what the resume "
+                    "proves and you never inflate a score to be encouraging."),
+            prompt=prompt,
+            schema=SCORE_SCHEMA,
+            checks=[_score_checks(profile, jd, anchor)],
+            db=db,
+            user_id=user_id,
+            temperature=0.1,
+            max_tokens=SCORING_OUTPUT_TOKENS,
+        )
+    except GuardrailError as exc:
+        # The model answered but the answer is not safe to use (v2.5). Before
+        # the pair is left with no verdict at all — a 0/100 panel, a board of
+        # "unscored" rows, a diagnosis that tells the user to retry by hand —
+        # the local decision engine is asked once, under the owner's own Laya
+        # policy (see :func:`_laya_rescue`). A rescued verdict is labelled
+        # ``laya`` and carries the rejection that produced it, so nothing about
+        # it pretends the model's answer was fine.
+        rescued = await _laya_rescue(profile, jd, db=db, user_id=user_id, persona=persona,
+                                     engine_down=laya_down)
+        if rescued is None:
+            # No engine answer either: the honest rejection stands, and the read
+            # that returns it announces the retry route (v2.5).
+            inc("jobhunter_scoring_guardrail_rescue_total", result="rejected")
+            raise
+        rescued["guardrail"] = {
+            **dict(rescued.get("guardrail") or {}),
+            "rescued_from": GUARDRAIL_RESCUE_SOURCE,
+            # Why the model's own answer was unusable travels with the verdict:
+            # the provenance of a rescued score includes the rejection.
+            "rejected_issues": [dict(issue) for issue in list(exc.issues)[:8]],
+        }
+        _charge_job_analysis(db, user_id)
+        inc("jobhunter_scoring_guardrail_rescue_total",
+            result="laya_low_confidence" if rescued.get("low_confidence") else "laya")
+        return rescued
 
     score = max(0.0, min(100.0, float(data.get("score", 0))))
     breakdown, breakdown_source = _merge_breakdown(data.get("breakdown"), anchor)

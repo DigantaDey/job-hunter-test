@@ -284,12 +284,37 @@ class Settings(BaseSettings):
     worker_concurrency: int = 2
     worker_poll_interval: float = 1.0
     worker_lease_seconds: int = 120
+    #: How often a running item renews its lease (seconds). The heartbeat is what
+    #: makes ``WORKER_LEASE_SECONDS`` an honest number for long work: without it
+    #: the lease written at claim time was never refreshed, so any run longer
+    #: than lease + ``WORKER_REAPER_SAFETY_SECONDS`` was re-queued while its
+    #: first copy was still running (same sources fetched twice, same AI
+    #: verdicts paid for twice). Clamped to a third of the lease, so two missed
+    #: beats cannot lose a row.
+    worker_heartbeat_interval_seconds: float = 30.0
     #: Default per-item failure budget: ``job_queue.fail()`` dead-letters an
     #: item once it has recorded this many *handler failures*. Claims, pauses
     #: (AI outages) and lease expiries do not count against it — see the
     #: ``app.services.job_queue`` module docstring.
     worker_max_attempts: int = 3
+    #: Soft deadline for one item, in seconds (0 = none). Enforced by the worker:
+    #: the handler is cancelled at the deadline, the session is rolled back and
+    #: the item is re-queued with an honest error under the normal failure
+    #: budget. It is a *deadline*, not a lease: the heartbeat keeps the lease
+    #: alive, so this is what stops a pathological run (a model that never
+    #: answers, a board that dribbles bytes) from occupying a slot forever.
     worker_max_runtime_seconds: int = 900
+    #: Per-pipeline slot budgets: ``pipeline=count`` pairs, comma-separated,
+    #: where ``count`` is the maximum number of that pipeline's rows allowed to
+    #: be ``processing`` at once **across the deployment**. Applied by
+    #: ``job_queue.claim`` — a pipeline at its budget is filtered out of the
+    #: claim query, so a blocked pipeline never starves the queues behind it.
+    #: ``0`` (or an unlisted pipeline) means no budget. Shipped default:
+    #: ``discovery=1`` — one discovery run holds a slot for minutes (AI verdicts
+    #: at ``AI_TIMEOUT`` each), so without a budget a second discovery would take
+    #: the platform's other slot and emails/applications would wait behind it.
+    #: Raise it (or set ``""``) on a deployment with slots to spare.
+    worker_pipeline_limits: str = "discovery=1"
     #: How often each worker loop runs the stall reaper (seconds). The reaper
     #: calls :func:`job_queue.recover_stalled` on an interval, not only at
     #: boot, so a hung AI call (lease 120s, AI timeout 300s) does not leave a
@@ -466,6 +491,15 @@ class Settings(BaseSettings):
     #: than holding the whole run open. Raise it on a slow network if the
     #: report shows healthy sources timing out.
     discovery_fetch_timeout_seconds: float = Field(default=45.0, ge=5.0, le=300.0)
+    #: Per-board budget *inside* one board source's fetch (seconds). A board
+    #: adapter fans out over up to ``MAX_ATS_BOARDS_PER_RUN`` boards on one host,
+    #: spaced by ``PER_HOST_MIN_INTERVAL_SECONDS`` — twelve Greenhouse boards with
+    #: ``content=true`` realistically want 36–60 s, right at
+    #: ``DISCOVERY_FETCH_TIMEOUT_SECONDS``, and one hanging board used to spend
+    #: the whole source's window. With its own budget a slow board is dropped (and
+    #: counted) while the boards that answered are kept and the source is
+    #: reported as ``partial``.
+    discovery_board_timeout_seconds: float = Field(default=20.0, ge=2.0, le=300.0)
 
     # ------------------------------------------------------------------ #
     # Shared job pool (cross-user discovery)
@@ -495,6 +529,16 @@ class Settings(BaseSettings):
     #: The AI gateway's own semaphore (``AI_MAX_CONCURRENCY``) is the hard
     #: bound; this is how many calls discovery hands it at once.
     discovery_ai_concurrency: int = Field(default=4, ge=1, le=16)
+    #: Wall-clock budget for one discovery run's AI work (seconds, 0 = none).
+    #: Verdicts are assigned best-first (the deterministic pre-rank order) and the
+    #: run stops spending when the budget is gone: the candidates that never got
+    #: a verdict stay at the honest ``score_source='preliminary'`` estimate they
+    #: already carry, and the run reports the cut. Only the *aggregate* of the AI
+    #: tail was ever unbounded — ``AI_TIMEOUT`` bounds one call, not
+    #: ``ceil(12/4)`` waves of them plus a classification stage — and a run that
+    #: returns most of the value in a few minutes beats a perfect one in
+    #: twenty-five.
+    discovery_ai_budget_seconds: float = Field(default=180.0, ge=0.0, le=1800.0)
     include_demo_pool: bool = False
     enabled_sources: List[str] = Field(default_factory=list)
     http_user_agent: str = "JobHunterAI/2.0 (+https://github.com/jobhunter-ai)"

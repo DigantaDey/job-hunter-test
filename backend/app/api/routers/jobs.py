@@ -31,6 +31,15 @@ router = APIRouter(tags=["jobs"])
 log = get_logger("app.jobs")
 
 
+#: Verdicts that got no answer from an engine, so re-running is meaningful and
+#: the response should say how: ``rejected`` (the model answered, the accuracy
+#: guardrail refused the answer) and ``pending`` (the model could not be
+#: reached). A real verdict is never re-run implicitly — see v2.5's guardrail
+#: rescue in ``services/scoring.py``, which now retries ``rejected`` pairs on the
+#: local decision engine automatically before this state is ever persisted.
+RETRYABLE_SCORE_SOURCES = ("rejected", "pending")
+
+
 def _job_or_404(db: Session, user_id: int, job_id: int) -> Job:
     job = db.query(Job).filter(Job.id == job_id, Job.user_id == user_id).first()
     if not job:
@@ -90,6 +99,12 @@ def list_jobs(
         d = {
             "id": r.id, "title": r.title, "company": r.company, "location": r.location, "url": r.url,
             "source": r.source, "status": r.status, "score": r.score, "company_size": r.company_size,
+            # Provenance travels with the number (v2.5): a board row whose score
+            # could not be produced (``rejected`` / ``pending``) renders as
+            # "unscored", not as a 0/100 verdict — the list used to show a
+            # literal "0 score" for a pair the model was never allowed to
+            # answer, which reads as "terrible match" instead of "no verdict".
+            "score_source": r.score_source,
             "discovered_at": r.discovered_at, "posted_at": r.posted_at, "applied_at": r.applied_at,
             "error": r.error,
             # Funding chip only. The old payload also carried
@@ -169,6 +184,19 @@ async def job_intelligence(job_id: int, request: Request, user: CurrentUser, db:
     detail["rubric"] = detail.get("weights") or RUBRIC_WEIGHTS
     detail["score"] = float(detail.get("overall") or detail.get("score") or job.score or 0)
     detail["score_source"] = str(detail.get("source") or "preliminary")
+
+    # The retry affordance (v2.5). A verdict the guardrail refused — or one the
+    # model was never reachable for — used to dead-end here: the diagnosis told
+    # the user to "retry" and there was no way to do it, and (because the stored
+    # payload short-circuits the read below) the dead end was permanent. The
+    # route that re-runs scoring is this same read with ``?refresh=1``; it is
+    # announced on the response so any client can offer it, and it says it
+    # costs an analysis.
+    if str(detail.get("source") or "") in RETRYABLE_SCORE_SOURCES:
+        detail["actions"] = {
+            "retry": {"allowed": True, "route": f"/api/jobs/{job.id}/intelligence?refresh=1",
+                      "method": "GET", "costs_quota": True},
+        }
 
     # Persist the verdict + its provenance on the job row so lists can be honest.
     job.score = detail["score"]
