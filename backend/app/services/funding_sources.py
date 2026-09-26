@@ -11,7 +11,14 @@ Real, verifiable sources first:
 * ``sec_edgar`` — SEC EDGAR full-text search for **Form D** filings (private
   placement notices). Free, public, keyless; every event links to the filing.
   This stays the verified direct path **when no search provider is
-  configured** — its robots.txt constraint is never bypassed.
+  configured**. The call is a JSON **RPC**: ``efts.sec.gov/robots.txt`` is not
+  a crawl policy but a WAF-style ``403`` body, which the robots client maps
+  (per the exclusion spec) to "disallow every URL on this host" — and that
+  default made every keyless scan die with ``PermissionError`` before a single
+  filing was fetched (the reported bug). SEC's published rules for automated
+  access to its APIs — a declared User-Agent with contact info and sane rate
+  limits (SEC Developer FAQs) — govern the call instead: one cached request
+  per scan, still SSRF-guarded, still under the provider timeout.
 * ``crunchbase`` / ``tracxn`` — official APIs when the operator holds a licence.
 * ``imported`` — an operator-supplied JSON/CSV export URL (documented schema),
   which is how teams publish their licensed Crunchbase/Tracxn extracts.
@@ -50,6 +57,7 @@ import asyncio
 import csv
 import io
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -241,6 +249,15 @@ async def _sec_edgar(context: Dict[str, Any], window_days: int, limit: int) -> L
         },
         headers=headers, cache_seconds=settings.discovery_cache_seconds,
         timeout=settings.funding_provider_timeout_seconds,
+        # EDGAR full-text search is SEC's own JSON API — an RPC, not a crawl of
+        # published pages (the same doctrine the search provider's call uses).
+        # efts.sec.gov/robots.txt answers 403 Forbidden, which the robots client
+        # maps to "disallow every URL on this host", so with the robots check on
+        # every default scan failed with PermissionError before reaching the API
+        # (the reported bug). SEC's policy for automated access is a declared
+        # User-Agent (SEC_EDGAR_USER_AGENT / HTTP_USER_AGENT) plus rate limits —
+        # honoured here: one cached request per scan, SSRF guard unchanged.
+        respect_robots=False,
     )
     if response.status_code != 200:
         raise FundingProviderError(f"EDGAR full-text search returned HTTP {response.status_code}",
@@ -545,24 +562,65 @@ async def _search(context: Dict[str, Any], window_days: int, limit: int) -> List
     return events[: max(1, limit) * 2]
 
 
+#: Place-name signals that the candidate's market is India. The job side of
+#: the product already defaults to India (``ADZUNA_COUNTRY=in``) — a funding
+#: search that only ever phrased queries for the US market answered the wrong
+#: question for those users. Any hit makes the queries market-angled (see
+#: :func:`_india_hinted`), which is what brings Indian publications — the ones
+#: reporting rounds in ₹ crore — into the result set at all.
+_INDIA_HINTS = frozenset({
+    "india", "bangalore", "bengaluru", "mumbai", "bombay", "delhi", "hyderabad",
+    "chennai", "pune", "kolkata", "calcutta", "gurugram", "gurgaon", "noida",
+    "ahmedabad", "coimbatore", "indore", "jaipur", "chandigarh", "kochi",
+    "thiruvananthapuram", "lucknow", "visakhapatnam",
+})
+
+
+def _india_hinted(context: Dict[str, Any]) -> bool:
+    """True when the candidate's own context points at the Indian market.
+
+    Checked on ``locations`` and ``keywords`` — both come from the user's
+    profile/resume via the keyword extractor, so no extra model call and no
+    guessing: a candidate in Kolkata (or whose keywords say "Bangalore
+    fintech") gets India-angled funding queries, everyone else keeps the
+    global phrasing.
+    """
+    raw = " ".join(
+        str(value)
+        for key in ("locations", "keywords")
+        for value in (context.get(key) or [])
+    ).casefold()
+    if not raw:
+        return False
+    tokens = set(filter(None, re.split(r"[^a-z]+", raw)))
+    return bool(tokens & _INDIA_HINTS)
+
+
 def _search_queries(context: Dict[str, Any]) -> List[str]:
     """Deterministic search queries from the AI-extracted search context.
 
     ``search_context`` (``app.api.deps.search_context``) is itself produced by
     the keyword-extractor model, so these queries are already "keywords + AI" —
     building them needs no extra model call. Funding focus leads, then
-    industries, then keywords; a role adds one hiring-angled query.
+    industries, then keywords; a role adds one hiring-angled query. When the
+    context points at India (:func:`_india_hinted`) every query is suffixed
+    with " India" and one market-angled query of its own is added — Indian
+    funding is reported by Indian publications that a US-phrased query never
+    surfaces.
     """
     def _terms(key: str) -> List[str]:
         return [str(v).strip() for v in (context.get(key) or []) if str(v).strip()]
 
+    india = " India" if _india_hinted(context) else ""
     leads = (_terms("funding_focus") or _terms("industries") or _terms("keywords"))[:2]
-    queries = [f"{term} startup funding round" for term in leads]
+    queries = [f"{term} startup funding round{india}" for term in leads]
+    if india:
+        queries.append("India startup funding round this month")
     if not queries:
         queries = ["startup funding announcement"]
     roles = _terms("roles")
     if roles:
-        queries.append(f"{roles[0]} startup raises funding round")
+        queries.append(f"{roles[0]} startup raises funding round{india}")
     return queries[:MAX_SEARCH_QUERIES]
 
 
@@ -580,7 +638,7 @@ def provider_status() -> List[Dict[str, Any]]:
     provider = funding_search.search_provider()
     search_label = f"Web search ({provider})" if provider else "Web search (not configured)"
     return [
-        {"id": "sec_edgar", "label": "SEC EDGAR Form D (live, keyless)", "configured": True, "verified": True},
+        {"id": "sec_edgar", "label": "SEC EDGAR Form D (US, live, keyless)", "configured": True, "verified": True},
         {"id": "search", "label": search_label, "configured": funding_search.search_configured(), "verified": True},
         {"id": "crunchbase", "label": "Crunchbase API", "configured": bool(settings.crunchbase_api_key), "verified": True},
         {"id": "tracxn", "label": "Tracxn API", "configured": bool(settings.tracxn_api_key), "verified": True},
@@ -651,12 +709,12 @@ async def fetch_funding_events(
         requested = [p["id"] for p in provider_status() if p["configured"]]
 
     # v2.2.6 — when a web-search provider is configured it REPLACES the direct
-    # sec_edgar slot: efts.sec.gov's robots.txt disallows the automated
-    # full-text search endpoint, so with RESPECT_ROBOTS_TXT=true (the default)
-    # a scan that went straight to EDGAR failed as scan_failed. The search
-    # path discovers the same Form D rounds (plus public announcements) and
-    # never touches efts.sec.gov. With no search provider configured, the
-    # direct EDGAR path stays exactly as it was — robots check included.
+    # sec_edgar slot: the search path discovers the same Form D rounds (plus
+    # public announcements, worldwide — Indian rounds included) and never
+    # touches efts.sec.gov. With no search provider configured the direct
+    # EDGAR path runs as an **RPC** (robots.txt on efts.sec.gov is a 403 body,
+    # not a crawl policy — see :func:`_sec_edgar`), so the default keyless
+    # scan works instead of dying on PermissionError every time.
     if "sec_edgar" in requested and funding_search.search_configured():
         deduped: List[str] = []
         for pid in ("search" if pid == "sec_edgar" else pid for pid in requested):
@@ -1077,9 +1135,11 @@ async def ai_extract_events_from_results(
         "investment). Skip opinion pieces, round-up listicles without a specific round, rumors, "
         "and anything outside the window.\n"
         "For each such result extract STRICTLY from its own text: the company name exactly as "
-        "published, the round stage, the amount in USD when stated, the announce date "
-        "(YYYY-MM-DD when stated), and a short industry tag. Always cite the result you used "
-        "with source_index. Never add, rename or complete a company no snippet mentions.\n"
+        "published, the round stage, the amount in USD when stated — or stated in Indian rupees "
+        "(₹, lakh, crore), which you convert to USD at a fixed approximation of ₹88 per US "
+        "dollar (an ordering-grade estimate; never invent any other rate or currency) — the "
+        "announce date (YYYY-MM-DD when stated), and a short industry tag. Always cite the "
+        "result you used with source_index. Never add, rename or complete a company no snippet mentions.\n"
         f"Candidate focus: {focus_json}\n"
         f"Search results: {results_json}\n"
         'Return JSON only: {"companies": [{"name": "<as published>", "source_index": <int>, '

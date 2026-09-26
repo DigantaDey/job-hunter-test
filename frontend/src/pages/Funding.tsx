@@ -127,7 +127,8 @@ export default function Funding() {
   const [history, setHistory] = useState<any[]>([])
   const [historyCollapsed, setHistoryCollapsed] = useState<boolean>(false)
   // v2.2.6 search-provider badge: how this radar scans (web search API vs the
-  // direct — robots-checked — EDGAR path). Fetched once, secret-free.
+  // direct EDGAR Form D path — US market, an RPC under SEC's UA rules).
+  // Fetched once, secret-free.
   const [searchInfo, setSearchInfo] = useState<SearchProviderInfo | null>(null)
 
   // Refs for visibility-aware polling and request coalescing
@@ -333,7 +334,7 @@ export default function Funding() {
           ) : (
             <span
               className="text-[11px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-200 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-800 mono inline-flex items-center gap-1"
-              title={searchInfo.hint || 'No search provider configured — scans use direct SEC EDGAR (robots-checked; may fail with scan_failed).'}
+              title={searchInfo.hint || 'No search provider configured — scans use direct SEC EDGAR Form D filings (US market only; worldwide coverage needs a search provider).'}
             >
               <Globe className="w-3 h-3" /> direct EDGAR only
             </span>
