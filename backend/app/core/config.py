@@ -434,6 +434,14 @@ class Settings(BaseSettings):
     # generation wait above is long. The httpx client is built as
     # Timeout(ai_timeout, connect=min(ai_connect_timeout, ai_timeout)).
     ai_connect_timeout: float = 10.0
+    # Streaming idle-read bound (seconds). A reasoning model can be silent for
+    # its whole thinking phase — SSE bytes only arrive once content does — so
+    # the streamed read timeout must never be shorter than the wait the model
+    # was promised. **0 (the shipped default) = follow the call's wait budget**:
+    # a stream is never aborted mid-think, the caller's own budget remains the
+    # deadline. A positive value caps silence earlier (an operator's tighter
+    # stall bound) but is still clamped to the call budget.
+    ai_stream_idle_timeout: float = 0.0
     ai_max_retries: int = 3
     ai_backoff_base: float = 1.5
     ai_daily_token_budget: int = 0

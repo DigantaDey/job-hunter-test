@@ -1397,7 +1397,10 @@ async def chat_completion(
 ) -> Dict[str, Any]:
     """Send a chat completion. Raises AIClientError on failure.
 
-    Streaming: when stream=True, uses http_client.stream with Timeout(1800, connect 10, read 60, write 60, pool 60) + SSE parsing.
+    Streaming: when stream=True, uses http_client.stream with connect=ai_connect_timeout
+    and an idle read timeout that follows the call budget (AI_STREAM_IDLE_TIMEOUT
+    may cap silence earlier) + SSE parsing. A reasoning model's silent thinking phase is
+    therefore never aborted before the caller's own budget elapses.
     """
     resolved = _resolve_ai_config(workflow, db, user_id)
     cfg = resolved.cfg
@@ -1528,10 +1531,26 @@ async def chat_completion(
             attempts = max(1, settings.ai_max_retries)
         connect_timeout = min(settings.ai_connect_timeout, effective_timeout)
         client_timeout = httpx.Timeout(effective_timeout, connect=connect_timeout)
-        # Streaming uses idle timeout (read 60s) while total respects per-call/per-user budget
-        # Effective read is min(60, effective_timeout) so a 0.4s budget still times out promptly
-        read_timeout = min(60, effective_timeout) if effective_timeout and effective_timeout > 0 else 60
-        streaming_timeout = httpx.Timeout(effective_timeout if effective_timeout <= 1800 else 1800, connect=10, read=read_timeout, write=60, pool=60)
+        # Streaming idle-read bound. A reasoning model can sit silent for its
+        # whole thinking phase — SSE bytes arrive only when content does — so
+        # the read timeout must never cut the model off mid-think: by default
+        # (AI_STREAM_IDLE_TIMEOUT=0) it follows the call's wait budget,
+        # and the caller's budget remains the only deadline. A positive setting
+        # caps silence earlier for operators who want a tighter stall bound,
+        # still clamped to the budget (so a 0.4s budget still times out
+        # promptly). Connect stays short: an unreachable endpoint must fail
+        # fast with `unreachable`, not hang for the full generation wait.
+        try:
+            idle_override = float(settings.ai_stream_idle_timeout or 0.0)
+        except (TypeError, ValueError):
+            idle_override = 0.0
+        if idle_override > 0:
+            stream_read_timeout = min(idle_override, effective_timeout)
+        else:
+            stream_read_timeout = effective_timeout
+        streaming_timeout = httpx.Timeout(effective_timeout if effective_timeout <= 1800 else 1800,
+                                          connect=connect_timeout, read=stream_read_timeout,
+                                          write=60, pool=60)
         last_error: Optional[str] = None
         http_client = await get_http_client()
         # The payload dict is mutated in place by the escalation/fix-up paths,

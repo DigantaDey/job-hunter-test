@@ -12,8 +12,8 @@ import { EmptyState, ErrorState, LoadingBlock, SectionCard } from '../../compone
  *    one), the endpoint, tokens/cost, latency, and a bounded excerpt of the
  *    answer. The list is metadata; the bodies come from the detail route.
  *  • **"How is Laya doing?"** — the local decision engine's status mix per task
- *    (`ok` / `low_confidence` / `timeout` / `error` / `parked`), its latency and
- *    its calibrated confidence against the configured floor.
+ *    (`ok` / `low_confidence` / `timeout` / `error` / `parked` / `busy`), its
+ *    latency and its calibrated confidence against the configured floor.
  *
  * Both are server-enforced owner-only: `/api/admin/ai/*` and `/api/admin/laya/*`
  * 403 a member token, the route is mounted behind `<RequireOwner>`, and the
@@ -47,11 +47,12 @@ type CallDetail = Call & {
 
 type LayaTask = { task: string; total: number; statuses: Record<string, number>; avg_latency_ms: number }
 
-const LAYA_STATUS_ORDER = ['ok', 'low_confidence', 'timeout', 'error', 'parked'] as const
+const LAYA_STATUS_ORDER = ['ok', 'low_confidence', 'timeout', 'error', 'parked', 'busy'] as const
 
 export function statusTone(status: string): string {
   if (status === 'ok') return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
   if (status === 'low_confidence') return 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300'
+  if (status === 'busy') return 'bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'
   return 'bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300'
 }
 
@@ -160,7 +161,7 @@ export default function AdminAILogs() {
                       hint="AI_LOG_ENABLED=false — calls and decisions are not being recorded." />
         ) : (
           <div data-testid="laya-health">
-            <div className="grid grid-cols-2 md:grid-cols-6 gap-2 text-center">
+            <div className="grid grid-cols-2 md:grid-cols-7 gap-2 text-center">
               {[
                 ['decisions', layaTotals.decisions ?? 0],
                 ['ok', layaTotals.ok ?? 0],
@@ -168,6 +169,7 @@ export default function AdminAILogs() {
                 ['timeouts', layaTotals.timeout ?? 0],
                 ['errors', layaTotals.error ?? 0],
                 ['parked', layaTotals.parked ?? 0],
+                ['busy', layaTotals.busy ?? 0],
               ].map(([label, value]) => (
                 <div key={String(label)} className="p-3 rounded-xl bg-zinc-50 dark:bg-zinc-800/60">
                   <div className="text-lg font-semibold mono" data-testid={`laya-${String(label).replace(' ', '-')}`}>{String(value)}</div>

@@ -26,6 +26,15 @@ Three deliberate design points:
   ceiling (``LAYA_ENABLED``) plus the owner's Settings → decision-engine
   mode (``auto`` / ``laya_only`` / ``llm_only``) and the per-task opt-ins.
   Nothing reaches Laya that the owner did not route to it.
+* **The engine is never punished for still thinking.** A forward pass is a
+  single typed call — there is no stream to keep alive, so the think-phase
+  protection the AI gateway gets from streaming idle timeouts is implemented
+  here as failure accounting instead: a caller whose budget elapsed while its
+  pass was *queued* behind a running one reports ``engine_busy`` (queue
+  pressure, never an engine failure), and a pass abandoned for running past
+  the budget credits the engine back when it finishes cleanly in its thread.
+  Neither can park a healthy engine that simply thinks longer than one
+  caller's budget.
 * **Honest unavailability.** When Laya cannot answer (not installed, load
   failure, timeout) the helpers return ``None`` / raise :class:`LayaUnavailable`
   — callers either fall back to the LLM (``auto``) or surface the same
@@ -89,6 +98,21 @@ _load_error: Optional[str] = None
 #: reports ``timeout`` rather than corrupting the process.
 _predict_lock = threading.Lock()
 
+#: Laya has no stream to keep alive — a forward pass is a single typed call, so
+#: "streaming" does not apply to this engine. The think-phase protection is
+#: instead about *not punishing the engine for still thinking*:
+#:
+#: * a caller whose budget elapsed while its pass was still **queued** behind a
+#:   running pass reports ``engine_busy`` — queue pressure, never an engine
+#:   failure, so waiting out a long think cannot park a healthy engine;
+#: * a caller whose own pass ran past the budget still reports ``timeout`` (a
+#:   real failure — the engine may be stuck), but when that abandoned pass
+#:   *finishes* in its thread, the engine is credited back (failures reset,
+#:   unless something newer failed): a slow-but-healthy engine is never left
+#:   benched mid-think.
+_in_flight = 0
+_failure_gen = 0
+
 #: Consecutive engine failures before it is parked, and for how long. A discovery
 #: run scores up to ``AI_RESCORE_TOP`` candidates; without this, an engine that
 #: is down (crash, missing GPU, OOM) costs the run one ``LAYA_TIMEOUT_SECONDS``
@@ -151,20 +175,23 @@ def _get_router() -> Any:
 
 def reset_for_tests() -> None:
     """Forget the cached router and failure state (fixtures swap fake modules)."""
-    global _router, _load_error, _failures, _last_failure
+    global _router, _load_error, _failures, _last_failure, _in_flight, _failure_gen
     with _lock:
         _router = None
         _load_error = None
         _failures = 0
         _last_failure = None
+        _in_flight = 0
+        _failure_gen = 0
 
 
 def _record_failure() -> None:
     """Count a failed forward pass (timeout, crash, bad payload)."""
-    global _failures, _last_failure
+    global _failures, _last_failure, _failure_gen
     with _lock:
         _failures += 1
         _last_failure = time.monotonic()
+        _failure_gen += 1
 
 
 def _record_success() -> None:
@@ -172,6 +199,31 @@ def _record_success() -> None:
     with _lock:
         _failures = 0
         _last_failure = None
+
+
+def _late_pass_finished_cleanly(failure_gen_at_abandonment: Optional[int]) -> bool:
+    """Credit a pass the caller already abandoned: the engine finished its think.
+
+    Resets the failure counter only when nothing has failed since this pass was
+    given up on — a crash recorded in the meantime is newer information about
+    the engine than this late success, and must not be erased. Returns whether
+    the credit was applied.
+    """
+    global _failures, _last_failure
+    if failure_gen_at_abandonment is None:
+        return False
+    with _lock:
+        if _failure_gen != failure_gen_at_abandonment:
+            return False
+        _failures = 0
+        _last_failure = None
+        return True
+
+
+def in_flight_passes() -> int:
+    """Forward passes currently running on the engine (mid-think)."""
+    with _lock:
+        return _in_flight
 
 
 def _failure_state() -> Tuple[int, Optional[float]]:
@@ -193,13 +245,21 @@ def parked() -> bool:
 
 
 def status() -> Dict[str, Any]:
-    """What the settings UI needs to describe the engine honestly."""
+    """What the settings UI needs to describe the engine honestly.
+
+    ``in_flight`` / ``parked`` make the *think-phase* state visible: a non-zero
+    ``in_flight`` means a forward pass is running right now (the engine is
+    thinking, not dead), and ``parked`` says whether recent failures have it
+    benched.
+    """
     return {
         "installed": installed(),
         "platform_enabled": bool(settings.laya_enabled),
         "device": settings.laya_device or "auto",
         "max_len": settings.laya_max_len,
         "load_error": _load_error,
+        "in_flight": in_flight_passes(),
+        "parked": parked(),
     }
 
 
@@ -208,6 +268,9 @@ LAYA_STATUS_OK = "ok"
 LAYA_STATUS_TIMEOUT = "timeout"
 LAYA_STATUS_PARKED = "parked"
 LAYA_STATUS_ERROR = "error"
+#: The caller gave up while its pass was still queued behind a running one —
+#: the engine was busy thinking, and nothing about its health was learned.
+LAYA_STATUS_BUSY = "busy"
 
 
 # --------------------------------------------------------------------------- #
@@ -306,6 +369,8 @@ def _status_for_code(code: str) -> str:
         return LAYA_STATUS_TIMEOUT
     if code == "engine_parked":
         return LAYA_STATUS_PARKED
+    if code == "engine_busy":
+        return LAYA_STATUS_BUSY
     return LAYA_STATUS_ERROR
 
 
@@ -371,7 +436,13 @@ def _verdict_summary(result: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 async def _predict_locked(questions: Mapping[str, Any], state: Any, *,
                           force_long: bool = False, timeout: Optional[float] = None,
                           task: str = "") -> Dict[str, Any]:
-    """The engine call itself (see :func:`predict`, which records it)."""
+    """The engine call itself (see :func:`predict`, which records it).
+
+    The engine is never punished for still thinking: a caller whose budget
+    elapsed while its pass was queued reports ``engine_busy`` (not a failure),
+    and a pass abandoned for running past the budget credits the engine back
+    when it finishes cleanly in its thread.
+    """
     router = _get_router()
     if parked():
         inc("jobhunter_laya_predict_total", result="parked")
@@ -392,18 +463,64 @@ async def _predict_locked(questions: Mapping[str, Any], state: Any, *,
         kwargs["model"] = "multilingual"
         kwargs["max_len"] = max_len
 
+    #: Set once this call's pass actually holds the engine (it was thinking on
+    #: our behalf, not merely queued). Checked when the caller's budget elapses.
+    pass_started = threading.Event()
+    #: Set by this coroutine when it abandons the pass, together with the
+    #: failure-generation at abandonment — the running thread reads both when
+    #: the pass eventually finishes, to credit the engine back if warranted.
+    abandoned: Dict[str, Any] = {"flag": False, "failure_gen": None}
+
     def _run() -> Dict[str, Any]:
-        with _predict_lock:
-            return router.predict(state, dict(questions), **kwargs)
+        global _in_flight
+        completed = False
+        try:
+            with _predict_lock:
+                pass_started.set()
+                with _lock:
+                    _in_flight += 1
+                try:
+                    result = router.predict(state, dict(questions), **kwargs)
+                    completed = True
+                    return result
+                finally:
+                    with _lock:
+                        _in_flight -= 1
+        finally:
+            if abandoned["flag"]:
+                # The caller already reported this pass. A clean finish means
+                # the engine was thinking, not broken — give it its credit back
+                # (unless something newer failed). A crash after abandonment is
+                # already covered by the recorded timeout: counting it twice
+                # would park the engine on one bad pass.
+                if completed and _late_pass_finished_cleanly(abandoned["failure_gen"]):
+                    inc("jobhunter_laya_predict_total", result="late_ok")
+                    log.debug("laya: abandoned pass finished after %.0fms — engine credited back",
+                              (time.perf_counter() - started) * 1000)
 
     started = time.perf_counter()
     budget = float(timeout or settings.laya_timeout or 20.0)
     try:
         result = await asyncio.wait_for(asyncio.to_thread(_run), timeout=budget)
     except asyncio.TimeoutError as exc:
-        _record_failure()
-        inc("jobhunter_laya_predict_total", result="timeout")
-        raise LayaUnavailable("timeout", f"laya did not answer within {budget:.0f}s") from exc
+        if pass_started.is_set():
+            # The engine WAS thinking on our behalf and ran past the caller's
+            # whole budget — a real timeout (the engine may be stuck).
+            abandoned["flag"] = True
+            _record_failure()
+            with _lock:
+                abandoned["failure_gen"] = _failure_gen
+            inc("jobhunter_laya_predict_total", result="timeout")
+            raise LayaUnavailable("timeout", f"laya did not answer within {budget:.0f}s") from exc
+        # The pass never started: the engine was still busy with an earlier
+        # forward pass when this caller's budget elapsed. Queue pressure —
+        # nothing about the engine's health was learned, so this is not a
+        # failure and must never park it.
+        inc("jobhunter_laya_predict_total", result="busy")
+        raise LayaUnavailable(
+            "engine_busy",
+            f"the engine was still busy with an earlier pass when the {budget:.0f}s budget elapsed",
+        ) from exc
     except LayaUnavailable:
         raise
     except Exception as exc:

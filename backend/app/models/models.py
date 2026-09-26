@@ -2070,7 +2070,9 @@ class LayaDecision(Base):
     """One local-engine forward pass — **owner-only**.
 
     ``status`` is ``ok`` when the engine answered at all, ``timeout`` /
-    ``error`` / ``parked`` when it did not, and ``low_confidence`` when it
+    ``error`` / ``parked`` when it did not, ``busy`` when the caller gave up
+    while its pass was still queued behind a running one (queue pressure, not
+    an engine failure), and ``low_confidence`` when it
     answered below ``floor`` (which is what makes ``auto`` mode escalate to the
     LLM). ``answers`` keeps the compact verdict per question — the choice, the
     rubric level, the calibrated confidence — never the state that was scored,
